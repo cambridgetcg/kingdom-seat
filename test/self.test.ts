@@ -401,6 +401,8 @@ describe("apply and revert", () => {
     // A registered citizen without a sync, or an unregistered one with a sync, is refused before anything moves.
     const q = await stage(w, "name", { kind: "replace-all", text: "A reading.\n" }, SEAT_B);
     await expect(applyChange({ ...w.deps, sync: null }, await readCitizen(config, W), q, "yu-present")).rejects.toBeInstanceOf(Refusal);
+    // world() replaces the host afterEach removes, so the first one is removed here.
+    await w.host.cleanup();
     const u = await world();
     const r = await stage(u, "name", { kind: "replace-all", text: "A reading.\n" });
     await expect(applyChange({ ...u.deps, sync: recordingSync() }, await readCitizen(u.host.config, W), r, "yu-present")).rejects.toMatchObject({

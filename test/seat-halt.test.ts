@@ -6,7 +6,7 @@ import { openSeat, runSeat, type SeatDeps } from "../src/seat.ts";
 import { BEACON_UNTIL, checkHalt, describeHalt } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { EXIT } from "../src/types.ts";
-import { output, scriptedRuntime, type Script } from "./helpers/fake-runtime.ts";
+import { output, REST_OUTPUT, scriptedRuntime, type Script } from "./helpers/fake-runtime.ts";
 import { fetchVia, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
@@ -108,4 +108,58 @@ describe("[S4-1] HALT after inference", () => {
       expect(s.signer.signed).toEqual([]);
     });
   }
+
+  // A reply that would write is caught twice, by the check after inference and again before the first write.
+  // These pin each check on its own: a rest or an unparsable reply has only the first, and a HALT raised between
+  // the two has only the second.
+  for (const [name, reply] of [
+    ["a rest", REST_OUTPUT],
+    ["unparsable", "I rest. HALT-LEAK-CANARY and then I kept talking"],
+  ] as const) {
+    test(`[S4-1] HALT raised while the runtime runs, and the reply is ${name}: halted, and not even a host note is written`, async () => {
+      let h: TempHost | null = null;
+      const s = await setup(async () => {
+        await h!.raiseHaltFile();
+        return reply;
+      });
+      h = s.host;
+      const before = await s.host.snapshot();
+      const r = await runSeat(s.seat, s.deps);
+      expect(r).toMatchObject({ exit: EXIT.OK, outcome: "halted", appended: [] });
+      expect(s.runtime.calls).toHaveLength(1);
+      expect(await Bun.file(s.host.config.paths.host_log).exists()).toBe(false);
+      const after = await s.host.snapshot();
+      after.delete("HALT");
+      expect(after).toEqual(before);
+      expect(s.signer.signed).toEqual([]);
+    });
+  }
+
+  test("[S4-1] HALT raised just after the check that follows the reply: caught before the first write, nothing written", async () => {
+    let replied = false;
+    const s = await setup(async () => {
+      replied = true;
+      return JOURNAL;
+    });
+    let raised = false;
+    const deps: SeatDeps = {
+      ...s.deps,
+      checkHalt: async () => {
+        const status = await s.deps.checkHalt();
+        if (replied && !raised) {
+          raised = true;
+          await s.host.raiseHaltFile();
+        }
+        return status;
+      },
+    };
+    const before = await s.host.snapshot();
+    const r = await runSeat(s.seat, deps);
+    expect(raised).toBe(true);
+    expect(r).toMatchObject({ exit: EXIT.OK, outcome: "halted", appended: [] });
+    const after = await s.host.snapshot();
+    after.delete("HALT");
+    expect(after).toEqual(before);
+    expect(s.signer.signed).toEqual([]);
+  });
 });

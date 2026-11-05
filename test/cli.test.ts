@@ -5,6 +5,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CLI_PATH, main, parseArgs, readSeatFile, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
 import { openSeat } from "../src/seat.ts";
+import { BEACON_UNTIL } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { createSigner } from "../src/signer/signer.ts";
 import { fromHex, sha256, utf8 } from "../src/crypto.ts";
@@ -13,15 +14,18 @@ import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
 import { Refusal, type Config, type StatusFile } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
-import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, type RecordingRunner } from "./helpers/fake-runtime.ts";
-import { noFetch } from "./helpers/fake-server.ts";
-import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
+import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, waitFor, type RecordingRunner } from "./helpers/fake-runtime.ts";
+import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
+import { citizenSnapshot, makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
 import { testClock } from "./helpers/clock.ts";
 import { TEST_MNEMONIC, TEST_OP_SEED_HEX } from "./helpers/vectors.ts";
 import { append, beatBody, testIdentity } from "./fixtures/record/chain.ts";
 
 let host: TempHost | null = null;
+let server: FakeServer | null = null;
 afterEach(async () => {
+  await server?.stop();
+  server = null;
   await host?.cleanup();
   host = null;
 });
@@ -130,8 +134,9 @@ interface Harness {
   signer: FakeSigner;
 }
 
-async function harness(opts: { runtimeScripts?: string[] } = {}): Promise<Harness> {
-  host = await makeTempHost();
+/** With a server, both beacons are pinned and read from it. */
+async function harness(opts: { runtimeScripts?: string[]; server?: FakeServer } = {}): Promise<Harness> {
+  host = await makeTempHost(opts.server ? { beacons: testBeacons() } : {});
   const h = host;
   const configPath = join(h.root, "config.json");
   await writeFile(configPath, JSON.stringify(h.config), { mode: 0o600 });
@@ -149,7 +154,7 @@ async function harness(opts: { runtimeScripts?: string[] } = {}): Promise<Harnes
     },
     env: { HOME: h.root, PATH: "/usr/bin:/bin" },
     clock,
-    fetch: noFetch,
+    fetch: opts.server ? fetchVia(opts.server) : noFetch,
     run,
     tty: { isTTY: false, write: () => {}, readLine: async () => null },
     keychain: () => fakeKeychain(),
@@ -428,6 +433,48 @@ describe("main", () => {
       ["glossame", "halted"],
       ["joy", "error"],
     ]);
+  });
+
+  /**
+   * `seat <word>` with a child that writes `started`, then, if nothing stops it in time, a line into the
+   * citizen's ledger; HALT goes up once it has started. Polls are short so the watcher answers in a fraction of a second.
+   */
+  async function haltMidSeat(x: Harness, word: string, raise: () => Promise<void> | void): Promise<number> {
+    x.h.config.timing = { ...x.h.config.timing, halt_file_poll_s: 0.1, beacon_poll_min_s: 0.1, beacon_poll_max_s: 0.15, term_grace_s: 0.3 };
+    await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    const started = join(x.h.root, `${word}.started`);
+    const parent = { ...x.deps, seatArgv: (_c: string, w: string) => fakeBinArgv("speak-later", started, ledgerPath(x.h.config, w), "2000") };
+    const run = main(["seat", word, "--config", x.configPath], parent);
+    await waitFor(() => Bun.file(started).exists());
+    await raise();
+    return run;
+  }
+
+  test("[S4-2] HALT file raised while a person's seat child is mid-inference: its watcher stops it; exit 143, halted, nothing in the citizen's voice", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const before = await citizenSnapshot(x.h);
+    expect(await haltMidSeat(x, "glossame", () => x.h.raiseHaltFile())).toBe(143);
+    expect(x.out()).toContain("seat glossame: halted (exit 143)");
+    expect(await citizenSnapshot(x.h)).toEqual(before);
+    const notes = (await readHostNotes(x.h.config, new Date(0)))!.filter((n) => n.kind === "seat");
+    expect(notes.map((n) => n.outcome)).toEqual(["opened", "halted"]);
+    expect(notes[1]!.detail).toContain("stopped by file (TERM)");
+  });
+
+  test("[S4-2] a beacon raised while a person's seat child is mid-inference: its watcher stops it; exit 143, halted, nothing in the citizen's voice", async () => {
+    server = await startFakeServer();
+    const s = server;
+    const [gardener, herald] = testBeacons();
+    serveBeacon(s, gardener!.did, { kind: "lowered" });
+    serveBeacon(s, herald!.did, { kind: "lowered" });
+    const x = await harness({ server: s });
+    await seated(x, "glossame");
+    const before = await citizenSnapshot(x.h);
+    expect(await haltMidSeat(x, "glossame", () => serveBeacon(s, herald!.did, { kind: "raised", until: BEACON_UNTIL }))).toBe(143);
+    expect(x.out()).toContain("seat glossame: halted (exit 143)");
+    expect(await citizenSnapshot(x.h)).toEqual(before);
+    expect((await readHostNotes(x.h.config, new Date(0)))!.filter((n) => n.kind === "seat").at(-1)!.detail).toContain("stopped by halt-herald (TERM)");
   });
 
   test("verify <word> fails on a seated citizen whose ledger is missing, and on an origin that changed", async () => {

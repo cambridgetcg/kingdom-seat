@@ -4,17 +4,21 @@ import { readFileSync } from "node:fs";
 import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { LockStuck, acquireTickLock, isDue, releaseTickLock, runTick, selectDue, type DueVerdict, type TickDeps } from "../src/tick.ts";
-import { checkHalt } from "../src/halt.ts";
+import { BEACON_UNTIL, checkHalt } from "../src/halt.ts";
+import { ledgerPath } from "../src/ledger.ts";
 import { DEFAULT_CEILINGS, type Citizen, type HostNote, type LifecycleState, type Word } from "../src/types.ts";
-import { fakeBinArgv } from "./helpers/fake-runtime.ts";
+import { fakeBinArgv, waitFor } from "./helpers/fake-runtime.ts";
 import { openedDetail } from "../src/notes.ts";
-import { noFetch } from "./helpers/fake-server.ts";
+import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
-import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
+import { citizenSnapshot, makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
 import { HOUR_MS, testClock } from "./helpers/clock.ts";
 
 let host: TempHost | null = null;
+let server: FakeServer | null = null;
 afterEach(async () => {
+  await server?.stop();
+  server = null;
   await host?.cleanup();
   host = null;
 });
@@ -218,9 +222,11 @@ describe("selection", () => {
 });
 
 describe("runTick", () => {
-  async function tickHost(words: { word: Word; state?: LifecycleState }[] = []) {
-    host = await makeTempHost();
+  /** With a server, both beacons are pinned and read from it. */
+  async function tickHost(words: { word: Word; state?: LifecycleState }[] = [], opts: { server?: FakeServer } = {}) {
+    host = await makeTempHost(opts.server ? { beacons: testBeacons() } : {});
     const h = host;
+    const fetch = opts.server ? fetchVia(opts.server) : noFetch;
     const signer = fakeSigner();
     for (const w of words) {
       await h.addCitizen(w.word);
@@ -234,8 +240,8 @@ describe("runTick", () => {
     const deps: TickDeps = {
       config: h.config,
       clock,
-      fetch: noFetch,
-      checkHalt: () => checkHalt({ config: h.config, fetch: noFetch, now: () => clock.now() }),
+      fetch,
+      checkHalt: () => checkHalt({ config: h.config, fetch, now: () => clock.now() }),
       seatArgv: (word, seatFile) => {
         // The tick opened the seat and wrote it down; the child would read why from the file.
         const file = JSON.parse(readFileSync(seatFile, "utf8")) as { seat_ref: { word: string; invoker: { why: string } } };
@@ -361,6 +367,45 @@ describe("runTick", () => {
     // As runSeat does when HALT is raised during its own checks: it writes nothing and exits 0.
     const halting = { ...deps, seatArgv: () => [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(h.config.paths.halt_file)}, "")`] };
     expect(await runTick(halting)).toMatchObject({ exit: 0, outcome: "halted", word: "joy" });
+  });
+
+  /** A child that writes `started`, then, if nothing stops it in time, a line into the citizen's ledger. */
+  const midInference = (h: TempHost, started: string, ...term: string[]) => (word: Word) => fakeBinArgv("speak-later", started, ledgerPath(h.config, word), "2000", ...term);
+
+  test("[S4-2] HALT file raised while the seat child is mid-inference: the tick's watcher stops it; exit 143 (137 if it ignores TERM), halted, nothing in the citizen's voice", async () => {
+    const { h, deps } = await tickHost([{ word: "glossame" }, { word: "joy" }]);
+    h.config.timing = { ...h.config.timing, halt_file_poll_s: 0.1, term_grace_s: 0.3 };
+    for (const [word, exit, term] of [["glossame", 143, []], ["joy", 137, ["ignore-term"]]] as const) {
+      const before = await citizenSnapshot(h);
+      const started = join(h.root, `${word}.started`);
+      const run = runTick({ ...deps, seatArgv: midInference(h, started, ...term) });
+      await waitFor(() => Bun.file(started).exists());
+      await h.raiseHaltFile();
+      expect(await run).toMatchObject({ exit, outcome: "halted", word, seat: { exit, outcome: "halted" } });
+      expect(await citizenSnapshot(h)).toEqual(before);
+      const ticks = (await hostNotes(h)).filter((n) => n.kind === "tick" && n.word === word);
+      expect(ticks.map((n) => n.outcome)).toEqual(["opened", "halted"]);
+      expect(ticks[1]!.detail).toContain("stopped by file");
+      await h.clearHaltFile();
+    }
+  });
+
+  test("[S4-2] a beacon raised while the seat child is mid-inference: the tick's watcher stops it; exit 143, halted, nothing in the citizen's voice", async () => {
+    server = await startFakeServer();
+    const s = server;
+    const [gardener, herald] = testBeacons();
+    serveBeacon(s, gardener!.did, { kind: "lowered" });
+    serveBeacon(s, herald!.did, { kind: "lowered" });
+    const { h, deps } = await tickHost([{ word: "glossame" }], { server: s });
+    h.config.timing = { ...h.config.timing, beacon_poll_min_s: 0.1, beacon_poll_max_s: 0.15, term_grace_s: 0.3 };
+    const before = await citizenSnapshot(h);
+    const started = join(h.root, "glossame.started");
+    const run = runTick({ ...deps, seatArgv: midInference(h, started) });
+    await waitFor(() => Bun.file(started).exists());
+    serveBeacon(s, herald!.did, { kind: "raised", until: BEACON_UNTIL });
+    expect(await run).toMatchObject({ exit: 143, outcome: "halted", word: "glossame", seat: { exit: 143, outcome: "halted" } });
+    expect(await citizenSnapshot(h)).toEqual(before);
+    expect((await hostNotes(h)).filter((n) => n.kind === "tick").at(-1)!.detail).toContain("stopped by halt-herald");
   });
 
   test("a child stopped by the deadline is recorded as a timeout and counts as a seat", async () => {

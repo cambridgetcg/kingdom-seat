@@ -131,6 +131,15 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
   };
 }
 
+const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "status.json", TEST_HALT_FILE]);
+
+/** A snapshot without the host's own records (its log, status, seat files and HALT): what is left is what a citizen's voice could reach. */
+export async function citizenSnapshot(h: TempHost): Promise<Map<string, string>> {
+  const snap = await h.snapshot();
+  for (const k of [...snap.keys()]) if (HOST_RECORDS.has(k) || k.startsWith("seats/")) snap.delete(k);
+  return snap;
+}
+
 /** The repo's own models.lock: unpinned, so the free lane must refuse until a test pins a digest. */
 export const UNPINNED_LOCK: ModelsLock = {
   format: "kingdom-seat-models-lock/v1",

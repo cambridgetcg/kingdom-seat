@@ -410,7 +410,7 @@ shows the whole mapping.
 | # | S4 verify item (redesign section 5) | Test file(s) | Owner |
 |---|---|---|---|
 | S4-1 | HALT checked before and after inference, for the local file and both beacons | `test/seat-halt.test.ts` (readings in `test/halt.test.ts`) | seat |
-| S4-2 | The watcher kills a running seat | `test/seat-watcher.test.ts` | seat |
+| S4-2 | The watcher kills a running seat | `test/seat-watcher.test.ts`; HALT handed to it by the tick and by `seat <word>` in `test/tick.test.ts`, `test/cli.test.ts` | seat |
 | S4-3 | Refusal of diverged homes, symlinks and executable bits | `test/mirror.test.ts`; symlinked letters and souls in `test/context.test.ts` | surface; voice |
 | S4-4 | Fail-closed ceilings | `test/signer/ceilings.test.ts`; at the send boundary in `test/signer/signer.test.ts` | signer |
 | S4-5 | Citizen quiet capped at 30 days or less | `test/signer/ceilings.test.ts`, `test/signer/signer.test.ts`; request shape in `test/agenttool/client.test.ts` | signer; agenttool |
