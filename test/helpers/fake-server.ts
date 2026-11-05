@@ -69,15 +69,21 @@ export async function startFakeServer(): Promise<FakeServer> {
  * URL, to the fake server, and throws for every other destination. Code under
  * test keeps its pinned origin; the test still cannot reach the network.
  */
-export function fetchVia(server: FakeServer, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+export function fetchVia(server: Pick<FakeServer, "url">, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+  return fetchViaUrl(server.url, pinnedOrigins);
+}
+
+/** fetchVia by the server's URL alone, for a child process that reaches the parent's fake server. */
+export function fetchViaUrl(serverUrl: string, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+  const target = new URL(serverUrl);
+  if (target.protocol !== "http:" || target.hostname !== "127.0.0.1") throw new Error("fetchViaUrl: the fake server is on http://127.0.0.1 only");
   return async (input, init) => {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const url = new URL(raw);
-    const target = new URL(server.url);
     if (url.origin !== target.origin && !pinnedOrigins.includes(url.origin)) {
       throw new Error(`fetchVia: refused ${url.origin}; tests may only reach the fake server`);
     }
-    const rewritten = `${server.url}${url.pathname}${url.search}`;
+    const rewritten = `${serverUrl}${url.pathname}${url.search}`;
     return fetch(rewritten, init);
   };
 }

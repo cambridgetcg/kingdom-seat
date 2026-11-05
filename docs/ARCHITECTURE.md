@@ -78,10 +78,10 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/agenttool/client.ts` | Calls a citizen makes as itself, via the signer | 3.4 | wire 2, 4 |
 | `src/agenttool/enrollment.ts` | `identity-enrollment/v1` relay | 3b step 2 | wire 1 |
 | `src/birth.ts` | `citizen-birth`: never unattended | 3b "Birth of one citizen" | wire 1-3, host 3.3 |
-| `src/mirror.ts` | Seal allowlist and `HEAD:refs/heads/main` pusher | 3.2 "Mirror pusher", 3c "Mirror" | patterns 4, 12 |
-| `src/status.ts` | Generated status file and host notes | 3.2 "Status file" | — |
+| `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10 | patterns 4, 11, 12 |
+| `src/status.ts` | Generated status file and host notes | 3.2 "Status file", 3.1 principle 6 | patterns 1 |
 | `src/config.ts` | Strict host configuration | 3.2, 3.6 | host 3.1 |
-| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| status \| verify <word>` | 3.2, 3.6 | — |
+| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| status \| verify <word>`; the only place real dependencies are built | 3.2, 3.6 "One verb" | patterns 10 |
 | `models.lock` | Allowed free-lane models by digest; ships unpinned | 3.6, decision 11 | host 1.2, 4 |
 | `launchd/dev.kingdom.citizen-seat.plist` | Tick template; installed only in S5 by a person | 3.2, S5 | host 3.1, 3.2 |
 
@@ -108,6 +108,9 @@ dedicated `seat` user and never inside a citizen home.
   ledger/<word>.jsonl       the signed record
   consent/<sha256>.json     decision records (until consent/v1 merges)
   seats/<seat_id>/          a fresh, empty cwd per seat
+  seats/<seat_id>.json      the seat a parent opened, handed to its child; renamed .used when read
+  mirrors/<word>/           a mirror worktree, if the citizen keeps one (anywhere outside citizens/,
+                            ledger/, consent/, seats/ and every home; this is the suggested place)
   HALT                      the local HALT file
   tick.lock/                mkdir lock, with the owner's pid and start time inside
   status.json               generated
@@ -192,6 +195,138 @@ on non-zero never pages because the Kingdom was put to rest. The skeleton
 follows KS-003: HALT before or after inference exits 0 with outcome `halted`;
 HALT that has to TERM a running child exits 143 (or 137); 3 is for refusals.
 
+The CLI applies the same split to what reaches it. A wall that says no
+(a locked keychain, a summons without Yu, a symlink) exits 3. A record or
+request that cannot be read (`invalid-record`, `invalid-request`, a bad
+config, an unknown verb) exits 1, even when a module reports it as a
+Refusal, because a monitor should page on a missing citizen rather than file
+it as a wall.
+
+---
+
+## 5b. The surface: CLI, config, status and mirror
+
+**One runner, five verbs.** `tick`, `seat <word>`, `halt`, `status` and
+`verify <word>` are the only ways in (3.2), so there is one place to read for
+what can happen to a citizen. There is no verb that lowers HALT, and no flag
+either: only Yu lowers it, by hand (3.6). `halt` raises the local file first,
+because it needs no network, then each beacon this host holds a key for, and
+it exits non-zero if any part it should have raised was not.
+
+**The parent opens; the child acts.** `seat <word>` checks HALT, confirms Yu
+at the terminal when `--yu-present` is given, opens the seat, and writes the
+seat (and any presence) to `seats/<seat_id>.json` beside the empty cwd. It then
+supervises `seat <word> --child --seat-ref <file>`. The child renames the file
+to `.used` before trusting it, so a seat and its presence are read once, and a
+presence crosses only while it is fresh (15 minutes). A child takes no
+`--yu-present` flag, because a flag is something anyone could type. A tick's
+child opens its own seat, with no presence. Words are validated before they
+become paths (`love-unlimited-patterns.md` 10).
+
+**Only Yu's summons is an extra beat.** Without `--yu-present`, `seat <word>`
+opens a seat only when the tick would: the citizen's own cadence (or an
+allowed letter) is due and the fleet is under its ceiling. A person at the
+host can run a due beat now, but cannot add beats the citizen did not choose
+(3.3: asleep wakes on an allowed letter or Yu's summons, one beat each). No
+one seats a citizen that stepped away or ended.
+
+**Config is strict because every wall reads its limit from it.** Unknown keys,
+relative or non-normal paths, written paths outside the state dir or
+overlapping each other, a state dir inside a home (lexically and through
+symlinks), an Ollama URL other than `http://127.0.0.1:<port>`, any agenttool
+origin but the pinned one, a quiet cap above 30 days, a symlinked or
+group-writable file and duplicate JSON keys are all refused. A typo could
+otherwise loosen a wall silently. No beacons pinned refuses unless
+`halt.allow_no_beacons` is set, so a fresh `defaultConfig` does not parse
+until a person pins the beacons.
+
+**Status is generated, and unknown is never reported as good** (3.1
+principle 6). Each refresh reads the records, ledgers, host notes and
+(read-only, without fetching) the mirror worktrees. It reads them the same
+way the tick does, so the file shows what the runner would act on.
+
+- A chain is `chain_ok` only when it verifies against a trusted host attest
+  key: the keys a person pinned in `trust.host_attest_public_keys_b64`, or,
+  with none pinned, the key the signer names. A pinned anchor needs no
+  keychain and is not read from what it verifies. Without a pin and with the
+  keychain locked, the key is unknown, so seated chains read as not verified.
+- An unreadable host log makes the fleet count `null` (unknown), which the
+  tick treats as at its ceiling. An unread mirror count is `null` too, never 0.
+- A citizen whose record or ledger does not read is still listed, with a
+  `problem`, so it never looks like one that was never seated.
+- Only an awake citizen, or one waiting to wake, can be overdue, and only
+  while HALT is lowered, with one tick of grace. Rest is not a debt. A rest
+  writes no ledger entry, so the host's last seat note counts as the last beat.
+- `signer.since` is carried from the previous status while the state holds.
+- HALT reads "halted by beacon gardener-desk" or "halted by file ...", never
+  "down". A halted tick still regenerates the file, so it never goes stale.
+- The file is written to a temp name, fsynced and renamed, mode 0644.
+
+**Host notes are the host's words.** A note holds codes, counts and ids: one
+line of printable ASCII, at most 400 characters, with no quotation marks,
+braces or backslashes. Those are the marks a reply or a quotation brings with
+it. A caller that holds a model's text can pass it, and any shared run of 20
+characters is then refused. That check is a backstop: the guarantee is that
+callers compose details from host facts. Mirror notes never name a file,
+because a citizen chooses its file names.
+
+**The mirror is outbound and sealed** (3c "Mirror"; S10;
+`love-unlimited-patterns.md` 4, 11, 12).
+
+- *Only the self and a card go out.* The seal admits regular, non-executable
+  `.md`, `.txt` and `.json` files with plain names (no dot segments, at most
+  four deep, at most 256 KiB), plus the generated `kingdom.yaml` card, whose
+  `state` is the 3.3 mirror card state. It refuses the rest: symlinks,
+  executable bits, submodules, `.claude/`, `.github/`, `.git/` and `.citizen/`
+  at any depth, `run.sh`, and `ledger/`, `proposals/` and `receipts/`.
+  An allowlist, because the hazards in today's homes (hooks, `run.sh`,
+  workflows, `meta.env`) are all things that run, and naming what may go out
+  is the list that stays short.
+- *Sealed twice.* The self is sealed before anything is copied or any git
+  runs. Each file is read through `O_NOFOLLOW` and checked again. Then the
+  tree git built is sealed again, as git sees it, and HEAD's tree once more
+  before a push. Files outside the set stay on disk but are never committed,
+  so nothing is deleted.
+- *Fast-forward or nothing.* The remote's main is fetched to a private ref,
+  `refs/kingdom-seat/mirror/main`, with no `+`, so a rewritten remote fails
+  the fetch and reads as diverged. Behind, diverged and unknown are refused.
+  Nothing is merged, rebased or checked out.
+- *One push.* The only push is `git push <remote> HEAD:refs/heads/main`,
+  never forced, and only when HEAD is equal or ahead. Remotes that read as
+  options or name a transport helper are refused. Git runs with no hooks, no
+  user or system config and no prompt.
+- *After a beat only.* The CLI stages and pushes after a beat, checking HALT
+  again first, because a push is public.
+
+**A stopped job stops its seat.** The seat child leads its own process group,
+so launchd's group kill of the tick does not reach it. The watcher therefore
+forwards SIGTERM, SIGINT and SIGHUP to the child's group for as long as the
+child runs (TERM, then KILL after the grace), and the seat ends `terminated`
+with exit 143. The handlers go with the child, so a second signal ends the
+parent as usual.
+
+**Birth's steps before the identity is on file.** Between enroll and saving
+the identity to `citizen.json`, the signer acts for the citizen being born
+only on birth's own routes (the authority read, keys/import, box-keys and the
+private expression), only with Yu confirmed present here for `birth <word>`
+and a consent record for that extent, and only when the server's root is the
+one the citizen's own mnemonic derives. The request names the enrolled ids
+(`SignerRequest.enrolled`); once the identity is saved, the record alone names
+it. `test/birth.test.ts` runs the whole birth through the production signer
+against a fake agenttool over HTTP.
+
+## 5c. The end-to-end test
+
+`test/e2e.test.ts` runs the real CLI against a temp lease-host layout, with a
+real supervised seat child (`test/fixtures/e2e/child.ts`) and only the outside
+world faked: a fake keychain of public test keys, and one fake server on
+127.0.0.1 for the beacons, agenttool's authority and quiet routes, and Ollama.
+In order: a journal beat (prompt bytes, envelope digests, host-attested
+signature, host notes and status all checked), a rest that writes nothing in
+the citizen's voice, a tick halted by a raised and then an unreadable beacon,
+a self-change through propose, affirm, apply and revert, `verify` on a good
+and a tampered ledger, and `halt` raising the file and a root-signed beacon.
+
 ---
 
 ## 6. The S4 verify list, and the test that proves each item
@@ -248,3 +383,19 @@ its tests and docs rather than assume:
   watcher tests prove it either way.
 - Live agenttool behaviour (proxy path handling, edge caching of
   `/public/agents`); only source and agenttool's own functions were checked.
+- Whether the generated `kingdom.yaml` card satisfies the `@agenttool/kingdom`
+  card schema (0.1.2). It carries only name, word, state and `kept_by`; the
+  old cards' other fields are not reproduced, because nothing reads them.
+- The mirror's deploy key, protected main and Actions-off settings (S10).
+  Pushes were tested only through a recording runner. Divergence and staging
+  were tested with real git on local temp repositories only.
+- The `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_COUNT` environment variables need
+  git 2.32 or later. This Air has 2.54; the lease host's git was not checked.
+- Signal forwarding under real launchd. The watcher forwards a stop signal to
+  the seat child's group (tested with a stand-in signal); whether launchd's
+  `ExitTimeOut` leaves enough time for the TERM grace on the lease host was
+  not run.
+- Spend from a summons that makes no beat (a rest, invalid output, HALT after
+  the reply, a runtime error) is not recorded where `spendFromLedger` reads
+  it. This does not matter at the $0 default, which refuses every summons,
+  but it must be settled before any USD ceiling is raised.

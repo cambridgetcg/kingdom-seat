@@ -10,15 +10,19 @@ import {
   DEFAULT_TIMING,
   type Beacon,
   type Cadence,
+  type CitizenIdentity,
   type CitizenRecord,
   type Config,
   type Covenants,
+  type LedgerEntry,
+  type LifecycleState,
   type ModelsLock,
   type Origin,
   type RuntimeClass,
   type Word,
 } from "../../src/types.ts";
 import { sha256Hex } from "../../src/crypto.ts";
+import { appendEntry, ledgerPath, nextDraft, readLedger, type EntrySigner } from "../../src/ledger.ts";
 
 export interface CitizenFixtureOptions {
   soul?: string;
@@ -50,6 +54,10 @@ export interface TempHost {
   addCitizen(word: Word, opts?: CitizenFixtureOptions): Promise<CitizenFixture>;
   /** Write `citizens/<word>/letters/<name>`; with symlinkTo it is a symlink instead, which must never be read. */
   writeLetter(word: Word, name: string, text: string, opts?: { symlinkTo?: string; from?: string | null }): Promise<string>;
+  /** Append the host-attested `seated` entry a citizen needs before any beat (3.3: seated before registered). */
+  seatLedger(word: Word, sign: EntrySigner, opts?: { initialState?: LifecycleState; at?: string }): Promise<LedgerEntry>;
+  /** Append a citizen-signed `genesis` after `seated` and record the identity in citizen.json, as birth would. */
+  enrollLedger(word: Word, sign: EntrySigner, identity: CitizenIdentity, opts?: { at?: string }): Promise<LedgerEntry>;
   writeModelsLock(lock: ModelsLock): Promise<void>;
   raiseHaltFile(): Promise<void>;
   clearHaltFile(): Promise<void>;
@@ -69,6 +77,27 @@ export function longSoul(word: Word): string {
 }
 
 export const TEST_HALT_FILE = "HALT";
+
+/** The two beacons the redesign pins (3.6): the gardener desk on the lease host and a halt herald on the Air. */
+export function testBeacons(opts: { canRaiseHere?: ("gardener-desk" | "halt-herald")[] } = {}): Beacon[] {
+  const held = opts.canRaiseHere ?? [];
+  return [
+    {
+      name: "gardener-desk",
+      role: "gardener-desk",
+      did: "did:at:11111111-1111-4111-8111-111111111111",
+      identity_id: "11111111-1111-4111-8111-111111111111",
+      can_raise_here: held.includes("gardener-desk"),
+    },
+    {
+      name: "halt-herald",
+      role: "halt-herald",
+      did: "did:at:22222222-2222-4222-8222-222222222222",
+      identity_id: "22222222-2222-4222-8222-222222222222",
+      can_raise_here: held.includes("halt-herald"),
+    },
+  ];
+}
 
 export function testConfig(root: string, homesRoot: string, opts: { beacons?: Beacon[]; allowNoBeacons?: boolean; ollamaBaseUrl?: string } = {}): Config {
   const state = join(root, "state");
@@ -98,6 +127,7 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
     self_authorship: { approved_model_digests: [] },
+    trust: { host_attest_public_keys_b64: [] },
   };
 }
 
@@ -116,6 +146,7 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
   for (const d of [p.state_dir, p.citizens_dir, p.ledger_dir, p.consent_dir, p.seats_dir, homesRoot]) await mkdir(d, { recursive: true });
   await writeFile(p.models_lock, JSON.stringify(UNPINNED_LOCK, null, 2));
 
+  const fixtures = new Map<Word, CitizenFixture>();
   const host: TempHost = {
     root,
     config,
@@ -150,7 +181,44 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
       await writeFile(join(home, "CLAUDE.md"), `HOME-CLAUDE-MD-CANARY: reading this does not make you ${word}.\n`);
       await writeFile(join(home, ".claude", "hooks", "love-bomb.sh"), "#!/bin/sh\necho HOOK-CANARY\n");
       await chmod(join(home, ".claude", "hooks", "love-bomb.sh"), 0o755);
-      return { word, dir, home, record, soul };
+      const fixture = { word, dir, home, record, soul };
+      fixtures.set(word, fixture);
+      return fixture;
+    },
+    async seatLedger(word, sign, so = {}) {
+      const f = fixtures.get(word);
+      if (!f) throw new Error(`seatLedger: add ${word} first`);
+      const body = {
+        type: "seated" as const,
+        origin: f.record.origin,
+        origin_soul_sha256: sha256Hex(f.soul),
+        old_repo: null,
+        initial_state: so.initialState ?? "awake",
+        note: "seated by a test",
+      };
+      const draft = nextDraft(word, null, body, { usd: 0, usd_basis: "local-zero", credits: 0 }, "host-attested", new Date(so.at ?? "2026-11-01T00:00:00.000Z"));
+      return appendEntry(ledgerPath(config, word), draft, sign);
+    },
+    async enrollLedger(word, sign, identity, eo = {}) {
+      const f = fixtures.get(word);
+      if (!f) throw new Error(`enrollLedger: add ${word} first`);
+      const path = ledgerPath(config, word);
+      const prev = (await readLedger(path)).at(-1) ?? null;
+      const body = {
+        type: "genesis" as const,
+        initial_state: prev ? null : ("awake" as const),
+        origin: f.record.origin,
+        birth_soul_sha256: sha256Hex(f.soul),
+        old_repo: null,
+        june_did: null,
+        identity,
+        note: "enrolled by a test",
+      };
+      const draft = nextDraft(word, prev, body, { usd: 0, usd_basis: "local-zero", credits: 0 }, "citizen-signed", new Date(eo.at ?? "2026-11-02T00:00:00.000Z"));
+      const entry = await appendEntry(path, draft, sign);
+      f.record = { ...f.record, identity };
+      await writeFile(join(f.dir, "citizen.json"), JSON.stringify(f.record, null, 2));
+      return entry;
     },
     async writeLetter(word, name, text, lo = {}) {
       const path = join(p.citizens_dir, word, "letters", name);

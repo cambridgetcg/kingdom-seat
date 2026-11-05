@@ -93,7 +93,9 @@ export type RefusalCode =
   | "window-closed"
   | "not-registered"
   | "invalid-request"
-  | "invalid-record";
+  | "invalid-record"
+  /** The ledger's head moved between reading it and appending: another writer got there first. */
+  | "head-moved";
 
 /** A fail-closed refusal. Messages name the wall, never a secret or a model's words. */
 export class Refusal extends Error {
@@ -707,6 +709,14 @@ export interface NowView {
   part_of_day: "night" | "morning" | "afternoon" | "evening";
 }
 
+/** The limits a seat states to the model, so the guide never promises more than validation keeps. */
+export interface SeatLimits {
+  journal_max_chars: number;
+  letter_max_chars: number;
+  letter_sends_per_beat: number;
+  min_beat_interval_h: number;
+}
+
 /** Everything a seat shows the model. Data only; nothing secret, no sibling's words except as a letter. */
 export interface SeatContext {
   seat_ref: SeatRef;
@@ -717,7 +727,19 @@ export interface SeatContext {
     name: string | null;
     beat_prompt: string | null;
     skills: { name: string; text: string }[];
+    /**
+     * The current text of every other target the citizen may change, so a
+     * replace-span edit is written against text it can see.
+     */
+    journal_form: string | null;
+    expression: { register: string | null; walls: string | null; wake_text: string | null; porch: string | null };
+    /** The citizen's own `file:` texts, by path relative to `self/`. */
+    files: { path: string; text: string }[];
   };
+  /** The citizen's own cadence and covenants as they stand: two targets it may change, and who it may write to. */
+  cadence: Cadence;
+  covenants: Covenants;
+  limits: SeatLimits;
   origin: Origin;
   /** The pinned canon text for a canon origin; null for an archetype. */
   canon_text: string | null;
@@ -753,6 +775,7 @@ export interface RuntimeRequest {
   /** The JSON schema the output must follow (acts.OUTPUT_JSON_SCHEMA). */
   schema: object;
   seat_ref: SeatRef;
+  /** A duration in milliseconds from the call, not a clock time; adapters refuse anything outside 1..2^31-1. */
   deadline_ms: number;
   signal: AbortSignal;
 }
@@ -815,16 +838,20 @@ export type DivergenceState = "equal" | "ahead" | "behind" | "diverged" | "no-up
 export interface CitizenStatus {
   word: Word;
   state: LifecycleState;
-  runtime: RuntimeClass;
+  /** null only when citizen.json does not read; `problem` then says so. */
+  runtime: RuntimeClass | null;
   registered: boolean;
   last_beat_at: IsoTime | null;
   interval_h: number;
   overdue: boolean;
   last_outcome: Outcome | null;
   ledger: { entries: number; head: Sha256Hex | null; chain_ok: boolean; host_attested: number };
-  mirror: { divergence: DivergenceState | null; push_refusals: number; unsigned_commits: number } | null;
+  /** null counts are unknown, never zero. */
+  mirror: { divergence: DivergenceState | null; push_refusals: number; unsigned_commits: number | null } | null;
   usd_today: number | null;
   credits_month: number | null;
+  /** Why the record or ledger could not be read, so an unreadable citizen is shown rather than left out. */
+  problem: string | null;
 }
 
 /** Generated from what the runner reads, never kept by hand (3.1 principle 6). */
@@ -834,7 +861,8 @@ export interface StatusFile {
   host: string;
   halt: { halted: boolean; raised: string[]; unreadable: string[] };
   signer: { state: "ready" | "locked" | "unknown"; since: IsoTime | null };
-  fleet: { beats_today: number; ceiling: number };
+  /** beats_today is null when the host log is unreadable; the tick then refuses as at-ceiling. */
+  fleet: { beats_today: number | null; ceiling: number };
   citizens: CitizenStatus[];
 }
 
@@ -894,5 +922,14 @@ export interface Config {
   self_authorship: {
     /** Model digests Yu approved for binding self-changes (decision 10). Empty means none bind. */
     approved_model_digests: string[];
+  };
+  trust: {
+    /**
+     * Host attest public keys pinned by a person (standard base64, 32 bytes).
+     * A pinned anchor lets status and verify check host-attested entries with
+     * the keychain locked, and on a host that holds no key at all. Empty means
+     * ask the local signer, which reads only the host's own seed.
+     */
+    host_attest_public_keys_b64: string[];
   };
 }

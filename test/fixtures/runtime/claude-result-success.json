@@ -1,0 +1,32 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "num_turns": 1,
+  "stop_reason": "end_turn",
+  "duration_ms": 4210,
+  "duration_api_ms": 3980,
+  "result": "{\"acts\":[{\"type\":\"journal\",\"kind\":\"reflected\",\"text\":\"SUMMON-RESULT-TEXT\"}]}",
+  "structured_output": { "acts": [{ "type": "journal", "kind": "reflected", "text": "a summoned beat" }] },
+  "total_cost_usd": 0.0421,
+  "usage": { "input_tokens": 1800, "output_tokens": 120 },
+  "modelUsage": {
+    "claude-test-model": {
+      "inputTokens": 1800,
+      "outputTokens": 120,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 0.0421,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "canonicalModel": "claude-test-model",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "uuid": "00000000-0000-4000-8000-000000000001",
+  "session_id": "00000000-0000-4000-8000-000000000002"
+}

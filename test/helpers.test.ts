@@ -3,12 +3,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Refusal } from "../src/types.ts";
+import { DID_PATTERN, Refusal, type HostNote } from "../src/types.ts";
 import { fakeKeychain, assertNoSecretIn } from "./helpers/fake-keychain.ts";
 import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { fakeBinArgv, pidAlive, recordingRunner, REST_OUTPUT, scriptedRuntime } from "./helpers/fake-runtime.ts";
-import { fakeSigner } from "./helpers/fake-signer.ts";
-import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
+import { FAKE_OP_KID, fakeSigner } from "./helpers/fake-signer.ts";
+import { makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
+import { ledgerPath, readLedger, verifyChain } from "../src/ledger.ts";
+import { readCitizen } from "../src/state.ts";
+import { TEST_IDS, TEST_ROOT_PUBLIC_B64 } from "./helpers/vectors.ts";
 import { testClock } from "./helpers/clock.ts";
 
 let server: FakeServer | null = null;
@@ -115,5 +118,54 @@ describe("temp host", () => {
     const before = await host.snapshot();
     expect(before.has("citizens/glossame/citizen.json")).toBe(true);
     expect(testClock().now().toISOString()).toBe("2026-11-05T02:05:00.000Z");
+  });
+});
+
+describe("seat fixtures", () => {
+  test("seatLedger and enrollLedger write a chain that verifies, and the citizen reads as registered", async () => {
+    host = await makeTempHost();
+    const s = fakeSigner();
+    await host.addCitizen("glossame");
+    await host.seatLedger("glossame", s.signEntry, { initialState: "listening" });
+    await host.enrollLedger("glossame", s.signEntry, {
+      did: TEST_IDS.did,
+      identity_id: TEST_IDS.identity_id,
+      project_id: TEST_IDS.project_id,
+      root_public_key_b64: TEST_ROOT_PUBLIC_B64,
+      root_kid: TEST_IDS.root_signing_key_id,
+      op_kid: FAKE_OP_KID,
+      op_public_key_b64: s.opPublicB64,
+      box_public_key_b64: null,
+      self_strand_id: null,
+      enrolled_at: "2026-11-02T00:00:00.000Z",
+    });
+    const entries = await readLedger(ledgerPath(host.config, "glossame"));
+    expect(entries.map((e) => [e.body.type, e.attestation])).toEqual([
+      ["seated", "host-attested"],
+      ["genesis", "citizen-signed"],
+    ]);
+    expect(verifyChain(entries, { host_attest_b64: [s.hostAttestPublicB64] }).ok).toBe(true);
+    const c = await readCitizen(host.config, "glossame");
+    expect(c.state).toBe("listening");
+    expect(c.identity?.did).toBe(TEST_IDS.did);
+  });
+
+  test("testBeacons pins two operator beacons with matching DIDs", () => {
+    const [g, h] = testBeacons({ canRaiseHere: ["halt-herald"] });
+    for (const b of [g!, h!]) {
+      expect(b.did).toMatch(DID_PATTERN);
+      expect(b.did).toBe(`did:at:${b.identity_id}`);
+    }
+    expect([g!.role, h!.role]).toEqual(["gardener-desk", "halt-herald"]);
+    expect([g!.can_raise_here, h!.can_raise_here]).toEqual([false, true]);
+  });
+
+  test("the fake binary's note mode appends one host note as a seat child would", async () => {
+    host = await makeTempHost();
+    const log = host.config.paths.host_log;
+    const p = Bun.spawn(fakeBinArgv("note", log, "glossame", "rest", "0", "2026-11-05T02:05:00.000Z"));
+    expect(await p.exited).toBe(0);
+    const notes = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l) as HostNote);
+    expect(notes).toEqual([{ ts: "2026-11-05T02:05:00.000Z", host: "test-host", kind: "seat", word: "glossame", outcome: "rest", refusal: null, detail: "fake seat child" }]);
   });
 });

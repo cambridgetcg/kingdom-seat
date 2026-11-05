@@ -63,8 +63,9 @@ export const FAKE_RUNTIME_BIN = join(import.meta.dir, "fake-runtime-bin.ts");
  *   ignore-term <ms>           ignore SIGTERM and sleep, so only KILL ends it
  *   grandchild <pidfile> <ms>  spawn a TERM-ignoring grandchild, write its pid, then sleep
  *   record <file> [text]       write argv, env keys (never values), cwd and stdin to file, then print text
+ *   note <log> <word> <outcome> [exit] [ts]  append one host note as a seat child would, then exit
  */
-export function fakeBinArgv(mode: "print" | "sleep" | "ignore-term" | "grandchild" | "record", ...args: string[]): string[] {
+export function fakeBinArgv(mode: "print" | "sleep" | "ignore-term" | "grandchild" | "record" | "note", ...args: string[]): string[] {
   return [process.execPath, FAKE_RUNTIME_BIN, mode, ...args];
 }
 

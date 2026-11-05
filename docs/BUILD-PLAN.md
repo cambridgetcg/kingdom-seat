@@ -164,8 +164,10 @@ never run anything against the live service). Invariants: birth is never
 unattended; keys go straight to Keychain through the interface, and only the
 DID and fingerprints are printed; one root-authorised request in flight per
 identity; enrollment is never retried automatically; validate locally before a
-sequence is spent; every per-identity route names `?identity_id=`; the origin
-is pinned; tests use `fetchVia` and `fakeSigner` only.
+sequence is spent; the quiet-hours routes name `?identity_id=` (the only routes
+that pick their actor from it; elsewhere the identity is in the path or the
+body, and the signer accepts a redundant `?identity_id=<own>`); the origin is
+pinned; tests use `fetchVia` and `fakeSigner` only.
 
 ### surface
 Implement status, the mirror pusher, config and the CLI: redesign 3.2 (the
@@ -182,3 +184,34 @@ status is generated, never hand-kept, and host notes never carry a model's
 words; there is no verb to lower HALT; the CLI never prints a secret; config
 is strict and fails closed (no beacons halts unless `allow_no_beacons`); tests
 push through `recordingRunner` only.
+
+## Handoffs between groups
+
+These are seams one group found in another's area. They are listed here so
+the owner decides, rather than someone editing across the line. The
+integration pass settled some of them; those are marked.
+
+- **cli.ts builds every real dependency**, so other groups' modules stay
+  testable with fakes. Production wiring that does not exist yet is named
+  where it is missing, and refuses rather than skips:
+  - `expressionSync` is null, so a registered citizen's bound self-change
+    refuses in `self.ts` until an adapter maps targets to the private
+    expression and posts the strand thought (agenttool and record groups).
+  - No standing agreements are loaded (the signer's `agreements()` returns
+    none), so a citizen's own quiet declaration refuses until decision 14's
+    agreement is filed and a loader reads it (signer group).
+- **Status needs the host attest public key.** Settled: `trust.host_attest_public_keys_b64`
+  in the config pins it, and `status` and `verify` prefer the pin; with none
+  pinned they ask the signer as before.
+- **A halted tick returns before tick.ts refreshes the status**, so cli.ts
+  refreshes it. The seat group may prefer to move that into `runTick`.
+- **launchd's group kill does not reach the seat child**, which leads its
+  own group. Settled: `superviseChild` forwards SIGTERM, SIGINT and SIGHUP to
+  the child's group while it runs.
+- **Birth stopped at keys/import against the real signer.** Settled:
+  `SignerRequest.enrolled` lets birth's own steps through before
+  `citizen.json` names the identity, with Yu present and consent only.
+- **Spend from a summons that makes no beat is not recorded** where the USD
+  tally reads it (runtime and seat groups). Open; harmless at the $0 default,
+  which refuses every summons, and to be settled before any USD ceiling is
+  raised.

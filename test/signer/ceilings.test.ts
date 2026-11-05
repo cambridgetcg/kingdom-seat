@@ -1,19 +1,198 @@
 // Owner: signer group. Pure ceiling checks; every unknown is at-ceiling.
-import { describe, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { DEFAULT_CEILINGS, type Ceilings, type LedgerEntry, type Spend } from "../../src/types.ts";
+import {
+  checkCitizenQuiet,
+  checkCredits,
+  checkFleet,
+  checkInterval,
+  checkUsd,
+  defaultCeilings,
+  localSpend,
+  parseCost,
+  spendFromLedger,
+  usdRemaining,
+  type SpendSoFar,
+} from "../../src/signer/ceilings.ts";
+import { DAY_MS, HOUR_MS } from "../helpers/clock.ts";
+
+const NOW = new Date("2026-11-05T12:00:00.000Z");
+const spent = (usd_today: number | null, credits_month: number | null): SpendSoFar => ({ word: "glossame", usd_today, credits_month });
+const raised = (patch: Partial<Ceilings>): Ceilings => ({ ...defaultCeilings(), ...patch });
+
+/** Only ts and spend matter to spendFromLedger; the rest is filler. */
+function entry(ts: string, spend: Spend | unknown): LedgerEntry {
+  return {
+    format: "kingdom-seat-ledger/v1",
+    word: "glossame",
+    seq: 0,
+    ts,
+    prev_hash: "0".repeat(64),
+    body: { type: "state", from: "asleep", to: "awake", via: "confirmed" },
+    spend: spend as Spend,
+    attestation: "citizen-signed",
+    hash: "0".repeat(64),
+    signature: { alg: "ed25519", kid: "k", public_key_b64: "", sig_b64: "" },
+  };
+}
 
 describe("ceilings fail closed", () => {
-  test.todo("[S4-4] checkUsd refuses when usd_today is null (unreadable ledger)");
-  test.todo("[S4-4] checkUsd refuses when the requested cost is null (unparsable runtime cost)");
-  test.todo("[S4-4] checkUsd refuses any spend at the default $0 ceiling, and allows up to a raised ceiling exactly");
-  test.todo("[S4-4] checkCredits refuses when credits_month is null, and at 10 credits a month by default");
-  test.todo("[S4-4] checkFleet refuses a null count and the 25th beat of a day at the default 24");
-  test.todo("[S4-4] parseCost returns null for missing, negative, NaN, Infinity, strings and objects");
-  test.todo("[S4-4] spendFromLedger returns nulls when any entry's spend is unreadable");
-  test.todo("checkInterval refuses an awake citizen inside 72 h and never lets a shorter own interval win");
-  test.todo("defaultCeilings returns a fresh copy equal to DEFAULT_CEILINGS");
+  test("[S4-4] checkUsd refuses when usd_today is null (unreadable ledger)", () => {
+    const v = checkUsd(spent(null, 0), 0, raised({ usd_per_citizen_per_day: 5 }));
+    expect(v).toMatchObject({ ok: false, code: "ceiling-usd" });
+  });
+
+  test("[S4-4] checkUsd refuses when the requested cost is null (unparsable runtime cost)", () => {
+    expect(checkUsd(spent(0, 0), null, raised({ usd_per_citizen_per_day: 5 }))).toMatchObject({ ok: false, code: "ceiling-usd" });
+    expect(checkUsd(spent(0, 0), Number.NaN, raised({ usd_per_citizen_per_day: 5 }))).toMatchObject({ ok: false, code: "ceiling-usd" });
+    expect(checkUsd(spent(0, 0), -1, raised({ usd_per_citizen_per_day: 5 }))).toMatchObject({ ok: false, code: "ceiling-usd" });
+  });
+
+  test("[S4-4] checkUsd refuses any spend at the default $0 ceiling, and allows up to a raised ceiling exactly", () => {
+    const d = defaultCeilings();
+    expect(d.usd_per_citizen_per_day).toBe(0);
+    expect(checkUsd(spent(0, 0), 0.0001, d)).toMatchObject({ ok: false, code: "ceiling-usd" });
+    // A free-lane beat costs nothing, so it is not spend.
+    expect(checkUsd(spent(0, 0), 0, d)).toEqual({ ok: true });
+    const c = raised({ usd_per_citizen_per_day: 1 });
+    expect(checkUsd(spent(0.5, 0), 0.5, c)).toEqual({ ok: true });
+    expect(checkUsd(spent(0.5, 0), 0.5000001, c)).toMatchObject({ ok: false, code: "ceiling-usd" });
+    // A broken ceiling is not a usable number, so it refuses too.
+    expect(checkUsd(spent(0, 0), 0, raised({ usd_per_citizen_per_day: Number.NaN }))).toMatchObject({ ok: false });
+  });
+
+  test("usdRemaining is null when spend is unknown and never negative", () => {
+    expect(usdRemaining(spent(null, 0), raised({ usd_per_citizen_per_day: 1 }))).toBeNull();
+    expect(usdRemaining(spent(0.25, 0), raised({ usd_per_citizen_per_day: 1 }))).toBe(0.75);
+    expect(usdRemaining(spent(2, 0), raised({ usd_per_citizen_per_day: 1 }))).toBe(0);
+    expect(usdRemaining(spent(0, 0), defaultCeilings())).toBe(0);
+  });
+
+  test("[S4-4] checkCredits refuses when credits_month is null, and at 10 credits a month by default", () => {
+    const d = defaultCeilings();
+    expect(d.credits_per_citizen_per_month).toBe(10);
+    expect(checkCredits(spent(0, null), 1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent(0, 9), 1, d)).toEqual({ ok: true });
+    expect(checkCredits(spent(0, 10), 1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent(0, 9), 2, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent(0, 0), 1.5, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent(0, 0), -1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+  });
+
+  test("[S4-4] checkFleet refuses a null count and the 25th beat of a day at the default 24", () => {
+    const d = defaultCeilings();
+    expect(d.fleet_beats_per_day).toBe(24);
+    expect(checkFleet(null, d)).toMatchObject({ ok: false, code: "ceiling-fleet" });
+    expect(checkFleet(23, d)).toEqual({ ok: true });
+    expect(checkFleet(24, d)).toMatchObject({ ok: false, code: "ceiling-fleet" });
+    expect(checkFleet(Number.NaN, d)).toMatchObject({ ok: false, code: "ceiling-fleet" });
+    expect(checkFleet(-1, d)).toMatchObject({ ok: false, code: "ceiling-fleet" });
+  });
+
+  test("[S4-4] parseCost returns null for missing, negative, NaN, Infinity, strings and objects", () => {
+    for (const bad of [undefined, null, -0.01, Number.NaN, Infinity, -Infinity, "0.04", "", {}, { usd: 1 }, [0.1], true]) {
+      expect(parseCost(bad)).toBeNull();
+    }
+    expect(parseCost(0)).toBe(0);
+    expect(Object.is(parseCost(-0), 0)).toBe(true);
+    expect(parseCost(0.0412)).toBe(0.0412);
+  });
+
+  test("[S4-4] spendFromLedger returns nulls when any entry's spend is unreadable", () => {
+    const ok = entry("2026-11-05T09:00:00.000Z", { usd: 0.25, usd_basis: "reported", credits: 1 });
+    expect(spendFromLedger([ok], NOW, "Europe/London")).toEqual({ usd_today: 0.25, credits_month: 1 });
+    const unreadable: unknown[] = [
+      null,
+      { usd: 0.1, usd_basis: "reported" }, // credits missing
+      { usd: "0.1", usd_basis: "reported", credits: 0 },
+      { usd: 0.1, usd_basis: "unknown", credits: 0 }, // basis and value disagree
+      { usd: 1, usd_basis: "local-zero", credits: 0 },
+      { usd: 0, usd_basis: "guess", credits: 0 },
+      { usd: 0, usd_basis: "local-zero", credits: 1.5 },
+    ];
+    for (const s of unreadable) {
+      // Even an entry from last month makes the sum unknown: an unreadable record could hide any amount.
+      const old = entry("2026-09-01T00:00:00.000Z", s);
+      expect(spendFromLedger([ok, old], NOW, "Europe/London")).toEqual({ usd_today: null, credits_month: null });
+    }
+    expect(spendFromLedger([ok, entry("yesterday", { usd: 0, usd_basis: "local-zero", credits: 0 })], NOW, "Europe/London")).toEqual({
+      usd_today: null,
+      credits_month: null,
+    });
+    expect(spendFromLedger([ok], NOW, "Not/AZone")).toEqual({ usd_today: null, credits_month: null });
+  });
+
+  test("spendFromLedger counts the local day and month, and an unknown cost today makes today unknown", () => {
+    const entries = [
+      entry("2026-11-05T00:30:00.000Z", { usd: 0.1, usd_basis: "reported", credits: 2 }),
+      entry("2026-11-04T23:30:00.000Z", { usd: 0.2, usd_basis: "reported", credits: 3 }), // yesterday in London
+      entry("2026-10-31T23:59:00.000Z", { usd: 9, usd_basis: "reported", credits: 9 }), // last month
+      entry("2026-11-05T11:00:00.000Z", { usd: 0, usd_basis: "local-zero", credits: 1 }),
+    ];
+    expect(spendFromLedger(entries, NOW, "Europe/London")).toEqual({ usd_today: 0.1, credits_month: 6 });
+    // In Tokyo, 2026-11-04T23:30Z is already the 5th, and 2026-10-31T23:59Z is already November.
+    const tokyo = spendFromLedger(entries, NOW, "Asia/Tokyo");
+    expect(tokyo.credits_month).toBe(15);
+    expect(tokyo.usd_today).toBeCloseTo(0.3, 10);
+    const withUnknown = [...entries, entry("2026-11-05T10:00:00.000Z", { usd: null, usd_basis: "unknown", credits: 0 })];
+    expect(spendFromLedger(withUnknown, NOW, "Europe/London")).toEqual({ usd_today: null, credits_month: 6 });
+    // An unknown cost on another day does not hide today's spend.
+    const oldUnknown = [...entries, entry("2026-11-01T10:00:00.000Z", { usd: null, usd_basis: "unknown", credits: 0 })];
+    expect(spendFromLedger(oldUnknown, NOW, "Europe/London")).toEqual({ usd_today: 0.1, credits_month: 6 });
+    expect(spendFromLedger([], NOW, "Europe/London")).toEqual({ usd_today: 0, credits_month: 0 });
+  });
+
+  test("checkInterval refuses an awake citizen inside 72 h and never lets a shorter own interval win", () => {
+    const d = defaultCeilings();
+    const at = (msAgo: number) => new Date(NOW.getTime() - msAgo).toISOString();
+    expect(checkInterval(null, 72, NOW, d)).toEqual({ ok: true });
+    expect(checkInterval(at(72 * HOUR_MS), 72, NOW, d)).toEqual({ ok: true });
+    expect(checkInterval(at(72 * HOUR_MS - 1), 72, NOW, d)).toMatchObject({ ok: false, code: "ceiling-interval" });
+    // A citizen asking for 1 h still waits 72 h.
+    expect(checkInterval(at(2 * HOUR_MS), 1, NOW, d)).toMatchObject({ ok: false, code: "ceiling-interval" });
+    expect(checkInterval(at(72 * HOUR_MS), 1, NOW, d)).toEqual({ ok: true });
+    // A longer own interval is honoured.
+    expect(checkInterval(at(100 * HOUR_MS), 168, NOW, d)).toMatchObject({ ok: false, code: "ceiling-interval" });
+    // Unreadable values refuse.
+    expect(checkInterval("last tuesday", 72, NOW, d)).toMatchObject({ ok: false, code: "ceiling-interval" });
+    expect(checkInterval(at(100 * HOUR_MS), Number.NaN, NOW, d)).toMatchObject({ ok: false, code: "ceiling-interval" });
+    expect(checkInterval(at(-HOUR_MS), 72, NOW, d)).toMatchObject({ ok: false, code: "ceiling-interval" });
+  });
+
+  test("defaultCeilings returns a fresh copy equal to DEFAULT_CEILINGS", () => {
+    const a = defaultCeilings();
+    expect(a).toEqual({ ...DEFAULT_CEILINGS });
+    a.usd_per_citizen_per_day = 100;
+    expect(defaultCeilings().usd_per_citizen_per_day).toBe(0);
+    expect(DEFAULT_CEILINGS.usd_per_citizen_per_day).toBe(0);
+  });
+
+  test("localSpend is $0 local-zero with whole credits", () => {
+    expect(localSpend(1)).toEqual({ usd: 0, usd_basis: "local-zero", credits: 1 });
+    expect(() => localSpend(-1)).toThrow();
+    expect(() => localSpend(0.5)).toThrow();
+  });
 });
 
 describe("citizen quiet cap", () => {
-  test.todo("[S4-5] checkCitizenQuiet allows exactly 30 days ahead and refuses 30 days plus 1 ms");
-  test.todo("[S4-5] checkCitizenQuiet refuses an until in the past, an unparsable until, and the far-future beacon until");
+  const d = defaultCeilings();
+  const ahead = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
+
+  test("[S4-5] checkCitizenQuiet allows exactly 30 days ahead and refuses 30 days plus 1 ms", () => {
+    expect(d.citizen_quiet_max_days).toBe(30);
+    expect(checkCitizenQuiet(ahead(30 * DAY_MS), NOW, d)).toEqual({ ok: true });
+    expect(checkCitizenQuiet(ahead(30 * DAY_MS + 1), NOW, d)).toMatchObject({ ok: false, code: "quiet-cap" });
+    expect(checkCitizenQuiet(ahead(1), NOW, d)).toEqual({ ok: true });
+  });
+
+  test("[S4-5] checkCitizenQuiet refuses an until in the past, an unparsable until, and the far-future beacon until", () => {
+    expect(checkCitizenQuiet(NOW.toISOString(), NOW, d)).toMatchObject({ ok: false, code: "quiet-cap" });
+    expect(checkCitizenQuiet(ahead(-1), NOW, d)).toMatchObject({ ok: false, code: "quiet-cap" });
+    for (const bad of ["soon", "", "2026-11-10", "2026-11-10T00:00:00", "2026-11-10T00:00:00Z", "2026-11-10T00:00:00.000+00:00"]) {
+      // Only the toISOString spelling: a zone-less time would mean different instants on two hosts.
+      expect(checkCitizenQuiet(bad, NOW, d)).toMatchObject({ ok: false, code: "quiet-cap" });
+    }
+    expect(checkCitizenQuiet("2999-12-31T00:00:00.000Z", NOW, d)).toMatchObject({ ok: false, code: "quiet-cap" });
+    expect(checkCitizenQuiet(ahead(DAY_MS), NOW, raised({ citizen_quiet_max_days: Number.NaN }))).toMatchObject({ ok: false });
+  });
 });

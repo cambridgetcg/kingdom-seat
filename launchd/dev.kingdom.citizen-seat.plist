@@ -15,7 +15,15 @@
     manual and kickstart runs.
   - Absolute paths everywhere: launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin.
   - Umask 63 (octal 077): logs and state are private to the seat user.
-  - AbandonProcessGroup unset: a stray child dies with the tick.
+    status.json is the one exception: the seat writes it 0644 on purpose,
+    because REGISTRY reads it.
+  - AbandonProcessGroup unset: when the job dies, launchd kills the tick's
+    own process group. The seat child is not in it: it leads its own group
+    so the watcher can signal it whole. The watcher forwards launchd's
+    SIGTERM to that group (TERM, then KILL after term_grace_s), so a stopped
+    job stops its seat too; ExitTimeOut must stay above term_grace_s.
+  - The tick runs with no secret in its environment; the signer reads
+    Keychain through /usr/bin/security, and nothing is sourced from a home.
   - ProgramArguments run bun on the source for now. Before S5, point it at a
     compiled, stably signed binary instead, so the Keychain ACL can trust
     that binary alone rather than the bun interpreter and every script it runs.

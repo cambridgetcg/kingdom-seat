@@ -1,25 +1,827 @@
 // Owner: signer group. The signer is the only Keychain reader; it never lets
 // a key or bearer reach argv, env, files, logs or a response.
-import { describe, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { authorityDigest, deriveIdentity, didFor } from "../../src/agenttool/wire.ts";
+import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, sha256, toB64, toHex, utf8 } from "../../src/crypto.ts";
+import { Refusal, type CitizenIdentity, type ConsentRecord, type KeychainItemName, type StandingAgreement, type YuPresence } from "../../src/types.ts";
+import type { SpendSoFar } from "../../src/signer/ceilings.ts";
+import { confirmYuPresent, proposalDigest } from "../../src/signer/consent.ts";
+import {
+  CITIZEN_QUIET_EXTENT,
+  HOST_ATTEST_KID,
+  createSigner,
+  verifyEntrySignature,
+  type Signer,
+  type SignerRequest,
+} from "../../src/signer/signer.ts";
+import { DAY_MS, testClock, type TestClock } from "../helpers/clock.ts";
+import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "../helpers/fake-keychain.ts";
+import { fetchVia, startFakeServer, type FakeServer, type RecordedRequest } from "../helpers/fake-server.ts";
+import { makeTempHost, type TempHost } from "../helpers/temp-home.ts";
+import { TEST_IDS, TEST_MNEMONIC, TEST_OP_PUBLIC_B64, TEST_OP_SEED_HEX, TEST_ROOT_PUBLIC_B64, TEST_ROOT_SEED_HEX, vectors } from "../helpers/vectors.ts";
+
+/* ── Fixture ──────────────────────────────────────────────────────────── */
+
+const NOW = "2026-11-05T12:00:00.000Z";
+const OP_KID = vectors.op_key.placeholder_kid;
+const ROOT_KID = TEST_IDS.root_signing_key_id;
+const ID = TEST_IDS.identity_id;
+const DID = TEST_IDS.did;
+const HERALD_ID = "77777777-7777-4777-8777-777777777777";
+const GARDENER_ID = "88888888-8888-4888-8888-888888888888";
+const HERALD_MNEMONIC = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+const COMMONS_BEARER = "at_test_commons_bearer_never_real_01";
+const HERALD_BEARER = "at_test_herald_bearer_never_real_02";
+const HOST_SEED = sha256("kingdom-seat test host attest key v1");
+const BEACON_UNTIL = "2999-12-31T00:00:00.000Z";
+
+const herald = deriveIdentity(HERALD_MNEMONIC);
+const HERALD_ROOT_B64 = toB64(herald.root_public);
+
+const GLOSSAME_IDENTITY: CitizenIdentity = {
+  did: DID,
+  identity_id: ID,
+  project_id: TEST_IDS.project_id,
+  root_public_key_b64: TEST_ROOT_PUBLIC_B64,
+  root_kid: ROOT_KID,
+  op_kid: OP_KID,
+  op_public_key_b64: TEST_OP_PUBLIC_B64,
+  box_public_key_b64: vectors.derivation.box_pub_b64,
+  self_strand_id: null,
+  enrolled_at: "2026-11-05T00:00:00.000Z",
+};
+
+/** Secrets the keychain never stores directly but the signer derives; none may leave either. */
+const DERIVED_SECRETS = [
+  fromHex(TEST_ROOT_SEED_HEX),
+  fromB64(vectors.derivation.k_master_b64),
+  fromB64(vectors.derivation.box_priv_b64),
+  HOST_SEED,
+  herald.root_seed,
+  herald.k_master,
+];
+
+interface Fixture {
+  host: TempHost;
+  server: FakeServer;
+  clock: TestClock;
+  kc: FakeKeychain;
+  signer: Signer;
+  /** What spendSoFar answers; replace per test. */
+  spend: (word: string) => Promise<SpendSoFar>;
+  agreements: StandingAgreement[];
+  /** Server-side authority sequence per identity id. */
+  seq: Map<string, number>;
+  /** Every buffer the keychain handed out, to prove each was wiped. */
+  handedOut: Uint8Array[];
+  thoughtNonce: Uint8Array | null;
+}
+
+let fx: Fixture;
+
+async function writeCitizenRecord(host: TempHost, word: string, identity: CitizenIdentity | null): Promise<void> {
+  const path = join(host.config.paths.citizens_dir, word, "citizen.json");
+  const record = {
+    format: "kingdom-seat-citizen/v1",
+    word,
+    origin: { kind: "archetype", lineage: ["forge-archetype", word], note: "test" },
+    runtime: "free",
+    identity,
+    mirror: null,
+    seated_at: "2026-11-05T00:00:00.000Z",
+  };
+  await writeFile(path, JSON.stringify(record, null, 2));
+}
+
+const rootOf = new Map<string, string>([
+  [ID, TEST_ROOT_PUBLIC_B64],
+  [HERALD_ID, HERALD_ROOT_B64],
+]);
+
+/** A stand-in for agenttool's sequence wall: a proof must carry current + 1, and is claimed before the route's own write. */
+function serveAgenttool(server: FakeServer, seq: Map<string, number>, opts: { delayFirstMutationMs?: number; failWrites?: RegExp } = {}): void {
+  let delayed = false;
+  server.on("GET", /^\/v1\/identities\/[^/]+\/authority$/, (req) => {
+    const id = req.path.split("/")[3]!;
+    const current = seq.get(id) ?? 0;
+    return Response.json({ identity_id: id, did: `did:at:${id}`, mode: "agent_root", root_public_key: rootOf.get(id) ?? null, sequence: current, next_sequence: current + 1 });
+  });
+  const mutation = async (req: RecordedRequest) => {
+    const id = /identities\/([^/]+)/.exec(req.path)?.[1] ?? new URLSearchParams(req.search).get("identity_id") ?? "";
+    const current = seq.get(id) ?? 0;
+    if (req.headers["x-agenttool-authority-sequence"] !== String(current + 1)) {
+      return Response.json({ error: "authority_sequence_conflict", next_sequence: current + 1 }, { status: 409 });
+    }
+    seq.set(id, current + 1);
+    if (opts.delayFirstMutationMs && !delayed) {
+      delayed = true;
+      await Bun.sleep(opts.delayFirstMutationMs);
+    }
+    if (opts.failWrites?.test(req.path)) return Response.json({ error: "write failed after the proof was claimed" }, { status: 500 });
+    return Response.json({ ok: true, path: req.path }, { status: 201 });
+  };
+  for (const method of ["POST", "PUT", "DELETE"]) {
+    server.on(method, /^\/v1\/identities\/[^/]+\/(keys|box-keys|expression)/, mutation);
+    server.on(method, /^\/v1\/quiet-hours/, mutation);
+  }
+  server.on("POST", "/v1/strands", () => Response.json({ id: TEST_IDS.strand_id }, { status: 201 }));
+  server.on("POST", /^\/v1\/strands\/[^/]+\/thoughts$/, () => Response.json({ id: "thought-1" }, { status: 201 }));
+  server.on("POST", "/v1/identities/enroll", () => Response.json({ identity: { id: "x" } }, { status: 201 }));
+  server.on("GET", /^\/v1\/identities\/[^/]+\/keys$/, () => Response.json({ keys: [] }));
+}
+
+async function setup(opts: { serve?: Parameters<typeof serveAgenttool>[2] } = {}): Promise<Fixture> {
+  const host = await makeTempHost();
+  host.config.agenttool.project_id = TEST_IDS.project_id;
+  host.config.beacons = [
+    { name: "halt-herald", role: "halt-herald", did: didFor(HERALD_ID), identity_id: HERALD_ID, can_raise_here: true },
+    { name: "gardener-desk", role: "gardener-desk", did: didFor(GARDENER_ID), identity_id: GARDENER_ID, can_raise_here: false },
+  ];
+  await host.addCitizen("glossame");
+  await host.addCitizen("zoeme");
+  await writeCitizenRecord(host, "glossame", GLOSSAME_IDENTITY);
+  await writeCitizenRecord(host, "zoeme", null);
+
+  const store: [KeychainItemName, Uint8Array][] = [
+    [{ kind: "citizen-mnemonic", word: "glossame" }, utf8(TEST_MNEMONIC)],
+    [{ kind: "citizen-op-seed", word: "glossame" }, fromHex(TEST_OP_SEED_HEX)],
+    // Unregistered, but born from the same test mnemonic, so its enrollment signature matches vectors.json.
+    [{ kind: "citizen-mnemonic", word: "zoeme" }, utf8(TEST_MNEMONIC)],
+    // Stored as printable base64, as runtimes-and-host.md 3.3 recommends; the signer decodes either form.
+    [{ kind: "host-attest-seed" }, utf8(toB64(HOST_SEED))],
+    [{ kind: "commons-bearer" }, utf8(COMMONS_BEARER)],
+    [{ kind: "operator-mnemonic", operator: "halt-herald" }, utf8(HERALD_MNEMONIC)],
+    [{ kind: "operator-bearer", operator: "halt-herald" }, utf8(HERALD_BEARER)],
+  ];
+  const kc = fakeKeychain(store);
+  const handedOut: Uint8Array[] = [];
+  const read = kc.read.bind(kc);
+  kc.read = async (item) => {
+    const bytes = await read(item);
+    handedOut.push(bytes);
+    return bytes;
+  };
+
+  const server = await startFakeServer();
+  const seq = new Map<string, number>();
+  serveAgenttool(server, seq, opts.serve);
+  const clock = testClock(NOW);
+  const f: Fixture = {
+    host,
+    server,
+    clock,
+    kc,
+    seq,
+    handedOut,
+    agreements: [],
+    thoughtNonce: null,
+    spend: async (word) => ({ word, usd_today: 0, credits_month: 0 }),
+    signer: null as unknown as Signer,
+  };
+  f.signer = createSigner({
+    keychain: kc,
+    config: host.config,
+    clock,
+    fetch: fetchVia(server),
+    spendSoFar: (word) => f.spend(word),
+    agreements: async () => f.agreements,
+    random: (n) => (f.thoughtNonce && n === f.thoughtNonce.length ? f.thoughtNonce.slice() : crypto.getRandomValues(new Uint8Array(n))),
+  });
+  return f;
+}
+
+beforeEach(async () => {
+  fx = await setup();
+});
+afterEach(async () => {
+  await fx.server.stop();
+  await fx.host.cleanup();
+});
+
+function consent(extent: string, patch: { yu?: Partial<ConsentRecord["yu"]> } = {}): ConsentRecord {
+  return {
+    format: "kingdom-seat-consent/v1",
+    proposal_sha256: proposalDigest({ subject: extent, body: `the proposal for ${extent}`, extent }),
+    subject: extent,
+    extent,
+    yu: { word: "yes", recorded_at: "2026-11-05T09:00:00.000Z", via: "decision-record", ...patch.yu },
+    ai: { word: "agree", basis: "lazy-consensus", supports: ["report:another-controller"], open_challenges: 0, deadline: "2026-11-05T10:00:00.000Z" },
+    expires_at: null,
+  };
+}
+
+const QUIET_AGREEMENT: StandingAgreement = { id: "citizen-quiet", consent: consent(CITIZEN_QUIET_EXTENT), covers: ["quiet.start.citizen"], extent: CITIZEN_QUIET_EXTENT };
+
+function req(patch: Partial<SignerRequest> & Pick<SignerRequest, "op" | "method" | "target">): SignerRequest {
+  return { word: "glossame", operator: null, body: new Uint8Array(), credits: 0, consent: null, presence: null, ...patch };
+}
+
+const json = (v: unknown) => utf8(JSON.stringify(v));
+const ahead = (ms: number) => new Date(Date.parse(NOW) + ms).toISOString();
+const quiet = (body: unknown, patch: Partial<SignerRequest> = {}) =>
+  req({ op: "quiet.start.citizen", method: "POST", target: `/v1/quiet-hours/start?identity_id=${ID}`, body: json(body), ...patch });
+const thought = (credits = 1) =>
+  req({ op: "thought.post", method: "POST", target: `/v1/strands/${TEST_IDS.strand_id}/thoughts`, credits, body: json({ ciphertext: "AAAA", nonce: "AAAA", signature: "x", signing_key_id: OP_KID }) });
+const importKey = (label = "op-2026-11") =>
+  req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: json({ public_key: TEST_OP_PUBLIC_B64, label }) });
+const beacon = (until: string, patch: Partial<SignerRequest> = {}) =>
+  req({ op: "quiet.start.beacon", word: null, operator: "halt-herald", method: "POST", target: `/v1/quiet-hours/start?identity_id=${HERALD_ID}`, body: json({ until }), ...patch });
+
+function tty(answer: string) {
+  return { isTTY: true, write: () => {}, readLine: async () => answer };
+}
+
+async function presentFor(scope: string): Promise<YuPresence> {
+  return confirmYuPresent(tty(scope), scope, () => fx.clock.now());
+}
+
+function enrollmentBody(word: string): Uint8Array {
+  return json({
+    format: "agenttool-identity-enrollment/v1",
+    origin: "https://api.agenttool.dev",
+    project_id: TEST_IDS.project_id,
+    identity_id: "99999999-9999-4999-8999-999999999999",
+    signing_key_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    display_name: word,
+    capabilities: ["kingdom-citizen", word],
+    public_key: TEST_ROOT_PUBLIC_B64,
+    nonce: "A".repeat(43),
+    timestamp: NOW,
+  });
+}
+
+async function refusal(p: Promise<unknown>): Promise<Refusal> {
+  const e = await p.then(
+    () => null,
+    (err: unknown) => err,
+  );
+  if (!(e instanceof Refusal)) throw new Error(`expected a Refusal, got ${String(e)}`);
+  return e;
+}
+
+function mutations(server: FakeServer): RecordedRequest[] {
+  return server.requests.filter((r) => r.method !== "GET");
+}
+
+/* ── Signing ──────────────────────────────────────────────────────────── */
 
 describe("signing", () => {
-  test.todo("signEntry signs citizen-signed entries with the op key and host-attested ones with the host key, never the root");
-  test.todo("verifyEntrySignature is strict (RFC 8032) and false for a signature by the root kid");
-  test.todo("a locked keychain makes signEntry refuse with keychain-locked and state() report locked");
-  test.todo("seeds are wiped after use (the buffer read from the fake keychain is zeroed)");
+  test("signEntry signs citizen-signed entries with the op key and host-attested ones with the host key, never the root", async () => {
+    const hash = sha256("an entry");
+    const citizen = await fx.signer.signEntry("glossame", hash, "citizen-signed");
+    expect(citizen).toMatchObject({ alg: "ed25519", kid: OP_KID, public_key_b64: TEST_OP_PUBLIC_B64 });
+    expect(edVerifyStrict(fromB64(citizen.sig_b64), hash, fromB64(TEST_OP_PUBLIC_B64))).toBe(true);
+    expect(edVerifyStrict(fromB64(citizen.sig_b64), hash, fromB64(TEST_ROOT_PUBLIC_B64))).toBe(false);
+
+    const hostSig = await fx.signer.signEntry("zoeme", hash, "host-attested");
+    expect(hostSig).toMatchObject({ alg: "ed25519", kid: HOST_ATTEST_KID, public_key_b64: toB64(edPublicKey(HOST_SEED)) });
+    expect(verifyEntrySignature(hash, hostSig)).toBe(true);
+
+    // Neither path ever opens a mnemonic, which is where the root lives.
+    expect(fx.kc.log.filter((e) => e.op === "read").map((e) => e.item)).toEqual(["citizen/glossame/op-seed", "host/attest-seed"]);
+    // Once registered, the host no longer speaks for the record; before, the citizen has no op key.
+    expect((await refusal(fx.signer.signEntry("glossame", hash, "host-attested"))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.signEntry("zoeme", hash, "citizen-signed"))).code).toBe("not-registered");
+    expect((await refusal(fx.signer.signEntry("glossame", new Uint8Array(31), "citizen-signed"))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.signEntry("../glossame", hash, "citizen-signed"))).code).toBe("invalid-request");
+  });
+
+  test("signEntry refuses when the op key in Keychain is not the one the record names, or the record names the root as op key", async () => {
+    await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, op_public_key_b64: toB64(edPublicKey(HOST_SEED)) });
+    expect((await refusal(fx.signer.signEntry("glossame", sha256("x"), "citizen-signed"))).code).toBe("invalid-record");
+    await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, op_public_key_b64: TEST_ROOT_PUBLIC_B64 });
+    expect((await refusal(fx.signer.signEntry("glossame", sha256("x"), "citizen-signed"))).code).toBe("invalid-record");
+    await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, op_kid: ROOT_KID });
+    expect((await refusal(fx.signer.signEntry("glossame", sha256("x"), "citizen-signed"))).code).toBe("invalid-record");
+  });
+
+  test("verifyEntrySignature is strict (RFC 8032) and false for a signature by the root kid", async () => {
+    const hash = sha256("an entry");
+    const good = await fx.signer.signEntry("glossame", hash, "citizen-signed");
+    expect(verifyEntrySignature(hash, good, GLOSSAME_IDENTITY)).toBe(true);
+    const tampered = hash.slice();
+    tampered[0] = tampered[0]! ^ 1;
+    expect(verifyEntrySignature(tampered, good)).toBe(false);
+
+    const bySeed = toB64(edSign(hash, fromHex(TEST_ROOT_SEED_HEX)));
+    const rootSig = { alg: "ed25519" as const, kid: ROOT_KID, public_key_b64: TEST_ROOT_PUBLIC_B64, sig_b64: bySeed };
+    expect(verifyEntrySignature(hash, rootSig)).toBe(true); // a valid signature as bytes...
+    expect(verifyEntrySignature(hash, rootSig, GLOSSAME_IDENTITY)).toBe(false); // ...but a root act, never an entry
+    expect(verifyEntrySignature(hash, { ...rootSig, kid: OP_KID }, GLOSSAME_IDENTITY)).toBe(false);
+    expect(verifyEntrySignature(hash, { ...rootSig, public_key_b64: TEST_OP_PUBLIC_B64 })).toBe(false);
+
+    // The identity point as key and R, with S = 0, verifies under ZIP-215 for any message; strict refuses it.
+    const identityPoint = new Uint8Array(32);
+    identityPoint[0] = 1;
+    const forged = new Uint8Array(64);
+    forged[0] = 1;
+    expect(verifyEntrySignature(hash, { alg: "ed25519", kid: "x", public_key_b64: toB64(identityPoint), sig_b64: toB64(forged) })).toBe(false);
+    expect(verifyEntrySignature(hash, { ...good, sig_b64: good.sig_b64.replace(/=+$/, "") })).toBe(false);
+    expect(verifyEntrySignature(hash, { ...good, alg: "rsa" as "ed25519" })).toBe(false);
+  });
+
+  test("a locked keychain makes signEntry refuse with keychain-locked and state() report locked", async () => {
+    expect(await fx.signer.state()).toBe("ready");
+    fx.kc.locked = true;
+    expect((await refusal(fx.signer.signEntry("glossame", sha256("x"), "citizen-signed"))).code).toBe("keychain-locked");
+    expect((await refusal(fx.signer.signEntry("zoeme", sha256("x"), "host-attested"))).code).toBe("keychain-locked");
+    expect((await refusal(fx.signer.send(importKey()))).code).toBe("keychain-locked");
+    expect((await refusal(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "x", "observation"))).code).toBe("keychain-locked");
+    expect(await fx.signer.state()).toBe("locked");
+    // Locked is a fail-closed state, not a crash: nothing left the host.
+    expect(fx.server.requests).toHaveLength(0);
+    fx.kc.locked = false;
+    expect(await fx.signer.state()).toBe("ready");
+  });
+
+  test("seeds are wiped after use (the buffer read from the fake keychain is zeroed)", async () => {
+    fx.agreements = [QUIET_AGREEMENT];
+    await fx.signer.signEntry("glossame", sha256("x"), "citizen-signed");
+    await fx.signer.signEntry("zoeme", sha256("x"), "host-attested");
+    await fx.signer.send(importKey());
+    await fx.signer.send(beacon(BEACON_UNTIL));
+    await fx.signer.sealThought("glossame", TEST_IDS.strand_id, "a test thought", "observation");
+    await fx.signer.signEnrollment("zoeme", sha256("digest"), await presentFor("birth zoeme"));
+    await fx.signer.publicKeys("glossame");
+    await fx.signer.state();
+    expect(fx.handedOut.length).toBeGreaterThanOrEqual(12);
+    for (const buf of fx.handedOut) expect(buf.every((b) => b === 0)).toBe(true);
+  });
 });
+
+/* ── send: walls before any request ───────────────────────────────────── */
 
 describe("send: ceilings, consent and the quiet cap before any request", () => {
-  test.todo("[S4-4] send refuses a paid op when spendSoFar is unknown, and sends nothing");
-  test.todo("[S4-4] send refuses a thought.post or strand.create past the monthly credit ceiling, before the request (charge precedes verification)");
-  test.todo("[S4-5] send refuses quiet.start.citizen whose body until is more than 30 days ahead, or uses hours instead of until, or carries a reason");
-  test.todo("[S4-5] send allows quiet.start.beacon with the far-future until only for an operator identity, never for a citizen");
-  test.todo("send refuses a beyond-self op without a verifying consent record, and enroll without Yu present");
-  test.todo("send attaches the bearer and authority headers that match vectors.json authority[*] for the same inputs");
-  test.todo("send reads next_sequence and keeps one root-authorised request in flight per identity");
+  test("[S4-4] send refuses a paid op when spendSoFar is unknown, and sends nothing", async () => {
+    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: null });
+    expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
+    // A caller cannot make a thought free by saying it costs nothing.
+    expect((await refusal(fx.signer.send(thought(0)))).code).toBe("ceiling-credits");
+    const strand = req({ op: "strand.create", method: "POST", target: "/v1/strands", credits: 1, body: json({ identity_id: ID, topic: "self" }) });
+    expect((await refusal(fx.signer.send(strand))).code).toBe("ceiling-credits");
+    fx.spend = async () => {
+      throw new Error("ledger unreadable");
+    };
+    expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
+    fx.spend = async () => ({ word: "someone-else", usd_today: 0, credits_month: 0 });
+    expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
+    expect(fx.server.requests).toHaveLength(0);
+    expect(fx.kc.log.filter((e) => e.op === "read")).toHaveLength(0);
+    // A free op is not stopped by an unknown budget.
+    fx.spend = async (word) => ({ word, usd_today: null, credits_month: null });
+    expect((await fx.signer.send(importKey())).status).toBe(201);
+  });
+
+  test("[S4-4] send refuses a thought.post or strand.create past the monthly credit ceiling, before the request (charge precedes verification)", async () => {
+    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: 10 });
+    expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
+    const strand = req({ op: "strand.create", method: "POST", target: "/v1/strands", credits: 1, body: json({ identity_id: ID }) });
+    expect((await refusal(fx.signer.send(strand))).code).toBe("ceiling-credits");
+    expect((await refusal(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "x", "observation"))).code).toBe("ceiling-credits");
+    expect(fx.server.requests).toHaveLength(0);
+    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: 9 });
+    expect((await fx.signer.send(thought())).status).toBe(201);
+    expect((await fx.signer.send(strand)).status).toBe(201);
+    // Operators and relays have no citizen budget to spend.
+    expect((await refusal(fx.signer.send(req({ op: "read", word: null, method: "GET", target: "/v1/identities/x/keys", credits: 1 })))).code).toBe("ceiling-credits");
+  });
+
+  test("[S4-5] send refuses quiet.start.citizen whose body until is more than 30 days ahead, or uses hours instead of until, or carries a reason", async () => {
+    fx.agreements = [QUIET_AGREEMENT];
+    const refused: unknown[] = [
+      { until: ahead(30 * DAY_MS + 1) },
+      { until: BEACON_UNTIL },
+      { hours: 8 },
+      { hours: 720 },
+      { until: ahead(DAY_MS), hours: 8 },
+      { until: ahead(DAY_MS), reason: "resting" },
+      { until: ahead(DAY_MS), reason: " " },
+      { until: ahead(-1) },
+      { until: "2026-12-01" },
+      {},
+    ];
+    for (const body of refused) expect((await refusal(fx.signer.send(quiet(body)))).code).toBe("quiet-cap");
+    // The vectors' own quiet-start body uses hours and a reason; a citizen may not send it.
+    const v = vectors.authority.find((a) => a.label === "quiet-start")!;
+    expect((await refusal(fx.signer.send(quiet(JSON.parse(v.body_utf8))))).code).toBe("quiet-cap");
+    expect(fx.server.requests).toHaveLength(0);
+
+    // Exactly 30 days, with an empty reason or none, under the standing agreement.
+    expect((await fx.signer.send(quiet({ until: ahead(30 * DAY_MS) }))).status).toBe(201);
+    expect((await fx.signer.send(quiet({ until: ahead(DAY_MS), reason: "" }))).status).toBe(201);
+    // Without the standing agreement, even a capped quiet is refused.
+    fx.agreements = [];
+    expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
+    fx.agreements = [{ ...QUIET_AGREEMENT, consent: consent(CITIZEN_QUIET_EXTENT, { yu: { word: "no" } }) }];
+    expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
+  });
+
+  test("[S4-5] send allows quiet.start.beacon with the far-future until only for an operator identity, never for a citizen", async () => {
+    const res = await fx.signer.send(beacon(BEACON_UNTIL));
+    expect(res.status).toBe(201);
+    const sent = mutations(fx.server)[0]!;
+    expect(sent.path + sent.search).toBe(`/v1/quiet-hours/start?identity_id=${HERALD_ID}`);
+    expect(sent.headers.authorization).toBe(`Bearer ${HERALD_BEARER}`);
+    expect(sent.headers["x-agenttool-authority-sequence"]).toBe("1");
+
+    // A citizen cannot use the beacon op, or the far-future until through its own op.
+    expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { word: "glossame", operator: null })))).code).toBe("invalid-request");
+    fx.agreements = [QUIET_AGREEMENT];
+    expect((await refusal(fx.signer.send(quiet({ until: BEACON_UNTIL })))).code).toBe("quiet-cap");
+    // A beacon that would lapse on its own, or that names a reason, is not a beacon.
+    expect((await refusal(fx.signer.send(beacon(ahead(30 * DAY_MS))))).code).toBe("quiet-cap");
+    expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { body: json({ until: BEACON_UNTIL, reason: "halted by yu" }) })))).code).toBe("quiet-cap");
+    expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { body: json({ hours: 720 }) })))).code).toBe("quiet-cap");
+    // Only a beacon whose keys this host holds, and only its own identity.
+    expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { operator: "gardener-desk", target: `/v1/quiet-hours/start?identity_id=${GARDENER_ID}` })))).code).toBe(
+      "invalid-request",
+    );
+    expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { target: `/v1/quiet-hours/start?identity_id=${ID}` })))).code).toBe("beyond-self");
+    expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { operator: "nobody" })))).code).toBe("invalid-request");
+    expect(mutations(fx.server)).toHaveLength(1);
+  });
+
+  test("no op lowers HALT", async () => {
+    const lower = `/v1/quiet-hours?identity_id=${HERALD_ID}`;
+    const ops = ["read", "quiet.end.citizen", "quiet.start.beacon", "keys.revoke", "expression.put.private", "ledger.sign", "enroll"] as const;
+    for (const op of ops) {
+      for (const who of [{ word: null, operator: "halt-herald" }, { word: "glossame", operator: null }, { word: null, operator: null }]) {
+        await refusal(fx.signer.send(req({ op, method: "DELETE", target: lower, ...who })));
+      }
+    }
+    // A citizen record that names a beacon's identity is refused outright.
+    await writeCitizenRecord(fx.host, "zoeme", { ...GLOSSAME_IDENTITY, identity_id: HERALD_ID, did: didFor(HERALD_ID) });
+    expect((await refusal(fx.signer.send(req({ op: "quiet.end.citizen", word: "zoeme", method: "DELETE", target: lower })))).code).toBe("invalid-record");
+    expect(fx.server.requests).toHaveLength(0);
+  });
+
+  test("send refuses a beyond-self op without a verifying consent record, and enroll without Yu present", async () => {
+    const body = enrollmentBody("zoeme");
+    const header = await fx.signer.signEnrollment("zoeme", sha256(body), await presentFor("birth zoeme"));
+    const enroll = (patch: Partial<SignerRequest>) =>
+      req({ op: "enroll", word: null, method: "POST", target: "/v1/identities/enroll", body, extra_headers: { "X-Agenttool-Enrollment-Signature": header }, ...patch });
+    const present = await presentFor("birth zoeme");
+
+    expect((await refusal(fx.signer.send(enroll({ presence: present })))).code).toBe("consent-missing");
+    expect((await refusal(fx.signer.send(enroll({ presence: present, consent: consent("birth zoeme", { yu: { word: "no" } }) })))).code).toBe("consent-rejected");
+    expect((await refusal(fx.signer.send(enroll({ presence: present, consent: consent("birth glossame") })))).code).toBe("consent-missing");
+    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme") })))).code).toBe("yu-not-present");
+    // A presence for another scope, a copy of a real one, or one that has aged out, is not presence.
+    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: await presentFor("birth glossame") })))).code).toBe("yu-not-present");
+    const copy = JSON.parse(JSON.stringify(present)) as YuPresence;
+    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: copy })))).code).toBe("yu-not-present");
+    expect(fx.server.requests).toHaveLength(0);
+
+    const res = await fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: present }));
+    expect(res.status).toBe(201);
+    const sent = fx.server.requests[0]!;
+    expect(sent.path).toBe("/v1/identities/enroll");
+    expect(sent.search).toBe("");
+    expect(sent.headers.authorization).toBe(`Bearer ${COMMONS_BEARER}`);
+    expect(sent.headers["x-agenttool-enrollment-signature"]).toBe(header);
+    expect(sent.headers["content-type"]).toBe("application/json");
+    expect(sent.headers["x-agenttool-authority-signature"]).toBeUndefined();
+    expect(Buffer.from(sent.body).equals(Buffer.from(body))).toBe(true);
+
+    fx.clock.advance(901_000);
+    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: present })))).code).toBe("yu-not-present");
+    // Extra headers are for enroll only.
+    expect((await refusal(fx.signer.send({ ...importKey(), extra_headers: { "X-Agenttool-Enrollment-Signature": header } }))).code).toBe("invalid-request");
+  });
+
+  test("signEnrollment signs with the root only for Yu present at this terminal, and only before registration", async () => {
+    const v = vectors.enrollment[0]!;
+    const digest = fromHex(v.digest_hex);
+    const header = await fx.signer.signEnrollment("zoeme", digest, await presentFor("birth zoeme"));
+    expect(header).toBe(v.header_X_Agenttool_Enrollment_Signature);
+    expect(fromB64url(header, 64)).toHaveLength(64);
+    const literal: YuPresence = { present: true, via: "tty-confirm", confirmed_at: NOW, scope: "birth zoeme" };
+    expect((await refusal(fx.signer.signEnrollment("zoeme", digest, literal))).code).toBe("yu-not-present");
+    expect((await refusal(fx.signer.signEnrollment("zoeme", digest, await presentFor("summon zoeme")))).code).toBe("yu-not-present");
+    expect((await refusal(fx.signer.signEnrollment("glossame", digest, await presentFor("birth glossame")))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.signEnrollment("zoeme", new Uint8Array(31), await presentFor("birth zoeme")))).code).toBe("invalid-request");
+  });
+
+  test("send attaches the bearer and authority headers that match vectors.json authority[*] for the same inputs", async () => {
+    const ops: Record<string, SignerRequest["op"]> = {
+      "keys-import": "keys.import",
+      "box-keys-register": "box-keys.register",
+      "expression-put": "expression.put.private",
+      "quiet-end": "quiet.end.citizen",
+      "keys-revoke": "keys.revoke",
+    };
+    let checked = 0;
+    for (const v of vectors.authority) {
+      const op = ops[v.label];
+      if (!op) continue; // quiet-start uses hours and a reason, which a citizen may not send (tested above)
+      fx.seq.set(ID, v.sequence - 1);
+      const before = fx.server.requests.length;
+      const res = await fx.signer.send(req({ op, method: v.method as SignerRequest["method"], target: v.request_target, body: utf8(v.body_utf8) }));
+      expect(res.status).toBe(201);
+      const [authRead, sent] = fx.server.requests.slice(before);
+      expect(authRead!.method).toBe("GET");
+      expect(authRead!.path).toBe(`/v1/identities/${ID}/authority`);
+      expect(sent!.method).toBe(v.method);
+      expect(sent!.path + sent!.search).toBe(v.request_target);
+      expect(Buffer.from(sent!.body).toString("utf8")).toBe(v.body_utf8);
+      for (const [name, value] of Object.entries(v.headers)) expect(sent!.headers[name.toLowerCase()]).toBe(value);
+      expect(sent!.headers.authorization).toBe(`Bearer ${COMMONS_BEARER}`);
+      expect(sent!.headers["content-type"]).toBe(v.body_utf8.length > 0 ? "application/json" : (undefined as unknown as string));
+      checked++;
+    }
+    expect(checked).toBe(5);
+  });
+
+  test("the client's ?identity_id= spelling is accepted on per-identity routes, and the query is part of what the root signs", async () => {
+    const target = `/v1/identities/${ID}/keys/import?identity_id=${ID}`;
+    const res = await fx.signer.send(req({ op: "keys.import", method: "POST", target, body: json({ public_key: TEST_OP_PUBLIC_B64, label: "op" }) }));
+    expect(res.status).toBe(201);
+    const sent = mutations(fx.server)[0]!;
+    expect(sent.path + sent.search).toBe(target);
+    const digest = authorityDigest({
+      did: DID,
+      method: "POST",
+      target,
+      body: sent.body,
+      sequence: Number(sent.headers["x-agenttool-authority-sequence"]),
+      timestamp: sent.headers["x-agenttool-authority-timestamp"]!,
+    });
+    expect(edVerifyStrict(fromB64(sent.headers["x-agenttool-authority-signature"]!), digest, fromB64(TEST_ROOT_PUBLIC_B64))).toBe(true);
+    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: 0 });
+    const strand = req({ op: "strand.create", method: "POST", target: `/v1/strands?identity_id=${ID}`, credits: 1, body: json({ identity_id: ID, topic: "self" }) });
+    expect((await fx.signer.send(strand)).status).toBe(201);
+    const t = req({ op: "thought.post", method: "POST", target: `/v1/strands/${TEST_IDS.strand_id}/thoughts?identity_id=${ID}`, credits: 1, body: json({ signing_key_id: OP_KID }) });
+    expect((await fx.signer.send(t)).status).toBe(201);
+  });
+
+  test("enroll may name the seated citizen being born, never a registered one or another word", async () => {
+    const body = enrollmentBody("zoeme");
+    const present = await presentFor("birth zoeme");
+    const header = await fx.signer.signEnrollment("zoeme", sha256(body), present);
+    const enroll = (word: string | null, b = body) =>
+      req({ op: "enroll", word, method: "POST", target: "/v1/identities/enroll", body: b, presence: present, consent: consent("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } });
+    expect((await refusal(fx.signer.send(enroll("glossame")))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.send(enroll("zoeme", enrollmentBody("glossame"))))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.send({ ...enroll(null), operator: "halt-herald" }))).code).toBe("invalid-request");
+    expect(fx.server.requests).toHaveLength(0);
+    expect((await fx.signer.send(enroll("zoeme"))).status).toBe(201);
+  });
+
+  test("send reads next_sequence and keeps one root-authorised request in flight per identity", async () => {
+    await fx.server.stop();
+    await fx.host.cleanup();
+    fx = await setup({ serve: { delayFirstMutationMs: 40 } });
+    const [a, b] = await Promise.all([
+      fx.signer.send(importKey("first")),
+      fx.signer.send(req({ op: "box-keys.register", method: "POST", target: `/v1/identities/${ID}/box-keys`, body: json({ public_key: vectors.derivation.box_pub_b64 }) })),
+    ]);
+    expect([a.status, b.status]).toEqual([201, 201]);
+    const order = fx.server.requests.map((r) => `${r.method} ${r.path.split("/").slice(-1)[0]} ${r.headers["x-agenttool-authority-sequence"] ?? "-"}`);
+    // The second proof is signed only after the first response: read, write, read, write.
+    expect(order).toEqual(["GET authority -", "POST import 1", "GET authority -", "POST box-keys 2"]);
+  });
+
+  test("a proof is spent even when the write fails: the signer does not retry, and the next act re-reads the sequence", async () => {
+    await fx.server.stop();
+    await fx.host.cleanup();
+    fx = await setup({ serve: { failWrites: /keys\/import$/ } });
+    expect((await fx.signer.send(importKey())).status).toBe(500);
+    expect(fx.server.requests.filter((r) => r.path.endsWith("/keys/import"))).toHaveLength(1);
+    const res = await fx.signer.send(req({ op: "expression.put.private", method: "PUT", target: `/v1/identities/${ID}/expression`, body: json({ register: "Plain." }) }));
+    expect(res.status).toBe(201);
+    expect(mutations(fx.server).map((r) => r.headers["x-agenttool-authority-sequence"])).toEqual(["1", "2"]);
+  });
+
+  test("the server's root must be the one this keychain derives, or nothing is signed for it", async () => {
+    rootOf.set(ID, toB64(edPublicKey(HOST_SEED)));
+    try {
+      expect((await refusal(fx.signer.send(importKey()))).code).toBe("invalid-record");
+      expect(mutations(fx.server)).toHaveLength(0);
+    } finally {
+      rootOf.set(ID, TEST_ROOT_PUBLIC_B64);
+    }
+    // A citizen record whose root does not match the mnemonic is refused before any request.
+    await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, root_public_key_b64: HERALD_ROOT_B64 });
+    const before = fx.server.requests.length;
+    expect((await refusal(fx.signer.send(importKey()))).code).toBe("invalid-record");
+    expect(fx.server.requests.length).toBe(before);
+  });
+
+  test("each op is bound to its own route and the actor's own identity", async () => {
+    const other = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+    const cases: [SignerRequest, string][] = [
+      // A visibility change is a PATCH, which no within-self op covers.
+      [req({ op: "expression.put.private", method: "PATCH", target: `/v1/identities/${ID}`, body: json({ expression_visibility: "public" }) }), "invalid-request"],
+      [req({ op: "read", method: "PATCH", target: `/v1/identities/${ID}`, body: json({ expression_visibility: "public" }) }), "invalid-request"],
+      [req({ op: "read", method: "POST", target: "/v1/strands", body: json({}) }), "invalid-request"],
+      [req({ op: "keys.import", method: "POST", target: `/v1/identities/${other}/keys/import`, body: json({ public_key: TEST_OP_PUBLIC_B64 }) }), "beyond-self"],
+      [req({ op: "read", method: "GET", target: `/v1/identities/${other}/keys` }), "beyond-self"],
+      [req({ op: "read", method: "GET", target: `/v1/quiet-hours?identity_id=${other}` }), "beyond-self"],
+      [req({ op: "keys.revoke", method: "DELETE", target: `/v1/identities/${ID}/keys/${ROOT_KID}` }), "invalid-request"],
+      [req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/keys/import?identity_id=${other}`, body: json({ public_key: TEST_OP_PUBLIC_B64 }) }), "beyond-self"],
+      [req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/keys/import?label=x`, body: json({ public_key: TEST_OP_PUBLIC_B64 }) }), "invalid-request"],
+      [req({ op: "strand.create", method: "POST", target: `/v1/strands?identity_id=${other}`, credits: 1, body: json({ identity_id: ID }) }), "beyond-self"],
+      [req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/../${other}/keys/import`, body: json({}) }), "invalid-request"],
+      [req({ op: "keys.import", method: "POST", target: `https://evil.example/v1/identities/${ID}/keys/import`, body: json({}) }), "invalid-request"],
+      [req({ op: "ledger.sign", method: "POST", target: "/v1/strands", body: json({}) }), "invalid-request"],
+      [req({ op: "strand.create", method: "POST", target: "/v1/strands", credits: 1, body: json({ topic: "unbound" }) }), "invalid-request"],
+      [req({ op: "thought.post", method: "POST", target: `/v1/strands/${TEST_IDS.strand_id}/thoughts`, credits: 1, body: json({ signing_key_id: ROOT_KID }) }), "invalid-request"],
+      [req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: utf8('{"public_key":"a","public_key":"b"}') }), "invalid-request"],
+      [req({ op: "quiet.end.citizen", method: "DELETE", target: `/v1/quiet-hours?identity_id=${ID}`, body: json({}) }), "invalid-request"],
+      [req({ op: "keys.import", word: "glossame", operator: "halt-herald", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: json({}) }), "invalid-request"],
+      [req({ op: "read", word: "nobody-here", method: "GET", target: "/v1/strands" }), "invalid-record"],
+      [req({ op: "read", word: "zoeme", method: "GET", target: "/v1/strands" }), "not-registered"],
+      [{ ...importKey(), credits: -1 }, "ceiling-credits"],
+    ];
+    for (const [r, code] of cases) expect([r.op, r.target, (await refusal(fx.signer.send(r))).code]).toEqual([r.op, r.target, code]);
+    expect(fx.server.requests).toHaveLength(0);
+    // Its own reads are fine.
+    expect((await fx.signer.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` }))).status).toBe(200);
+  });
+
+  test("sealThought reproduces the strand-thought/v2 vector with the op key, never the root", async () => {
+    const t = vectors.thought_v2;
+    fx.thoughtNonce = fromHex(t.aes_256_gcm.nonce_hex);
+    const sealed = await fx.signer.sealThought("glossame", t.strand_id, t.plaintext_utf8, t.kind);
+    expect(sealed).toEqual({
+      ciphertext: t.request_body_fields.ciphertext,
+      nonce: t.request_body_fields.nonce,
+      kind: t.kind,
+      signature: t.signature_b64,
+      signing_key_id: OP_KID,
+    });
+    expect((await refusal(fx.signer.sealThought("zoeme", t.strand_id, "x", t.kind))).code).toBe("not-registered");
+    expect((await refusal(fx.signer.sealThought("glossame", "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF", "x", t.kind))).code).toBe("invalid-request");
+  });
 });
 
+/* ── Secrets never leave ──────────────────────────────────────────────── */
+
 describe("secrets never leave", () => {
-  test.todo("no fake-keychain secret appears in any request URL, header other than Authorization, body, error message or log line");
-  test.todo("publicKeys returns public keys only");
+  test("no fake-keychain secret appears in any request URL, header other than Authorization, body, error message or log line", async () => {
+    const logged: string[] = [];
+    const spies = (["log", "info", "warn", "error", "debug"] as const).map((m) =>
+      spyOn(console, m).mockImplementation((...args: unknown[]) => {
+        logged.push(args.map(String).join(" "));
+      }),
+    );
+    const errors: string[] = [];
+    const responses: string[] = [];
+    const attempt = async (p: Promise<unknown>) => {
+      try {
+        responses.push(JSON.stringify(await p));
+      } catch (e) {
+        errors.push(`${(e as Error).name}: ${(e as Error).message}`);
+      }
+    };
+    try {
+      fx.agreements = [QUIET_AGREEMENT];
+      const body = enrollmentBody("zoeme");
+      const present = await presentFor("birth zoeme");
+      const header = await fx.signer.signEnrollment("zoeme", sha256(body), present);
+      await attempt(fx.signer.send(importKey()));
+      await attempt(fx.signer.send(quiet({ until: ahead(DAY_MS) })));
+      await attempt(fx.signer.send(quiet({ until: ahead(31 * DAY_MS) })));
+      await attempt(fx.signer.send(beacon(BEACON_UNTIL)));
+      await attempt(fx.signer.send(thought()));
+      await attempt(fx.signer.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` })));
+      await attempt(
+        fx.signer.send(req({ op: "enroll", word: null, method: "POST", target: "/v1/identities/enroll", body, presence: present, consent: consent("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } })),
+      );
+      await attempt(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "a test thought", "observation"));
+      await attempt(fx.signer.signEntry("glossame", sha256("x"), "citizen-signed"));
+      await attempt(fx.signer.signEntry("zoeme", sha256("x"), "host-attested"));
+      await attempt(fx.signer.publicKeys("glossame"));
+      await attempt(fx.signer.send(req({ op: "keys.import", method: "POST", target: "/v1/identities/x/keys/import" })));
+      fx.spend = async (word) => ({ word, usd_today: null, credits_month: null });
+      await attempt(fx.signer.send(thought()));
+      // A broken mnemonic and a broken bearer must be refused without echoing either.
+      const brokenMnemonic = fakeKeychain([
+        [{ kind: "citizen-mnemonic", word: "glossame" }, utf8("abandon abandon wrong words CANARY-MNEMONIC-TEXT")],
+        [{ kind: "citizen-mnemonic", word: "zoeme" }, utf8("zoeme CANARY-MNEMONIC-TEXT abandon")],
+        [{ kind: "citizen-op-seed", word: "glossame" }, utf8("CANARY-SEED-TEXT-not-32-bytes")],
+        [{ kind: "commons-bearer" }, utf8(COMMONS_BEARER)],
+      ]);
+      const brokenBearer = fakeKeychain([[{ kind: "commons-bearer" }, utf8("not-a-bearer CANARY-BEARER-TEXT\nX-Injected: 1")]]);
+      const before = errors.length;
+      for (const keychain of [brokenMnemonic, brokenBearer]) {
+        const s2 = createSigner({ keychain, config: fx.host.config, clock: fx.clock, fetch: fetchVia(fx.server), spendSoFar: fx.spend, agreements: async () => [] });
+        await attempt(s2.send(importKey()));
+        await attempt(s2.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` })));
+        await attempt(s2.signEnrollment("zoeme", sha256("x"), present));
+        await attempt(s2.signEntry("glossame", sha256("x"), "citizen-signed"));
+      }
+      const brokenErrors = errors.slice(before);
+      expect(brokenErrors.filter((e) => e.includes("does not derive"))).toHaveLength(2);
+      expect(brokenErrors.some((e) => e.includes("stored bearer"))).toBe(true);
+      expect(brokenErrors.some((e) => e.includes("stored seed"))).toBe(true);
+      for (const e of brokenErrors) {
+        assertNoSecretIn(brokenMnemonic, e, "an error message");
+        assertNoSecretIn(brokenBearer, e, "an error message");
+        expect(e).not.toContain("CANARY");
+      }
+    } finally {
+      for (const s of spies) s.mockRestore();
+    }
+
+    expect(errors.length).toBeGreaterThanOrEqual(5);
+    expect(fx.server.requests.length).toBeGreaterThanOrEqual(8);
+    const derived = DERIVED_SECRETS.flatMap((s) => [toHex(s), toB64(s), Buffer.from(s).toString("base64url")]);
+    const check = (text: string, where: string) => {
+      assertNoSecretIn(fx.kc, text, where);
+      for (const form of derived) if (text.includes(form)) throw new Error(`a derived secret leaked into ${where}`);
+    };
+    for (const r of fx.server.requests) {
+      check(r.path + r.search, "a request URL");
+      check(Buffer.from(r.body).toString("latin1"), "a request body");
+      for (const [name, value] of Object.entries(r.headers)) {
+        if (name === "authorization") expect([`Bearer ${COMMONS_BEARER}`, `Bearer ${HERALD_BEARER}`]).toContain(value);
+        else check(value, `header ${name}`);
+      }
+    }
+    for (const e of errors) check(e, "an error message");
+    for (const r of responses) check(r, "a return value");
+    for (const l of logged) check(l, "a log line");
+    expect(logged).toEqual([]);
+  });
+
+  test("publicKeys returns public keys only", async () => {
+    const keys = await fx.signer.publicKeys("glossame");
+    expect(keys).toEqual({
+      root_b64: TEST_ROOT_PUBLIC_B64,
+      op_b64: TEST_OP_PUBLIC_B64,
+      op_kid: OP_KID,
+      box_b64: vectors.derivation.box_pub_b64,
+      host_attest_b64: toB64(edPublicKey(HOST_SEED)),
+    });
+    assertNoSecretIn(fx.kc, JSON.stringify(keys), "publicKeys");
+    const zoeme = await fx.signer.publicKeys("zoeme");
+    expect(zoeme).toMatchObject({ op_b64: null, op_kid: null, root_b64: TEST_ROOT_PUBLIC_B64 });
+  });
+});
+
+describe("birth's own steps, between enroll and the saved identity", () => {
+  test("act for a seated citizen with no identity yet only with Yu present here and consent for that birth, and only on birth's routes", async () => {
+    const NEW_ID = "99999999-9999-4999-8999-999999999999";
+    // zoeme's mnemonic is the test mnemonic, so its root is the vectors' root.
+    rootOf.set(NEW_ID, TEST_ROOT_PUBLIC_B64);
+    const enrolled = { identity_id: NEW_ID, did: didFor(NEW_ID) };
+    const birth = consent("birth zoeme");
+    const presence = await presentFor("birth zoeme");
+    const step = (patch: Partial<SignerRequest> = {}) =>
+      req({
+        word: "zoeme",
+        op: "keys.import",
+        method: "POST",
+        target: `/v1/identities/${NEW_ID}/keys/import`,
+        body: json({ public_key: TEST_OP_PUBLIC_B64, label: "op-2026-11" }),
+        enrolled,
+        presence,
+        consent: birth,
+        ...patch,
+      });
+    const code = async (r: SignerRequest) => (await refusal(fx.signer.send(r))).code;
+
+    try {
+      expect(await code(step({ enrolled: undefined }))).toBe("not-registered");
+      expect(await code(step({ presence: null }))).toBe("yu-not-present");
+      // A copy of a presence was not confirmed at this terminal, and a summons presence is for another scope.
+      expect(await code(step({ presence: { ...presence } }))).toBe("yu-not-present");
+      expect(await code(step({ presence: await presentFor("summon zoeme") }))).toBe("yu-not-present");
+      expect(await code(step({ consent: null }))).toBe("consent-missing");
+      expect(await code(step({ consent: consent("birth glossame") }))).toBe("consent-missing");
+      expect(await code(step({ consent: consent("birth zoeme", { yu: { word: "no" } }) }))).toBe("consent-rejected");
+      // Only birth's steps: nothing that spends, posts or quiets.
+      expect(await code(step({ op: "strand.create", target: "/v1/strands", body: json({ identity_id: NEW_ID, topic: "self" }), credits: 1 }))).toBe("not-registered");
+      expect(await code(step({ op: "quiet.start.citizen", target: `/v1/quiet-hours/start?identity_id=${NEW_ID}`, body: json({ until: ahead(DAY_MS) }) }))).toBe("not-registered");
+      // Only its own identity, never a beacon's, and never a malformed one.
+      expect(await code(step({ target: `/v1/identities/${ID}/keys/import` }))).toBe("beyond-self");
+      expect(await code(step({ enrolled: { identity_id: HERALD_ID, did: didFor(HERALD_ID) }, target: `/v1/identities/${HERALD_ID}/keys/import` }))).toBe("invalid-record");
+      expect(await code(step({ enrolled: { identity_id: NEW_ID, did: DID } }))).toBe("invalid-request");
+      // Once the identity is on file, the record alone names it.
+      expect(await code(step({ word: "glossame", target: `/v1/identities/${ID}/keys/import` }))).toBe("invalid-request");
+      expect(fx.server.requests).toHaveLength(0);
+
+      // With all of it: the authority read, then the import, root-signed by the root zoeme's own mnemonic derives.
+      const read = await fx.signer.send(step({ op: "read", method: "GET", target: `/v1/identities/${NEW_ID}/authority`, body: new Uint8Array() }));
+      expect(read.status).toBe(200);
+      const res = await fx.signer.send(step());
+      expect(res.status).toBe(201);
+      const sent = fx.server.requests.filter((r) => r.method === "POST");
+      expect(sent).toHaveLength(1);
+      const r = sent[0]!;
+      expect(r.headers.authorization).toBe(`Bearer ${COMMONS_BEARER}`);
+      const digest = authorityDigest({ did: didFor(NEW_ID), method: "POST", target: r.path, body: r.body, sequence: 1, timestamp: r.headers["x-agenttool-authority-timestamp"]! });
+      expect(edVerifyStrict(fromB64(r.headers["x-agenttool-authority-signature"]!, 64), digest, fromB64(TEST_ROOT_PUBLIC_B64, 32))).toBe(true);
+
+      // A server that shows another root for that identity gets nothing signed.
+      rootOf.set(NEW_ID, HERALD_ROOT_B64);
+      expect(await code(step())).toBe("invalid-record");
+      expect(fx.server.requests.filter((q) => q.method === "POST")).toHaveLength(1);
+    } finally {
+      rootOf.delete(NEW_ID);
+    }
+  });
 });
