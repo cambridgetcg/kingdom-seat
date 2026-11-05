@@ -10,7 +10,7 @@
 // routes by their path, and a strand by identity_id in its body. Targets are
 // otherwise exactly the vectors' targets, which is the shape the signer's
 // route table accepts.
-import { fromB64 } from "../crypto.ts";
+import { fromB64, toB64 } from "../crypto.ts";
 import {
   DID_PATTERN,
   Refusal,
@@ -19,6 +19,7 @@ import {
   type CitizenIdentity,
   type FetchLike,
   type ProposalText,
+  type RootEvidence,
   type SignerOp,
   type Word,
   type YuPresence,
@@ -284,8 +285,21 @@ export async function listKeys(deps: ClientDeps, word: Word): Promise<KeyRow[]> 
 
 /* ── Root-signed acts ─────────────────────────────────────────────────── */
 
-/** Root-signed POST keys/import of the op key; the kid comes back from the server. */
-export async function importOpKey(deps: ClientDeps, word: Word, publicKeyB64: string, label: string, auth?: ActAuth): Promise<{ kid: string }> {
+/**
+ * The signer's copy of the root-signed request just answered, which must be
+ * this call as sent. A ledger entry needs it to show the root authorised an
+ * op key, and agenttool keeps none, so an answer without it is not usable.
+ */
+function evidenceFor(what: string, call: Call, res: SignerResponse): RootEvidence {
+  const ev = res.root_evidence;
+  if (!ev || ev.method !== call.method || ev.target !== call.target || ev.body_b64 !== toB64(call.body)) {
+    throw malformed(what, res.status, "the signer kept no copy of this root-signed request");
+  }
+  return ev;
+}
+
+/** Root-signed POST keys/import of the op key; the kid comes back from the server, the root evidence from the signer. */
+export async function importOpKey(deps: ClientDeps, word: Word, publicKeyB64: string, label: string, auth?: ActAuth): Promise<{ kid: string; evidence: RootEvidence }> {
   const what = "keys/import";
   try {
     fromB64(publicKeyB64, 32);
@@ -296,28 +310,25 @@ export async function importOpKey(deps: ClientDeps, word: Word, publicKeyB64: st
   const id = await citizen(deps, word);
   // The root is already the `primary` key; importing it again would let a routine signature pass as a root act.
   if (publicKeyB64 === id.root_public_key_b64) throw new Refusal("invalid-request", "the root is never imported as the op key");
-  const res = await rootAct(
-    deps,
-    word,
-    id,
-    { op: "keys.import", method: "POST", target: identityRoute(id.identity_id, "/keys/import"), body: jsonBody({ public_key: publicKeyB64, label }), credits: 0 },
-    auth,
-  );
+  const call: Call = { op: "keys.import", method: "POST", target: identityRoute(id.identity_id, "/keys/import"), body: jsonBody({ public_key: publicKeyB64, label }), credits: 0 };
+  const res = await rootAct(deps, word, id, call, auth);
   if (!ok(res.status)) throw refused(what, res);
   const j = res.json;
   if (!isObject(j) || typeof j.kid !== "string" || !UUID_PATTERN.test(j.kid)) throw malformed(what, res.status, "no lowercase kid");
   if (j.public_key !== publicKeyB64) throw malformed(what, res.status, "the stored key is not the key sent");
-  return { kid: j.kid };
+  return { kid: j.kid, evidence: evidenceFor(what, call, res) };
 }
 
-/** Root-signed DELETE of an op key during rotation; the root row can never be revoked. */
-export async function revokeKey(deps: ClientDeps, word: Word, kid: string, auth?: ActAuth): Promise<void> {
+/** Root-signed DELETE of an op key during rotation; the root row can never be revoked. Returns the root evidence. */
+export async function revokeKey(deps: ClientDeps, word: Word, kid: string, auth?: ActAuth): Promise<{ evidence: RootEvidence }> {
   const what = "key revoke";
   if (typeof kid !== "string" || !UUID_PATTERN.test(kid)) throw new Refusal("invalid-request", "kid must be a lowercase UUID");
   const id = await citizen(deps, word);
   if (kid === id.root_kid) throw new Refusal("invalid-request", "the root key row can never be revoked");
-  const res = await rootAct(deps, word, id, { op: "keys.revoke", method: "DELETE", target: identityRoute(id.identity_id, `/keys/${kid}`), body: EMPTY, credits: 0 }, auth);
+  const call: Call = { op: "keys.revoke", method: "DELETE", target: identityRoute(id.identity_id, `/keys/${kid}`), body: EMPTY, credits: 0 };
+  const res = await rootAct(deps, word, id, call, auth);
   if (!ok(res.status)) throw refused(what, res);
+  return { evidence: evidenceFor(what, call, res) };
 }
 
 /** Root-signed POST /v1/identities/:id/box-keys, once at birth, after a local 32-byte check. */

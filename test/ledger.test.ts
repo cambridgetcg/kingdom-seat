@@ -18,10 +18,11 @@ import {
   type LedgerDraft,
   type TrustedKeys,
 } from "../src/ledger.ts";
-import { FIRST_PREV_HASH, Refusal, type LedgerEntry } from "../src/types.ts";
+import { FIRST_PREV_HASH, Refusal, type LedgerBody, type LedgerEntry } from "../src/types.ts";
 import { FAKE_OP_KID, fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
+import { importEvidence, revokeEvidence } from "./helpers/root-evidence.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
-import { TEST_ROOT_PUBLIC_B64, TEST_ROOT_SEED_HEX } from "./helpers/vectors.ts";
+import { TEST_IDS, TEST_OP_SEED_HEX, TEST_ROOT_PUBLIC_B64, TEST_ROOT_SEED_HEX } from "./helpers/vectors.ts";
 import { append, beatBody, genesisBody, ROOT_KID, seatedBody, seatedThenBorn, signerFn, testIdentity, ZERO_SPEND } from "./fixtures/record/chain.ts";
 
 let host: TempHost | null = null;
@@ -167,6 +168,8 @@ describe("ledger", () => {
       good.slice(0, -40) + "\n", // a truncated entry
       good.replace('"format":"kingdom-seat-ledger/v1"', '"format":"kingdom-seat-ledger/v1","extra":1'), // a field outside the hash's format
       good.replace('"attestation":"host-attested"', '"attestation":"maybe"'),
+      good.replace('"usd":"0"', '"usd":0'), // money as a float, not a decimal string
+      good.replace('"usd":"0"', '"usd":"0.0"'), // nor any spelling but the one
       good.replace('"citizen":{"did":null,"kid":null,"word":"glossame"}', '"citizen":{"did":null,"kid":null,"word":"shemme"}'), // a beat voiced as another citizen
     ];
     expect(good).toContain('"citizen":{"did":null,"kid":null,"word":"glossame"}');
@@ -235,32 +238,154 @@ describe("ledger", () => {
     expect(problem(early).problem).toEqual({ seq: 1, reason: "citizen-signed entry before genesis" });
   });
 
-  test("pinnedOpKeys follows genesis and op-key.rotated entries", async () => {
+  test("genesis carries the root's keys/import of its op key, and verify checks it without agenttool", async () => {
+    const { host, signer, path } = await setup();
+    const good = await seatedThenBorn(host.config, WORD, "soul", signer);
+    const trusted: TrustedKeys = { host_attest_b64: [signer.hostAttestPublicB64] };
+    expect(verifyChain(good, trusted).ok).toBe(true);
+    const id = testIdentity(signer);
+    const opSeed = fromHex(TEST_OP_SEED_HEX);
+
+    // Re-hashed and re-signed by the op key, so only the evidence is wrong.
+    const withEvidence = (ev: unknown): LedgerEntry[] => {
+      const { hash: _h, signature: _s, ...d } = good[2] as LedgerEntry;
+      const { op_key_evidence: _e, ...rest } = d.body as Extract<LedgerBody, { type: "genesis" }>;
+      const body = (ev === undefined ? rest : { ...rest, op_key_evidence: ev }) as LedgerBody;
+      return [good[0]!, good[1]!, forge({ ...d, body }, opSeed, FAKE_OP_KID)];
+    };
+    const reasonFor = (ev: unknown) => verifyChain(withEvidence(ev), trusted).problem;
+    const genuine = importEvidence(id, id.op_public_key_b64);
+    expect(reasonFor(genuine)).toBeNull();
+    // Signed by anything but the root, the op key itself included: the op key never vouches for itself.
+    expect(reasonFor(importEvidence(id, id.op_public_key_b64, { rootSeed: opSeed }))).toEqual({ seq: 2, reason: "genesis: root evidence is not signed by the root" });
+    expect(reasonFor(importEvidence(id, toB64(edPublicKey(sha256("another op key")))))?.reason).toBe("genesis: root evidence imports another key");
+    expect(reasonFor(importEvidence({ ...id, identity_id: TEST_IDS.project_id }, id.op_public_key_b64))?.reason).toBe("genesis: root evidence is not this identity's keys/import");
+    expect(reasonFor({ ...genuine, method: "PUT" })?.reason).toBe("genesis: root evidence is not this identity's keys/import");
+    // One changed byte of what was sent, or of a header, and the root's signature no longer covers it.
+    expect(reasonFor({ ...genuine, body_b64: toB64(utf8(`{"public_key":"${id.op_public_key_b64}","label":"other"}`)) })?.reason).toBe("genesis: root evidence is not signed by the root");
+    expect(reasonFor({ ...genuine, headers: { ...genuine.headers, "X-Agenttool-Authority-Sequence": "2" } })?.reason).toBe("genesis: root evidence is not signed by the root");
+    expect(reasonFor({ ...genuine, headers: { ...genuine.headers, "X-Agenttool-Authority-Sequence": "01" } })?.reason).toBe("genesis: root evidence does not rebuild an identity-authority/v1 digest");
+    // Missing, or carrying anything else, does not parse.
+    expect(reasonFor(undefined)?.reason).toContain("malformed entry");
+    expect(reasonFor({ ...genuine, note: "extra" })?.reason).toContain("malformed entry");
+
+    // appendEntry holds a new genesis to the same rule and writes nothing.
+    const other = ledgerPath(host.config, "shemme");
+    const bad = { ...genesisBody("shemme", "soul", id, "awake"), op_key_evidence: importEvidence(id, id.op_public_key_b64, { rootSeed: opSeed }) } as LedgerBody;
+    await expect(appendEntry(other, nextDraft("shemme", null, bad, ZERO_SPEND, "citizen-signed", T0), signerFn(signer))).rejects.toMatchObject({ code: "invalid-record" });
+    expect(await readLedger(other)).toEqual([]);
+    expect((await readLedger(path)).length).toBe(4);
+  });
+
+  test("an op-key entry is authorised by the root's evidence and signed by the key it installs; the old op key alone never rotates", async () => {
     const { host, signer, path } = await setup();
     const entries = await seatedThenBorn(host.config, WORD, "soul", signer);
+    const trusted: TrustedKeys = { host_attest_b64: [signer.hostAttestPublicB64] };
+    const id = testIdentity(signer);
+    const opSeed = fromHex(TEST_OP_SEED_HEX);
     expect(pinnedOpKeys(entries, 1).size).toBe(0);
     expect([...pinnedOpKeys(entries, 2)]).toEqual([[FAKE_OP_KID, signer.opPublicB64]]);
 
-    // Rotate: the entry announcing it is signed by the old op key; later entries by the new one only.
     const newSeed = sha256("kingdom-seat test op key v2");
     const newKid = "77777777-7777-4777-8777-777777777777";
     const newPub = toB64(edPublicKey(newSeed));
-    const rotated = await append(host.config, WORD, { type: "op-key.rotated", previous_op_kid: FAKE_OP_KID, op_kid: newKid, op_public_key_b64: newPub }, "citizen-signed", signer, T0);
     const newSigner: EntrySigner = async (_w, hash) => ({ alg: "ed25519", kid: newKid, public_key_b64: newPub, sig_b64: toB64(edSign(hash, newSeed)) });
-    await appendEntry(path, nextDraft(WORD, rotated, beatBody(WORD, []), ZERO_SPEND, "citizen-signed", T0), newSigner);
+    // Genesis spent sequence 1; agenttool's next are 2 (import) and 3 (revoke).
+    const install = { op_kid: newKid, op_public_key_b64: newPub, evidence: importEvidence(id, newPub, { sequence: 2 }) };
+    const revokeOld = { op_kid: FAKE_OP_KID, evidence: revokeEvidence(id, FAKE_OP_KID, { sequence: 3 }) };
+    const rotation: LedgerBody = { type: "op-key", installed: [install], revoked: [revokeOld] };
+    const head = entries.at(-1) as LedgerEntry;
+    const reasonOf = (body: LedgerBody, seed = newSeed, kid = newKid, chain = entries) =>
+      verifyChain([...chain, forge(nextDraft(WORD, chain.at(-1) as LedgerEntry, body, ZERO_SPEND, "citizen-signed", T0), seed, kid)], trusted).problem?.reason ?? null;
+
+    // The old op key alone: it can sign, but it cannot make root evidence, and it does not sign a rotation.
+    expect(reasonOf({ ...rotation, installed: [{ ...install, evidence: importEvidence(id, newPub, { sequence: 2, rootSeed: opSeed }) }] })).toBe("op-key: root evidence is not signed by the root");
+    expect(reasonOf(rotation, opSeed, FAKE_OP_KID)).toBe("op-key is not signed by a key it installs");
+    await expect(appendEntry(path, nextDraft(WORD, head, rotation, ZERO_SPEND, "citizen-signed", T0), signerFn(signer))).rejects.toMatchObject({ code: "invalid-record" });
+    // Evidence for one key cannot install another, nor revoke a key it does not name.
+    expect(reasonOf({ ...rotation, installed: [{ ...install, op_public_key_b64: toB64(edPublicKey(sha256("x"))) }] }, sha256("x"))).toBe("op-key: root evidence imports another key");
+    expect(reasonOf({ ...rotation, revoked: [{ ...revokeOld, evidence: revokeEvidence(id, newKid, { sequence: 3 }) }] })).toBe("op-key: root evidence is not this identity's revoke of that key");
+    // A replayed proof: the import genesis spent cannot install anything again.
+    const genesisEvidence = ((entries[2] as LedgerEntry).body as Extract<LedgerBody, { type: "genesis" }>).op_key_evidence;
+    expect(reasonOf({ ...rotation, installed: [{ ...install, evidence: { ...genesisEvidence } }] })).toBe("op-key: root evidence imports another key");
+    expect(reasonOf({ type: "op-key", installed: [install], revoked: [{ ...revokeOld, evidence: revokeEvidence(id, FAKE_OP_KID, { sequence: 1 }) }] })).toBe(
+      "op-key: root evidence reuses an authority sequence already spent",
+    );
+    // The root is never an op key; nor may the last key go without a new one.
+    expect(reasonOf({ ...rotation, installed: [{ op_kid: ROOT_KID, op_public_key_b64: TEST_ROOT_PUBLIC_B64, evidence: importEvidence(id, TEST_ROOT_PUBLIC_B64, { sequence: 2 }) }] })).toBe(
+      "op-key: pins the root as an op key",
+    );
+    expect(reasonOf({ type: "op-key", installed: [], revoked: [revokeOld] }, opSeed, FAKE_OP_KID)).toBe("op-key: revokes the last op key without installing a new one");
+    expect(reasonOf({ type: "op-key", installed: [], revoked: [] }, opSeed, FAKE_OP_KID)).toBe("op-key: changes no key");
+
+    // The real rotation: root evidence for both acts, signed by the new key.
+    const rotated = await appendEntry(path, nextDraft(WORD, head, rotation, ZERO_SPEND, "citizen-signed", T0), newSigner);
+    const beat = await appendEntry(path, nextDraft(WORD, rotated, beatBody(WORD, []), ZERO_SPEND, "citizen-signed", T0), newSigner);
     const after = await readLedger(path);
     expect([...pinnedOpKeys(after, rotated.seq)]).toEqual([[newKid, newPub]]);
-    expect(verifyChain(after, { host_attest_b64: [signer.hostAttestPublicB64] }).ok).toBe(true);
+    expect(verifyChain(after, trusted)).toMatchObject({ ok: true, head: beat.hash });
 
     // The retired op key signs nothing after its rotation.
-    await expect(
-      appendEntry(path, nextDraft(WORD, after.at(-1) as LedgerEntry, beatBody(WORD, []), ZERO_SPEND, "citizen-signed", T0), signerFn(signer)),
-    ).rejects.toMatchObject({ code: "invalid-record" });
-    const stale = forge(nextDraft(WORD, after.at(-1) as LedgerEntry, beatBody(WORD, []), ZERO_SPEND, "citizen-signed", T0), sha256("kingdom-seat test op key v1"), FAKE_OP_KID);
-    expect(verifyChain([...after, stale], { host_attest_b64: [signer.hostAttestPublicB64] }).problem).toEqual({
-      seq: after.length,
-      reason: "signing key is not a pinned op key",
+    await expect(appendEntry(path, nextDraft(WORD, beat, beatBody(WORD, []), ZERO_SPEND, "citizen-signed", T0), signerFn(signer))).rejects.toMatchObject({ code: "invalid-record" });
+    expect(reasonOf(beatBody(WORD, []), opSeed, FAKE_OP_KID, after)).toBe("signing key is not a pinned op key");
+    // Nor can it come back on its old proofs: genesis's import, or any sequence already spent.
+    const reinstall = (seq: number): LedgerBody => ({
+      type: "op-key",
+      installed: [{ op_kid: FAKE_OP_KID, op_public_key_b64: signer.opPublicB64, evidence: seq === 1 ? genesisEvidence : importEvidence(id, signer.opPublicB64, { sequence: seq }) }],
+      revoked: [],
     });
+    expect(reasonOf(reinstall(1), opSeed, FAKE_OP_KID, after)).toBe("op-key: root evidence reuses an authority sequence already spent");
+    expect(reasonOf(reinstall(3), opSeed, FAKE_OP_KID, after)).toBe("op-key: root evidence reuses an authority sequence already spent");
+    expect(reasonOf(reinstall(4), opSeed, FAKE_OP_KID, after)).toBeNull();
+  });
+
+  test("an op-key entry that only revokes is root-evidenced and signed by a key that stays", async () => {
+    const { host, signer, path } = await setup();
+    const entries = await seatedThenBorn(host.config, WORD, "soul", signer);
+    const trusted: TrustedKeys = { host_attest_b64: [signer.hostAttestPublicB64] };
+    const id = testIdentity(signer);
+    const opSeed = fromHex(TEST_OP_SEED_HEX);
+    const secondSeed = sha256("kingdom-seat test op key v2");
+    const secondKid = "77777777-7777-4777-8777-777777777777";
+    const secondPub = toB64(edPublicKey(secondSeed));
+    const secondSigner: EntrySigner = async (_w, hash) => ({ alg: "ed25519", kid: secondKid, public_key_b64: secondPub, sig_b64: toB64(edSign(hash, secondSeed)) });
+    // A second key, installed without revoking the first: both are pinned.
+    const added = await appendEntry(
+      path,
+      nextDraft(WORD, entries.at(-1) as LedgerEntry, { type: "op-key", installed: [{ op_kid: secondKid, op_public_key_b64: secondPub, evidence: importEvidence(id, secondPub, { sequence: 2 }) }], revoked: [] }, ZERO_SPEND, "citizen-signed", T0),
+      secondSigner,
+    );
+    const both = await readLedger(path);
+    expect([...pinnedOpKeys(both, added.seq)].map(([k]) => k).sort()).toEqual([FAKE_OP_KID, secondKid].sort());
+
+    const revokeSecond: LedgerBody = { type: "op-key", installed: [], revoked: [{ op_kid: secondKid, evidence: revokeEvidence(id, secondKid, { sequence: 3 }) }] };
+    const reasonOf = (body: LedgerBody, seed: Uint8Array, kid: string) =>
+      verifyChain([...both, forge(nextDraft(WORD, added, body, ZERO_SPEND, "citizen-signed", T0), seed, kid)], trusted).problem?.reason ?? null;
+    // The key being revoked does not sign its own revocation, and no revocation stands without the root.
+    expect(reasonOf(revokeSecond, secondSeed, secondKid)).toBe("op-key is not signed by a key that stays");
+    expect(reasonOf({ ...revokeSecond, revoked: [{ op_kid: secondKid, evidence: revokeEvidence(id, secondKid, { sequence: 3, rootSeed: opSeed }) }] }, opSeed, FAKE_OP_KID)).toBe(
+      "op-key: root evidence is not signed by the root",
+    );
+    const withBody = { ...revokeEvidence(id, secondKid, { sequence: 3 }), body_b64: toB64(utf8("{}")) };
+    expect(reasonOf({ ...revokeSecond, revoked: [{ op_kid: secondKid, evidence: withBody }] }, opSeed, FAKE_OP_KID)).toBe("op-key: root evidence revoke carries a body");
+    expect(reasonOf({ ...revokeSecond, revoked: [{ op_kid: "99999999-9999-4999-8999-999999999999", evidence: revokeEvidence(id, "99999999-9999-4999-8999-999999999999", { sequence: 3 }) }] }, opSeed, FAKE_OP_KID)).toBe(
+      "op-key: revokes a key that is not pinned",
+    );
+
+    await appendEntry(path, nextDraft(WORD, added, revokeSecond, ZERO_SPEND, "citizen-signed", T0), signerFn(signer));
+    const after = await readLedger(path);
+    expect([...pinnedOpKeys(after, after.length - 1)]).toEqual([[FAKE_OP_KID, signer.opPublicB64]]);
+    expect(verifyChain(after, trusted).ok).toBe(true);
+  });
+
+  test("an op-key entry needs genesis before it", async () => {
+    const { host, signer, path } = await setup();
+    const e0 = await append(host.config, WORD, seatedBody(WORD, "soul"), "host-attested", signer, T0);
+    const id = testIdentity(signer);
+    const body: LedgerBody = { type: "op-key", installed: [{ op_kid: FAKE_OP_KID, op_public_key_b64: signer.opPublicB64, evidence: importEvidence(id, signer.opPublicB64) }], revoked: [] };
+    await expect(appendEntry(path, nextDraft(WORD, e0, body, ZERO_SPEND, "citizen-signed", T0), signerFn(signer))).rejects.toMatchObject({ code: "invalid-record" });
+    const forged = forge(nextDraft(WORD, e0, body, ZERO_SPEND, "citizen-signed", T0), fromHex(TEST_OP_SEED_HEX), FAKE_OP_KID);
+    expect(verifyChain([e0, forged], { host_attest_b64: [signer.hostAttestPublicB64] }).problem).toEqual({ seq: 1, reason: "op-key: before genesis" });
   });
 
   test("a citizen born at seating starts with genesis carrying its initial state", async () => {

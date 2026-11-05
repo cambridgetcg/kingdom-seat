@@ -7,7 +7,8 @@ import { checkHalt } from "../src/halt.ts";
 import { appendEntry, ledgerPath, nextDraft, readLedger } from "../src/ledger.ts";
 import { openedDetail } from "../src/notes.ts";
 import { spawnRunner } from "../src/cli.ts";
-import type { HaltStatus, HostNote, StatusFile } from "../src/types.ts";
+import type { HaltStatus, HostNote, SeatRef, StatusFile } from "../src/types.ts";
+import { hostSpendRecorder } from "../src/spend.ts";
 import { beatBody, signerFn, testIdentity } from "./fixtures/record/chain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { REST_THEN_TALK_OUTPUT } from "./helpers/fake-runtime.ts";
@@ -37,7 +38,7 @@ async function beat(h: TempHost, signer: FakeSigner, word: string, at: Date, cre
   const path = ledgerPath(h.config, word);
   const prev = (await readLedger(path)).at(-1) ?? null;
   const body = beatBody(word, [{ type: "journal", kind: "reflected", text: "a word" }], { ts: at.toISOString() });
-  return appendEntry(path, nextDraft(word, prev, body, { usd: 0, usd_basis: "local-zero", credits }, attestation, at), signerFn(signer));
+  return appendEntry(path, nextDraft(word, prev, body, { usd: "0", usd_basis: "local-zero", credits }, attestation, at), signerFn(signer));
 }
 
 describe("status", () => {
@@ -70,7 +71,7 @@ describe("status", () => {
       last_outcome: null,
       ledger: { entries: 3, chain_ok: true, host_attested: 3 },
       mirror: null,
-      usd_today: 0,
+      usd_today: "0",
       credits_month: 3,
     });
     expect(g!.ledger.head).toBe((await readLedger(ledgerPath(h.config, "glossame"))).at(-1)!.hash);
@@ -106,6 +107,34 @@ describe("status", () => {
     expect(overdue(ago(72).toISOString(), 72, NOW)).toBe(false);
     expect(overdue(ago(73).toISOString(), 72, NOW)).toBe(true);
     expect(overdue("not a time", 72, NOW)).toBe(true);
+  });
+
+  test("usd_today is read from the host's spend record: a summons that wrote no entry counts, and an unsettled one is unknown", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const signer = fakeSigner();
+    await h.addCitizen("glossame", { runtime: "summon" });
+    await h.seatLedger("glossame", signer.signEntry);
+    const ref = (n: number): SeatRef => ({
+      format: "kingdom-seat-seat/v1",
+      seat_id: `11111111-1111-4111-8111-${String(n).padStart(12, "0")}`,
+      host: "test-host",
+      word: "glossame",
+      runtime: "summon",
+      invoker: { kind: "summons", who: "yu", why: "test" },
+      opened_at: ago(1).toISOString(),
+    });
+    const rec = hostSpendRecorder(h.config, { now: () => ago(1) });
+    const status = async () => (await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready" })).citizens[0]!;
+    // A summons that rested: no ledger entry, yet its spend is today's.
+    await rec.begin(ref(1));
+    await rec.settle(ref(1), { usd: "0.0421", usd_basis: "reported", credits: 0 });
+    expect(await status()).toMatchObject({ usd_today: "0.0421", ledger: { entries: 1 } });
+    expect(renderStatus(await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready" }))).toContain("$0.0421 today");
+    // One that began and never settled: unknown, which the ceiling reads as reached.
+    await rec.begin(ref(2));
+    expect((await status()).usd_today).toBeNull();
+    expect(renderStatus(await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready" }))).toContain("spend unknown today");
   });
 
   test("a mirror row shows divergence, push refusals and unsigned commits", async () => {
@@ -199,7 +228,7 @@ describe("status", () => {
         last_outcome: null,
         ledger: { entries: i, head: null, chain_ok: true, host_attested: i },
         mirror: null,
-        usd_today: 0,
+        usd_today: "0",
         credits_month: 0,
         origin: { intact: true, drift: 0 },
         problem: null,

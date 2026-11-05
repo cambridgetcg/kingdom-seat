@@ -510,7 +510,7 @@ export async function superviseChild(opts: SuperviseOptions): Promise<Supervised
 
 /* ── The in-child pipeline ────────────────────────────────────────────── */
 
-const NO_SPEND: Spend = { usd: 0, usd_basis: "local-zero", credits: 0 };
+const NO_SPEND: Spend = { usd: "0", usd_basis: "local-zero", credits: 0 };
 
 /** The work a validated beat leaves for the write phase, planned before HALT's last check so planning writes nothing. */
 interface Plan {

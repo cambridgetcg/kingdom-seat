@@ -92,9 +92,9 @@ one is something it does, not something it hopes.
   citizen's bound self-change refuses rather than skipping its agenttool
   side; no standing agreement is filed, so a citizen's own quiet declaration
   refuses (decision 14 is Yu and Ai's to record).
-- **Spend from a summons that makes no beat is not yet recorded** where the
-  USD tally reads it. The $0 default refuses every summons, so this is safe
-  today, and it must be settled before any USD ceiling is raised.
+- **Op-key rotation is not wired.** The ledger accepts an op key only with
+  the root's evidence and `verify` checks it, but nothing writes an `op-key`
+  entry yet.
 - **Never run for real:** Ollama, `claude`, the macOS Keychain, launchd and
   agenttool itself. `docs/ARCHITECTURE.md` section 8 lists what is unverified.
 

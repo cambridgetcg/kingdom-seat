@@ -6,13 +6,16 @@
 import { constants } from "node:fs";
 import { mkdir, open, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { canonicalJson, domainDigest, edVerifyStrict, fromB64, fromHex, fromUtf8, toHex, utf8 } from "./crypto.ts";
+import { AUTHORITY_HEADERS, authorityDigest } from "./agenttool/wire.ts";
+import { canonicalJson, domainDigest, edVerifyStrict, fromB64, fromHex, fromUtf8, parseStrictJson, toHex, utf8 } from "./crypto.ts";
+import { isUsd } from "./money.ts";
 import {
   DID_PATTERN,
   FIRST_PREV_HASH,
   LIFECYCLE_STATES,
   Refusal,
   SHA256_HEX_PATTERN,
+  UUID_PATTERN,
   WORD_PATTERN,
   type Attestation,
   type CitizenIdentity,
@@ -23,6 +26,7 @@ import {
   type LedgerSignature,
   type LifecycleState,
   type Origin,
+  type RootEvidence,
   type Sha256Hex,
   type Spend,
   type Word,
@@ -43,8 +47,8 @@ export type EntrySigner = (word: Word, entryHash: Uint8Array, attestation: Attes
 /**
  * The public keys a chain may be signed with: the host attest key for
  * host-attested entries, and for citizen-signed ones the op keys the chain
- * itself pins (genesis, then op-key.rotated). A signature by any other key,
- * including the root, fails verification.
+ * itself pins (genesis, then op-key entries, each with root evidence). A
+ * signature by any other key, including the root, fails verification.
  */
 export interface TrustedKeys {
   host_attest_b64: string[];
@@ -62,13 +66,73 @@ export function pinnedOpKeys(entries: LedgerEntry[], seq: number): Map<string, s
   for (const e of entries) {
     if (e.seq > seq) break;
     if (e.body.type === "genesis") pinned = new Map([[e.body.identity.op_kid, e.body.identity.op_public_key_b64]]);
-    else if (e.body.type === "op-key.rotated") {
-      // A rotated key is no longer active, so it signs nothing after its rotation (agenttool-wire.md 5, rule 2).
-      pinned.delete(e.body.previous_op_kid);
-      pinned.set(e.body.op_kid, e.body.op_public_key_b64);
-    }
+    else if (e.body.type === "op-key") pinned = afterOpKey(pinned, e.body);
   }
   return pinned;
+}
+
+/** The op keys pinned once an op-key entry applies: a revoked key signs nothing after it (agenttool-wire.md 5, rule 2). */
+function afterOpKey(pinned: Map<string, string>, body: Extract<LedgerBody, { type: "op-key" }>): Map<string, string> {
+  const next = new Map(pinned);
+  for (const r of body.revoked) next.delete(r.op_kid);
+  for (const k of body.installed) next.set(k.op_kid, k.op_public_key_b64);
+  return next;
+}
+
+/** What one piece of root evidence must authorise. */
+type EvidenceFor = { kind: "import"; public_key_b64: string } | { kind: "revoke"; kid: string };
+
+/**
+ * Why `ev` does not prove that the identity's root authorised `what`, or null.
+ * It rebuilds the identity-authority/v1 digest agenttool verifies
+ * (services/identity/authority.ts:114-121, :190-194) from the request as sent
+ * and the identity's DID, and checks the root's signature over it, so a copy
+ * of the ledger is enough: agenttool keeps no proof to ask for. The request
+ * must be the route that does `what`, for this identity, and nothing else.
+ */
+export function rootEvidenceProblem(ev: RootEvidence, identity: Pick<CitizenIdentity, "did" | "identity_id" | "root_public_key_b64">, what: EvidenceFor): string | null {
+  const own = `/v1/identities/${identity.identity_id}`;
+  const query = `?identity_id=${identity.identity_id}`;
+  let body: Uint8Array;
+  try {
+    body = fromB64(ev.body_b64);
+  } catch {
+    return "root evidence body is not canonical base64";
+  }
+  if (what.kind === "import") {
+    if (ev.method !== "POST" || (ev.target !== `${own}/keys/import` && ev.target !== `${own}/keys/import${query}`)) return "root evidence is not this identity's keys/import";
+    let named: unknown;
+    try {
+      named = (parseStrictJson(body) as { public_key?: unknown } | null)?.public_key;
+    } catch {
+      return "root evidence body is not strict JSON";
+    }
+    if (named !== what.public_key_b64) return "root evidence imports another key";
+  } else {
+    if (ev.method !== "DELETE" || (ev.target !== `${own}/keys/${what.kid}` && ev.target !== `${own}/keys/${what.kid}${query}`)) return "root evidence is not this identity's revoke of that key";
+    if (body.length > 0) return "root evidence revoke carries a body";
+  }
+  const h = ev.headers;
+  try {
+    const digest = authorityDigest({
+      did: identity.did,
+      method: ev.method,
+      target: ev.target,
+      body,
+      sequence: evidenceSequence(ev),
+      timestamp: h[AUTHORITY_HEADERS.timestamp],
+    });
+    if (!edVerifyStrict(fromB64(h[AUTHORITY_HEADERS.signature], 64), digest, fromB64(identity.root_public_key_b64, 32))) return "root evidence is not signed by the root";
+  } catch {
+    return "root evidence does not rebuild an identity-authority/v1 digest";
+  }
+  return null;
+}
+
+/** The authority sequence a piece of evidence spent; NaN when the header is not a plain positive integer. */
+function evidenceSequence(ev: RootEvidence): number {
+  const raw = ev.headers[AUTHORITY_HEADERS.sequence];
+  return /^[1-9][0-9]{0,15}$/.test(raw) ? Number(raw) : Number.NaN;
 }
 
 export interface ChainVerdict {
@@ -201,6 +265,13 @@ class ChainWalk {
   private prev: LedgerEntry | null = null;
   private pinned = new Map<string, string>();
   private root: { kid: string; b64: string } | null = null;
+  private identity: CitizenIdentity | null = null;
+  /**
+   * The highest authority sequence any root evidence so far spent. agenttool
+   * claims each sequence once and only upward, so evidence at or below it is a
+   * replay: a revoked key cannot come back on its old import.
+   */
+  private lastSequence = 0;
   private genesis = false;
 
   /** The first problem with `e` as the next entry, or null. `trusted` null skips only the host-key trust list. */
@@ -229,16 +300,22 @@ class ChainWalk {
       if (seq === 0 && body.initial_state === null) return "a first genesis must carry initial_state";
       if (seq !== 0 && body.initial_state !== null) return "a genesis after seated carries no initial_state";
       const id = body.identity;
+      if (id.did !== `did:at:${id.identity_id}`) return "genesis names a DID that is not its identity's";
       if (id.op_kid === id.root_kid || id.op_public_key_b64 === id.root_public_key_b64) return "genesis pins the root as an op key";
       if (trusted?.identity && (trusted.identity.did !== id.did || trusted.identity.root_public_key_b64 !== id.root_public_key_b64)) {
         return "genesis names an identity other than the host's record";
       }
+      // The first op key is the root's choice too, shown the same way as every later one.
+      const problem = rootEvidenceProblem(body.op_key_evidence, id, { kind: "import", public_key_b64: id.op_public_key_b64 });
+      if (problem) return `genesis: ${problem}`;
       keys = new Map([[id.op_kid, id.op_public_key_b64]]);
       root = { kid: id.root_kid, b64: id.root_public_key_b64 };
-    } else if (body.type === "op-key.rotated") {
-      if (!this.genesis) return "op-key.rotated before genesis";
-      if (!this.pinned.has(body.previous_op_kid)) return "op-key.rotated names a key that is not pinned";
-      if (body.op_kid === this.root?.kid || body.op_public_key_b64 === this.root?.b64) return "op-key.rotated pins the root as an op key";
+    } else if (body.type === "op-key") {
+      const problem = this.opKeyProblem(body);
+      if (problem) return `op-key: ${problem}`;
+      // A new key signs the entry that installs it, so the key being replaced never authorises its replacement;
+      // an entry that only revokes is signed by a key that stays.
+      keys = body.installed.length > 0 ? new Map(body.installed.map((k) => [k.op_kid, k.op_public_key_b64])) : afterOpKey(this.pinned, body);
     }
 
     const citizenEra = this.genesis || body.type === "genesis";
@@ -251,9 +328,41 @@ class ChainWalk {
       if (trusted && !trusted.host_attest_b64.includes(sig.public_key_b64)) return "host attest key is not trusted";
     } else {
       if (root && (sig.kid === root.kid || sig.public_key_b64 === root.b64)) return "signed by the root key, which signs only authority acts";
-      if (keys.get(sig.kid) !== sig.public_key_b64) return "signing key is not a pinned op key";
+      if (keys.get(sig.kid) !== sig.public_key_b64) {
+        if (body.type === "op-key") return body.installed.length > 0 ? "op-key is not signed by a key it installs" : "op-key is not signed by a key that stays";
+        return "signing key is not a pinned op key";
+      }
     }
     if (signatures && !signatureVerifies(e.hash, sig)) return "signature does not verify";
+    return null;
+  }
+
+  /** Why an op-key entry may not follow the chain so far, or null. Every key it touches comes with the root's evidence. */
+  private opKeyProblem(body: Extract<LedgerBody, { type: "op-key" }>): string | null {
+    const id = this.identity;
+    if (!this.genesis || !id) return "before genesis";
+    if (body.installed.length + body.revoked.length === 0) return "changes no key";
+    const sequences: number[] = [];
+    const kids = new Set<string>();
+    for (const k of body.installed) {
+      if (k.op_kid === id.root_kid || k.op_public_key_b64 === id.root_public_key_b64) return "pins the root as an op key";
+      if (kids.has(k.op_kid) || this.pinned.has(k.op_kid) || [...this.pinned.values()].includes(k.op_public_key_b64)) return "installs a key that is already pinned";
+      kids.add(k.op_kid);
+      const problem = rootEvidenceProblem(k.evidence, id, { kind: "import", public_key_b64: k.op_public_key_b64 });
+      if (problem) return problem;
+      sequences.push(evidenceSequence(k.evidence));
+    }
+    for (const r of body.revoked) {
+      if (!this.pinned.has(r.op_kid) || kids.has(r.op_kid)) return "revokes a key that is not pinned";
+      kids.add(r.op_kid);
+      const problem = rootEvidenceProblem(r.evidence, id, { kind: "revoke", kid: r.op_kid });
+      if (problem) return problem;
+      sequences.push(evidenceSequence(r.evidence));
+    }
+    if (new Set(sequences).size !== sequences.length || sequences.some((n) => !(n > this.lastSequence))) {
+      return "root evidence reuses an authority sequence already spent";
+    }
+    if (afterOpKey(this.pinned, body).size === 0) return "revokes the last op key without installing a new one";
     return null;
   }
 
@@ -261,11 +370,14 @@ class ChainWalk {
   advance(e: LedgerEntry): void {
     if (e.body.type === "genesis") {
       this.genesis = true;
+      this.identity = e.body.identity;
       this.pinned = new Map([[e.body.identity.op_kid, e.body.identity.op_public_key_b64]]);
       this.root = { kid: e.body.identity.root_kid, b64: e.body.identity.root_public_key_b64 };
-    } else if (e.body.type === "op-key.rotated") {
-      this.pinned.delete(e.body.previous_op_kid);
-      this.pinned.set(e.body.op_kid, e.body.op_public_key_b64);
+      this.lastSequence = evidenceSequence(e.body.op_key_evidence);
+    } else if (e.body.type === "op-key") {
+      this.pinned = afterOpKey(this.pinned, e.body);
+      const spent = [...e.body.installed, ...e.body.revoked].map((k) => evidenceSequence(k.evidence));
+      this.lastSequence = Math.max(this.lastSequence, ...spent);
     }
     this.prev = e;
   }
@@ -334,7 +446,8 @@ export function parseEntry(value: unknown): LedgerEntry {
   if (sig.alg !== "ed25519") throw new Error("signature.alg");
   for (const k of ["kid", "public_key_b64", "sig_b64"]) str(sig[k], `signature.${k}`);
   const spend = obj(e.spend, "spend");
-  if (spend.usd !== null && !(typeof spend.usd === "number" && Number.isFinite(spend.usd) && spend.usd >= 0)) throw new Error("spend.usd");
+  // Money is a decimal string, never a float (money.ts); null is an unknown cost.
+  if (spend.usd !== null && !isUsd(spend.usd)) throw new Error("spend.usd");
   if (!["local-zero", "reported", "unknown"].includes(spend.usd_basis as string)) throw new Error("spend.usd_basis");
   if (!(typeof spend.credits === "number" && Number.isFinite(spend.credits) && spend.credits >= 0)) throw new Error("spend.credits");
   parseBody(e.body);
@@ -361,13 +474,24 @@ function parseBody(value: unknown): void {
       oldRepo(b.old_repo);
       if (b.june_did !== null) str(b.june_did, "body.june_did");
       validateIdentity(b.identity);
+      rootEvidence(b.op_key_evidence, "body.op_key_evidence");
       str(b.note, "body.note", true);
       return;
-    case "op-key.rotated":
-      str(b.previous_op_kid, "body.previous_op_kid");
-      str(b.op_kid, "body.op_kid");
-      b64Key(b.op_public_key_b64, "body.op_public_key_b64");
+    case "op-key": {
+      if (!Array.isArray(b.installed) || !Array.isArray(b.revoked)) throw new Error("body.installed and body.revoked are lists");
+      for (const raw of b.installed) {
+        const k = exactly(raw, ["evidence", "op_kid", "op_public_key_b64"], "body.installed[]");
+        uuid(k.op_kid, "body.installed[].op_kid");
+        b64Key(k.op_public_key_b64, "body.installed[].op_public_key_b64");
+        rootEvidence(k.evidence, "body.installed[].evidence");
+      }
+      for (const raw of b.revoked) {
+        const k = exactly(raw, ["evidence", "op_kid"], "body.revoked[]");
+        uuid(k.op_kid, "body.revoked[].op_kid");
+        rootEvidence(k.evidence, "body.revoked[].evidence");
+      }
       return;
+    }
     case "beat": {
       const env = obj(b.envelope, "body.envelope");
       if (env.format !== "kingdom-seat-beat/v1") throw new Error("body.envelope.format");
@@ -454,6 +578,29 @@ function claim(value: unknown): void {
   for (const ref of c.evidence) str(ref, "body.claim.evidence[]");
   if (!["high", "medium", "low", "unknown"].includes(c.confidence as string)) throw new Error("body.claim.confidence");
   str(c.limits, "body.claim.limits", true);
+}
+
+/** A RootEvidence's shape; whether it proves anything is rootEvidenceProblem's to say. */
+function rootEvidence(value: unknown, what: string): void {
+  const ev = exactly(value, ["body_b64", "headers", "method", "target"], what);
+  str(ev.method, `${what}.method`);
+  str(ev.target, `${what}.target`);
+  if (typeof ev.body_b64 !== "string") throw new Error(`${what}.body_b64`);
+  const h = exactly(ev.headers, Object.values(AUTHORITY_HEADERS), `${what}.headers`);
+  for (const name of Object.values(AUTHORITY_HEADERS)) str(h[name], `${what}.headers.${name}`);
+}
+
+/** An object with exactly these keys: evidence is hashed into the entry, so nothing may ride along unchecked. */
+function exactly(value: unknown, keys: readonly string[], what: string): Record<string, unknown> {
+  const o = obj(value, what);
+  const got = Object.keys(o).sort();
+  const want = [...keys].sort();
+  if (got.length !== want.length || got.some((k, i) => k !== want[i])) throw new Error(`${what} has other fields than ${want.join(", ")}`);
+  return o;
+}
+
+function uuid(value: unknown, what: string): void {
+  if (typeof value !== "string" || !UUID_PATTERN.test(value)) throw new Error(what);
 }
 
 function oldRepo(value: unknown): void {

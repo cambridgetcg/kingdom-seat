@@ -448,7 +448,7 @@ export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: Se
     word,
     entries.at(-1) ?? null,
     { type: "self.applied", proposal_id: stored.id, target: act.target, prior_hash: act.prior_hash, new_hash: act.new_hash, via, claim: act.claim, strand_thought_id: thought },
-    { usd: 0, usd_basis: "local-zero", credits: thought === null ? 0 : 1 },
+    { usd: "0", usd_basis: "local-zero", credits: thought === null ? 0 : 1 },
     registered ? "citizen-signed" : "host-attested",
     deps.clock.now(),
   );
@@ -477,7 +477,7 @@ export async function revertTo(deps: SelfDeps, citizen: Citizen, toHash: Sha256H
     word,
     entries.at(-1) ?? null,
     { type: "self.reverted", target, from_hash: fromHash, to_hash: toHash, via },
-    { usd: 0, usd_basis: "local-zero", credits: 0 },
+    { usd: "0", usd_basis: "local-zero", credits: 0 },
     registered ? "citizen-signed" : "host-attested",
     deps.clock.now(),
   );

@@ -37,6 +37,13 @@ export function keychainSigner(kc: FakeKeychain, opts: { opKid?: string } = {}):
       wipe(d.box_private);
     }
   };
+  s.rootSeedFor = async (word) => {
+    if (word === null) throw new Error("keychainSigner: root evidence names a citizen");
+    const d = await root(word);
+    wipe(d.k_master);
+    wipe(d.box_private);
+    return d.root_seed;
+  };
   s.signEnrollment = async (word, digest, presence) => {
     if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
     if (!presence?.present) throw new Refusal("yu-not-present", "enrollment needs Yu present");

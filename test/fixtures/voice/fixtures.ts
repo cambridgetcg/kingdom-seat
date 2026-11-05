@@ -62,7 +62,7 @@ export function beatEntry(word: Word, seq: number, acts: Act[]): LedgerEntry {
         voiced_through: `${word}, voiced through fake-model:test in seat ${SEAT_ID}`,
       },
     },
-    spend: { usd: 0, usd_basis: "local-zero", credits: 0 },
+    spend: { usd: "0", usd_basis: "local-zero", credits: 0 },
     attestation: "host-attested",
     hash: ZERO,
     signature: { alg: "ed25519", kid: "host-attest", public_key_b64: "AAAA", sig_b64: "AAAA" },

@@ -57,6 +57,29 @@ describe("fake server", () => {
     await expect(f("https://example.com/")).rejects.toThrow();
     await expect(noFetch("https://api.agenttool.dev/")).rejects.toThrow();
   });
+
+  test("stop() returns even when a client gave up on a handler that never answers while it was still awaiting", async () => {
+    // The pattern behind the flaky afterEach in test/runtime/free.test.ts: under load, the deadline's abort
+    // reached the server while the handler was still reading the request, and then the handler hung for good.
+    // A handler that is still awaiting when the client leaves, and never answers after, makes that happen
+    // every time rather than under load.
+    const s = await startFakeServer();
+    let entered!: () => void;
+    const inHandler = new Promise<void>((r) => (entered = r));
+    s.on("POST", "/api/chat", async () => {
+      entered();
+      await Bun.sleep(100);
+      return new Promise<Response>(() => {});
+    });
+    const client = new AbortController();
+    const call = fetchVia(s)(`${s.url}/api/chat`, { method: "POST", body: "{}", signal: client.signal }).catch(() => "aborted");
+    await inHandler;
+    client.abort();
+    expect(await call).toBe("aborted");
+    await Bun.sleep(150);
+    const stopped = await Promise.race([s.stop().then(() => "stopped"), Bun.sleep(2_000).then(() => "still waiting")]);
+    expect(stopped).toBe("stopped");
+  });
 });
 
 describe("fake runtimes", () => {

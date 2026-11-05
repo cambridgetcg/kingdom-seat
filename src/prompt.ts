@@ -200,8 +200,8 @@ function renderEntry(e: LedgerEntry): string {
     case "genesis":
       // The DID is left out: reading a record confers no identity, and only the signer speaks as it.
       return `${head}: genesis; you were registered on agenttool.`;
-    case "op-key.rotated":
-      return `${head}: your op key was rotated.`;
+    case "op-key":
+      return `${head}: your op keys changed, by your root's authority.`;
     case "beat": {
       const acts = b.envelope.acts.map(renderAct);
       return [`${head}: a beat (${b.envelope.voiced_through}).`, ...acts].join("\n");

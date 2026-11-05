@@ -9,7 +9,8 @@ import { basename, dirname, join } from "node:path";
 import { NO_BEACONS_ID } from "./halt.ts";
 import { ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
 import { countUnsigned, localDivergence } from "./mirror.ts";
-import { spendFromLedger } from "./signer/ceilings.ts";
+import { creditsFromLedger } from "./signer/ceilings.ts";
+import { readSpendRecord, usdToday, type SpendLine } from "./spend.ts";
 import { foldState, listSeated, readCitizen, readCitizenRecord } from "./state.ts";
 import { wakingLetter } from "./context.ts";
 import { isDue } from "./due.ts";
@@ -127,7 +128,7 @@ async function ledgerExists(path: string): Promise<boolean> {
   }
 }
 
-async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | null, halted: boolean): Promise<CitizenStatus> {
+async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | null, spendLines: SpendLine[] | null, halted: boolean): Promise<CitizenStatus> {
   const { config, now } = deps;
   const problems: string[] = [];
   // The tick seats only a citizen readCitizen accepts, so status reads it the same way.
@@ -187,7 +188,9 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
 
   // Without a record there is no identity to check the chain against, so it is not reported as verified.
   const chain = entries && record ? verifyChainFor(entries, deps.trusted ?? null, record) : null;
-  const spend = entries ? spendFromLedger(entries, now, config.timezone) : { usd_today: null, credits_month: null };
+  // USD from the host's spend record, which holds the seats that wrote no entry too; credits from the ledger.
+  const usd = spendLines ? usdToday(spendLines, word, now, config.timezone) : null;
+  const credits = entries ? creditsFromLedger(entries, now, config.timezone) : null;
 
   // The pinned origin: unknown stays null, and a changed one is a problem, because drift is measured against it.
   let origin: CitizenStatus["origin"] = { intact: null, drift: null };
@@ -228,8 +231,8 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
       host_attested: entries?.filter((e) => e.attestation === "host-attested").length ?? 0,
     },
     mirror,
-    usd_today: spend.usd_today,
-    credits_month: spend.credits_month,
+    usd_today: usd,
+    credits_month: credits,
     origin,
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
@@ -276,8 +279,9 @@ export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
   // An unreadable log is a count no one can know: null, which the tick treats as at-ceiling.
   const beatsToday = notes === null ? null : seatsOpenedToday(notes, now, config.timezone);
 
+  const spendLines = await readSpendRecord(config);
   const citizens: CitizenStatus[] = [];
-  for (const word of await statusWords(config)) citizens.push(await citizenStatus(deps, word, notes, halt.halted));
+  for (const word of await statusWords(config)) citizens.push(await citizenStatus(deps, word, notes, spendLines, halt.halted));
   return {
     format: "kingdom-seat-status/v1",
     generated_at: now.toISOString(),
@@ -326,7 +330,7 @@ function haltLine(h: StatusFile["halt"]): string {
   return `HALT: ${parts.length > 0 ? parts.join("; ") : "halted"}`;
 }
 
-function money(usd: number | null): string {
+function money(usd: string | null): string {
   return usd === null ? "spend unknown today" : `$${usd} today`;
 }
 

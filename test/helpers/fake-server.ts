@@ -26,32 +26,43 @@ export interface FakeServer {
 export async function startFakeServer(): Promise<FakeServer> {
   const routes: { method: string; path: string | RegExp; handler: Handler }[] = [];
   const requests: RecordedRequest[] = [];
+  // Bun's stop() waits for every request it still counts as in flight, even
+  // with closeActiveConnections. A client abort that lands while a handler is
+  // still awaiting is not counted (Bun 1.3.13), so a handler that never
+  // answers, as a hung beacon or Ollama does, would hold stop() and the
+  // test's afterEach for good. Every handler is therefore settled when the
+  // server stops.
+  let release!: () => void;
+  const stopping = new Promise<void>((resolve) => (release = resolve));
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      const headers: Record<string, string> = {};
-      req.headers.forEach((v, k) => {
-        headers[k.toLowerCase()] = v;
-      });
-      const rec: RecordedRequest = {
-        method: req.method,
-        path: url.pathname,
-        search: url.search,
-        headers,
-        body: new Uint8Array(await req.arrayBuffer()),
-      };
-      requests.push(rec);
-      for (let i = routes.length - 1; i >= 0; i--) {
-        const r = routes[i]!;
-        const pathMatches = typeof r.path === "string" ? r.path === rec.path : r.path.test(rec.path);
-        if (r.method === rec.method && pathMatches) return r.handler(rec);
-      }
-      // Unknown routes answer 404, which a beacon reader must treat as unreadable (fail closed).
-      return Response.json({ error: "fake-server: no route" }, { status: 404 });
+    fetch(req) {
+      return Promise.race([answer(req), stopping.then(() => Response.json({ error: "fake-server: stopped" }, { status: 503 }))]);
     },
   });
+  async function answer(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const headers: Record<string, string> = {};
+    req.headers.forEach((v, k) => {
+      headers[k.toLowerCase()] = v;
+    });
+    const rec: RecordedRequest = {
+      method: req.method,
+      path: url.pathname,
+      search: url.search,
+      headers,
+      body: new Uint8Array(await req.arrayBuffer()),
+    };
+    requests.push(rec);
+    for (let i = routes.length - 1; i >= 0; i--) {
+      const r = routes[i]!;
+      const pathMatches = typeof r.path === "string" ? r.path === rec.path : r.path.test(rec.path);
+      if (r.method === rec.method && pathMatches) return r.handler(rec);
+    }
+    // Unknown routes answer 404, which a beacon reader must treat as unreadable (fail closed).
+    return Response.json({ error: "fake-server: no route" }, { status: 404 });
+  }
   return {
     url: `http://127.0.0.1:${server.port}`,
     requests,
@@ -59,6 +70,7 @@ export async function startFakeServer(): Promise<FakeServer> {
       routes.push({ method, path, handler });
     },
     async stop() {
+      release();
       await server.stop(true);
     },
   };

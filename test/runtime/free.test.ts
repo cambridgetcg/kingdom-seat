@@ -364,7 +364,7 @@ describe("the call and after", () => {
       model: NAME,
       model_digest: `sha256:${DIGEST}`,
       raw_output: REPLY,
-      spend: { usd: 0, usd_basis: "local-zero", credits: 0 },
+      spend: { usd: "0", usd_basis: "local-zero", credits: 0 },
       done_reason: "stop",
       duration_ms: result.duration_ms,
     });

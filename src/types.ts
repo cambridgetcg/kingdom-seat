@@ -4,6 +4,9 @@
 // additive where possible, because seven groups compile against it.
 //
 // Section references ("3.3", "3b") are to CITIZEN-REDESIGN-2026-11-05.md.
+import type { Usd } from "./money.ts";
+
+export type { Usd };
 
 /* ── Small shared scalars ─────────────────────────────────────────────── */
 
@@ -417,17 +420,62 @@ export interface LedgerSignature {
   sig_b64: string;
 }
 
-/** Money and credits an entry spent. `usd: null` means unknown, which ceilings treat as at-ceiling. */
+/**
+ * Money and credits an entry spent. `usd` is a decimal string (money.ts), never
+ * a float; null means unknown, which ceilings treat as at-ceiling.
+ */
 export interface Spend {
-  usd: number | null;
+  usd: Usd | null;
   usd_basis: "local-zero" | "reported" | "unknown";
   credits: number;
+}
+
+/** The authority headers a root-signed request carried, by their exact names (agenttool-wire.md 2). */
+export interface AuthorityHeaderValues {
+  "X-Agenttool-Authority-Sequence": string;
+  "X-Agenttool-Authority-Timestamp": string;
+  "X-Agenttool-Authority-Signature": string;
+}
+
+/**
+ * A root-signed agenttool request exactly as the signer sent it. agenttool
+ * keeps no copy of an authority proof, so this is the only one. With the
+ * entry's DID it rebuilds the identity-authority/v1 digest, which the root
+ * public key in genesis verifies: anyone holding a copy of the ledger can
+ * check that the root authorised an op key, without asking agenttool.
+ */
+export interface RootEvidence {
+  method: string;
+  /** Path and query exactly as sent; it is what the root signed. */
+  target: string;
+  /** The exact body bytes, padded standard base64; "" for none. */
+  body_b64: string;
+  headers: AuthorityHeaderValues;
+}
+
+/** An op key an `op-key` entry installs, with the root-signed keys/import that installed it. */
+export interface InstalledOpKey {
+  op_kid: string;
+  op_public_key_b64: string;
+  evidence: RootEvidence;
+}
+
+/** An op key an `op-key` entry retires, with the root-signed DELETE that revoked it. */
+export interface RevokedOpKey {
+  op_kid: string;
+  evidence: RootEvidence;
 }
 
 /**
  * A citizen may be seated before it is registered (3.3), so the first entry
  * is `seated` (host-attested) and `genesis` comes at birth, after which every
  * entry is citizen-signed. A citizen born at seating starts with `genesis`.
+ *
+ * Op keys come only with root evidence: genesis carries the keys/import of
+ * the first one, and an `op-key` entry the requests that changed them. An
+ * entry that installs a key is signed by a key it installs, and one that only
+ * revokes by a key that stays, so an op key alone can never authorise a
+ * rotation (KS-004 re-review B2, C1 and R4).
  */
 export type LedgerBody =
   | {
@@ -452,9 +500,11 @@ export type LedgerBody =
       june_did: string | null;
       /** Public values only. The ledger pins the op key that signs every later entry. */
       identity: CitizenIdentity;
+      /** The root-signed keys/import that installed identity's op key. */
+      op_key_evidence: RootEvidence;
       note: string;
     }
-  | { type: "op-key.rotated"; previous_op_kid: string; op_kid: string; op_public_key_b64: string }
+  | { type: "op-key"; installed: InstalledOpKey[]; revoked: RevokedOpKey[] }
   | { type: "beat"; envelope: Envelope }
   | {
       type: "self.applied";
@@ -501,8 +551,8 @@ export interface Ceilings {
   /** An awake citizen beats at most once per this many hours. */
   min_beat_interval_h: number;
   fleet_beats_per_day: number;
-  /** Metered spend per citizen per day. Raised only by Yu, per runtime class. */
-  usd_per_citizen_per_day: number;
+  /** Metered spend per citizen per day, a decimal string (money.ts). Raised only by Yu, per runtime class. */
+  usd_per_citizen_per_day: Usd;
   credits_per_citizen_per_month: number;
   max_registered_citizens: number;
   max_batch: number;
@@ -525,7 +575,7 @@ export interface Ceilings {
 export const DEFAULT_CEILINGS: Readonly<Ceilings> = Object.freeze({
   min_beat_interval_h: 72,
   fleet_beats_per_day: 24,
-  usd_per_citizen_per_day: 0,
+  usd_per_citizen_per_day: "0",
   credits_per_citizen_per_month: 10,
   max_registered_citizens: 12,
   max_batch: 5,
@@ -881,7 +931,8 @@ export interface CitizenStatus {
   ledger: { entries: number; head: Sha256Hex | null; chain_ok: boolean; host_attested: number };
   /** null counts are unknown, never zero. */
   mirror: { divergence: DivergenceState | null; push_refusals: number; unsigned_commits: number | null } | null;
-  usd_today: number | null;
+  /** Metered spend today from the host's spend record (spend.ts); null is unknown, which the USD ceiling treats as reached. */
+  usd_today: Usd | null;
   credits_month: number | null;
   /**
    * The pinned origin (3c): whether origin/ still matches the record, and how
@@ -930,6 +981,8 @@ export interface Config {
     lock_dir: string;
     status_file: string;
     host_log: string;
+    /** The host's own record of what every metered seat spent (spend.ts); the USD ceiling reads it. */
+    spend_log: string;
     models_lock: string;
     /** Roots that count as citizen homes. No seat cwd and no --add-dir may be inside one. */
     homes: string[];

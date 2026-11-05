@@ -27,7 +27,7 @@ export function scriptedRuntime(scripts: Script[]): ScriptedRuntime {
       model: FAKE_MODEL,
       model_digest: FAKE_MODEL_DIGEST,
       raw_output: raw,
-      spend: { usd: 0, usd_basis: "local-zero", credits: 0 },
+      spend: { usd: "0", usd_basis: "local-zero", credits: 0 },
       done_reason: "stop",
       duration_ms: 1,
     };

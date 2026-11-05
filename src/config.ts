@@ -11,6 +11,7 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fromB64, parseStrictJson } from "./crypto.ts";
+import { usdFromText } from "./money.ts";
 import { DEFAULT_CEILINGS, DEFAULT_TIMING, DID_PATTERN, UUID_PATTERN, WORD_PATTERN, type Beacon, type Ceilings, type Config, type Timing } from "./types.ts";
 import { CITIZEN_QUIET_HARD_MAX_DAYS } from "./signer/ceilings.ts";
 
@@ -68,6 +69,7 @@ export function defaultConfig(stateDir: string, host: string, opts: { home?: str
       lock_dir: join(stateDir, "tick.lock"),
       status_file: join(stateDir, "status.json"),
       host_log: join(stateDir, "host.jsonl"),
+      spend_log: join(stateDir, "spend.jsonl"),
       models_lock: join(stateDir, "models.lock"),
       homes: [],
     },
@@ -144,9 +146,9 @@ function validTimeZone(tz: string): boolean {
 
 /* ── Sections ─────────────────────────────────────────────────────────── */
 
-const PATH_KEYS = ["state_dir", "citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "halt_file", "lock_dir", "status_file", "host_log", "models_lock", "homes"] as const;
+const PATH_KEYS = ["state_dir", "citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "halt_file", "lock_dir", "status_file", "host_log", "spend_log", "models_lock", "homes"] as const;
 /** Everything the seat writes; each must live under state_dir and none may overlap another. */
-const WRITTEN = ["citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "halt_file", "lock_dir", "status_file", "host_log"] as const;
+const WRITTEN = ["citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "halt_file", "lock_dir", "status_file", "host_log", "spend_log"] as const;
 
 function parsePaths(raw: unknown): Config["paths"] {
   const o = obj(raw, "paths");
@@ -258,6 +260,13 @@ function parseCeilings(raw: unknown): Ceilings {
     if (!(k in o)) continue;
     const v = o[k];
     const field = `ceilings.${k}`;
+    if (k === "usd_per_citizen_per_day") {
+      // Money is a decimal string (money.ts): a JSON number is already a float by the time it is read.
+      const usd = usdFromText(v);
+      if (usd === null) throw new ConfigError(field, 'must be a plain decimal string such as "0" or "2.50"; a JSON number is refused');
+      out[k] = usd;
+      continue;
+    }
     if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw new ConfigError(field, "must be a finite number, not negative");
     if (INTEGER_CEILINGS.has(k) && !Number.isInteger(v)) throw new ConfigError(field, "must be a whole number");
     out[k] = v;

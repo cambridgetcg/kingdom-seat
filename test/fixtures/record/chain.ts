@@ -17,10 +17,11 @@ import type {
   Word,
 } from "../../../src/types.ts";
 import type { FakeSigner } from "../../helpers/fake-signer.ts";
+import { importEvidence } from "../../helpers/root-evidence.ts";
 import { FAKE_OP_KID } from "../../helpers/fake-signer.ts";
 import { TEST_IDS, TEST_ROOT_PUBLIC_B64 } from "../../helpers/vectors.ts";
 
-export const ZERO_SPEND: Spend = { usd: 0, usd_basis: "local-zero", credits: 0 };
+export const ZERO_SPEND: Spend = { usd: "0", usd_basis: "local-zero", credits: 0 };
 export const ROOT_KID = TEST_IDS.root_signing_key_id;
 export const MODEL_DIGEST = `sha256:${"ab".repeat(32)}`;
 
@@ -52,7 +53,17 @@ export function seatedBody(word: Word, soul: string, initial: LifecycleState = "
 }
 
 export function genesisBody(word: Word, soul: string, identity: CitizenIdentity, initial: LifecycleState | null = null): LedgerBody {
-  return { type: "genesis", initial_state: initial, origin: canonOrigin(word), birth_soul_sha256: sha256Hex(soul), old_repo: null, june_did: null, identity, note: "born for a test" };
+  return {
+    type: "genesis",
+    initial_state: initial,
+    origin: canonOrigin(word),
+    birth_soul_sha256: sha256Hex(soul),
+    old_repo: null,
+    june_did: null,
+    identity,
+    op_key_evidence: importEvidence(identity, identity.op_public_key_b64),
+    note: "born for a test",
+  };
 }
 
 let seatCounter = 0;

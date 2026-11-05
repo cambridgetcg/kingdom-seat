@@ -18,6 +18,7 @@ import { open } from "node:fs/promises";
 import { join } from "node:path";
 import {
   AGENTTOOL_ORIGIN,
+  AUTHORITY_HEADERS,
   ENROLLMENT_BODY_FORMAT,
   ENROLLMENT_PATH,
   ENROLLMENT_SIGNATURE_HEADER,
@@ -45,6 +46,7 @@ import {
   type KeychainItemName,
   type LedgerSignature,
   type ProposalText,
+  type RootEvidence,
   type SignerOp,
   type StandingAgreement,
   type Word,
@@ -112,6 +114,12 @@ export interface SignerRequest {
 export interface SignerResponse {
   status: number;
   json: unknown;
+  /**
+   * For a root-signed request, the request exactly as sent, whatever the
+   * answer. agenttool keeps no copy of a proof, so this is what a ledger entry
+   * carries to show the root authorised an op key (KS-004 re-review B2, R4).
+   */
+  root_evidence?: RootEvidence;
 }
 
 /** Fields a strand thought needs, already encrypted under K_master and signed by the op key (strand-thought/v2). */
@@ -780,9 +788,20 @@ export function createSigner(deps: SignerDeps): Signer {
         }
         return b;
       });
+      // Captured from the very values sent, before the bearer joins them; the bearer is never part of it.
+      const evidence: RootEvidence = {
+        method: req.method,
+        target: req.target,
+        body_b64: toB64(req.body),
+        headers: {
+          [AUTHORITY_HEADERS.sequence]: base[AUTHORITY_HEADERS.sequence]!,
+          [AUTHORITY_HEADERS.timestamp]: base[AUTHORITY_HEADERS.timestamp]!,
+          [AUTHORITY_HEADERS.signature]: base[AUTHORITY_HEADERS.signature]!,
+        },
+      };
       base.Authorization = bearer;
       // Never retried here: after an uncertain result the caller re-reads the sequence (agenttool-wire.md 2).
-      return http(req.method, req.target, base, req.body);
+      return { ...(await http(req.method, req.target, base, req.body)), root_evidence: evidence };
     });
   }
 

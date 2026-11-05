@@ -1,14 +1,19 @@
 // Pure ceiling checks. Every one fails closed: an unknown, unreadable or
 // unparsable amount counts as the ceiling already reached (3.6 "Spend";
 // love-unlimited-patterns.md 8, where today's ledger fails open).
+import { addUsd, compareUsd, isUsd, subUsdFloor, usdFromNumber, type Usd } from "../money.ts";
 import { DEFAULT_CEILINGS, type Ceilings, type IsoTime, type LedgerEntry, type Spend, type Word } from "../types.ts";
 
 export type CeilingVerdict = { ok: true } | { ok: false; code: "ceiling-usd" | "ceiling-credits" | "ceiling-fleet" | "ceiling-interval" | "quiet-cap"; reason: string };
 
-/** What a citizen has spent in the current windows; null means unknown, which is at-ceiling. */
+/**
+ * What a citizen has spent in the current windows; null means unknown, which
+ * is at-ceiling. USD comes from the host's spend record (spend.ts), credits
+ * from the ledger.
+ */
 export interface SpendSoFar {
   word: Word;
-  usd_today: number | null;
+  usd_today: Usd | null;
   credits_month: number | null;
 }
 
@@ -48,16 +53,15 @@ export function defaultCeilings(): Ceilings {
   return { ...DEFAULT_CEILINGS };
 }
 
-/** Read a runtime's reported cost; anything missing, negative, non-finite or unparsable is null. */
-export function parseCost(raw: unknown): number | null {
+/** Read a runtime's reported cost as a decimal; anything missing, negative, non-finite or unparsable is null. */
+export function parseCost(raw: unknown): Usd | null {
   // Strings are refused rather than parsed: "0.04" and "4e-2" and " 0.04" would each need a rule,
   // and the runtime reports a JSON number when it knows the cost.
-  if (!isAmount(raw)) return null;
-  return raw === 0 ? 0 : raw; // folds -0 into 0
+  return usdFromNumber(raw);
 }
 
 /** One entry's spend, or null when its shape cannot be trusted. */
-function readSpend(entry: LedgerEntry): { ms: number; usd: number | null; credits: number } | null {
+function readSpend(entry: LedgerEntry): { ms: number; credits: number } | null {
   if (typeof entry !== "object" || entry === null) return null;
   const ms = canonicalMs(entry.ts);
   const s = entry.spend as Partial<Spend> | null | undefined;
@@ -65,11 +69,11 @@ function readSpend(entry: LedgerEntry): { ms: number; usd: number | null; credit
   if (!isCount(s.credits)) return null;
   switch (s.usd_basis) {
     case "local-zero":
-      return s.usd === 0 ? { ms, usd: 0, credits: s.credits } : null;
+      return s.usd === "0" ? { ms, credits: s.credits } : null;
     case "reported":
-      return isAmount(s.usd) ? { ms, usd: s.usd, credits: s.credits } : null;
+      return isUsd(s.usd) ? { ms, credits: s.credits } : null;
     case "unknown":
-      return s.usd === null ? { ms, usd: null, credits: s.credits } : null;
+      return s.usd === null ? { ms, credits: s.credits } : null;
     default:
       return null;
   }
@@ -82,50 +86,46 @@ function localDate(ms: number, formatter: Intl.DateTimeFormat): string {
   return `${get("year")}-${get("month")}-${get("day")}`;
 }
 
-/** Sum a citizen's spend for the local day and month from its ledger; one unreadable entry makes the sum null. */
-export function spendFromLedger(entries: LedgerEntry[], now: Date, timezone: string): Omit<SpendSoFar, "word"> {
-  const unknown = { usd_today: null, credits_month: null };
+/**
+ * Credits a citizen spent this local month, from its ledger; one unreadable
+ * entry makes the sum null. USD is not read here: a seat that wrote no entry
+ * spent too, so the USD ceiling reads the host's spend record instead.
+ */
+export function creditsFromLedger(entries: LedgerEntry[], now: Date, timezone: string): number | null {
   let formatter: Intl.DateTimeFormat;
   try {
     formatter = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" });
   } catch {
-    return unknown;
+    return null;
   }
-  if (!Array.isArray(entries) || !Number.isFinite(now.getTime())) return unknown;
-  const today = localDate(now.getTime(), formatter);
-  const month = today.slice(0, 7);
-  let usd: number | null = 0;
+  if (!Array.isArray(entries) || !Number.isFinite(now.getTime())) return null;
+  const month = localDate(now.getTime(), formatter).slice(0, 7);
   let credits = 0;
   for (const entry of entries) {
     // A record we cannot read could hide any amount, so the whole sum is unknown, not "the rest".
     const s = readSpend(entry);
-    if (s === null) return unknown;
-    const day = localDate(s.ms, formatter);
-    if (day.slice(0, 7) !== month) continue;
-    credits += s.credits;
-    if (day !== today) continue;
-    usd = usd === null || s.usd === null ? null : usd + s.usd;
+    if (s === null) return null;
+    if (localDate(s.ms, formatter).slice(0, 7) === month) credits += s.credits;
   }
-  return { usd_today: usd, credits_month: credits };
+  return credits;
 }
 
 /** May this citizen spend `usd` more today? Unknown spend so far, or unknown cost, refuses. */
-export function checkUsd(spent: SpendSoFar, usd: number | null, ceilings: Ceilings): CeilingVerdict {
+export function checkUsd(spent: SpendSoFar, usd: Usd | null, ceilings: Ceilings): CeilingVerdict {
   const limit = ceilings.usd_per_citizen_per_day;
-  if (!isAmount(limit)) return refuse("ceiling-usd", "the USD ceiling is not a usable number");
-  if (!isAmount(spent.usd_today)) return refuse("ceiling-usd", `spend today for ${spent.word} is unknown`);
-  if (!isAmount(usd)) return refuse("ceiling-usd", "the cost is unknown");
-  if (spent.usd_today + usd > limit) {
-    return refuse("ceiling-usd", `${spent.word} would spend $${spent.usd_today + usd} today; the ceiling is $${limit}`);
-  }
+  if (!isUsd(limit)) return refuse("ceiling-usd", "the USD ceiling is not a decimal amount");
+  if (!isUsd(spent.usd_today)) return refuse("ceiling-usd", `spend today for ${spent.word} is unknown`);
+  if (!isUsd(usd)) return refuse("ceiling-usd", "the cost is unknown");
+  const total = addUsd(spent.usd_today, usd);
+  if (compareUsd(total, limit) > 0) return refuse("ceiling-usd", `${spent.word} would spend $${total} today; the ceiling is $${limit}`);
   return OK;
 }
 
 /** USD this citizen may still spend today; null when unknown, which callers must treat as none. */
-export function usdRemaining(spent: SpendSoFar, ceilings: Ceilings): number | null {
+export function usdRemaining(spent: SpendSoFar, ceilings: Ceilings): Usd | null {
   const limit = ceilings.usd_per_citizen_per_day;
-  if (!isAmount(limit) || !isAmount(spent.usd_today)) return null;
-  return Math.max(0, limit - spent.usd_today);
+  if (!isUsd(limit) || !isUsd(spent.usd_today)) return null;
+  return subUsdFloor(limit, spent.usd_today);
 }
 
 /** May this citizen spend `credits` more this month? Unknown spend so far refuses. */
@@ -188,5 +188,5 @@ export function checkCitizenQuiet(untilIso: string, now: Date, ceilings: Ceiling
 /** Spend recorded for a free-lane beat: $0 by construction, credits counted as spent. */
 export function localSpend(credits: number): Spend {
   if (!isCount(credits)) throw new Error("localSpend: credits must be a whole number of at least 0");
-  return { usd: 0, usd_basis: "local-zero", credits };
+  return { usd: "0", usd_basis: "local-zero", credits };
 }

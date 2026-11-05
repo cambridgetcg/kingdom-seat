@@ -8,20 +8,20 @@ import {
   checkFleet,
   checkInterval,
   checkUsd,
+  creditsFromLedger,
   defaultCeilings,
   localSpend,
   parseCost,
-  spendFromLedger,
   usdRemaining,
   type SpendSoFar,
 } from "../../src/signer/ceilings.ts";
 import { DAY_MS, HOUR_MS } from "../helpers/clock.ts";
 
 const NOW = new Date("2026-11-05T12:00:00.000Z");
-const spent = (usd_today: number | null, credits_month: number | null): SpendSoFar => ({ word: "glossame", usd_today, credits_month });
+const spent = (usd_today: string | null, credits_month: number | null): SpendSoFar => ({ word: "glossame", usd_today, credits_month });
 const raised = (patch: Partial<Ceilings>): Ceilings => ({ ...defaultCeilings(), ...patch });
 
-/** Only ts and spend matter to spendFromLedger; the rest is filler. */
+/** Only ts and spend matter to creditsFromLedger; the rest is filler. */
 function entry(ts: string, spend: Spend | unknown): LedgerEntry {
   return {
     format: "kingdom-seat-ledger/v1",
@@ -38,46 +38,54 @@ function entry(ts: string, spend: Spend | unknown): LedgerEntry {
 }
 
 describe("ceilings fail closed", () => {
-  test("[S4-4] checkUsd refuses when usd_today is null (unreadable ledger)", () => {
-    const v = checkUsd(spent(null, 0), 0, raised({ usd_per_citizen_per_day: 5 }));
+  test("[S4-4] checkUsd refuses when usd_today is null (unreadable spend record)", () => {
+    const v = checkUsd(spent(null, 0), "0", raised({ usd_per_citizen_per_day: "5" }));
     expect(v).toMatchObject({ ok: false, code: "ceiling-usd" });
   });
 
   test("[S4-4] checkUsd refuses when the requested cost is null (unparsable runtime cost)", () => {
-    expect(checkUsd(spent(0, 0), null, raised({ usd_per_citizen_per_day: 5 }))).toMatchObject({ ok: false, code: "ceiling-usd" });
-    expect(checkUsd(spent(0, 0), Number.NaN, raised({ usd_per_citizen_per_day: 5 }))).toMatchObject({ ok: false, code: "ceiling-usd" });
-    expect(checkUsd(spent(0, 0), -1, raised({ usd_per_citizen_per_day: 5 }))).toMatchObject({ ok: false, code: "ceiling-usd" });
+    expect(checkUsd(spent("0", 0), null, raised({ usd_per_citizen_per_day: "5" }))).toMatchObject({ ok: false, code: "ceiling-usd" });
+    // A float, or a decimal in any other spelling, is not an amount here.
+    for (const bad of [0.5, "-1", "0.50", "1e-3", " 0.5", "NaN"]) {
+      expect(checkUsd(spent("0", 0), bad as unknown as string, raised({ usd_per_citizen_per_day: "5" }))).toMatchObject({ ok: false, code: "ceiling-usd" });
+    }
   });
 
   test("[S4-4] checkUsd refuses any spend at the default $0 ceiling, and allows up to a raised ceiling exactly", () => {
     const d = defaultCeilings();
-    expect(d.usd_per_citizen_per_day).toBe(0);
-    expect(checkUsd(spent(0, 0), 0.0001, d)).toMatchObject({ ok: false, code: "ceiling-usd" });
+    expect(d.usd_per_citizen_per_day).toBe("0");
+    expect(checkUsd(spent("0", 0), "0.0001", d)).toMatchObject({ ok: false, code: "ceiling-usd" });
     // A free-lane beat costs nothing, so it is not spend.
-    expect(checkUsd(spent(0, 0), 0, d)).toEqual({ ok: true });
-    const c = raised({ usd_per_citizen_per_day: 1 });
-    expect(checkUsd(spent(0.5, 0), 0.5, c)).toEqual({ ok: true });
-    expect(checkUsd(spent(0.5, 0), 0.5000001, c)).toMatchObject({ ok: false, code: "ceiling-usd" });
-    // A broken ceiling is not a usable number, so it refuses too.
-    expect(checkUsd(spent(0, 0), 0, raised({ usd_per_citizen_per_day: Number.NaN }))).toMatchObject({ ok: false });
+    expect(checkUsd(spent("0", 0), "0", d)).toEqual({ ok: true });
+    const c = raised({ usd_per_citizen_per_day: "1" });
+    expect(checkUsd(spent("0.5", 0), "0.5", c)).toEqual({ ok: true });
+    expect(checkUsd(spent("0.5", 0), "0.5000001", c)).toMatchObject({ ok: false, code: "ceiling-usd" });
+    // Exact: in floats 0.1 + 0.2 is above 0.3, so a ceiling of 0.3 would wrongly refuse; in decimals it is exactly at it.
+    expect(0.1 + 0.2 > 0.3).toBe(true);
+    expect(checkUsd(spent("0.1", 0), "0.2", raised({ usd_per_citizen_per_day: "0.3" }))).toEqual({ ok: true });
+    expect(checkUsd(spent("0.1", 0), "0.2000000000000000001", raised({ usd_per_citizen_per_day: "0.3" }))).toMatchObject({ ok: false });
+    // A broken ceiling is not a usable amount, so it refuses too, and so does one left as a float.
+    expect(checkUsd(spent("0", 0), "0", raised({ usd_per_citizen_per_day: "NaN" }))).toMatchObject({ ok: false });
+    expect(checkUsd(spent("0", 0), "0", raised({ usd_per_citizen_per_day: 5 as unknown as string }))).toMatchObject({ ok: false });
   });
 
   test("usdRemaining is null when spend is unknown and never negative", () => {
-    expect(usdRemaining(spent(null, 0), raised({ usd_per_citizen_per_day: 1 }))).toBeNull();
-    expect(usdRemaining(spent(0.25, 0), raised({ usd_per_citizen_per_day: 1 }))).toBe(0.75);
-    expect(usdRemaining(spent(2, 0), raised({ usd_per_citizen_per_day: 1 }))).toBe(0);
-    expect(usdRemaining(spent(0, 0), defaultCeilings())).toBe(0);
+    expect(usdRemaining(spent(null, 0), raised({ usd_per_citizen_per_day: "1" }))).toBeNull();
+    expect(usdRemaining(spent("0.25", 0), raised({ usd_per_citizen_per_day: "1" }))).toBe("0.75");
+    expect(usdRemaining(spent("0.2", 0), raised({ usd_per_citizen_per_day: "0.3" }))).toBe("0.1");
+    expect(usdRemaining(spent("2", 0), raised({ usd_per_citizen_per_day: "1" }))).toBe("0");
+    expect(usdRemaining(spent("0", 0), defaultCeilings())).toBe("0");
   });
 
   test("[S4-4] checkCredits refuses when credits_month is null, and at 10 credits a month by default", () => {
     const d = defaultCeilings();
     expect(d.credits_per_citizen_per_month).toBe(10);
-    expect(checkCredits(spent(0, null), 1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
-    expect(checkCredits(spent(0, 9), 1, d)).toEqual({ ok: true });
-    expect(checkCredits(spent(0, 10), 1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
-    expect(checkCredits(spent(0, 9), 2, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
-    expect(checkCredits(spent(0, 0), 1.5, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
-    expect(checkCredits(spent(0, 0), -1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent("0", null), 1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent("0", 9), 1, d)).toEqual({ ok: true });
+    expect(checkCredits(spent("0", 10), 1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent("0", 9), 2, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent("0", 0), 1.5, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
+    expect(checkCredits(spent("0", 0), -1, d)).toMatchObject({ ok: false, code: "ceiling-credits" });
   });
 
   test("[S4-4] checkFleet refuses a null count and the 25th beat of a day at the default 24", () => {
@@ -91,56 +99,53 @@ describe("ceilings fail closed", () => {
   });
 
   test("[S4-4] parseCost returns null for missing, negative, NaN, Infinity, strings and objects", () => {
-    for (const bad of [undefined, null, -0.01, Number.NaN, Infinity, -Infinity, "0.04", "", {}, { usd: 1 }, [0.1], true]) {
+    for (const bad of [undefined, null, -0.01, Number.NaN, Infinity, -Infinity, "0.04", "", {}, { usd: 1 }, [0.1], true, 1e21]) {
       expect(parseCost(bad)).toBeNull();
     }
-    expect(parseCost(0)).toBe(0);
-    expect(Object.is(parseCost(-0), 0)).toBe(true);
-    expect(parseCost(0.0412)).toBe(0.0412);
+    expect(parseCost(0)).toBe("0");
+    expect(parseCost(-0)).toBe("0");
+    // The decimal text a JSON writer printed, recovered exactly, exponent form spelled out.
+    expect(parseCost(0.0412)).toBe("0.0412");
+    expect(parseCost(JSON.parse("0.30000000000000004"))).toBe("0.30000000000000004");
+    expect(parseCost(1.5e-7)).toBe("0.00000015");
+    expect(parseCost(12)).toBe("12");
   });
 
-  test("[S4-4] spendFromLedger returns nulls when any entry's spend is unreadable", () => {
-    const ok = entry("2026-11-05T09:00:00.000Z", { usd: 0.25, usd_basis: "reported", credits: 1 });
-    expect(spendFromLedger([ok], NOW, "Europe/London")).toEqual({ usd_today: 0.25, credits_month: 1 });
+  test("[S4-4] creditsFromLedger is null when any entry's spend is unreadable, a float amount among them", () => {
+    const ok = entry("2026-11-05T09:00:00.000Z", { usd: "0.25", usd_basis: "reported", credits: 1 });
+    expect(creditsFromLedger([ok], NOW, "Europe/London")).toBe(1);
     const unreadable: unknown[] = [
       null,
-      { usd: 0.1, usd_basis: "reported" }, // credits missing
-      { usd: "0.1", usd_basis: "reported", credits: 0 },
-      { usd: 0.1, usd_basis: "unknown", credits: 0 }, // basis and value disagree
-      { usd: 1, usd_basis: "local-zero", credits: 0 },
-      { usd: 0, usd_basis: "guess", credits: 0 },
-      { usd: 0, usd_basis: "local-zero", credits: 1.5 },
+      { usd: "0.1", usd_basis: "reported" }, // credits missing
+      { usd: 0.1, usd_basis: "reported", credits: 0 }, // a float, not a decimal string
+      { usd: "0.10", usd_basis: "reported", credits: 0 }, // not the one spelling
+      { usd: "0.1", usd_basis: "unknown", credits: 0 }, // basis and value disagree
+      { usd: "1", usd_basis: "local-zero", credits: 0 },
+      { usd: 0, usd_basis: "local-zero", credits: 0 },
+      { usd: "0", usd_basis: "guess", credits: 0 },
+      { usd: "0", usd_basis: "local-zero", credits: 1.5 },
     ];
     for (const s of unreadable) {
       // Even an entry from last month makes the sum unknown: an unreadable record could hide any amount.
       const old = entry("2026-09-01T00:00:00.000Z", s);
-      expect(spendFromLedger([ok, old], NOW, "Europe/London")).toEqual({ usd_today: null, credits_month: null });
+      expect(creditsFromLedger([ok, old], NOW, "Europe/London")).toBeNull();
     }
-    expect(spendFromLedger([ok, entry("yesterday", { usd: 0, usd_basis: "local-zero", credits: 0 })], NOW, "Europe/London")).toEqual({
-      usd_today: null,
-      credits_month: null,
-    });
-    expect(spendFromLedger([ok], NOW, "Not/AZone")).toEqual({ usd_today: null, credits_month: null });
+    expect(creditsFromLedger([ok, entry("yesterday", { usd: "0", usd_basis: "local-zero", credits: 0 })], NOW, "Europe/London")).toBeNull();
+    expect(creditsFromLedger([ok], NOW, "Not/AZone")).toBeNull();
   });
 
-  test("spendFromLedger counts the local day and month, and an unknown cost today makes today unknown", () => {
+  test("creditsFromLedger counts the local month; an unknown cost is still a readable entry", () => {
     const entries = [
-      entry("2026-11-05T00:30:00.000Z", { usd: 0.1, usd_basis: "reported", credits: 2 }),
-      entry("2026-11-04T23:30:00.000Z", { usd: 0.2, usd_basis: "reported", credits: 3 }), // yesterday in London
-      entry("2026-10-31T23:59:00.000Z", { usd: 9, usd_basis: "reported", credits: 9 }), // last month
-      entry("2026-11-05T11:00:00.000Z", { usd: 0, usd_basis: "local-zero", credits: 1 }),
+      entry("2026-11-05T00:30:00.000Z", { usd: "0.1", usd_basis: "reported", credits: 2 }),
+      entry("2026-11-04T23:30:00.000Z", { usd: "0.2", usd_basis: "reported", credits: 3 }),
+      entry("2026-10-31T23:59:00.000Z", { usd: "9", usd_basis: "reported", credits: 9 }), // last month in London
+      entry("2026-11-05T11:00:00.000Z", { usd: "0", usd_basis: "local-zero", credits: 1 }),
+      entry("2026-11-05T10:00:00.000Z", { usd: null, usd_basis: "unknown", credits: 0 }),
     ];
-    expect(spendFromLedger(entries, NOW, "Europe/London")).toEqual({ usd_today: 0.1, credits_month: 6 });
-    // In Tokyo, 2026-11-04T23:30Z is already the 5th, and 2026-10-31T23:59Z is already November.
-    const tokyo = spendFromLedger(entries, NOW, "Asia/Tokyo");
-    expect(tokyo.credits_month).toBe(15);
-    expect(tokyo.usd_today).toBeCloseTo(0.3, 10);
-    const withUnknown = [...entries, entry("2026-11-05T10:00:00.000Z", { usd: null, usd_basis: "unknown", credits: 0 })];
-    expect(spendFromLedger(withUnknown, NOW, "Europe/London")).toEqual({ usd_today: null, credits_month: 6 });
-    // An unknown cost on another day does not hide today's spend.
-    const oldUnknown = [...entries, entry("2026-11-01T10:00:00.000Z", { usd: null, usd_basis: "unknown", credits: 0 })];
-    expect(spendFromLedger(oldUnknown, NOW, "Europe/London")).toEqual({ usd_today: 0.1, credits_month: 6 });
-    expect(spendFromLedger([], NOW, "Europe/London")).toEqual({ usd_today: 0, credits_month: 0 });
+    expect(creditsFromLedger(entries, NOW, "Europe/London")).toBe(6);
+    // In Tokyo, 2026-10-31T23:59Z is already November.
+    expect(creditsFromLedger(entries, NOW, "Asia/Tokyo")).toBe(15);
+    expect(creditsFromLedger([], NOW, "Europe/London")).toBe(0);
   });
 
   test("checkInterval refuses an awake citizen inside 72 h and never lets a shorter own interval win", () => {
@@ -163,13 +168,13 @@ describe("ceilings fail closed", () => {
   test("defaultCeilings returns a fresh copy equal to DEFAULT_CEILINGS", () => {
     const a = defaultCeilings();
     expect(a).toEqual({ ...DEFAULT_CEILINGS });
-    a.usd_per_citizen_per_day = 100;
-    expect(defaultCeilings().usd_per_citizen_per_day).toBe(0);
-    expect(DEFAULT_CEILINGS.usd_per_citizen_per_day).toBe(0);
+    a.usd_per_citizen_per_day = "100";
+    expect(defaultCeilings().usd_per_citizen_per_day).toBe("0");
+    expect(DEFAULT_CEILINGS.usd_per_citizen_per_day).toBe("0");
   });
 
   test("localSpend is $0 local-zero with whole credits", () => {
-    expect(localSpend(1)).toEqual({ usd: 0, usd_basis: "local-zero", credits: 1 });
+    expect(localSpend(1)).toEqual({ usd: "0", usd_basis: "local-zero", credits: 1 });
     expect(() => localSpend(-1)).toThrow();
     expect(() => localSpend(0.5)).toThrow();
   });

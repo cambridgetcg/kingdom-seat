@@ -212,6 +212,6 @@ integration pass settled some of them; those are marked.
   `SignerRequest.enrolled` lets birth's own steps through before
   `citizen.json` names the identity, with Yu present and consent only.
 - **Spend from a summons that makes no beat is not recorded** where the USD
-  tally reads it (runtime and seat groups). Open; harmless at the $0 default,
-  which refuses every summons, and to be settled before any USD ceiling is
-  raised.
+  tally reads it (runtime and seat groups). Settled: the summon adapter writes
+  the host's spend record (`src/spend.ts`) however the run ends, and the USD
+  ceiling reads that record (KS-004 re-review B2, R2).

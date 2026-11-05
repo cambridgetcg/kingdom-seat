@@ -173,7 +173,7 @@ describe("pipeline", () => {
       ts: s.clock.now().toISOString(),
     });
     expect(env.voiced_through).toBe(`glossame, voiced through fake-model:test in seat ${s.seat.ref.seat_id}`);
-    expect(entry.spend).toEqual({ usd: 0, usd_basis: "local-zero", credits: 0 });
+    expect(entry.spend).toEqual({ usd: "0", usd_basis: "local-zero", credits: 0 });
   });
 
   test("input_digest is sha256 of promptBytes and output_digest is sha256 of the raw output", async () => {

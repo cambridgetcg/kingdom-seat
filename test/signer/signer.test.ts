@@ -19,6 +19,7 @@ import {
   type Signer,
   type SignerRequest,
 } from "../../src/signer/signer.ts";
+import { rootEvidenceProblem } from "../../src/ledger.ts";
 import { DAY_MS, testClock, type TestClock } from "../helpers/clock.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "../helpers/fake-keychain.ts";
 import { fetchVia, startFakeServer, type FakeServer, type RecordedRequest } from "../helpers/fake-server.ts";
@@ -180,7 +181,7 @@ async function setup(opts: { serve?: Parameters<typeof serveAgenttool>[2] } = {}
     handedOut,
     agreements: [],
     thoughtNonce: null,
-    spend: async (word) => ({ word, usd_today: 0, credits_month: 0 }),
+    spend: async (word) => ({ word, usd_today: "0", credits_month: 0 }),
     signer: null as unknown as Signer,
   };
   f.signer = createSigner({
@@ -375,7 +376,7 @@ describe("signing", () => {
 
 describe("send: ceilings, consent and the quiet cap before any request", () => {
   test("[S4-4] send refuses a paid op when spendSoFar is unknown, and sends nothing", async () => {
-    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: null });
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: null });
     expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
     // A caller cannot make a thought free by saying it costs nothing.
     expect((await refusal(fx.signer.send(thought(0)))).code).toBe("ceiling-credits");
@@ -385,7 +386,7 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
       throw new Error("ledger unreadable");
     };
     expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
-    fx.spend = async () => ({ word: "someone-else", usd_today: 0, credits_month: 0 });
+    fx.spend = async () => ({ word: "someone-else", usd_today: "0", credits_month: 0 });
     expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
     expect(fx.server.requests).toHaveLength(0);
     expect(fx.kc.log.filter((e) => e.op === "read")).toHaveLength(0);
@@ -395,13 +396,13 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
   });
 
   test("[S4-4] send refuses a thought.post or strand.create past the monthly credit ceiling, before the request (charge precedes verification)", async () => {
-    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: 10 });
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: 10 });
     expect((await refusal(fx.signer.send(thought()))).code).toBe("ceiling-credits");
     const strand = req({ op: "strand.create", method: "POST", target: "/v1/strands", credits: 1, body: json({ identity_id: ID }) });
     expect((await refusal(fx.signer.send(strand))).code).toBe("ceiling-credits");
     expect((await refusal(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "x", "observation"))).code).toBe("ceiling-credits");
     expect(fx.server.requests).toHaveLength(0);
-    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: 9 });
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: 9 });
     expect((await fx.signer.send(thought())).status).toBe(201);
     expect((await fx.signer.send(strand)).status).toBe(201);
     // Operators and relays have no citizen budget to spend.
@@ -591,6 +592,33 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     expect(checked).toBe(5);
   });
 
+  test("a root-signed request comes back with the signer's copy of it as sent, which a ledger can verify alone", async () => {
+    const res = await fx.signer.send(importKey());
+    const sent = mutations(fx.server)[0]!;
+    const ev = res.root_evidence!;
+    // Exactly what left the host: method, path and query, body bytes, and the three authority headers.
+    expect(ev).toEqual({
+      method: sent.method,
+      target: sent.path + sent.search,
+      body_b64: Buffer.from(sent.body).toString("base64"),
+      headers: {
+        "X-Agenttool-Authority-Sequence": sent.headers["x-agenttool-authority-sequence"]!,
+        "X-Agenttool-Authority-Timestamp": sent.headers["x-agenttool-authority-timestamp"]!,
+        "X-Agenttool-Authority-Signature": sent.headers["x-agenttool-authority-signature"]!,
+      },
+    });
+    // The ledger's own check accepts it against the root and the key it names; the bearer is not in it.
+    expect(rootEvidenceProblem(ev, GLOSSAME_IDENTITY, { kind: "import", public_key_b64: TEST_OP_PUBLIC_B64 })).toBeNull();
+    expect(JSON.stringify(ev)).not.toContain(COMMONS_BEARER);
+    // A revoke comes back the same way, whatever the answer; a request the root does not sign carries none.
+    fx.seq.set(ID, 7);
+    const revoke = await fx.signer.send(req({ op: "keys.revoke", method: "DELETE", target: `/v1/identities/${ID}/keys/${OP_KID}` }));
+    expect(revoke.root_evidence!.headers["X-Agenttool-Authority-Sequence"]).toBe("8");
+    expect(rootEvidenceProblem(revoke.root_evidence!, GLOSSAME_IDENTITY, { kind: "revoke", kid: OP_KID })).toBeNull();
+    const read = await fx.signer.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` }));
+    expect(read.root_evidence).toBeUndefined();
+  });
+
   test("the client's ?identity_id= spelling is accepted on per-identity routes, and the query is part of what the root signs", async () => {
     const target = `/v1/identities/${ID}/keys/import?identity_id=${ID}`;
     const res = await fx.signer.send(req({ op: "keys.import", method: "POST", target, body: json({ public_key: TEST_OP_PUBLIC_B64, label: "op" }) }));
@@ -606,7 +634,7 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
       timestamp: sent.headers["x-agenttool-authority-timestamp"]!,
     });
     expect(edVerifyStrict(fromB64(sent.headers["x-agenttool-authority-signature"]!), digest, fromB64(TEST_ROOT_PUBLIC_B64))).toBe(true);
-    fx.spend = async (word) => ({ word, usd_today: 0, credits_month: 0 });
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: 0 });
     const strand = req({ op: "strand.create", method: "POST", target: `/v1/strands?identity_id=${ID}`, credits: 1, body: json({ identity_id: ID, topic: "self" }) });
     expect((await fx.signer.send(strand)).status).toBe(201);
     const t = req({ op: "thought.post", method: "POST", target: `/v1/strands/${TEST_IDS.strand_id}/thoughts?identity_id=${ID}`, credits: 1, body: json({ signing_key_id: OP_KID }) });
@@ -689,6 +717,11 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
       [req({ op: "thought.post", method: "POST", target: `/v1/strands/${other}/thoughts`, credits: 1, body: json({ signing_key_id: OP_KID }) }), "beyond-self"],
       [req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: utf8('{"public_key":"a","public_key":"b"}') }), "invalid-request"],
       [req({ op: "quiet.end.citizen", method: "DELETE", target: `/v1/quiet-hours?identity_id=${ID}`, body: json({}) }), "invalid-request"],
+      // Quiet hours takes its actor from ?identity_id=; without it the route acts for the project's earliest
+      // identity (the gardener desk in Commons), so no quiet request leaves without naming its own.
+      [req({ op: "quiet.start.citizen", method: "POST", target: "/v1/quiet-hours/start", body: json({ until: ahead(DAY_MS) }) }), "invalid-request"],
+      [req({ op: "quiet.end.citizen", method: "DELETE", target: "/v1/quiet-hours" }), "invalid-request"],
+      [beacon(BEACON_UNTIL, { target: "/v1/quiet-hours/start" }), "invalid-request"],
       [req({ op: "keys.import", word: "glossame", operator: "halt-herald", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: json({}) }), "invalid-request"],
       [req({ op: "read", word: "nobody-here", method: "GET", target: "/v1/strands" }), "invalid-record"],
       [req({ op: "read", word: "zoeme", method: "GET", target: "/v1/strands" }), "not-registered"],

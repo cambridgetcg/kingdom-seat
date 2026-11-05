@@ -134,7 +134,7 @@ describe("requests through the signer", () => {
     const h = harness();
     const presence = { present: true as const, via: "tty-confirm" as const, confirmed_at: "2026-11-05T12:00:00.000Z", scope: `birth ${WORD}` };
     const auth = { presence, proposal: null };
-    expect(await importOpKey(h.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11", auth)).toEqual({ kid: FAKE_OP_KID });
+    expect(await importOpKey(h.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11", auth)).toMatchObject({ kid: FAKE_OP_KID });
     expect(await registerBoxKey(h.deps, WORD, vectors.derivation.box_pub_b64, auth)).toEqual({ id: "77777777-7777-4777-8777-777777777777" });
     await putExpression(h.deps, WORD, { register: "Plain.", wake_text: "A test wake text." }, auth);
     expect(await startCitizenQuiet(h.deps, WORD, "2026-11-20T00:00:00.000Z")).toEqual({ until: "2026-11-20T00:00:00.000Z" });
@@ -251,13 +251,35 @@ describe("requests through the signer", () => {
     expect(h.signer.sent.length).toBe(before);
   });
 
+  test("importOpKey and revokeKey return the signer's copy of the root-signed request, and refuse an answer without it", async () => {
+    const h = harness();
+    const imported = await importOpKey(h.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11");
+    const revoked = await revokeKey(h.deps, WORD, FAKE_OP_KID);
+    const [imp, rev] = h.acts();
+    // The request as sent: what a ledger entry carries so the root's authority can be checked without agenttool.
+    expect(imported.evidence).toMatchObject({ method: "POST", target: imp!.target, body_b64: Buffer.from(imp!.body).toString("base64") });
+    expect(revoked.evidence).toMatchObject({ method: "DELETE", target: rev!.target, body_b64: "" });
+    for (const ev of [imported.evidence, revoked.evidence]) {
+      expect(Object.keys(ev.headers).sort()).toEqual(["X-Agenttool-Authority-Sequence", "X-Agenttool-Authority-Signature", "X-Agenttool-Authority-Timestamp"]);
+    }
+
+    // A signer that keeps no copy, or a copy of another request, leaves nothing a ledger could show; the act is not usable.
+    for (const strip of [(r: SignerResponse) => ({ status: r.status, json: r.json }), (r: SignerResponse) => ({ ...r, root_evidence: { ...r.root_evidence!, target: `${r.root_evidence!.target}?x` } })]) {
+      const bare = harness();
+      const send = bare.signer.send.bind(bare.signer);
+      bare.deps.signer = { ...bare.signer, send: async (req) => (req.op === "read" ? send(req) : strip(await send(req))) };
+      expect((await agenttoolErrorOf(importOpKey(bare.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11"))).code).toBe("malformed_response");
+      expect((await agenttoolErrorOf(revokeKey(bare.deps, WORD, FAKE_OP_KID))).code).toBe("malformed_response");
+    }
+  });
+
   test("a 409 authority_sequence_conflict re-reads next_sequence once and never sends two root requests at once", async () => {
     const conflict: SignerResponse = { status: 409, json: { error: "authority_sequence_conflict", details: { received_sequence: 1, current_sequence: 1, next_sequence: 2 } } };
 
     // One conflict: read, send, read again, send again.
     const h = harness();
     h.at.override((r) => r.op === "keys.import", conflict);
-    expect(await importOpKey(h.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11")).toEqual({ kid: FAKE_OP_KID });
+    expect(await importOpKey(h.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11")).toMatchObject({ kid: FAKE_OP_KID });
     expect(h.signer.sent.map((r) => r.op)).toEqual(["read", "keys.import", "read", "keys.import"]);
 
     // Two conflicts: it stops after the one resend.

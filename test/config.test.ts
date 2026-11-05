@@ -197,6 +197,28 @@ describe("config", () => {
     refuses(sec, /keychain.security_path/);
   });
 
+  test("the USD ceiling is a decimal string, never a float, and the spend record is a written path like the others", () => {
+    expect(parseConfig(raw()).ceilings.usd_per_citizen_per_day).toBe("0");
+    const raised = raw();
+    raised.ceilings.usd_per_citizen_per_day = "2.50";
+    expect(parseConfig(raised).ceilings.usd_per_citizen_per_day).toBe("2.5");
+    // A JSON number has already been read as a float, so it is refused rather than guessed at.
+    for (const bad of [2.5, 0, "-1", "1e2", "", " 2", "2.5 "]) {
+      const c = raw();
+      c.ceilings.usd_per_citizen_per_day = bad;
+      refuses(c, /ceilings.usd_per_citizen_per_day: must be a plain decimal string/);
+    }
+    const outside = raw();
+    outside.paths.spend_log = "/srv/elsewhere/spend.jsonl";
+    refuses(outside, /paths.spend_log: must be inside paths.state_dir/);
+    const overlap = raw();
+    overlap.paths.spend_log = overlap.paths.host_log;
+    refuses(overlap, /paths.spend_log: overlaps paths.host_log|paths.host_log: overlaps paths.spend_log/);
+    const missing = raw();
+    delete missing.paths.spend_log;
+    refuses(missing, /paths: missing key "spend_log"/);
+  });
+
   test("loadConfig reads a strict regular file and refuses a symlinked config file", async () => {
     const d = await tempDir();
     const file = join(d, "config.json");

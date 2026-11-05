@@ -105,7 +105,7 @@ beforeAll(async () => {
     config: h.config,
     clock,
     fetch: fetchVia(server),
-    spendSoFar: async (word) => ({ word, usd_today: 0, credits_month: 0 }),
+    spendSoFar: async (word) => ({ word, usd_today: "0", credits_month: 0 }),
     agreements: async () => [],
   });
   await h.seatLedger(WORD, signer.signEntry, { initialState: "awake" });
@@ -195,7 +195,7 @@ describe("end to end: one citizen on one host", () => {
       expect(env.input_digest).toBe(sha256Hex(promptBytes({ system: chat.system, user: chat.user })));
       expect(env.output_digest).toBe(sha256Hex(output({ type: "journal", kind: "reflected", text: JOURNAL })));
       expect(env.voiced_through).toBe(`${WORD}, voiced through ${MODEL} in seat ${env.seat_ref.seat_id}`);
-      expect(beat.spend).toEqual({ usd: 0, usd_basis: "local-zero", credits: 0 });
+      expect(beat.spend).toEqual({ usd: "0", usd_basis: "local-zero", credits: 0 });
       expect(verifyChain(entries, { host_attest_b64: [w.hostPin], identity: null })).toMatchObject({ ok: true, entries: 2, host_attested: 2 });
 
       // The seat's cwd was fresh and is left empty: no CLAUDE.md, hook or file of the model's. Beside it, the seat
@@ -226,7 +226,7 @@ describe("end to end: one citizen on one host", () => {
         last_beat_at: env.ts,
         last_outcome: "beat",
         ledger: { entries: 2, head: beat.hash, chain_ok: true, host_attested: 2 },
-        usd_today: 0,
+        usd_today: "0",
         problem: null,
       });
       await assertNothingLeaked();

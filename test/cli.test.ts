@@ -8,16 +8,17 @@ import { openSeat } from "../src/seat.ts";
 import { BEACON_UNTIL } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { createSigner } from "../src/signer/signer.ts";
-import { fromHex, sha256, utf8 } from "../src/crypto.ts";
-import { ledgerPath, readLedger } from "../src/ledger.ts";
+import { canonicalJson, edSign, fromHex, sha256, toB64, utf8 } from "../src/crypto.ts";
+import { entryHash, ledgerPath, readLedger } from "../src/ledger.ts";
 import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
-import { Refusal, type Config, type StatusFile } from "../src/types.ts";
+import { Refusal, type Config, type LedgerBody, type StatusFile } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, waitFor, type RecordingRunner } from "./helpers/fake-runtime.ts";
 import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { citizenSnapshot, makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
 import { testClock } from "./helpers/clock.ts";
+import { importEvidence } from "./helpers/root-evidence.ts";
 import { TEST_MNEMONIC, TEST_OP_SEED_HEX } from "./helpers/vectors.ts";
 import { append, beatBody, testIdentity } from "./fixtures/record/chain.ts";
 
@@ -559,6 +560,29 @@ describe("main", () => {
     expect(x.run.calls).toEqual([]);
   });
 
+  test("verify <word> exits 1 on a registered chain whose op key the root did not authorise", async () => {
+    const x = await harness();
+    await seated(x, "joy");
+    const id = testIdentity(x.signer);
+    await x.h.enrollLedger("joy", x.signer.signEntry, id);
+    const cfg = ["--config", x.configPath];
+    expect(await main(["verify", "joy", ...cfg], x.deps)).toBe(0);
+    expect(x.out()).toContain("joy: chain ok, 2 entries, 1 host-attested");
+
+    // Whoever holds only the op key can re-sign genesis, but not make the root's evidence for it.
+    const path = ledgerPath(x.h.config, "joy");
+    const [seatedEntry, genesis] = await readLedger(path);
+    const opSeed = fromHex(TEST_OP_SEED_HEX);
+    const { hash: _h, signature, ...draft } = genesis!;
+    const body = { ...(draft.body as Extract<LedgerBody, { type: "genesis" }>), op_key_evidence: importEvidence(id, id.op_public_key_b64, { rootSeed: opSeed }) };
+    const forged = { ...draft, body };
+    const hash = entryHash(forged);
+    const entry = { ...forged, hash, signature: { ...signature, sig_b64: toB64(edSign(fromHex(hash), opSeed)) } };
+    await writeFile(path, `${canonicalJson(seatedEntry)}\n${canonicalJson(entry)}\n`);
+    expect(await main(["verify", "joy", ...cfg], x.deps)).toBe(1);
+    expect(x.out()).toContain("joy: chain BROKEN at seq 1: genesis: root evidence is not signed by the root");
+  });
+
   test("stdout and stderr never contain a fake-keychain secret", async () => {
     const x = await harness({ runtimeScripts: [REST_OUTPUT] });
     const signerSeeds = fakeSigner();
@@ -573,7 +597,7 @@ describe("main", () => {
       ...x.deps,
       keychain: () => kc,
       signer: (config, keychain) =>
-        createSigner({ keychain, config, clock: x.deps.clock!, fetch: noFetch, spendSoFar: async (word) => ({ word, usd_today: 0, credits_month: 0 }), agreements: async () => [] }),
+        createSigner({ keychain, config, clock: x.deps.clock!, fetch: noFetch, spendSoFar: async (word) => ({ word, usd_today: "0", credits_month: 0 }), agreements: async () => [] }),
     };
     await seated(x, "glossame");
     await seated(x, "joy");

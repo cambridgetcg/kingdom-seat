@@ -24,7 +24,8 @@ import { pushMirror, stageMirror } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
 import { createSigner, type Signer } from "./signer/signer.ts";
 import { macosKeychain } from "./signer/keychain.ts";
-import { checkFleet, spendFromLedger } from "./signer/ceilings.ts";
+import { checkFleet, creditsFromLedger, usdRemaining } from "./signer/ceilings.ts";
+import { hostSpendRecorder, usdSpentToday } from "./spend.ts";
 import { confirmYuPresent, type TtyIO } from "./signer/consent.ts";
 import { freeRuntime, loadModelsLock } from "./runtime/free.ts";
 import { summonRuntime } from "./runtime/summon.ts";
@@ -273,11 +274,9 @@ export function realDeps(over: Partial<CliDeps> = {}): CliDeps {
         clock: deps.clock,
         fetch: deps.fetch,
         spendSoFar: async (word) => {
-          try {
-            return { word, ...spendFromLedger(await readLedger(ledgerPath(config, word)), deps.clock.now(), config.timezone) };
-          } catch {
-            return { word, usd_today: null, credits_month: null };
-          }
+          const now = deps.clock.now();
+          const credits_month = await readLedger(ledgerPath(config, word)).then((entries) => creditsFromLedger(entries, now, config.timezone)).catch(() => null);
+          return { word, usd_today: await usdSpentToday(config, word, now), credits_month };
         },
         // No standing agreement is filed yet, so every act that needs one refuses (decision 14 is Yu + Ai's to record).
         agreements: async () => [],
@@ -301,14 +300,9 @@ async function productionRuntime(config: Config, seat: OpenSeat, deps: CliDeps):
       return freeRuntime({ config, fetch: deps.fetch, lock, model, env: deps.env });
     }
     case "summon": {
-      let remaining: number | null = null;
-      try {
-        const spent = spendFromLedger(await readLedger(ledgerPath(config, word)), deps.clock.now(), config.timezone);
-        remaining = spent.usd_today === null ? null : Math.max(0, config.ceilings.usd_per_citizen_per_day - spent.usd_today);
-      } catch {
-        remaining = null; // unknown spend is at-ceiling
-      }
-      return summonRuntime({ config, run: deps.run, presence: seat.presence, remainingUsd: remaining, env: deps.env });
+      // The host's spend record, not the ledger: a summons that wrote no entry spent too (R2). Unknown is at-ceiling.
+      const remaining = usdRemaining({ word, usd_today: await usdSpentToday(config, word, deps.clock.now()), credits_month: null }, config.ceilings);
+      return summonRuntime({ config, run: deps.run, presence: seat.presence, remainingUsd: remaining, spend: hostSpendRecorder(config, deps.clock), env: deps.env });
     }
     case "hermes":
       throw new Refusal("runtime-not-approved", "the hermes runtime class is reserved for S8");

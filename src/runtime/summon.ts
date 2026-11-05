@@ -4,9 +4,15 @@
 // fail validation (runtimes-and-host.md 2). The signer's USD ceiling is the
 // bound that fails closed; --max-budget-usd is a second, runtime-side one.
 // No citizen home is ever passed as --add-dir or used as cwd.
+//
+// Every run is in the host's spend record (spend.ts): "begun" before claude
+// starts, "settled" with its cost however it ends, so a summons that writes
+// no ledger entry still counts against the ceiling.
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fromUtf8, utf8 } from "../crypto.ts";
+import { addUsd, compareUsd, floorUsd, isUsd, maxUsd, minUsd, usdFromNumber, type Usd } from "../money.ts";
+import type { SpendRecorder } from "../spend.ts";
 import { checkDeadline } from "./free.ts";
 import {
   Refusal,
@@ -27,7 +33,7 @@ export interface SummonOptions {
   /** The seat's empty cwd; never inside a home. */
   cwd: string;
   /** USD the signer has left for this citizen today; the run is refused when it is 0 or unknown. */
-  budgetUsd: number;
+  budgetUsd: Usd;
   schema: object;
 }
 
@@ -35,8 +41,10 @@ export interface SummonDeps {
   config: Config;
   run: CommandRunner;
   presence: YuPresence | null;
-  /** Remaining USD for this citizen today from the signer's ceiling; null is unknown, which refuses. */
-  remainingUsd: number | null;
+  /** Remaining USD for this citizen today, from the host's spend record and the ceiling; null is unknown, which refuses. */
+  remainingUsd: Usd | null;
+  /** The host's spend record; a run whose start it cannot record does not start. */
+  spend: SpendRecorder;
   /** The parent environment summonEnv filters; defaults to process.env. */
   env?: Record<string, string | undefined>;
 }
@@ -108,12 +116,10 @@ export function summonArgv(opts: SummonOptions): string[] {
 }
 
 /** Rounded down to whole micro-dollars, so the runtime's bound never exceeds what the signer has left. */
-function budgetFlag(usd: number): string {
-  const micros = Number.isFinite(usd) ? Math.floor(usd * 1e6) : 0;
-  if (micros <= 0) throw new Refusal("ceiling-usd", "no USD left for a summons");
-  const whole = Math.floor(micros / 1e6);
-  const frac = String(micros % 1e6).padStart(6, "0").replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : String(whole);
+function budgetFlag(usd: Usd): string {
+  const flag = isUsd(usd) ? floorUsd(usd, 6) : "0";
+  if (flag === "0") throw new Refusal("ceiling-usd", "no USD left for a summons");
+  return flag;
 }
 
 /** An explicit environment allowlist; CLAUDE_CODE_RESTRICTED is not relied on and no secret is passed. */
@@ -179,15 +185,17 @@ function readCost(obj: Record<string, unknown>): { spend: Spend; model: string }
   const models = Object.keys(usage).sort();
   const model = models.length > 0 ? models.join("+") : "unknown";
   const unknown = { spend: { ...UNKNOWN_SPEND }, model };
-  const total = obj.total_cost_usd;
-  if (!isUsd(total) || models.length === 0) return unknown;
-  let sum = 0;
+  // Each amount is read back as the decimal text claude wrote, and summed exactly (money.ts).
+  const total = usdFromNumber(obj.total_cost_usd);
+  if (total === null || models.length === 0) return unknown;
+  let sum: Usd = "0";
   for (const m of models) {
     const e = usage[m];
-    if (!isRecord(e) || !isUsd(e.costUSD) || typeof e.costBasis !== "string" || !KNOWN_COST_BASES.has(e.costBasis)) return unknown;
-    sum += e.costUSD;
+    const cost = isRecord(e) ? usdFromNumber(e.costUSD) : null;
+    if (!isRecord(e) || cost === null || typeof e.costBasis !== "string" || !KNOWN_COST_BASES.has(e.costBasis)) return unknown;
+    sum = addUsd(sum, cost);
   }
-  return { spend: { usd: Math.max(total, sum), usd_basis: "reported", credits: 0 }, model };
+  return { spend: { usd: maxUsd(total, sum), usd_basis: "reported", credits: 0 }, model };
 }
 
 /** The summon adapter: refuses without Yu present or with no USD left; records cost, with unknown counted as at-ceiling. */
@@ -204,11 +212,21 @@ export function summonRuntime(deps: SummonDeps): RuntimeAdapter {
     const env = summonEnv(deps.env ?? process.env);
     if (req.signal.aborted) throw req.signal.reason;
 
+    // From here claude may spend, so the record says so first. A seat killed before it settles stays "begun",
+    // which the ceiling reads as unknown; a settle that fails leaves the same, so it never fails the seat.
+    try {
+      await deps.spend.begin(req.seat_ref);
+    } catch {
+      throw new Refusal("ceiling-usd", "summon: the spend record cannot be written, so this run's spend would go unseen");
+    }
+    const settle = (spend: Spend) => deps.spend.settle(req.seat_ref, spend).catch(() => {});
+
     let ran;
     try {
       ran = await untilAborted(deps.run(argv, { stdin: summonStdin(req.prompt), env, cwd, timeoutMs: deadlineMs }), req.signal);
     } catch (err) {
       // claude may have spent before it stopped; nothing here says how much.
+      await settle(UNKNOWN_SPEND);
       throw new SummonError("summon: the run did not finish; its cost is unknown", { ...UNKNOWN_SPEND }, null, { cause: err });
     }
 
@@ -216,8 +234,11 @@ export function summonRuntime(deps: SummonDeps): RuntimeAdapter {
     try {
       parsed = parseSummonResult(ran.stdout);
     } catch (err) {
+      await settle(UNKNOWN_SPEND);
       throw new SummonError(`summon: claude exited ${ran.code} without a readable result; its cost is unknown`, { ...UNKNOWN_SPEND }, null, { cause: err });
     }
+    // Settled before anything is judged, so a refusal, an error, a rest or HALT after the reply all keep it.
+    await settle(parsed.spend);
     // Messages carry the subtype and exit code only: `result` and `errors` are the model's or claude's words.
     if (parsed.subtype === "error_max_budget_usd") {
       throw new SummonRefusal("ceiling-usd", "summon: claude stopped at --max-budget-usd", parsed.spend, parsed.subtype);
@@ -248,12 +269,12 @@ function assertYuPresent(presence: YuPresence | null, word: Word): void {
   if (presence.scope !== `summon ${word}`) throw new Refusal("yu-not-present", `Yu's confirmation does not cover summon ${word}`);
 }
 
-/** The lower of what the signer says is left and the configured ceiling; $0, unknown or nonsense refuses. */
-function budgetFor(remainingUsd: number | null, ceilingUsd: number): number {
+/** The lower of what is left today and the configured ceiling; $0, unknown or nonsense refuses. */
+function budgetFor(remainingUsd: Usd | null, ceilingUsd: Usd): Usd {
   if (remainingUsd === null) throw new Refusal("ceiling-usd", "USD left today is unknown, which counts as at-ceiling");
-  if (!isUsd(remainingUsd) || remainingUsd <= 0) throw new Refusal("ceiling-usd", "no USD left today for this citizen");
-  if (!isUsd(ceilingUsd) || ceilingUsd <= 0) throw new Refusal("ceiling-usd", "the per-citizen USD ceiling is $0");
-  return Math.min(remainingUsd, ceilingUsd);
+  if (!isUsd(remainingUsd) || compareUsd(remainingUsd, "0") <= 0) throw new Refusal("ceiling-usd", "no USD left today for this citizen");
+  if (!isUsd(ceilingUsd) || compareUsd(ceilingUsd, "0") <= 0) throw new Refusal("ceiling-usd", "the per-citizen USD ceiling is $0");
+  return minUsd(remainingUsd, ceilingUsd);
 }
 
 /**
@@ -317,8 +338,4 @@ function untilAborted<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function isUsd(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && v >= 0;
 }

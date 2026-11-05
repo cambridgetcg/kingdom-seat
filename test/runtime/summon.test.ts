@@ -18,6 +18,7 @@ import {
   UNKNOWN_SPEND,
 } from "../../src/runtime/summon.ts";
 import { Refusal, type CommandResult, type RefusalCode, type RuntimeRequest, type SeatRef, type YuPresence } from "../../src/types.ts";
+import { hostSpendRecorder, readSpendRecord, usdSpentToday, type SpendRecorder } from "../../src/spend.ts";
 import { recordingRunner, type RecordedCommand } from "../helpers/fake-runtime.ts";
 import { makeTempHost, type TempHost } from "../helpers/temp-home.ts";
 import successFixture from "../fixtures/runtime/claude-result-success.json";
@@ -99,7 +100,7 @@ let seatCwd: string;
 beforeEach(async () => {
   host = await makeTempHost();
   // A summons is metered spend, which Yu raises per runtime class; the $0 default refuses (tested below).
-  host.config.ceilings = { ...host.config.ceilings, usd_per_citizen_per_day: 1 };
+  host.config.ceilings = { ...host.config.ceilings, usd_per_citizen_per_day: "1" };
   seatCwd = join(host.config.paths.seats_dir, SEAT_ID);
   await mkdir(seatCwd);
 });
@@ -108,24 +109,36 @@ afterEach(async () => {
   await host.cleanup();
 });
 
-function deps(run: ReturnType<typeof recordingRunner>, over: { presence?: YuPresence | null; remainingUsd?: number | null; env?: Record<string, string | undefined> } = {}) {
+/** The host's own spend record under the temp host, on a clock fixed at the seat's day. */
+function recorder(): SpendRecorder {
+  return hostSpendRecorder(host.config, { now: () => new Date("2026-11-05T02:06:00.000Z") });
+}
+
+function deps(
+  run: ReturnType<typeof recordingRunner>,
+  over: { presence?: YuPresence | null; remainingUsd?: string | null; env?: Record<string, string | undefined>; spend?: SpendRecorder } = {},
+) {
   return {
     config: host.config,
     run,
     presence: over.presence === undefined ? PRESENT : over.presence,
-    remainingUsd: over.remainingUsd === undefined ? 0.5 : over.remainingUsd,
+    remainingUsd: over.remainingUsd === undefined ? "0.5" : over.remainingUsd,
+    spend: over.spend ?? recorder(),
     env: over.env ?? { HOME: "/Users/seat", LANG: "en_GB.UTF-8" },
   };
 }
 
 describe("summon", () => {
   test("summonArgv contains --restricted, --strict-mcp-config, -p, --output-format json, --max-budget-usd, --permission-mode dontAsk, --permission-prompts none, --no-session-persistence, --tools '' and --json-schema", async () => {
-    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: 0.25, schema: SCHEMA })).toEqual(expectedArgv("0.25"));
-    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: 2, schema: SCHEMA })[7]).toBe("2");
+    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: "0.25", schema: SCHEMA })).toEqual(expectedArgv("0.25"));
+    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: "2", schema: SCHEMA })[7]).toBe("2");
     // Rounded down to whole micro-dollars, so the runtime's bound is never above what is left.
-    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: 0.0123456789, schema: SCHEMA })[7]).toBe("0.012345");
-    await expectRefusal(() => summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: 0.0000001, schema: SCHEMA }), "ceiling-usd");
-    await expectRefusal(() => summonArgv({ claudePath: "claude", cwd: seatCwd, budgetUsd: 1, schema: SCHEMA }), "invalid-request");
+    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: "0.0123456789", schema: SCHEMA })[7]).toBe("0.012345");
+    expect(summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: "0.1000009", schema: SCHEMA })[7]).toBe("0.1");
+    await expectRefusal(() => summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: "0.0000001", schema: SCHEMA }), "ceiling-usd");
+    // A float is not an amount, so it is no budget either.
+    await expectRefusal(() => summonArgv({ claudePath: CLAUDE, cwd: seatCwd, budgetUsd: 0.5 as unknown as string, schema: SCHEMA }), "ceiling-usd");
+    await expectRefusal(() => summonArgv({ claudePath: "claude", cwd: seatCwd, budgetUsd: "1", schema: SCHEMA }), "invalid-request");
 
     // Through the adapter: the same argv, run from the seat's cwd, with the lower of what is left and the ceiling.
     const run = recordingRunner(answer(resultJson()));
@@ -136,7 +149,7 @@ describe("summon", () => {
     expect(run.calls[0]!.argv[0]).toBe(host.config.claude.path);
 
     const capped = recordingRunner(answer(resultJson()));
-    await summonRuntime(deps(capped, { remainingUsd: 7 }))(request());
+    await summonRuntime(deps(capped, { remainingUsd: "7" }))(request());
     expect(capped.calls[0]!.argv).toEqual(expectedArgv("1"));
   });
 
@@ -254,18 +267,20 @@ describe("summon", () => {
     ];
     for (const presence of notPresent) await expectRefusal(() => summonRuntime(deps(run, { presence }))(request()), "yu-not-present");
 
-    for (const remainingUsd of [0, null, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    for (const remainingUsd of ["0", null, "-1", "NaN", "Infinity", 0.5 as unknown as string]) {
       await expectRefusal(() => summonRuntime(deps(run, { remainingUsd }))(request()), "ceiling-usd");
     }
 
     // The $0 default ceiling refuses even if a caller claims USD is left.
-    host.config.ceilings = { ...host.config.ceilings, usd_per_citizen_per_day: 0 };
-    await expectRefusal(() => summonRuntime(deps(run, { remainingUsd: 5 }))(request()), "ceiling-usd");
-    host.config.ceilings = { ...host.config.ceilings, usd_per_citizen_per_day: 1 };
+    host.config.ceilings = { ...host.config.ceilings, usd_per_citizen_per_day: "0" };
+    await expectRefusal(() => summonRuntime(deps(run, { remainingUsd: "5" }))(request()), "ceiling-usd");
+    host.config.ceilings = { ...host.config.ceilings, usd_per_citizen_per_day: "1" };
 
     // A seat opened for another runtime class is not a summons.
     await expectRefusal(() => summonRuntime(deps(run))(request({ seat_ref: { ...SEAT_REF, runtime: "free" } })), "runtime-not-approved");
     expect(run.calls).toHaveLength(0);
+    // Nothing ran, so nothing could spend, and the record holds nothing.
+    expect(await readSpendRecord(host.config)).toEqual([]);
   });
 
   test("parseSummonResult reads total_cost_usd and modelUsage costBasis; costBasis unknown or a missing cost gives usd null", async () => {
@@ -275,7 +290,7 @@ describe("summon", () => {
       subtype: "success",
       is_error: false,
       model: "claude-test-model",
-      spend: { usd: 0.0421, usd_basis: "reported", credits: 0 },
+      spend: { usd: "0.0421", usd_basis: "reported", credits: 0 },
       stop_reason: "end_turn",
       duration_ms: 4210,
     });
@@ -301,8 +316,11 @@ describe("summon", () => {
 
     // Two models, both priced: the higher of the total and the per-model sum is recorded.
     const two = parseSummonResult(utf8(JSON.stringify(withUsage({ "model-b": { ...entry, costUSD: 0.03 }, "model-a": { ...entry, costUSD: 0.02, costBasis: "managed" } }, { total_cost_usd: 0.045 }))));
-    expect(two.spend).toEqual({ usd: 0.05, usd_basis: "reported", credits: 0 });
+    expect(two.spend).toEqual({ usd: "0.05", usd_basis: "reported", credits: 0 });
     expect(two.model).toBe("model-a+model-b");
+    // Summed as decimals: in floats 0.1 + 0.2 would be recorded as 0.30000000000000004.
+    const exact = parseSummonResult(utf8(JSON.stringify(withUsage({ a: { ...entry, costUSD: 0.1 }, b: { ...entry, costUSD: 0.2 } }, { total_cost_usd: 0.3 }))));
+    expect(exact.spend).toEqual({ usd: "0.3", usd_basis: "reported", credits: 0 });
 
     expect(() => parseSummonResult(utf8("Error: not json"))).toThrow(/not one JSON result/);
     expect(() => parseSummonResult(utf8(JSON.stringify({ type: "assistant" })))).toThrow(/not a result/);
@@ -322,7 +340,7 @@ describe("summon", () => {
       model: "claude-test-model",
       model_digest: "claude-test-model",
       raw_output: JSON.stringify(successFixture.structured_output),
-      spend: { usd: 0.0421, usd_basis: "reported", credits: 0 },
+      spend: { usd: "0.0421", usd_basis: "reported", credits: 0 },
       done_reason: "stop",
       duration_ms: 4210,
     });
@@ -347,19 +365,19 @@ describe("summon", () => {
     const run = recordingRunner(answer(budget, 1));
     const err = await expectRefusal(() => summonRuntime(deps(run))(request()), "ceiling-usd");
     expect(err).toBeInstanceOf(SummonRefusal);
-    expect((err as SummonRefusal).spend).toEqual({ usd: 0.51, usd_basis: "reported", credits: 0 });
+    expect((err as SummonRefusal).spend).toEqual({ usd: "0.51", usd_basis: "reported", credits: 0 });
     expect((err as SummonRefusal).subtype).toBe("error_max_budget_usd");
     expect(err.message).not.toContain("CANARY");
     expect(run.calls).toHaveLength(1);
   });
 
   test("every other way a run ends without a beat is an error that still carries its spend", async () => {
-    const cases: [string, (cmd: RecordedCommand) => CommandResult, number | null][] = [
-      ["error_during_execution", answer(resultJson({ subtype: "error_during_execution", is_error: true, errors: ["ERRORS-CANARY"] }), 1), 0.0421],
-      ["error_max_structured_output_retries", answer(resultJson({ subtype: "error_max_structured_output_retries", is_error: true, structured_output: undefined }), 1), 0.0421],
-      ["success marked is_error", answer(resultJson({ is_error: true })), 0.0421],
-      ["success with a non-zero exit", answer(resultJson(), 1), 0.0421],
-      ["success without structured_output", answer(resultJson({ structured_output: undefined })), 0.0421],
+    const cases: [string, (cmd: RecordedCommand) => CommandResult, string | null][] = [
+      ["error_during_execution", answer(resultJson({ subtype: "error_during_execution", is_error: true, errors: ["ERRORS-CANARY"] }), 1), "0.0421"],
+      ["error_max_structured_output_retries", answer(resultJson({ subtype: "error_max_structured_output_retries", is_error: true, structured_output: undefined }), 1), "0.0421"],
+      ["success marked is_error", answer(resultJson({ is_error: true })), "0.0421"],
+      ["success with a non-zero exit", answer(resultJson(), 1), "0.0421"],
+      ["success without structured_output", answer(resultJson({ structured_output: undefined })), "0.0421"],
       ["unreadable stdout", answer("Error: Exceeded USD budget (0.5)", 1), null],
       ["empty stdout", answer("", 143), null],
       ["the runner itself failed", () => {
@@ -387,5 +405,71 @@ describe("summon", () => {
     expect(aborted).toBeInstanceOf(SummonError);
     expect((aborted as SummonError).spend.usd).toBeNull();
     expect(((aborted as SummonError).cause as Error).message).toBe("SEAT-ABORT");
+  });
+
+  test("every run is in the host's spend record, begun before claude starts and settled however it ends", async () => {
+    const entry = successFixture.modelUsage["claude-test-model"];
+    const outcomes: [string, (cmd: RecordedCommand) => CommandResult, string | null][] = [
+      ["a reply, which the seat may then rest, discard at HALT, or record", answer(resultJson()), "0.0421"],
+      ["stopped at --max-budget-usd", answer(resultJson({ subtype: "error_max_budget_usd", is_error: true, structured_output: undefined, total_cost_usd: 0.51, modelUsage: { m: { ...entry, costUSD: 0.51 } } }), 1), "0.51"],
+      ["a runtime error", answer(resultJson({ subtype: "error_during_execution", is_error: true }), 1), "0.0421"],
+      ["a cost claude cannot stand behind", answer(withUsage({ m: { ...entry, costBasis: "unknown" } })), null],
+      ["no readable result", answer("Error", 1), null],
+    ];
+    let n = 0;
+    for (const [why, respond, usd] of outcomes) {
+      const seat_id = `22222222-2222-4222-8222-${String(++n).padStart(12, "0")}`;
+      await mkdir(join(host.config.paths.seats_dir, seat_id));
+      const order: string[] = [];
+      const spend = recorder();
+      const watched: SpendRecorder = {
+        begin: async (ref) => {
+          order.push("begun");
+          await spend.begin(ref);
+        },
+        settle: async (ref, s) => {
+          order.push("settled");
+          await spend.settle(ref, s);
+        },
+      };
+      const run = recordingRunner((cmd) => {
+        order.push("claude");
+        return respond(cmd);
+      });
+      await summonRuntime(deps(run, { spend: watched }))(request({ seat_ref: { ...SEAT_REF, seat_id } })).catch(() => null);
+      expect(order, why).toEqual(["begun", "claude", "settled"]);
+      const mine = (await readSpendRecord(host.config))!.filter((l) => l.seat_id === seat_id);
+      expect(
+        mine.map((l) => [l.phase, l.usd]),
+        why,
+      ).toEqual([
+        ["begun", null],
+        ["settled", usd],
+      ]);
+      expect(mine.every((l) => l.word === WORD && l.runtime === "summon"), why).toBe(true);
+    }
+    // Settled costs, and two unknown ones, today: the day is unknown, which is at the ceiling.
+    expect(await usdSpentToday(host.config, WORD, new Date("2026-11-05T12:00:00.000Z"))).toBeNull();
+  });
+
+  test("a run whose start cannot be recorded never starts, and one that cannot settle stays at the ceiling", async () => {
+    const failing: SpendRecorder = {
+      begin: async () => {
+        throw new Error("disk full");
+      },
+      settle: async () => {},
+    };
+    const run = recordingRunner(answer(resultJson()));
+    await expectRefusal(() => summonRuntime(deps(run, { spend: failing }))(request()), "ceiling-usd");
+    expect(run.calls).toHaveLength(0);
+
+    // Begun, then the settle fails (or the seat is killed first): the seat's spend is unknown, never zero.
+    const spend = recorder();
+    const noSettle: SpendRecorder = { begin: (ref) => spend.begin(ref), settle: () => Promise.reject(new Error("disk full")) };
+    const ok = recordingRunner(answer(resultJson()));
+    const result = await summonRuntime(deps(ok, { spend: noSettle }))(request());
+    expect(result.spend.usd).toBe("0.0421");
+    expect((await readSpendRecord(host.config))!.map((l) => l.phase)).toEqual(["begun"]);
+    expect(await usdSpentToday(host.config, WORD, new Date("2026-11-05T12:00:00.000Z"))).toBeNull();
   });
 });

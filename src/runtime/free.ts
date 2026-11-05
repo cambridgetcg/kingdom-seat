@@ -49,7 +49,7 @@ const PROXY_VARS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "A
 /** setTimeout fires at once past 2^31-1 ms, which would turn a long deadline into none. */
 const MAX_TIMER_MS = 2_147_483_647;
 
-export const LOCAL_ZERO_SPEND: Readonly<Spend> = Object.freeze({ usd: 0, usd_basis: "local-zero", credits: 0 });
+export const LOCAL_ZERO_SPEND: Readonly<Spend> = Object.freeze({ usd: "0", usd_basis: "local-zero", credits: 0 });
 
 /* ── models.lock ──────────────────────────────────────────────────────── */
 

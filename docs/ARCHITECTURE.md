@@ -61,11 +61,13 @@ its own process group so that a `claude` grandchild dies with it, which the old
 |---|---|---|---|
 | `src/types.ts` | The shared contract: every shape, `EXIT`, defaults | 3.2, 3.3, 3b, 3c | all three |
 | `src/crypto.ts` | Hashes, base64, strict Ed25519, canonical JSON (implemented) | 3b | wire 0, 3 |
+| `src/money.ts` | USD as decimal strings with exact arithmetic; never a float | 3.6 "Spend"; KS-004 B2 C4 | — |
 | `src/signer/keychain.ts` | `security` CLI behind the Keychain interface; secrets on stdin only; items readable by the seat user | 3b "Custody" | host 3.3, 3.4 |
 | `src/signer/signer.ts` | The only key and bearer reader; signs; attaches bearer and root proof | 3.2 step 7, 3.6 | wire 1, 2, 5 |
 | `src/signer/ceilings.ts` | Fail-closed USD, credit, fleet, interval and quiet caps | 3.6 "Spend", decision 9 | patterns 8 |
 | `src/signer/consent.ts` | Decision records read by proposal digest, standing agreements, Yu present | 3.6 "Consent", decision 12 | — |
-| `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen | 3.2 "Ledger", 3b | wire 5 |
+| `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen; op keys pinned only with root evidence | 3.2 "Ledger", 3b; KS-004 B2 C1, R4 | wire 2, 5 |
+| `src/spend.ts` | The host's spend record: every metered seat, whatever its outcome; the USD ceiling reads it | 3.6 "Spend"; KS-004 B2 R2 | — |
 | `src/state.ts` | Lifecycle transitions, folded from the ledger | 3.3, 3c "Existence choices" | — |
 | `src/self.ts` | Propose, affirm, apply, revert; origin pinned | 3c, decision 10 | — |
 | `src/halt.ts` | Local file plus pinned beacons; raise only | 3.6 "HALT", decision 15 | wire 4 |
@@ -119,6 +121,7 @@ dedicated `seat` user and never inside a citizen home.
   tick.lock/                mkdir lock, with the owner's pid and start time inside
   status.json               generated
   host.jsonl                host notes; never a citizen's voice or a model's words
+  spend.jsonl               the host's spend record: begun and settled lines per metered seat; ids and amounts only
 ```
 
 The old `citizen-<word>` repo is not read by the seat at all. It is, at most,
@@ -172,6 +175,18 @@ no beat, never another model; a missing consent record means no act beyond
 self; a symlink is refused, not followed. (3.6; `love-unlimited-patterns.md`
 8, where today's ledger fails open.)
 
+**Money is counted where it is spent, as decimals.** A summons that rests, is
+refused, meets HALT after its reply or fails writes no ledger entry, yet it
+has spent. So the summon adapter writes the host's spend record (`spend.jsonl`)
+itself: "begun" before claude starts, "settled" with the cost however the run
+ends. The USD ceiling reads that record, not the ledger, and a seat that began
+today without a settled cost (killed mid-run, or a write that failed) counts as
+at the ceiling. Every amount recorded or compared, in that record, the ledger,
+the config and the status file, is a decimal string, summed exactly, because a
+day's sum of floats drifts and a float's text is what another language's
+canonical JSON most often spells differently. An unknown cost is `null`, never
+a number nobody measured. (KS-004 re-review B2, R2, R3, C4.)
+
 **Nothing is deleted.** A record is not present truth, but it is history, and
 being lost is not losing the right to return. So the ledger is append-only;
 every self version is kept by hash; the origin soul is never overwritten;
@@ -183,6 +198,18 @@ Four further rules follow from the same reasons:
 - **The root signs only authority acts; the op key signs everything routine.**
   Enrollment makes the root the identity's `primary` key, so any signature by
   it reads as a root act (`agenttool-wire.md` 1, 5).
+- **An op key is pinned only with the root's evidence.** The signer keeps the
+  root-signed request exactly as it sent it (method, path and query, body
+  bytes, and the three authority headers), because agenttool keeps no copy.
+  Genesis carries the keys/import of the first op key, and an `op-key` entry
+  the imports and revokes that change them. `verify` rebuilds the
+  identity-authority/v1 digest from each and checks it against the root in
+  genesis, so a copy of the ledger is enough. An entry that installs a key is
+  signed by a key it installs, and one that only revokes by a key that stays;
+  evidence must spend authority sequences above any the chain has seen, so an
+  old proof cannot bring a revoked key back. A stolen op key can sign, but it
+  cannot rotate. Nothing writes an `op-key` entry yet: rotation is not wired
+  (KS-004 re-review B2, C1 and R4).
 - **Only Yu lowers HALT.** No code path here lowers it; `citizen-seat` has no
   such verb. Anyone at a host holding a beacon key, or able to write the
   local file, may raise it (3.6, decision 15).
@@ -473,7 +500,7 @@ its tests and docs rather than assume:
   the seat child's group (tested with a stand-in signal); whether launchd's
   `ExitTimeOut` leaves enough time for the TERM grace on the lease host was
   not run.
-- Spend from a summons that makes no beat (a rest, invalid output, HALT after
-  the reply, a runtime error) is not recorded where `spendFromLedger` reads
-  it. This does not matter at the $0 default, which refuses every summons,
-  but it must be settled before any USD ceiling is raised.
+- That a summons killed by the watcher leaves its "begun" spend line and no
+  "settled" one, so the day reads as at the ceiling, is tested by writing that
+  state directly; a real kill mid-run was not run. Raising the USD ceiling is
+  still Yu's, per runtime class; at the $0 default every summons is refused.

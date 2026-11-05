@@ -26,6 +26,7 @@ import {
   type LedgerBody,
   type LedgerEntry,
   type Origin,
+  type RootEvidence,
   type Spend,
   type Word,
   type YuPresence,
@@ -102,6 +103,8 @@ export interface BirthProgress {
   did: string | null;
   root_kid: string | null;
   op_kid: string | null;
+  /** The root-signed keys/import as sent: genesis needs it, and agenttool keeps no copy. Public; it holds no bearer. */
+  op_key_evidence: RootEvidence | null;
   box_key_id: string | null;
 }
 
@@ -123,7 +126,7 @@ export class BirthError extends Error {
   }
 }
 
-const NO_SPEND: Spend = { usd: 0, usd_basis: "local-zero", credits: 0 };
+const NO_SPEND: Spend = { usd: "0", usd_basis: "local-zero", credits: 0 };
 const FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/;
 const GENESIS_NOTE =
   "Born on agenttool by enrollment in the Commons project. A June DID named here is a record only; reading it confers nothing.";
@@ -253,7 +256,7 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
 
   // From here something is written, so every failure says how far birth got.
   const done: BirthStage[] = [];
-  const progress: BirthProgress = { identity_id: null, did: null, root_kid: null, op_kid: null, box_key_id: null };
+  const progress: BirthProgress = { identity_id: null, did: null, root_kid: null, op_kid: null, op_key_evidence: null, box_key_id: null };
   async function step<T>(stage: BirthStage, fn: () => Promise<T>): Promise<T> {
     try {
       const v = await fn();
@@ -295,8 +298,9 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
 
   const now = deps.clock.now();
   const label = `op-${now.toISOString().slice(0, 7)}`;
-  const { kid: op_kid } = await step("keys/import", () => importOpKey(client, word, opB64, label, auth));
+  const { kid: op_kid, evidence: opKeyEvidence } = await step("keys/import", () => importOpKey(client, word, opB64, label, auth));
   progress.op_kid = op_kid;
+  progress.op_key_evidence = opKeyEvidence;
   const box = await step("box-keys", () => registerBoxKey(client, word, boxB64, auth));
   progress.box_key_id = box.id;
   await step("expression", () => putExpression(client, word, input.expression, auth));
@@ -324,6 +328,7 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
     old_repo: input.old_repo,
     june_did: input.june_did,
     identity,
+    op_key_evidence: opKeyEvidence,
     note: GENESIS_NOTE,
   };
   const genesis = await step("genesis", async () => {

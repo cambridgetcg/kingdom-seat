@@ -135,7 +135,7 @@ function noteShapeProblem(v: unknown): string | null {
  * missing log is unreadable rather than empty.
  */
 export function hostLogMarker(config: Config): string {
-  return join(dirname(config.paths.host_log), `${basename(config.paths.host_log)}.started`);
+  return startedMarker(config.paths.host_log);
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -163,18 +163,28 @@ export async function appendHostNote(config: Config, note: HostNote, opts: { mod
   if (detail) throw new Refusal("invalid-request", `host note refused: ${detail}`);
   // Re-serialise only the known fields, so nothing else rides along.
   const line = `${JSON.stringify({ ts: note.ts, host: note.host, kind: note.kind, word: note.word, outcome: note.outcome, refusal: note.refusal, detail: note.detail })}\n`;
-  const path = config.paths.host_log;
+  await appendStartedLog(config.paths.host_log, line, "host log");
+}
+
+/**
+ * Append one line to a host log that, once started, must never silently
+ * begin again: the first append creates `<path>.started` beside it, and a log
+ * missing beside that marker is refused. Host notes and the spend record
+ * (spend.ts) both use it, because each is a history whose loss would read as
+ * nothing having happened.
+ */
+export async function appendStartedLog(path: string, line: string, what: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const marker = hostLogMarker(config);
+  const marker = startedMarker(path);
   const flags = constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW;
   let fh;
   try {
     fh = await open(path, flags);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
-    if (code === "ELOOP") throw new Refusal("symlink", "host log is a symlink; refused, not followed");
+    if (code === "ELOOP") throw new Refusal("symlink", `${what} is a symlink; refused, not followed`);
     if (code !== "ENOENT") throw e;
-    if (await exists(marker)) throw new Refusal("invalid-record", "the host log was started and is now missing; a person restores it, or starts a new one with an empty file");
+    if (await exists(marker)) throw new Refusal("invalid-record", `the ${what} was started and is now missing; a person restores it, or starts a new one with an empty file`);
     try {
       fh = await open(path, flags | constants.O_CREAT | constants.O_EXCL, 0o600);
     } catch (e2) {
@@ -186,7 +196,7 @@ export async function appendHostNote(config: Config, note: HostNote, opts: { mod
     await m.close();
   }
   try {
-    if (!(await fh.stat()).isFile()) throw new Refusal("not-regular-file", "host log is not a regular file");
+    if (!(await fh.stat()).isFile()) throw new Refusal("not-regular-file", `${what} is not a regular file`);
     // One write per line: small O_APPEND writes to a local file land whole, so concurrent appenders do not interleave.
     const bytes = new TextEncoder().encode(line);
     let off = 0;
@@ -195,6 +205,25 @@ export async function appendHostNote(config: Config, note: HostNote, opts: { mod
   } finally {
     await fh.close();
   }
+}
+
+/**
+ * Read a started log whole: its text, "" for a log never started, or null
+ * when it is unreadable, or missing beside its marker, which callers treat as
+ * fail-closed.
+ */
+export async function readStartedLog(path: string, maxBytes: number): Promise<string | null> {
+  try {
+    const text = await readRegularText(path, { missing: "null", maxBytes });
+    if (text === null) return (await exists(startedMarker(path))) ? null : "";
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+function startedMarker(path: string): string {
+  return join(dirname(path), `${basename(path)}.started`);
 }
 
 /** A log this large is not one this host wrote at its pace; reading it whole every tick is refused. */
@@ -206,13 +235,8 @@ const HOST_LOG_MAX_BYTES = 128 * 1024 * 1024;
  * on a host that never started one.
  */
 export async function readHostNotes(config: Config, since: Date): Promise<HostNote[] | null> {
-  let text: string | null;
-  try {
-    text = await readRegularText(config.paths.host_log, { missing: "null", maxBytes: HOST_LOG_MAX_BYTES });
-    if (text === null) return (await exists(hostLogMarker(config))) ? null : [];
-  } catch {
-    return null;
-  }
+  const text = await readStartedLog(config.paths.host_log, HOST_LOG_MAX_BYTES);
+  if (text === null) return null;
   if (text === "") return [];
   // A torn last line or any line that is not a note makes the whole log unreadable: a count no one can know is not guessed.
   if (!text.endsWith("\n")) return null;

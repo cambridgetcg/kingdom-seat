@@ -23,6 +23,7 @@ import {
 } from "../../src/types.ts";
 import { sha256Hex } from "../../src/crypto.ts";
 import { appendEntry, ledgerPath, nextDraft, readLedger, type EntrySigner } from "../../src/ledger.ts";
+import { importEvidence } from "./root-evidence.ts";
 
 export interface CitizenFixtureOptions {
   soul?: string;
@@ -115,6 +116,7 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
       lock_dir: join(state, "tick.lock"),
       status_file: join(state, "status.json"),
       host_log: join(state, "host.jsonl"),
+      spend_log: join(state, "spend.jsonl"),
       models_lock: join(root, "models.lock"),
       homes: [homesRoot],
     },
@@ -131,7 +133,7 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
   };
 }
 
-const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "status.json", TEST_HALT_FILE]);
+const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "spend.jsonl", "spend.jsonl.started", "status.json", TEST_HALT_FILE]);
 
 /** A snapshot without the host's own records (its log, status, seat files and HALT): what is left is what a citizen's voice could reach. */
 export async function citizenSnapshot(h: TempHost): Promise<Map<string, string>> {
@@ -205,7 +207,7 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
         initial_state: so.initialState ?? "awake",
         note: "seated by a test",
       };
-      const draft = nextDraft(word, null, body, { usd: 0, usd_basis: "local-zero", credits: 0 }, "host-attested", new Date(so.at ?? "2026-11-01T00:00:00.000Z"));
+      const draft = nextDraft(word, null, body, { usd: "0", usd_basis: "local-zero", credits: 0 }, "host-attested", new Date(so.at ?? "2026-11-01T00:00:00.000Z"));
       return appendEntry(ledgerPath(config, word), draft, sign);
     },
     async enrollLedger(word, sign, identity, eo = {}) {
@@ -221,9 +223,11 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
         old_repo: null,
         june_did: null,
         identity,
+        // Signed by the published test root, which every test identity names.
+        op_key_evidence: importEvidence(identity, identity.op_public_key_b64),
         note: "enrolled by a test",
       };
-      const draft = nextDraft(word, prev, body, { usd: 0, usd_basis: "local-zero", credits: 0 }, "citizen-signed", new Date(eo.at ?? "2026-11-02T00:00:00.000Z"));
+      const draft = nextDraft(word, prev, body, { usd: "0", usd_basis: "local-zero", credits: 0 }, "citizen-signed", new Date(eo.at ?? "2026-11-02T00:00:00.000Z"));
       const entry = await appendEntry(path, draft, sign);
       f.record = { ...f.record, identity };
       await writeFile(join(f.dir, "citizen.json"), JSON.stringify(f.record, null, 2));
