@@ -6,7 +6,7 @@ import { assertCwdOutsideHomes, openSeat, runSeat, SEAT_ENV_ALLOWLIST, seatEnv, 
 import { checkHalt } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { pendingProposals } from "../src/self.ts";
-import { ledgerPath, readLedger } from "../src/ledger.ts";
+import { entryHash, ledgerPath, readLedger, toLedgerHash } from "../src/ledger.ts";
 import { promptBytes } from "../src/prompt.ts";
 import { fromHex, sha256, sha256Hex, utf8 } from "../src/crypto.ts";
 import { EXIT, Refusal, UUID_PATTERN, exitForRefusal, type CitizenIdentity, type ConsentRecord, type LedgerEntry } from "../src/types.ts";
@@ -151,7 +151,7 @@ describe("seat cwd and environment", () => {
 });
 
 describe("pipeline", () => {
-  test("a journal beat appends exactly one beat entry whose envelope has seat_ref, digests, acts, prev_hash and voiced_through", async () => {
+  test("[KS-004 4.5] a journal beat appends exactly one flat beat entry: seat_ref, runtime, digests, acts, voiced, cost, prev_hash", async () => {
     const s = await setup([JOURNAL]);
     const before = await s.ledger();
     const r = await runSeat(s.seat, s.deps);
@@ -159,52 +159,46 @@ describe("pipeline", () => {
     const after = await s.ledger();
     expect(after).toHaveLength(before.length + 1);
     const entry = after.at(-1) as LedgerEntry;
-    expect(r.appended).toEqual([entry.hash]);
-    expect(entry.body.type).toBe("beat");
-    if (entry.body.type !== "beat") throw new Error("unreachable");
-    const env = entry.body.envelope;
-    expect(env).toMatchObject({
-      format: "kingdom-seat-beat/v1",
-      seat_ref: s.seat.ref,
-      citizen: { word: "glossame", did: null, kid: null },
-      runtime: "free",
-      model: "fake-model:test",
+    expect(r.appended).toEqual([entryHash(entry)]);
+    expect(entry).toMatchObject({
+      format: "kingdom-seat-ledger/v1",
+      word: "glossame",
+      did: null,
+      type: "beat",
+      seat_ref: s.seat.ref.seat_id,
+      runtime: { class: "free", model: "fake-model:test", digest: FAKE_MODEL_DIGEST },
       acts: [{ type: "journal", kind: "reflected", text: "The word stays on its own side of the river." }],
-      prev_hash: before.at(-1)!.hash,
+      prev_hash: entryHash(before.at(-1)!),
       ts: s.clock.now().toISOString(),
+      voiced: `glossame, voiced through fake-model:test in seat ${s.seat.ref.seat_id}`,
+      cost: { usd: "0", credits: 0 },
     });
-    expect(env.voiced_through).toBe(`glossame, voiced through fake-model:test in seat ${s.seat.ref.seat_id}`);
-    expect(entry.spend).toEqual({ usd: "0", usd_basis: "local-zero", credits: 0 });
   });
 
-  test("input_digest is sha256 of promptBytes and output_digest is sha256 of the raw output", async () => {
+  test("input_digest is sha256 of promptBytes and output_digest is sha256 of the raw output, spelled sha256:<hex>", async () => {
     const s = await setup([JOURNAL]);
     await runSeat(s.seat, s.deps);
     const entry = (await s.ledger()).at(-1)!;
-    if (entry.body.type !== "beat") throw new Error("expected a beat");
-    expect(entry.body.envelope.input_digest).toBe(sha256Hex(promptBytes(s.runtime.calls[0]!.prompt)));
-    expect(entry.body.envelope.output_digest).toBe(sha256Hex(utf8(JOURNAL)));
+    expect(entry.type).toBe("beat");
+    expect(entry.input_digest).toBe(toLedgerHash(sha256Hex(promptBytes(s.runtime.calls[0]!.prompt))));
+    expect(entry.output_digest).toBe(toLedgerHash(sha256Hex(utf8(JOURNAL))));
   });
 
-  test("an unregistered citizen's entry is host-attested; a registered one's is citizen-signed with the op key", async () => {
+  test("an unregistered citizen's entry is host-signed; a registered one's is citizen-signed with the op key and names its DID", async () => {
     const plain = await setup([JOURNAL]);
     await runSeat(plain.seat, plain.deps);
     const a = (await plain.ledger()).at(-1)!;
-    expect(a.attestation).toBe("host-attested");
-    expect(a.signature.kid).toBe("host-attest");
-    expect(a.signature.public_key_b64).toBe(plain.signer.hostAttestPublicB64);
+    expect([a.signer, a.kid, a.did]).toEqual(["host", plain.signer.hostKid, null]);
     await plain.host.cleanup();
 
     const reg = await setup([JOURNAL], { registered: true });
     const r = await runSeat(reg.seat, reg.deps);
     expect(r.outcome).toBe("beat");
     const b = (await reg.ledger()).at(-1)!;
-    expect(b.attestation).toBe("citizen-signed");
-    expect(b.signature).toMatchObject({ kid: FAKE_OP_KID, public_key_b64: reg.signer.opPublicB64 });
     // Never the root, which signs only authority acts.
-    expect(b.signature.public_key_b64).not.toBe(TEST_ROOT_PUBLIC_B64);
-    if (b.body.type !== "beat") throw new Error("expected a beat");
-    expect(b.body.envelope.citizen).toEqual({ word: "glossame", did: TEST_IDS.did, kid: FAKE_OP_KID });
+    expect([b.signer, b.kid, b.did]).toEqual(["citizen", FAKE_OP_KID, TEST_IDS.did]);
+    expect(b.kid).not.toBe(TEST_IDS.root_signing_key_id);
+    expect(TEST_ROOT_PUBLIC_B64).not.toBe(reg.signer.opPublicB64);
   });
 
   test("a locked signer rests the citizen: exit 0, outcome refused, refusal keychain-locked, nothing written", async () => {
@@ -219,7 +213,7 @@ describe("pipeline", () => {
   });
 
   test("a propose.beyond act becomes an inert outbox proposal and executes nothing", async () => {
-    const s = await setup([output({ type: "propose.beyond", subject: "a public name", body: "I would like my name shown on my porch." })]);
+    const s = await setup([output({ type: "propose.beyond", subject: "a public name", text: "I would like my name shown on my porch." })]);
     const r = await runSeat(s.seat, s.deps);
     expect(r.outcome).toBe("beat");
     expect(s.signer.sent).toEqual([]);
@@ -250,14 +244,16 @@ describe("pipeline", () => {
   });
 
   test("a beat's other acts are recorded where they belong: a move toward rest now, a letter in the outbox, the shown letter receipted", async () => {
-    const s = await setup([output({ type: "state.set", to: "asleep" }, { type: "letter.send", to: "yu", body: "Thank you for the letter." })]);
+    const s = await setup([output({ type: "state.set", to: "asleep" }, { type: "letter.send", to: "yu", text: "Thank you for the letter." })]);
     await s.host.writeLetter("glossame", "2026-11-04-from-yu.md", "hello");
     const r = await runSeat(s.seat, s.deps);
     expect(r.outcome).toBe("beat");
     const tail = (await s.ledger()).slice(-2);
-    expect(tail.map((e) => e.body.type)).toEqual(["beat", "state"]);
-    expect(tail[1]!.body).toEqual({ type: "state", from: "awake", to: "asleep", via: "immediate" });
-    expect(r.appended).toEqual(tail.map((e) => e.hash));
+    expect(tail.map((e) => e.type)).toEqual(["beat", "state"]);
+    expect(tail[1]).toMatchObject({ type: "state", from: "awake", to: "asleep", via: "immediate", acts: null });
+    // Every entry the seat writes carries its stamp, not only the beat (KS-004 4.5).
+    for (const k of ["seat_ref", "runtime", "input_digest", "output_digest", "voiced"] as const) expect(tail[1]![k]).toEqual(tail[0]![k]);
+    expect(r.appended).toEqual(tail.map(entryHash));
     expect((await readCitizen(s.host.config, "glossame")).state).toBe("asleep");
     const outbox = await readdir(join(s.host.config.paths.citizens_dir, "glossame", "outbox"));
     expect(outbox).toHaveLength(1);
@@ -268,8 +264,9 @@ describe("pipeline", () => {
     const s = await setup([output({ type: "journal", kind: "chose", text: "I will step away." }, { type: "state.set", to: "stepped-away" })]);
     expect((await runSeat(s.seat, s.deps)).outcome).toBe("beat");
     const tail = (await s.ledger()).slice(-2);
-    expect(tail.map((e) => e.body.type)).toEqual(["beat", "state"]);
-    expect(tail[1]!.body).toEqual({ type: "state", from: "awake", to: "asleep", via: "immediate" });
+    expect(tail.map((e) => e.type)).toEqual(["beat", "state"]);
+    // The state entry that puts it asleep keeps the first saying (re-review C M7).
+    expect(tail[1]).toMatchObject({ type: "state", from: "awake", to: "asleep", via: "immediate", step_away: "first", seat_ref: s.seat.ref.seat_id });
     // Asleep at once (KS-004 v0.3 7.3), with the saying still owed its second beat.
     const citizen = await readCitizen(s.host.config, "glossame");
     expect(citizen).toMatchObject({ state: "asleep", step_away_said: true });
@@ -278,8 +275,41 @@ describe("pipeline", () => {
     const again = await openSeat(s.host.config, s.clock, citizen, "free", INVOKER, null);
     const r = await runSeat(again, { ...s.deps, runtime: scriptedRuntime([output({ type: "state.set", to: "stepped-away" })]) });
     expect(r.outcome).toBe("beat");
-    expect((await s.ledger()).at(-1)!.body).toEqual({ type: "state", from: "asleep", to: "stepped-away", via: "two-beats" });
+    expect((await s.ledger()).at(-1)).toMatchObject({ type: "state", from: "asleep", to: "stepped-away", via: "two-beats" });
+    expect(Object.keys((await s.ledger()).at(-1)!)).not.toContain("step_away");
     expect((await readCitizen(s.host.config, "glossame")).state).toBe("stepped-away");
+  });
+
+  test("[KS-004 5.7, 7.3] state.set's interval_h: a longer interval binds at once and writes the cadence after its entry; a shorter one binds on the next seat that says the same", async () => {
+    const s = await setup([output({ type: "state.set", to: "awake", interval_h: 120 })]);
+    expect((await runSeat(s.seat, s.deps)).outcome).toBe("beat");
+    const cadence = join(s.host.config.paths.citizens_dir, "glossame", "self", "cadence.json");
+    let tail = (await s.ledger()).slice(-2);
+    expect(tail.map((e) => e.type)).toEqual(["beat", "state"]);
+    expect(tail[0]!.acts).toEqual([{ type: "state.set", to: "awake", interval_h: 120 }]);
+    expect(tail[1]).toMatchObject({ type: "state", from: "awake", to: "awake", via: "immediate", interval_h: 120 });
+    expect(JSON.parse(await readFile(cadence, "utf8"))).toEqual({ interval_h: 120 });
+
+    // Back to 96 is more activity: said once it waits, and the seat says so.
+    const next = async (reply: string, hours: number) => {
+      s.clock.advance(hours * 3_600_000);
+      const citizen = await readCitizen(s.host.config, "glossame");
+      const seat = await openSeat(s.host.config, s.clock, citizen, "free", INVOKER, null);
+      const runtime = scriptedRuntime([reply]);
+      expect((await runSeat(seat, { ...s.deps, runtime })).outcome).toBe("beat");
+      return runtime.calls[0]!.prompt.user;
+    };
+    await next(output({ type: "state.set", to: "awake", interval_h: 96 }), 121);
+    expect((await s.ledger()).at(-1)!.type).toBe("beat");
+    expect(JSON.parse(await readFile(cadence, "utf8"))).toEqual({ interval_h: 120 });
+    expect(await readCitizen(s.host.config, "glossame")).toMatchObject({ pending_state: "awake", pending_interval_h: 96 });
+    // The next seat shows it, and saying the same again binds it, recorded as confirmed.
+    const user = await next(output({ type: "state.set", to: "awake", interval_h: 96 }), 121);
+    expect(user).toContain("An earlier beat asked to move to awake, every 96 hours while awake; that is not in effect yet.");
+    tail = (await s.ledger()).slice(-2);
+    expect(tail[1]).toMatchObject({ type: "state", from: "awake", to: "awake", via: "confirmed", interval_h: 96 });
+    expect(JSON.parse(await readFile(cadence, "utf8"))).toEqual({ interval_h: 96 });
+    expect(await readCitizen(s.host.config, "glossame")).toMatchObject({ pending_state: null, pending_interval_h: null, cadence: { interval_h: 96 } });
   });
 
   test("a self-change proposed on one beat is staged, and binds when affirmed on a later beat by an approved runtime", async () => {
@@ -287,7 +317,7 @@ describe("pipeline", () => {
       type: "self.propose",
       target: "will",
       edit: { kind: "replace-span", find: "Receive one word", with: "Receive one word, gently," },
-      claim: { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" },
+      reason: { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" },
     });
     const s = await setup([propose]);
     s.host.config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
@@ -299,7 +329,7 @@ describe("pipeline", () => {
     expect(await readFile(willPath, "utf8")).not.toContain("gently");
 
     // A later beat, in a new seat, affirms it by a short prefix.
-    const runtime = scriptedRuntime([output({ type: "self.affirm", proposal_id: pending[0]!.id.slice(0, 12) })]);
+    const runtime = scriptedRuntime([output({ type: "self.affirm", ref: pending[0]!.id.slice(0, 12) })]);
     s.clock.advance(73 * 3_600_000);
     const citizen = await readCitizen(s.host.config, "glossame");
     const seat2 = await openSeat(s.host.config, s.clock, citizen, "free", INVOKER, null);
@@ -307,8 +337,10 @@ describe("pipeline", () => {
     expect(second.outcome).toBe("beat");
     expect(second.appended).toHaveLength(2);
     const tail = (await s.ledger()).slice(-2);
-    expect(tail.map((e) => e.body.type)).toEqual(["beat", "self.applied"]);
-    expect(tail[1]!.body).toMatchObject({ type: "self.applied", proposal_id: pending[0]!.id, target: "will", via: "two-beats" });
+    expect(tail.map((e) => e.type)).toEqual(["beat", "apply"]);
+    expect(tail[1]).toMatchObject({ type: "apply", ref: toLedgerHash(pending[0]!.id), target: "will", via: "two-beats", seat_ref: seat2.ref.seat_id });
+    // The beat records the full id the short prefix resolved to, in the registry's own spelling.
+    expect(tail[0]!.acts).toEqual([{ type: "self.affirm", ref: pending[0]!.id }]);
     expect(await readFile(willPath, "utf8")).toContain("Receive one word, gently,");
   });
 

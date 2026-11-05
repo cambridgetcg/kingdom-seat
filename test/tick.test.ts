@@ -38,6 +38,7 @@ function citizen(over: Partial<Citizen> = {}): Citizen {
     seated_at: "2026-11-01T00:00:00.000Z",
     state: "awake",
     pending_state: null,
+    pending_interval_h: null,
     step_away_said: false,
     cadence: { interval_h: 72 },
     covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },
@@ -348,7 +349,7 @@ describe("runTick", () => {
   test("the tick reads the switch from config: off, an asleep citizen that asked to wake is not seated without a letter", async () => {
     const { h, deps, spawned } = await tickHost([{ word: "glossame", state: "asleep" }]);
     // Asleep, it said once that it would wake: a saying that takes a second beat.
-    await append(h.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }]), "host-attested", fakeSigner(), new Date("2026-11-01T01:00:00.000Z"));
+    await append(h.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }]), "host", fakeSigner(), new Date("2026-11-01T01:00:00.000Z"));
     h.config.schedule = { wake_confirm_seat: false };
     expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "nothing-due" });
     expect(spawned).toEqual([]);

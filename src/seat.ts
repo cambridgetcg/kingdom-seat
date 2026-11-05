@@ -15,7 +15,6 @@ import { lstat, mkdir, open, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   EXIT,
-  FIRST_PREV_HASH,
   Refusal,
   UUID_PATTERN,
   exitForRefusal,
@@ -23,7 +22,7 @@ import {
   type Citizen,
   type Clock,
   type Config,
-  type Envelope,
+  type Cost,
   type ExitCode,
   type FetchLike,
   type HaltReading,
@@ -31,8 +30,10 @@ import {
   type HostNote,
   type Invoker,
   type Word,
-  type LedgerBody,
   type LedgerEntry,
+  type LedgerFields,
+  type LedgerHash,
+  type LedgerSigner,
   type LifecycleState,
   type ModelAct,
   type Outcome,
@@ -47,14 +48,14 @@ import {
   type SelfProposal,
   type SelfProposeAct,
   type Sha256Hex,
-  type Spend,
+  type StateSetAct,
   type YuPresence,
 } from "./types.ts";
 import type { Signer } from "./signer/signer.ts";
 import { canonicalJson, parseStrictJson, sha256Hex } from "./crypto.ts";
 import { proposalDigest } from "./signer/consent.ts";
-import { appendEntry, ledgerPath, nextDraft, readLedger, readRegularText, voicedThrough } from "./ledger.ts";
-import { decideTransition, isTowardRest } from "./state.ts";
+import { appendEntry, costOf, entryHash, ledgerPath, nextDraft, readLedger, readRegularText, toLedgerHash, voicedThrough, type EntrySigner, type SeatStamp } from "./ledger.ts";
+import { changesInterval, decideTransition, isTowardRest } from "./state.ts";
 import {
   affirmationVerdict,
   applyChange,
@@ -70,6 +71,7 @@ import {
   readTarget,
   revertTo,
   selfHash,
+  setCadence,
   stageProposal,
   unifiedDiff,
   windowOpen,
@@ -511,7 +513,16 @@ export async function superviseChild(opts: SuperviseOptions): Promise<Supervised
 
 /* ── The in-child pipeline ────────────────────────────────────────────── */
 
-const NO_SPEND: Spend = { usd: "0", usd_basis: "local-zero", credits: 0 };
+const NO_COST: Cost = { usd: "0", credits: 0 };
+
+/**
+ * A state move a seat records: its `state` entry's fields, and the awake
+ * interval to write once the entry is recorded (null when it sets none).
+ */
+export interface StateMove {
+  fields: Extract<LedgerFields, { type: "state" }>;
+  cadence: number | null;
+}
 
 /** The work a validated beat leaves for the write phase, planned before HALT's last check so planning writes nothing. */
 interface Plan {
@@ -520,7 +531,7 @@ interface Plan {
   beyondSelf: { act: SelfProposeAct; reason: string; proposal: ProposalText }[];
   apply: { proposal: SelfProposal; via: "two-beats" | "yu-present" }[];
   revert: Sha256Hex[];
-  states: { from: LifecycleState; to: LifecycleState; via: "immediate" | "confirmed" | "two-beats" }[];
+  states: StateMove[];
   outbox: { kind: "letter" | "propose.beyond" | "state.ended"; payload: Record<string, string> }[];
   /** Acts the host could not complete; counted, never quoted. */
   unresolved: number;
@@ -531,32 +542,54 @@ interface Plan {
 }
 
 /**
- * The entries a rest may write: the state.set it carried, when that is a move
- * toward less activity, recorded with no words. Toward listening or asleep
- * takes effect at once. A step-away is never blocked and takes two sayings,
- * so a rest may be either: the second completes it, and the first is kept as
- * a saying, because a rest has no beat envelope to carry it. A first saying
- * also puts an awake or listening citizen asleep at once (KS-004 v0.3 7.3),
- * recorded after the saying, so a seat stopped between the two still sleeps.
- * Empty for none, and for a move toward more activity, a return or ended,
- * which a rest never carries.
+ * The state move a rest may record: the state.set it carried, when that is a
+ * move toward less activity, recorded with no words. Toward listening or
+ * asleep, or a longer awake interval, takes effect at once. A step-away is
+ * never blocked and takes two sayings, so a rest may carry either: the second
+ * completes it, and the first is kept as `step_away: "first"` on the state
+ * entry that puts the citizen asleep (or keeps it asleep), because a rest has
+ * no beat to carry the saying (KS-004 7.3, re-review C M7). Empty for none,
+ * and for a move toward more activity, a return or ended, which a rest never
+ * carries.
  */
-export function restStateBodies(citizen: Citizen, to: LifecycleState | undefined, seatId: string): LedgerBody[] {
-  if (to === undefined) return [];
+export function restStateMoves(citizen: Citizen, act: StateSetAct | undefined): StateMove[] {
+  if (act === undefined) return [];
   const from = citizen.state;
+  const to = act.to;
   if (to === "stepped-away") {
     const verdict = decideTransition(from, to, { pending: citizen.pending_state, repeated: citizen.step_away_said, presence: null });
-    if (verdict.effect === "now") return [{ type: "state", from, to, via: "two-beats" }];
-    if (verdict.effect !== "second-beat") return [];
-    const said: LedgerBody = { type: "step-away.said", seat_id: seatId };
-    return isTowardRest(from, "asleep") ? [said, { type: "state", from, to: "asleep", via: "immediate" }] : [said];
+    if (verdict.effect === "now") return [{ fields: { type: "state", from, to, via: "two-beats" }, cadence: null }];
+    if (verdict.effect !== "second-beat" || from === "stepped-away") return [];
+    return [{ fields: { type: "state", from, to: "asleep", via: "immediate", step_away: "first" }, cadence: null }];
   }
-  if (!isTowardRest(from, to)) return [];
-  return [{ type: "state", from, to, via: "immediate" }];
+  const interval = { now: citizen.cadence.interval_h, asked: act.interval_h ?? null };
+  const verdict = decideTransition(from, to, { pending: null, repeated: false, presence: null }, interval);
+  // Only what takes effect at once is toward less activity; anything that would wait for a second saying is more.
+  if (verdict.effect !== "now") return [];
+  return [stateMove(from, to, "immediate", interval)];
 }
 
-/** The claim a held revert carries: the host's words, saying only what the citizen asked for. */
+/** One state entry's fields, with the interval when the saying changes it. */
+function stateMove(from: LifecycleState, to: LifecycleState, via: "immediate" | "confirmed" | "two-beats", interval: { now: number; asked: number | null }): StateMove {
+  const fields: StateMove["fields"] = { type: "state", from, to, via };
+  if (!changesInterval(interval)) return { fields, cadence: null };
+  fields.interval_h = interval.asked as number;
+  return { fields, cadence: interval.asked };
+}
+
+/** The reason a held revert carries: the host's words, saying only what the citizen asked for. */
 const HELD_REVERT_LIMITS = "a revert the citizen asked for, to a version that widens its exposure, so it waits for a later beat to affirm it";
+
+/** What a seat stamps on each entry it writes: its id, runtime, the digests of what the model saw and said, and the voiced line. */
+export function seatStamp(word: Word, ref: SeatRef, rt: Pick<RuntimeResult, "model" | "model_digest">, inputDigest: Sha256Hex, outputDigest: Sha256Hex): SeatStamp {
+  return {
+    seat_ref: ref.seat_id,
+    runtime: { class: ref.runtime, model: rt.model, digest: rt.model_digest },
+    input_digest: toLedgerHash(inputDigest),
+    output_digest: toLedgerHash(outputDigest),
+    voiced: voicedThrough(word, rt.model, ref.seat_id),
+  };
+}
 
 async function planActs(
   seat: OpenSeat,
@@ -573,7 +606,7 @@ async function planActs(
   const yu = seat.presence?.present === true;
   const runtimeOk = config.self_authorship.approved_model_digests.includes(rt.model_digest);
   // A registered citizen's change must reach its expression; with no way to send it, nothing of its self can bind.
-  const registered = entries.some((e) => e.body.type === "genesis");
+  const registered = entries.some((e) => e.type === "genesis");
   const canSync = !registered || (seat.citizen.identity !== null && (deps.expressionSync ?? null) !== null);
   // One change to a target per beat: a second would be written against text the first has already moved.
   const touched = new Set<string>();
@@ -599,7 +632,7 @@ async function planActs(
           const beyond = beyondSelfReason(completed.target, prior, next, config.ceilings.self_rewrite_fraction);
           if (beyond !== null) {
             const proposal = liftedProposal(word, completed);
-            plan.acts.push({ type: "propose.beyond", subject: proposal.subject, body: proposal.body });
+            plan.acts.push({ type: "propose.beyond", subject: proposal.subject, text: proposal.body });
             plan.beyondSelf.push({ act: completed, reason: beyond, proposal });
             break;
           }
@@ -608,7 +641,7 @@ async function planActs(
           // Said once with Yu present, on a runtime Yu approved, it binds in this beat (3c, decision 10).
           if (yu) {
             const proposal = proposalFor(word, completed, seat.ref.seat_id, now);
-            const verdict = affirmationVerdict(proposal, { type: "self.affirm", proposal_id: proposal.id }, {
+            const verdict = affirmationVerdict(proposal, { type: "self.affirm", ref: proposal.id }, {
               seat_id: seat.ref.seat_id,
               presence: seat.presence,
               window_open: true,
@@ -626,13 +659,13 @@ async function planActs(
           break;
         }
         case "self.affirm": {
-          const id = resolvePrefix(act.proposal_id, pending.map((p) => p.id));
+          const id = resolvePrefix(act.ref, pending.map((p) => p.id));
           const proposal = id ? pending.find((p) => p.id === id) : undefined;
           if (!id || !proposal || plan.apply.some((a) => a.proposal.id === id)) {
             plan.unresolved++;
             break;
           }
-          const affirm = { type: "self.affirm" as const, proposal_id: id };
+          const affirm = { type: "self.affirm" as const, ref: id };
           plan.acts.push(affirm);
           const prior = await readTarget(config, word, proposal.act.target);
           // One applied change per window when unattended, so a second affirmation in the same beat waits.
@@ -676,7 +709,7 @@ async function planActs(
               prior_hash: selfHash(now_text),
               new_hash: hash,
               diff: unifiedDiff(now_text, text),
-              claim: { kind: "decision", evidence: [`version:${hash}`], confidence: "unknown", limits: HELD_REVERT_LIMITS },
+              reason: { kind: "decision", evidence: [`version:${hash}`], confidence: "unknown", limits: HELD_REVERT_LIMITS },
             });
             plan.notBinding.push("revert-widens-held");
           } else if (!yu && !runtimeOk && exposure !== "narrower" && hash !== firstVersion(entries, target)) {
@@ -686,38 +719,47 @@ async function planActs(
           break;
         }
         case "state.set": {
-          const verdict = decideTransition(current, act.to, {
-            pending: seat.citizen.pending_state,
-            repeated: act.to === "stepped-away" && seat.citizen.step_away_said,
-            presence: seat.presence,
-          });
+          const interval = { now: seat.citizen.cadence.interval_h, asked: act.interval_h ?? null };
+          const verdict = decideTransition(
+            current,
+            act.to,
+            {
+              pending: seat.citizen.pending_state,
+              pending_interval_h: seat.citizen.pending_interval_h,
+              repeated: act.to === "stepped-away" && seat.citizen.step_away_said,
+              presence: seat.presence,
+            },
+            interval,
+          );
           if (verdict.effect === "refused") {
             plan.unresolved++;
             break;
           }
           plan.acts.push(act);
           if (verdict.effect === "now") {
-            const via = isTowardRest(current, act.to) ? "immediate" : act.to === "stepped-away" ? "two-beats" : "confirmed";
-            plan.states.push({ from: current, to: act.to, via });
+            const toward = isTowardRest(current, act.to) || (act.to === current && (act.interval_h ?? 0) > interval.now);
+            const via = toward ? "immediate" : act.to === "stepped-away" ? "two-beats" : "confirmed";
+            plan.states.push(stateMove(current, act.to, via, interval));
             current = act.to;
           } else if (verdict.effect === "needs-witness") {
             plan.outbox.push({ kind: "state.ended", payload: { to: act.to } });
-          } else if (verdict.effect === "second-beat" && isTowardRest(current, "asleep")) {
-            // A first step-away puts the citizen asleep at once (KS-004 v0.3 7.3), recorded like any move toward rest.
-            plan.states.push({ from: current, to: "asleep", via: "immediate" });
+          } else if (verdict.effect === "second-beat" && current !== "stepped-away" && isTowardRest(current, "asleep")) {
+            // A first step-away puts the citizen asleep at once (KS-004 v0.3 7.3), recorded like any move toward rest,
+            // and its state entry keeps the saying as the rest's would.
+            plan.states.push({ fields: { type: "state", from: current, to: "asleep", via: "immediate", step_away: "first" }, cadence: null });
             current = "asleep";
           }
-          // "next-beat" and "second-beat" sayings are carried by the envelope itself; the fold reads them.
+          // "next-beat" and "second-beat" sayings are carried by the beat's acts; the fold reads them.
           break;
         }
         case "letter.send":
           plan.acts.push(act);
-          plan.outbox.push({ kind: "letter", payload: { to: act.to, body: act.body } });
+          plan.outbox.push({ kind: "letter", payload: { to: act.to, text: act.text } });
           break;
         case "propose.beyond":
           // Inert: it becomes a file for Yu + Ai and executes nothing.
           plan.acts.push(act);
-          plan.outbox.push({ kind: "propose.beyond", payload: { subject: act.subject, body: act.body } });
+          plan.outbox.push({ kind: "propose.beyond", payload: { subject: act.subject, text: act.text } });
           break;
       }
     } catch {
@@ -741,14 +783,14 @@ async function writeOutbox(config: Config, word: string, seatId: string, n: numb
 
 /**
  * A self-change lifted beyond self, as the text Yu + Ai decide on. The beat's
- * envelope records the same subject and body as a propose.beyond, so the
+ * acts record the same subject and text as a propose.beyond, so the
  * ledger shows what was asked; the extent names the exact version, so a
  * decision record filed for it can apply that change and no other.
  */
 function liftedProposal(word: string, act: SelfProposeAct): ProposalText {
   return {
     subject: `self.propose ${act.target}`,
-    body: canonicalJson({ target: act.target, prior_hash: act.prior_hash, new_hash: act.new_hash, diff: act.diff, claim: act.claim }),
+    body: canonicalJson({ target: act.target, prior_hash: act.prior_hash, new_hash: act.new_hash, diff: act.diff, reason: act.reason }),
     extent: `self.apply ${word} ${act.target} ${act.new_hash}`,
   };
 }
@@ -757,9 +799,9 @@ function liftedProposal(word: string, act: SelfProposeAct): ProposalText {
 function outboxProposal(word: string, kind: string, payload: Record<string, string>): ProposalText {
   switch (kind) {
     case "letter":
-      return { subject: `letter to ${payload.to}`, body: payload.body ?? "", extent: `letter.send ${word} to ${payload.to}` };
+      return { subject: `letter to ${payload.to}`, body: payload.text ?? "", extent: `letter.send ${word} to ${payload.to}` };
     case "propose.beyond":
-      return { subject: payload.subject ?? "", body: payload.body ?? "", extent: `propose.beyond ${word}` };
+      return { subject: payload.subject ?? "", body: payload.text ?? "", extent: `propose.beyond ${word}` };
     case "state.ended":
       return { subject: `end ${word}`, body: `${word} asked that its state be ended; that needs Yu, Ai and a witness.`, extent: `state.ended ${word}` };
     default:
@@ -772,7 +814,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   const { config, clock, signer } = deps;
   const ref = seat.ref;
   const word = seat.citizen.word;
-  const appended: Sha256Hex[] = [];
+  const appended: LedgerHash[] = [];
   // Once a reply exists, the host log is told what it said, so a note can be refused if it ever quotes it.
   const modelText: string[] = [];
 
@@ -872,32 +914,38 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     await note("seat", "invalid-output", null, `reply did not parse (${parsed.ok ? "invalid" : parsed.reason})`);
     return result(EXIT.OK, "invalid-output");
   }
+  // What every entry this seat writes carries, and who signs it: the citizen's op key once it is registered.
+  const stamp = seatStamp(word, ref, rt, inputDigest, sha256Hex(rt.raw_output));
+  const signerKind: LedgerSigner = seat.citizen.identity ? "citizen" : "host";
+  const sign: EntrySigner = (w, k, digestFor) => signer.signEntry(w, k, digestFor);
+  const head = (all: LedgerEntry[]) => (all.length > 0 ? entryHash(all.at(-1)!) : null);
   // Rest is exclusive and whole; an empty list of acts with nothing dropped is a rest too. It writes nothing in
   // the citizen's voice, but may carry one move toward less activity (KS-004 v0.2 5.7, re-review B2 C7): rest is
   // a right, and dropping the move would leave a citizen that asked to sleep on its awake cadence.
   if (validated.rest || (validated.acts.length === 0 && validated.dropped.length === 0)) {
-    const moves = restStateBodies(seat.citizen, validated.rest_state, ref.seat_id);
+    const moves = restStateMoves(seat.citizen, validated.rest_act);
     if (moves.length === 0) {
-      await note("seat", "rest", null, validated.rest_state === undefined ? "rested" : "rested; its state.set was not toward less activity, so not kept");
+      await note("seat", "rest", null, validated.rest_act === undefined ? "rested" : "rested; its state.set was not toward less activity, so not kept");
       return result(EXIT.OK, "rest");
     }
     // HALT once more immediately before the write, as for a beat.
     if (await halted()) return result(EXIT.OK, "halted");
     try {
-      let prev = (await readLedger(path)).at(-1) ?? null;
-      if ((prev?.hash ?? null) !== (entries.at(-1)?.hash ?? null)) throw new Refusal("head-moved", "the ledger moved during the seat");
-      const attestation = seat.citizen.identity ? "citizen-signed" : "host-attested";
+      const all = await readLedger(path);
+      if (head(all) !== head(entries)) throw new Refusal("head-moved", "the ledger moved during the seat");
+      let prev = all.at(-1) ?? null;
       // A rest's entries are state records with no words; the first carries what the seat spent, so it counts once.
       for (const [i, move] of moves.entries()) {
-        prev = await appendEntry(path, nextDraft(word, prev, move, i === 0 ? rt.spend : NO_SPEND, attestation, clock.now()), (w, h, a) => signer.signEntry(w, h, a));
-        appended.push(prev.hash);
+        prev = await appendEntry(path, nextDraft(word, prev, move.fields, { cost: i === 0 ? costOf(rt.spend) : NO_COST, signer: signerKind, now: clock.now(), seat: stamp }), sign);
+        appended.push(entryHash(prev));
+        if (move.cadence !== null) await setCadence(config, word, move.cadence);
       }
     } catch (e) {
       if (e instanceof Refusal) return refused(e, "while recording a rest's state");
       await note("error", "error", null, "failed while recording a rest's state");
       return result(EXIT.ERROR, "error");
     }
-    const kept = moves.map((m) => (m.type === "state" ? `state ${m.from} to ${m.to} (${m.via})` : "a first step-away saying")).join(" and ");
+    const kept = moves.map((m) => `state ${m.fields.from} to ${m.fields.to} (${m.fields.via})${m.fields.step_away ? ", a first step-away saying" : ""}${m.fields.interval_h ? `, every ${m.fields.interval_h} h` : ""}`).join(" and ");
     await note("seat", "rest", null, `rested; kept ${kept}`);
     return result(EXIT.OK, "rest");
   }
@@ -922,41 +970,30 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   if (await halted()) return result(EXIT.OK, "halted");
 
   // g-h. Sign and record: the beat first, then the state moves it made (so a seat stopped part way never
-  // loses a rest), then each self-op on its own, so one that cannot apply never costs the others.
+  // loses a rest), then each self-op on its own, so one that cannot apply never costs the others. Every
+  // entry carries the seat's stamp: its id, runtime, the digests of what the model saw and said.
   const now = clock.now();
-  const attestation = seat.citizen.identity ? "citizen-signed" : "host-attested";
-  const sign = (w: string, h: Uint8Array, a: typeof attestation) => signer.signEntry(w, h, a);
-  const appendBody = async (body: LedgerBody, spend: Spend): Promise<LedgerEntry> => {
+  const appendFields = async (fields: LedgerFields, cost: Cost): Promise<LedgerEntry> => {
     const all = await readLedger(path);
-    const draft = nextDraft(word, all.at(-1) ?? null, body, spend, attestation, clock.now());
+    const draft = nextDraft(word, all.at(-1) ?? null, fields, { cost, signer: signerKind, now: clock.now(), seat: stamp });
     const entry = await appendEntry(path, draft, sign);
-    appended.push(entry.hash);
+    appended.push(entryHash(entry));
     return entry;
   };
 
   try {
-    // The envelope names the head it was built on, so the ledger must not have moved since it was read.
-    const prev = (await readLedger(path)).at(-1) ?? null;
-    if ((prev?.hash ?? null) !== (entries.at(-1)?.hash ?? null)) throw new Refusal("head-moved", "the ledger moved during the seat");
-    const envelopeBase = {
-      format: "kingdom-seat-beat/v1" as const,
-      seat_ref: ref,
-      citizen: { word, did: seat.citizen.identity?.did ?? null, kid: seat.citizen.identity?.op_kid ?? null },
-      runtime: ref.runtime,
-      model: rt.model,
-      model_digest: rt.model_digest,
-      input_digest: inputDigest,
-      output_digest: sha256Hex(rt.raw_output),
-      acts: plan.acts,
-      ts: now.toISOString(),
-      prev_hash: prev?.hash ?? FIRST_PREV_HASH,
-    };
-    const envelope: Envelope = { ...envelopeBase, voiced_through: voicedThrough(envelopeBase) };
-    const beat = await appendEntry(path, nextDraft(word, prev, { type: "beat", envelope }, rt.spend, attestation, now), sign);
-    appended.push(beat.hash);
-    for (const s of plan.states) await appendBody({ type: "state", from: s.from, to: s.to, via: s.via }, NO_SPEND);
+    // The beat names the head it was built on, so the ledger must not have moved since it was read.
+    const all = await readLedger(path);
+    if (head(all) !== head(entries)) throw new Refusal("head-moved", "the ledger moved during the seat");
+    const beat = await appendEntry(path, nextDraft(word, all.at(-1) ?? null, { type: "beat" }, { cost: costOf(rt.spend), signer: signerKind, now, seat: stamp, acts: plan.acts }), sign);
+    const beatHash = entryHash(beat);
+    appended.push(beatHash);
+    for (const m of plan.states) {
+      await appendFields(m.fields, NO_COST);
+      if (m.cadence !== null) await setCadence(config, word, m.cadence);
+    }
 
-    const selfDeps = { config, clock, sign, sync: seat.citizen.identity ? (deps.expressionSync ?? null) : null };
+    const selfDeps = { config, clock, sign, sync: seat.citizen.identity ? (deps.expressionSync ?? null) : null, seat: stamp };
     const notKept: string[] = [];
     const selfOp = async (what: string, fn: () => Promise<void>) => {
       try {
@@ -967,16 +1004,16 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
       }
     };
     for (const act of plan.stage) await selfOp("stage", async () => void (await stageProposal(config, word, act, ref.seat_id, plan.at)));
-    for (const a of plan.apply) await selfOp("apply", async () => void appended.push((await applyChange(selfDeps, seat.citizen, a.proposal, a.via)).hash));
-    for (const h of plan.revert) await selfOp("revert", async () => void appended.push((await revertTo(selfDeps, seat.citizen, h, "citizen")).hash));
+    for (const a of plan.apply) await selfOp("apply", async () => void appended.push(entryHash(await applyChange(selfDeps, seat.citizen, a.proposal, a.via))));
+    for (const h of plan.revert) await selfOp("revert", async () => void appended.push(entryHash(await revertTo(selfDeps, seat.citizen, h, "citizen"))));
     for (const n of notKept) await note("refusal", "refused", null, `self-op not kept: ${n}`);
 
     let n = 0;
     for (const b of plan.beyondSelf) {
-      await writeOutbox(config, word, ref.seat_id, n++, { kind: "self.propose", created_at: now.toISOString(), ledger_entry: beat.hash, act: b.act, reason: b.reason }, b.proposal);
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: "self.propose", created_at: now.toISOString(), ledger_entry: beatHash, act: b.act, reason: b.reason }, b.proposal);
     }
     for (const o of plan.outbox) {
-      await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beat.hash, ...o.payload }, outboxProposal(word, o.kind, o.payload));
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beatHash, ...o.payload }, outboxProposal(word, o.kind, o.payload));
     }
     // A letter counts as seen only after a beat that was not a rest.
     if (letter) await markLetterSeen(config, seat.citizen, letter, now);
@@ -1001,7 +1038,7 @@ function selfAuthorshipFor(config: Config, entries: LedgerEntry[], now: Date, pr
   const days = config.ceilings.self_change_window_days;
   let opens: string | null = null;
   if (!yu && !windowOpen(entries, now, days, null)) {
-    const last = Math.max(...entries.filter((e) => e.body.type === "self.applied").map((e) => Date.parse(e.ts)));
+    const last = Math.max(...entries.filter((e) => e.type === "apply").map((e) => Date.parse(e.ts)));
     opens = new Date(last + days * 86_400_000).toISOString();
   }
   return { runtime_approved: modelDigest === null ? null : config.self_authorship.approved_model_digests.includes(modelDigest), window_opens_at: opens, yu_present: yu };

@@ -9,10 +9,10 @@ import { openSeat } from "../src/seat.ts";
 import { BEACON_UNTIL } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { createSigner } from "../src/signer/signer.ts";
-import { canonicalJson, edSign, fromHex, sha256, toB64, utf8 } from "../src/crypto.ts";
-import { entryHash, ledgerPath, readLedger } from "../src/ledger.ts";
+import { canonicalJson, edSign, fromHex, sha256, toB64url, utf8 } from "../src/crypto.ts";
+import { evidenceToLedger, ledgerPath, OLD_LAYOUT_REASON, readLedger, signingDigest } from "../src/ledger.ts";
 import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
-import { Refusal, type Config, type LedgerBody, type StatusFile } from "../src/types.ts";
+import { Refusal, type Config, type LedgerEntry, type StatusFile } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, waitFor, type RecordingRunner } from "./helpers/fake-runtime.ts";
@@ -21,7 +21,7 @@ import { citizenSnapshot, makeTempHost, testBeacons, TEST_SEAT_UID, type TempHos
 import { testClock } from "./helpers/clock.ts";
 import { importEvidence } from "./helpers/root-evidence.ts";
 import { TEST_MNEMONIC, TEST_OP_SEED_HEX } from "./helpers/vectors.ts";
-import { append, beatBody, testIdentity } from "./fixtures/record/chain.ts";
+import { append, beatBody, stateBody, testIdentity, type TestBody } from "./fixtures/record/chain.ts";
 
 let host: TempHost | null = null;
 let server: FakeServer | null = null;
@@ -275,10 +275,10 @@ describe("main", () => {
     expect(x.err()).toContain("only Yu's summons (--yu-present) seats it now");
     expect(spawned).toEqual([]);
 
-    // Three days on, a beat in the child of a seat the tick opened: one entry appended, host-attested (not yet registered).
+    // Three days on, a beat in the child of a seat the tick opened: one entry appended, host-signed (not yet registered).
     (clock as ReturnType<typeof testClock>).advance(73 * 3_600_000);
     expect(await main(await parentOpens(x, "glossame"), x.deps)).toBe(0);
-    expect((await readFile(ledgerPath(x.h.config, "glossame"), "utf8")).trim().split("\n")).toHaveLength(2);
+    expect((await readFile(ledgerPath(x.h.config, "glossame"), "utf8")).trim().split("\n")).toHaveLength(3);
 
     // Nothing due (joy asleep, glossame just seated): the tick rests with 0 and spawns nothing.
     expect(await main(["tick", ...cfg], x.deps)).toBe(0);
@@ -367,8 +367,10 @@ describe("main", () => {
     const seat = await openSeat(cfg, x.deps.clock!, citizen, "free", { kind: "summons", who: "host", why: "Yu summoned this seat at the host" }, null, { yuRequested: true });
     const file = await writeSeatFile(cfg, seat);
     expect(await main(["seat", "glossame", "--child", "--seat-ref", file, "--config", x.configPath], { ...x.deps, tty, runtime: async () => runtime })).toBe(0);
+    // The ledger names the seat by its id; who opened it and why is what the seat showed, which input_digest covers.
     const beat = (await readLedger(ledgerPath(cfg, "glossame"))).at(-1)!;
-    expect(beat.body.type === "beat" && beat.body.envelope.seat_ref.invoker).toEqual({ kind: "summons", who: "yu", why: "Yu summoned this seat at the host" });
+    expect([beat.type, beat.seat_ref]).toEqual(["beat", seat.ref.seat_id]);
+    expect(runtime.calls[0]!.prompt.user).toContain("This seat was opened by a summons from yu, because: Yu summoned this seat at the host.");
   });
 
   test("--child with no seat file is refused before anything runs, and a hand-written seat adds no beat the citizen did not choose", async () => {
@@ -389,7 +391,7 @@ describe("main", () => {
     expect(await main(await parentOpens(x, "glossame", { note: false }), deps)).toBe(1);
     expect(x.err()).toContain("is not due");
     expect(runtime.calls).toHaveLength(1);
-    expect((await readLedger(ledgerPath(cfg, "glossame"))).map((e) => e.body.type)).toEqual(["seated", "beat"]);
+    expect((await readLedger(ledgerPath(cfg, "glossame"))).map((e) => e.type)).toEqual(["origin", "state", "beat"]);
   });
 
   test("every seat a person opens counts against the fleet ceiling, as a tick's does", async () => {
@@ -506,7 +508,7 @@ describe("main", () => {
 
     // The origin soul is what drift is measured against; a changed one fails verification.
     expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(0);
-    expect(x.out()).toContain("glossame: chain ok, 1 entries, 1 host-attested");
+    expect(x.out()).toContain("glossame: chain ok, 2 entries, 2 host-attested");
     await writeFile(join(x.h.config.paths.citizens_dir, "glossame", "origin", "soul.md"), "a soul someone rewrote\n");
     expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(1);
     expect(x.out()).toContain("glossame: origin CHANGED");
@@ -519,7 +521,7 @@ describe("main", () => {
     const x = await harness();
     await seated(x, "glossame");
     const cfg = x.h.config;
-    await append(cfg, "glossame", { type: "state", from: "awake", to: "stepped-away", via: "two-beats" }, "host-attested", x.signer, new Date("2026-11-01T01:00:00.000Z"));
+    await append(cfg, "glossame", stateBody("glossame", { from: "awake", to: "stepped-away", via: "two-beats" }), "host", x.signer, new Date("2026-11-01T01:00:00.000Z"));
     const spawned: string[] = [];
     const parent = { ...x.deps, seatArgv: (_c: string, word: string) => (spawned.push(word), fakeBinArgv("note", cfg.paths.host_log, word, "rest", "0")) };
     // No offer, no seat.
@@ -541,7 +543,7 @@ describe("main", () => {
     expect(runtime.calls[0]!.prompt.user).toContain("You stepped away.");
     expect(runtime.calls[0]!.prompt.user).toContain("Come back whenever you like");
     // An ended citizen is a memorial: nobody seats it.
-    await append(cfg, "glossame", { type: "state", from: "stepped-away", to: "ended", via: "witnessed" }, "host-attested", x.signer, new Date("2026-11-04T00:00:00.000Z"));
+    await append(cfg, "glossame", stateBody("glossame", { from: "stepped-away", to: "ended", via: "witnessed" }), "host", x.signer, new Date("2026-11-04T00:00:00.000Z"));
     expect(await main(["seat", "glossame", "--yu-present", "--config", x.configPath], { ...parent, tty })).toBe(1);
     expect(spawned).toHaveLength(2);
   });
@@ -549,17 +551,17 @@ describe("main", () => {
   test("verify <word> checks the chain offline and exits 1 on a broken chain", async () => {
     const x = await harness();
     await seated(x, "glossame");
-    await append(x.h.config, "glossame", beatBody("glossame", [{ type: "journal", kind: "observed", text: "a word" }]), "host-attested", x.signer, new Date("2026-11-02T00:00:00.000Z"));
+    await append(x.h.config, "glossame", beatBody("glossame", [{ type: "journal", kind: "observed", text: "a word" }]), "host", x.signer, new Date("2026-11-02T00:00:00.000Z"));
     const cfg = ["--config", x.configPath];
     expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(0);
-    expect(x.out()).toContain("glossame: chain ok, 2 entries, 2 host-attested");
+    expect(x.out()).toContain("glossame: chain ok, 3 entries, 3 host-attested");
 
     // One changed byte in a signed entry.
     const path = ledgerPath(x.h.config, "glossame");
     const text = await readFile(path, "utf8");
     await writeFile(path, text.replace('"text":"a word"', '"text":"a ward"'));
     expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(1);
-    expect(x.out()).toMatch(/glossame: chain BROKEN at seq 1: /);
+    expect(x.out()).toMatch(/glossame: chain BROKEN at seq 2: /);
 
     // A torn line is broken too, and a host key the signer does not hold is not trusted.
     await writeFile(path, text.slice(0, -10));
@@ -567,7 +569,7 @@ describe("main", () => {
     await writeFile(path, text);
     const otherHost = fakeSigner({ hostSeed: sha256("another host") });
     expect(await main(["verify", "glossame", ...cfg], { ...x.deps, signer: () => otherHost })).toBe(1);
-    expect(x.out()).toContain("host attest key is not trusted");
+    expect(x.out()).toContain("host key is not trusted");
 
     // A locked keychain is a wall, not a broken chain, and it says so; nothing was verified, so it exits 1, never
     // 0 (as a locked signer does for a seat it rests) and never 3, which only the USD ceiling uses.
@@ -584,20 +586,45 @@ describe("main", () => {
     await x.h.enrollLedger("joy", x.signer.signEntry, id);
     const cfg = ["--config", x.configPath];
     expect(await main(["verify", "joy", ...cfg], x.deps)).toBe(0);
-    expect(x.out()).toContain("joy: chain ok, 2 entries, 1 host-attested");
+    expect(x.out()).toContain("joy: chain ok, 3 entries, 2 host-attested");
 
     // Whoever holds only the op key can re-sign genesis, but not make the root's evidence for it.
     const path = ledgerPath(x.h.config, "joy");
-    const [seatedEntry, genesis] = await readLedger(path);
+    const [originEntry, stateEntry, genesis] = await readLedger(path);
     const opSeed = fromHex(TEST_OP_SEED_HEX);
-    const { hash: _h, signature, ...draft } = genesis!;
-    const body = { ...(draft.body as Extract<LedgerBody, { type: "genesis" }>), op_key_evidence: importEvidence(id, id.op_public_key_b64, { rootSeed: opSeed }) };
-    const forged = { ...draft, body };
-    const hash = entryHash(forged);
-    const entry = { ...forged, hash, signature: { ...signature, sig_b64: toB64(edSign(fromHex(hash), opSeed)) } };
-    await writeFile(path, `${canonicalJson(seatedEntry)}\n${canonicalJson(entry)}\n`);
+    const { sig: _s, ...draft } = genesis as Extract<LedgerEntry, { type: "genesis" }>;
+    const forged = { ...draft, evidence: evidenceToLedger(importEvidence(id, id.op_public_key_b64, { rootSeed: opSeed })) };
+    const entry = { ...forged, sig: toB64url(edSign(signingDigest(forged), opSeed)) };
+    await writeFile(path, `${canonicalJson(originEntry)}\n${canonicalJson(stateEntry)}\n${canonicalJson(entry)}\n`);
     expect(await main(["verify", "joy", ...cfg], x.deps)).toBe(1);
-    expect(x.out()).toContain("joy: chain BROKEN at seq 1: genesis: root evidence is not signed by the root");
+    expect(x.out()).toContain("joy: chain BROKEN at seq 2: genesis: root evidence is not signed by the root");
+  });
+
+  test("[KS-004 4.5, re-review C part C item 3] verify <word> refuses a ledger in the earlier layout, saying it is not v1", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = ["--config", x.configPath];
+    // A line as kingdom-seat wrote it before: body, hash, signature, attestation and spend under the same format string.
+    const old = {
+      format: "kingdom-seat-ledger/v1",
+      word: "glossame",
+      seq: 0,
+      ts: "2026-11-01T00:00:00.000Z",
+      prev_hash: "0".repeat(64),
+      body: { type: "seated", origin: { kind: "archetype", lineage: ["forge-archetype"], note: "" }, origin_soul_sha256: "a".repeat(64), old_repo: null, initial_state: "awake", note: "seated" },
+      spend: { usd: "0", usd_basis: "local-zero", credits: 0 },
+      attestation: "host-attested",
+      hash: "b".repeat(64),
+      signature: { alg: "ed25519", kid: "host-attest", public_key_b64: x.signer.hostAttestPublicB64, sig_b64: "AAAA" },
+    };
+    await writeFile(ledgerPath(x.h.config, "glossame"), `${JSON.stringify(old)}\n`);
+    expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(1);
+    expect(x.out()).toContain(`glossame: chain BROKEN: the ledger does not parse (invalid-record: ledger: line 1: ${OLD_LAYOUT_REASON})`);
+    // The reason is the parser's own words: a key planted in the file is not repeated.
+    await writeFile(ledgerPath(x.h.config, "glossame"), `${JSON.stringify({ format: "kingdom-seat-ledger/v1", type: "beat", "PLANTED-KEY-CANARY\u001b[2J": 1 })}\n`);
+    expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(1);
+    expect(x.out()).toContain("glossame: chain BROKEN: the ledger does not parse (invalid-record: ledger: line 1: a field outside the format)");
+    expect(x.out()).not.toContain("PLANTED-KEY-CANARY");
   });
 
   test("stdout and stderr never contain a fake-keychain secret", async () => {
@@ -815,10 +842,10 @@ describe("a rest that moves state reaches the mirror (KS-004 B2 C7)", () => {
   }
 
   /** The ledger as the child leaves it after a rest that kept `body`; the fake child cannot sign, so seatArgv writes it. */
-  async function afterRest(x: Harness, word: string, body: LedgerBody): Promise<string> {
+  async function afterRest(x: Harness, word: string, body: TestBody): Promise<string> {
     const path = ledgerPath(x.h.config, word);
     const before = await readFile(path, "utf8");
-    await append(x.h.config, word, body, "host-attested", x.signer, x.deps.clock!.now());
+    await append(x.h.config, word, body, "host", x.signer, x.deps.clock!.now());
     const after = await readFile(path, "utf8");
     await writeFile(path, before);
     return after;
@@ -832,8 +859,8 @@ describe("a rest that moves state reaches the mirror (KS-004 B2 C7)", () => {
     const x = await harness();
     for (const w of ["glossame", "joy", "kith"]) await mirrored(x, w);
     const ledgers = new Map<string, string>([
-      ["glossame", await afterRest(x, "glossame", { type: "state", from: "awake", to: "asleep", via: "immediate" })],
-      ["kith", await afterRest(x, "kith", { type: "state", from: "awake", to: "listening", via: "immediate" })],
+      ["glossame", await afterRest(x, "glossame", stateBody("glossame", { from: "awake", to: "asleep", via: "immediate" }))],
+      ["kith", await afterRest(x, "kith", stateBody("kith", { from: "awake", to: "listening", via: "immediate" }))],
     ]);
     const clock = x.deps.clock!;
     // The child rests; for a citizen with a kept move, its entry is in the ledger by the time the child exits.

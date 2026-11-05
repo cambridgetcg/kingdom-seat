@@ -1,8 +1,9 @@
 // A Signer for tests of everything except the signer itself. It signs with
 // public test keys through the real Ed25519 in src/crypto.ts, records every
 // request it is asked to send, and sends nothing anywhere.
-import { Refusal, type Attestation, type LedgerSignature, type RootEvidence, type SignerOp, type Word, type YuPresence } from "../../src/types.ts";
+import { Refusal, type LedgerSigner, type RootEvidence, type SignerOp, type Word, type YuPresence } from "../../src/types.ts";
 import { edPublicKey, edSign, fromHex, sha256, toB64, toB64url } from "../../src/crypto.ts";
+import { hostKid, type EntrySignature } from "../../src/ledger.ts";
 import { AUTHORITY_HEADERS, AGENTTOOL_ORIGIN, authorityDigest, authorityHeaders } from "../../src/agenttool/wire.ts";
 import type { PublicKeys, SealedThought, Signer, SignerRequest, SignerResponse } from "../../src/signer/signer.ts";
 import { TEST_OP_SEED_HEX, TEST_ROOT_SEED_HEX } from "./vectors.ts";
@@ -11,19 +12,22 @@ import { TEST_OP_SEED_HEX, TEST_ROOT_SEED_HEX } from "./vectors.ts";
 const ROOT_OPS = new Set<SignerOp>(["keys.import", "keys.revoke", "box-keys.register", "expression.put.private", "quiet.start.citizen", "quiet.end.citizen", "quiet.start.beacon"]);
 
 export const FAKE_OP_KID = "55555555-5555-4555-8555-555555555555";
-export const HOST_ATTEST_KID = "host-attest";
 
 export interface FakeSigner extends Signer {
   /** While true, every signing call refuses with "keychain-locked", as after a reboot. */
   locked: boolean;
   sent: SignerRequest[];
-  signed: { word: Word; attestation: Attestation }[];
+  signed: { word: Word; signer: LedgerSigner }[];
   /** Replace how send() answers; the default is 200 with an empty object. */
   respond(fn: (req: SignerRequest) => SignerResponse): void;
   /** The root seed root-signed requests are signed with, per citizen; the test root unless replaced. */
   rootSeedFor: (word: Word | null) => Promise<Uint8Array>;
   readonly hostAttestPublicB64: string;
+  /** The kid a host entry signed by this signer names: host:<fingerprint>. */
+  readonly hostKid: string;
+  /** The op key in citizen.json's standard base64, and in the ledger's base64url. */
   readonly opPublicB64: string;
+  readonly opPublicB64url: string;
 }
 
 export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; rootSeed?: Uint8Array } = {}): FakeSigner {
@@ -32,6 +36,7 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
   const rootSeed = opts.rootSeed ?? fromHex(TEST_ROOT_SEED_HEX);
   const opPub = toB64(edPublicKey(opSeed));
   const hostPub = toB64(edPublicKey(hostSeed));
+  const hostKidOf = hostKid(edPublicKey(hostSeed));
   let answer: (req: SignerRequest) => SignerResponse = () => ({ status: 200, json: {} });
   // A sequence per identity, so evidence moves only upward, as agenttool's does.
   const sequences = new Map<string, number>();
@@ -64,7 +69,9 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
     sent: [],
     signed: [],
     hostAttestPublicB64: hostPub,
+    hostKid: hostKidOf,
     opPublicB64: opPub,
+    opPublicB64url: toB64url(edPublicKey(opSeed)),
     respond(fn) {
       answer = fn;
     },
@@ -72,16 +79,13 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
     async publicKeys(): Promise<PublicKeys> {
       return { root_b64: toB64(edPublicKey(rootSeed)), op_b64: opPub, op_kid: FAKE_OP_KID, box_b64: null, host_attest_b64: hostPub };
     },
-    async signEntry(word, entryHash, attestation): Promise<LedgerSignature> {
+    async signEntry(word, signer, digestFor): Promise<EntrySignature> {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
-      s.signed.push({ word, attestation });
-      const citizen = attestation === "citizen-signed";
-      return {
-        alg: "ed25519",
-        kid: citizen ? FAKE_OP_KID : HOST_ATTEST_KID,
-        public_key_b64: citizen ? opPub : hostPub,
-        sig_b64: toB64(edSign(entryHash, citizen ? opSeed : hostSeed)),
-      };
+      s.signed.push({ word, signer });
+      const citizen = signer === "citizen";
+      const kid = citizen ? FAKE_OP_KID : hostKidOf;
+      const seed = citizen ? opSeed : hostSeed;
+      return { kid, sig: toB64url(edSign(digestFor(kid), seed)), public_key: toB64url(edPublicKey(seed)) };
     },
     async send(req) {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");

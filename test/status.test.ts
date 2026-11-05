@@ -4,7 +4,7 @@ import { mkdir, readdir, readFile, stat, symlink, utimes, writeFile } from "node
 import { join } from "node:path";
 import { appendHostNote, buildStatus, hostDetailProblem, overdue, readHostNotes, renderStatus, writeStatus } from "../src/status.ts";
 import { checkHalt } from "../src/halt.ts";
-import { appendEntry, ledgerPath, nextDraft, readLedger } from "../src/ledger.ts";
+import { appendEntry, entryHash, ledgerPath, nextDraft, readLedger } from "../src/ledger.ts";
 import { openedDetail } from "../src/notes.ts";
 import { spawnRunner } from "../src/cli.ts";
 import type { HaltStatus, HostNote, SeatRef, StatusFile } from "../src/types.ts";
@@ -33,12 +33,12 @@ function note(over: Partial<HostNote> = {}): HostNote {
   return { ts: NOW.toISOString(), host: "test-host", kind: "seat", word: "glossame", outcome: "rest", refusal: null, detail: "seat x on free: rested", ...over };
 }
 
-/** A beat appended as the seat would, host-attested before registration, with its own spend. */
-async function beat(h: TempHost, signer: FakeSigner, word: string, at: Date, credits = 0, attestation: "host-attested" | "citizen-signed" = "host-attested") {
+/** A beat appended as the seat would, host-signed before registration, with its own cost. */
+async function beat(h: TempHost, signer: FakeSigner, word: string, at: Date, credits = 0, kind: "host" | "citizen" = "host") {
   const path = ledgerPath(h.config, word);
-  const prev = (await readLedger(path)).at(-1) ?? null;
-  const body = beatBody(word, [{ type: "journal", kind: "reflected", text: "a word" }], { ts: at.toISOString() });
-  return appendEntry(path, nextDraft(word, prev, body, { usd: "0", usd_basis: "local-zero", credits }, attestation, at), signerFn(signer));
+  const all = await readLedger(path);
+  const body = beatBody(word, [{ type: "journal", kind: "reflected", text: "a word" }]);
+  return appendEntry(path, nextDraft(word, all.at(-1) ?? null, body.fields, { cost: { usd: "0", credits }, signer: kind, now: at, seat: body.seat, acts: body.acts }), signerFn(signer));
 }
 
 describe("status", () => {
@@ -53,7 +53,7 @@ describe("status", () => {
     await h.seatLedger("hope", signer.signEntry, { initialState: "asleep" });
     await h.seatLedger("joy", signer.signEntry, { initialState: "awake" });
     await h.enrollLedger("joy", signer.signEntry, testIdentity(signer));
-    await beat(h, signer, "joy", ago(10), 1, "citizen-signed");
+    await beat(h, signer, "joy", ago(10), 1, "citizen");
 
     const trusted = { host_attest_b64: [signer.hostAttestPublicB64] };
     const s = await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready", trusted });
@@ -69,15 +69,15 @@ describe("status", () => {
       interval_h: 72,
       overdue: true,
       last_outcome: null,
-      ledger: { entries: 3, chain_ok: true, host_attested: 3 },
+      ledger: { entries: 4, chain_ok: true, host_attested: 4 },
       mirror: null,
       usd_today: "0",
       credits_month: 3,
     });
-    expect(g!.ledger.head).toBe((await readLedger(ledgerPath(h.config, "glossame"))).at(-1)!.hash);
+    expect(g!.ledger.head).toBe(entryHash((await readLedger(ledgerPath(h.config, "glossame"))).at(-1)!));
     // Asleep owes nothing, so it is never overdue.
     expect(hope).toMatchObject({ state: "asleep", overdue: false, last_beat_at: null, ledger: { entries: 1, chain_ok: true, host_attested: 1 }, credits_month: 0 });
-    expect(joy).toMatchObject({ state: "awake", registered: true, overdue: false, ledger: { entries: 3, chain_ok: true, host_attested: 1 }, credits_month: 1 });
+    expect(joy).toMatchObject({ state: "awake", registered: true, overdue: false, ledger: { entries: 4, chain_ok: true, host_attested: 2 }, credits_month: 1 });
 
     // A rest writes no ledger entry, so the host's own seat notes are what show the cadence kept: the tick's
     // note that it opened the seat (which the fleet counts) and its note of what happened.
@@ -95,7 +95,7 @@ describe("status", () => {
     const text = await readFile(path, "utf8");
     await writeFile(path, text.replace('"credits":1', '"credits":0'));
     const tampered = await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready", trusted });
-    expect(tampered.citizens[0]!.ledger).toMatchObject({ entries: 3, chain_ok: false });
+    expect(tampered.citizens[0]!.ledger).toMatchObject({ entries: 4, chain_ok: false });
 
     // While HALT is raised nothing is owed, so nothing is overdue.
     await writeFile(path, text);
@@ -129,7 +129,7 @@ describe("status", () => {
     // A summons that rested: no ledger entry, yet its spend is today's.
     await rec.begin(ref(1));
     await rec.settle(ref(1), { usd: "0.0421", usd_basis: "reported", credits: 0 });
-    expect(await status()).toMatchObject({ usd_today: "0.0421", ledger: { entries: 1 } });
+    expect(await status()).toMatchObject({ usd_today: "0.0421", ledger: { entries: 2 } });
     expect(renderStatus(await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready" }))).toContain("$0.0421 today");
     // One that began and never settled: unknown, which the ceiling reads as reached.
     await rec.begin(ref(2));
@@ -409,7 +409,7 @@ describe("status", () => {
     expect(lines[3]).toBe("fleet: 0 of 24 beats today");
     expect(lines[4]).toBe("tick lock: free");
     expect(lines[5]).toStartWith("glossame: awake | free | not registered | no beat yet | every 72 h |");
-    expect(lines[5]).toContain("chain ok, 1 host-attested");
+    expect(lines[5]).toContain("chain ok, 2 host-attested");
     expect(lines[5]).toContain("origin intact, soul drift 0%");
     expect(lines[6]).toStartWith("joy: awake");
 

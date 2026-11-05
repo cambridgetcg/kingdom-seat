@@ -177,7 +177,7 @@ export function seatLimits(config: Config): SeatLimits {
   const c = config.ceilings;
   return {
     journal_max_chars: Math.min(c.journal_max_chars, ACT_LIMITS.max_journal_chars),
-    letter_max_chars: Math.min(c.letter_max_chars, ACT_LIMITS.max_body_chars),
+    letter_max_chars: Math.min(c.letter_max_chars, ACT_LIMITS.max_text_chars),
     letter_sends_per_beat: Math.min(c.letter_sends_per_beat, 1),
     min_beat_interval_h: c.min_beat_interval_h,
   };
@@ -236,6 +236,7 @@ export async function buildContext(
     recent: k === 0 ? [] : own.slice(-k),
     state: citizen.state,
     pending_state: citizen.pending_state,
+    pending_interval_h: citizen.pending_interval_h,
     pending_proposals: pending.filter((p) => p.word === citizen.word && p.status === "pending"),
     versions,
     self_authorship: opts.selfAuthorship ?? { runtime_approved: null, window_opens_at: null, yu_present: false },

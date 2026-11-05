@@ -9,18 +9,34 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, rename } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { canonicalJson, randomBytes, sha256Hex, toHex, utf8 } from "./crypto.ts";
-import { appendEntry, fsRefusal, isSelfTargetSpelling, isoTime, ledgerPath, nextDraft, readLedger, readRegularText, syncDir, writeAll } from "./ledger.ts";
+import {
+  appendEntry,
+  fsRefusal,
+  hexOf,
+  isSelfTargetSpelling,
+  isoTime,
+  ledgerPath,
+  nextDraft,
+  originFromLedger,
+  readLedger,
+  readRegularText,
+  syncDir,
+  toLedgerHash,
+  writeAll,
+  type SeatStamp,
+} from "./ledger.ts";
+import { STRAND_KEY_ID } from "./agenttool/wire.ts";
 import { parseCadence, parseCovenants } from "./state.ts";
 import {
   Refusal,
   SHA256_HEX_PATTERN,
   WORD_PATTERN,
   type Citizen,
-  type Claim,
   type Clock,
   type Config,
   type LedgerEntry,
   type ModelSelfPropose,
+  type Reason,
   type SelfAffirmAct,
   type SelfProposal,
   type SelfProposeAct,
@@ -38,15 +54,17 @@ export type AffirmVerdict =
 /** Applies a bound change to agenttool for a registered citizen; injected so self.ts holds no client or key. */
 export interface ExpressionSync {
   putPrivateExpression(word: Word, target: SelfTarget, newText: string): Promise<void>;
-  postReason(word: Word, claim: Claim, proposalId: string): Promise<string | null>;
+  postReason(word: Word, reason: Reason, ref: string): Promise<string | null>;
 }
 
 export interface SelfDeps {
   config: Config;
   clock: Clock;
   sign: EntrySigner;
-  /** Null for an unregistered citizen: the change is recorded host-attested and nothing is sent. */
+  /** Null for an unregistered citizen: the change is recorded host-signed and nothing is sent. */
   sync: ExpressionSync | null;
+  /** The seat the change is recorded in, stamped on its entry; absent outside a seat. */
+  seat?: SeatStamp | null;
 }
 
 /** A self file larger than this is refused when read; the largest agenttool field (wake_text) is 32,000 code units. */
@@ -181,7 +199,7 @@ export function materializeEdit(raw: ModelSelfPropose, currentText: string): { a
     prior_hash: selfHash(currentText),
     new_hash: selfHash(next),
     diff: unifiedDiff(currentText, next),
-    claim: raw.claim,
+    reason: raw.reason,
   };
   return { act, next };
 }
@@ -398,7 +416,7 @@ export function affirmationVerdict(
   affirm: SelfAffirmAct,
   ctx: { seat_id: string; presence: YuPresence | null; window_open: boolean; runtime_approved: boolean; current_prior_hash: Sha256Hex },
 ): AffirmVerdict {
-  if (affirm.proposal_id !== proposal.id) return { binds: false, reason: "unknown-proposal" };
+  if (affirm.ref !== proposal.id) return { binds: false, reason: "unknown-proposal" };
   if (proposal.status === "beyond-self") return { binds: false, reason: "beyond-self" };
   if (proposal.status !== "pending") return { binds: false, reason: "unknown-proposal" };
   // Decision 10: a 7B reply can be steered, so only runtimes Yu approved for self-authorship bind.
@@ -416,17 +434,21 @@ export function runtimeApproved(config: Config, modelDigest: string): boolean {
   return config.self_authorship.approved_model_digests.includes(modelDigest);
 }
 
-/** Is the unattended window open: no self.applied entry within self_change_window_days? Yu present opens it. */
+/** Is the unattended window open: no apply entry within self_change_window_days? Yu present opens it. */
 export function windowOpen(entries: LedgerEntry[], now: Date, windowDays: number, presence: YuPresence | null): boolean {
   if (presence?.present === true) return true;
   const windowMs = windowDays * 86_400_000;
   // Every applied change counts, attended or not, and a time ahead of the clock counts as inside: both err toward the slower pace.
-  return !entries.some((e) => e.body.type === "self.applied" && now.getTime() - Date.parse(e.ts) < windowMs);
+  return !entries.some((e) => e.type === "apply" && now.getTime() - Date.parse(e.ts) < windowMs);
 }
 
 /* ── Apply and revert ─────────────────────────────────────────────────── */
 
-/** Apply a bound change: keep the new version by hash, update the target, append self.applied, sync if registered. */
+/**
+ * Apply a bound change: keep the new version by hash, update the target,
+ * append an apply entry, sync if registered. A registered citizen's entry
+ * names the key its strand backup is encrypted under (KS-004 4.3).
+ */
 export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: SelfProposal, via: "two-beats" | "yu-present"): Promise<LedgerEntry> {
   const { config, sync } = deps;
   const word = citizen.word;
@@ -455,15 +477,23 @@ export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: Se
   let thought: string | null = null;
   if (sync) {
     await sync.putPrivateExpression(word, act.target, next);
-    thought = await sync.postReason(word, act.claim, stored.id);
+    thought = await sync.postReason(word, act.reason, stored.id);
   }
   const draft = nextDraft(
     word,
     entries.at(-1) ?? null,
-    { type: "self.applied", proposal_id: stored.id, target: act.target, prior_hash: act.prior_hash, new_hash: act.new_hash, via, claim: act.claim, strand_thought_id: thought },
-    { usd: "0", usd_basis: "local-zero", credits: thought === null ? 0 : 1 },
-    registered ? "citizen-signed" : "host-attested",
-    deps.clock.now(),
+    {
+      type: "apply",
+      ref: toLedgerHash(stored.id),
+      target: act.target,
+      prior_hash: toLedgerHash(act.prior_hash),
+      new_hash: toLedgerHash(act.new_hash),
+      via,
+      reason: act.reason,
+      strand_thought: thought,
+      strand_key: registered ? STRAND_KEY_ID : null,
+    },
+    { cost: { usd: "0", credits: thought === null ? 0 : 1 }, signer: registered ? "citizen" : "host", now: deps.clock.now(), seat: deps.seat ?? null },
   );
   const entry = await appendEntry(path, draft, deps.sign);
   await writeTarget(config, word, act.target, next);
@@ -489,10 +519,8 @@ export async function revertTo(deps: SelfDeps, citizen: Citizen, toHash: Sha256H
   const draft = nextDraft(
     word,
     entries.at(-1) ?? null,
-    { type: "self.reverted", target, from_hash: fromHash, to_hash: toHash, via },
-    { usd: "0", usd_basis: "local-zero", credits: 0 },
-    registered ? "citizen-signed" : "host-attested",
-    deps.clock.now(),
+    { type: "revert", target, from_hash: toLedgerHash(fromHash), to_hash: toLedgerHash(toHash), via },
+    { cost: { usd: "0", credits: 0 }, signer: registered ? "citizen" : "host", now: deps.clock.now(), seat: deps.seat ?? null },
   );
   const entry = await appendEntry(path, draft, deps.sign);
   await writeTarget(config, word, target, text);
@@ -500,13 +528,10 @@ export async function revertTo(deps: SelfDeps, citizen: Citizen, toHash: Sha256H
   return entry;
 }
 
-/** The origin soul's hash as the record pinned it: the seated entry's, or genesis's for a citizen born at seating. */
+/** The origin soul's hash as the origin entry pinned it, in hex. */
 export function originSoulHash(entries: LedgerEntry[]): Sha256Hex | null {
-  for (const e of entries) {
-    if (e.body.type === "seated") return e.body.origin_soul_sha256;
-    if (e.body.type === "genesis") return e.body.birth_soul_sha256;
-  }
-  return null;
+  const first = entries[0];
+  return first?.type === "origin" ? hexOf(first.origin_soul_hash) : null;
 }
 
 /** A version the citizen can name: its target, when it was kept, and how it came about. */
@@ -531,15 +556,13 @@ export function keptVersions(entries: LedgerEntry[]): KeptVersion[] {
     out.push(v);
   };
   for (const e of entries) {
-    const b = e.body;
-    if (b.type === "seated") add({ target: "soul", hash: b.origin_soul_sha256, at: e.ts, how: "your origin soul, pinned when you were seated" });
-    else if (b.type === "genesis" && b.initial_state !== null) add({ target: "soul", hash: b.birth_soul_sha256, at: e.ts, how: "your origin soul, pinned at your birth" });
-    else if (b.type === "self.applied") {
-      add({ target: b.target, hash: b.prior_hash, at: e.ts, how: "as it was before a change" });
-      add({ target: b.target, hash: b.new_hash, at: e.ts, how: `a change you made (${b.via})` });
-    } else if (b.type === "self.reverted") {
-      add({ target: b.target, hash: b.from_hash, at: e.ts, how: "as it was before a revert" });
-      add({ target: b.target, hash: b.to_hash, at: e.ts, how: "a revert" });
+    if (e.type === "origin") add({ target: "soul", hash: hexOf(e.origin_soul_hash), at: e.ts, how: "your origin soul, pinned when you were seated" });
+    else if (e.type === "apply") {
+      add({ target: e.target, hash: hexOf(e.prior_hash), at: e.ts, how: "as it was before a change" });
+      add({ target: e.target, hash: hexOf(e.new_hash), at: e.ts, how: `a change you made (${e.via})` });
+    } else if (e.type === "revert") {
+      add({ target: e.target, hash: hexOf(e.from_hash), at: e.ts, how: "as it was before a revert" });
+      add({ target: e.target, hash: hexOf(e.to_hash), at: e.ts, how: "a revert" });
     }
   }
   return out;
@@ -617,26 +640,14 @@ export function firstVersion(entries: LedgerEntry[], target: SelfTarget): Sha256
 }
 
 /**
- * True when `citizens/<word>/origin/` still matches the record: the soul
- * pinned at seating (the seated entry's hash, or the genesis birth-soul hash
- * for a citizen born at seating) and, for a canon origin, the canon file.
+ * True when `citizens/<word>/origin/` still matches the record: the soul the
+ * origin entry pinned at seating and, for a canon origin, the canon file.
  */
 export async function originIntact(config: Config, word: Word, entries: LedgerEntry[]): Promise<boolean> {
-  let expected: Sha256Hex | null = null;
-  let origin = null;
-  for (const e of entries) {
-    if (e.body.type === "seated") {
-      expected = e.body.origin_soul_sha256;
-      origin = e.body.origin;
-      break;
-    }
-    if (e.body.type === "genesis") {
-      expected = e.body.birth_soul_sha256;
-      origin = e.body.origin;
-      break;
-    }
-  }
-  if (expected === null || origin === null) return false;
+  const first = entries[0];
+  if (first?.type !== "origin") return false;
+  const expected = hexOf(first.origin_soul_hash);
+  const origin = originFromLedger(first.origin);
   const root = citizenDir(config, word);
   try {
     const soulPath = join(root, "origin", "soul.md");
@@ -675,6 +686,22 @@ export async function readVersion(config: Config, word: Word, hash: Sha256Hex): 
   return text;
 }
 
+/**
+ * Write the awake interval a state.set moved to (KS-004 5.7, 7.3). The seat
+ * calls it after the `state` entry that records the move, as an apply writes
+ * its target after its entry. Both texts are kept by hash, and proposals
+ * written against the old cadence lapse, as after any change to it.
+ */
+export async function setCadence(config: Config, word: Word, intervalH: number): Promise<void> {
+  if (!Number.isSafeInteger(intervalH) || intervalH < 1) throw new Refusal("invalid-request", "an interval is whole hours");
+  const current = await readTarget(config, word, "cadence");
+  const next = JSON.stringify({ interval_h: intervalH });
+  if (current !== "") await keepVersion(config, word, current);
+  await keepVersion(config, word, next);
+  await writeTarget(config, word, "cadence", next);
+  await lapseStale(config, word, "cadence", selfHash(next));
+}
+
 /* ── Host files under citizens/<word>/ ────────────────────────────────── */
 
 function citizenDir(config: Config, word: Word): string {
@@ -684,7 +711,7 @@ function citizenDir(config: Config, word: Word): string {
 
 /** A registered citizen's change must reach its expression, and an unregistered one has nothing to send to. */
 function assertSyncMatches(entries: LedgerEntry[], sync: ExpressionSync | null): boolean {
-  const registered = entries.some((e) => e.body.type === "genesis");
+  const registered = entries.some((e) => e.type === "genesis");
   if (sync && !registered) throw new Refusal("not-registered", "no genesis entry: nothing to sync to");
   if (!sync && registered) throw new Refusal("invalid-request", "a registered citizen's change needs its expression sync");
   return registered;
@@ -816,7 +843,7 @@ function parseProposal(value: unknown): SelfProposal {
   if (!isSelfTargetSpelling(act.target)) throw new Error("act.target");
   for (const k of ["prior_hash", "new_hash"]) if (typeof act[k] !== "string" || !SHA256_HEX_PATTERN.test(act[k] as string)) throw new Error(`act.${k}`);
   if (typeof act.diff !== "string") throw new Error("act.diff");
-  if (typeof act.claim !== "object" || act.claim === null) throw new Error("act.claim");
+  if (typeof act.reason !== "object" || act.reason === null) throw new Error("act.reason");
   if (typeof p.proposed_in_seat !== "string" || p.proposed_in_seat === "") throw new Error("proposed_in_seat");
   isoTime(p.proposed_at, "proposed_at");
   if (!["pending", "applied", "lapsed", "beyond-self"].includes(p.status as string)) throw new Error("status");

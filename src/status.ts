@@ -7,7 +7,7 @@ import { constants } from "node:fs";
 import { chmod, lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { NO_BEACONS_ID } from "./halt.ts";
-import { ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
+import { entryHash, ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
 import { countUnsigned, localDivergence } from "./mirror.ts";
 import { creditsFromLedger } from "./signer/ceilings.ts";
 import { readSpendRecord, usdToday, type SpendLine } from "./spend.ts";
@@ -227,9 +227,9 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     last_outcome: lastOutcome,
     ledger: {
       entries: entries?.length ?? 0,
-      head: entries?.at(-1)?.hash ?? null,
+      head: entries && entries.length > 0 ? entryHash(entries.at(-1)!) : null,
       chain_ok: chain?.ok ?? false,
-      host_attested: entries?.filter((e) => e.attestation === "host-attested").length ?? 0,
+      host_attested: entries?.filter((e) => e.signer === "host").length ?? 0,
     },
     mirror,
     usd_today: usd,

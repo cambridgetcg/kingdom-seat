@@ -265,7 +265,7 @@ export async function readAuthority(deps: ClientDeps, word: Word): Promise<{ seq
   return { sequence: s.sequence, next_sequence: s.next_sequence };
 }
 
-/** GET /v1/identities/:id/keys: the key rows, for verifying envelopes against the op key. */
+/** GET /v1/identities/:id/keys: the key rows, for checking ledger entries against the op key. */
 export async function listKeys(deps: ClientDeps, word: Word): Promise<KeyRow[]> {
   const what = "key list";
   const id = await citizen(deps, word);

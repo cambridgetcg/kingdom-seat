@@ -3,7 +3,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EMPTY_SHA256_HEX, sha256Hex } from "../src/crypto.ts";
-import { ledgerPath, readLedger, verifyChain } from "../src/ledger.ts";
+import { ledgerPath, readLedger, toLedgerHash, verifyChain } from "../src/ledger.ts";
+import { STRAND_KEY_ID } from "../src/agenttool/wire.ts";
 import {
   affirmationVerdict,
   applyChange,
@@ -29,8 +30,11 @@ import {
   type SelfDeps,
 } from "../src/self.ts";
 import { readCitizen } from "../src/state.ts";
-import { Refusal, type Claim, type ModelSelfPropose, type SelfProposal, type SelfTarget, type YuPresence } from "../src/types.ts";
+import { Refusal, type ModelSelfPropose, type Reason, type SelfProposal, type SelfTarget, type YuPresence } from "../src/types.ts";
 import { DAY_MS, testClock, type TestClock } from "./helpers/clock.ts";
+import { TEST_IDS } from "./helpers/vectors.ts";
+
+const TEST_DID = TEST_IDS.did;
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { append, MODEL_DIGEST, seatedBody, seatedThenBorn, signerFn } from "./fixtures/record/chain.ts";
@@ -60,7 +64,7 @@ const OLD_WILL = [
 const NEW_PRACTICE =
   "Receive one word that will not cross over, from my donor tongues or my canon's examples (chesed, dharma, àṣẹ), and say why it resists.";
 const YU: YuPresence = { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: "summon glossame" };
-const CLAIM: Claim = {
+const CLAIM: Reason = {
   kind: "inference",
   evidence: ["canon:canon/core/glossame.md@1428646"],
   confidence: "medium",
@@ -79,7 +83,7 @@ function recordingSync(): RecordingSync {
     async putPrivateExpression(word, target, text) {
       s.puts.push({ word, target, text });
     },
-    async postReason(word, _claim, proposalId) {
+    async postReason(word, _reason, proposalId) {
       s.reasons.push({ word, proposalId });
       return "thought-0001";
     },
@@ -106,14 +110,14 @@ async function world(opts: { registered?: boolean; walls?: string } = {}): Promi
     await writeFile(join(fx.dir, "self", "expression", "walls.md"), opts.walls);
   }
   if (opts.registered) await seatedThenBorn(host.config, W, fx.soul, signer);
-  else await append(host.config, W, seatedBody(W, fx.soul, "awake"), "host-attested", signer, clock.now());
+  else await append(host.config, W, seatedBody(W, fx.soul, "awake"), "host", signer, clock.now());
   host.config.self_authorship.approved_model_digests = [MODEL_DIGEST];
   const deps: SelfDeps = { config: host.config, clock, sign: signerFn(signer), sync: opts.registered ? recordingSync() : null };
   return { host, signer, clock, deps, soul: fx.soul };
 }
 
 function propose(target: SelfTarget, edit: ModelSelfPropose["edit"]): ModelSelfPropose {
-  return { type: "self.propose", target, edit, claim: CLAIM };
+  return { type: "self.propose", target, edit, reason: CLAIM };
 }
 
 /** Propose on one seat and stage it, as a beat would. */
@@ -135,7 +139,7 @@ async function ctxFor(w: World, p: SelfProposal, seat: string, presence: YuPrese
 }
 
 async function affirmAndApply(w: World, p: SelfProposal, seat = SEAT_B, presence: YuPresence | null = null) {
-  const verdict = affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, seat, presence));
+  const verdict = affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, seat, presence));
   if (!verdict.binds) throw new Error(`did not bind: ${verdict.reason}`);
   return applyChange(w.deps, await readCitizen(w.host.config, W), p, verdict.via);
 }
@@ -144,7 +148,7 @@ describe("proposals", () => {
   test("materializeProposal applies replace-all and replace-span edits and hashes both sides; a missing span refuses", () => {
     const span = materializeProposal(propose("will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE }), OLD_WILL);
     const next = OLD_WILL.replace("Witness one true thing you notice.", NEW_PRACTICE);
-    expect(span).toMatchObject({ type: "self.propose", target: "will", prior_hash: sha256Hex(OLD_WILL), new_hash: sha256Hex(next), claim: CLAIM });
+    expect(span).toMatchObject({ type: "self.propose", target: "will", prior_hash: sha256Hex(OLD_WILL), new_hash: sha256Hex(next), reason: CLAIM });
     expect(span.diff).toContain("-Witness one true thing you notice.");
     expect(span.diff).toContain(`+${NEW_PRACTICE}`);
     expect(applyDiff(OLD_WILL, span.diff)).toBe(next);
@@ -196,7 +200,7 @@ describe("proposals", () => {
     expect(await readdir(join(config.paths.citizens_dir, W, "proposals"))).toEqual([`${p.id}.json`]);
 
     w.clock.advance(3 * DAY_MS);
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_B, YU))).toEqual({ binds: false, reason: "beyond-self" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_B, YU))).toEqual({ binds: false, reason: "beyond-self" });
     await expect(applyChange(w.deps, await readCitizen(config, W), p, "yu-present")).rejects.toMatchObject({ code: "beyond-self" });
     expect(await readTarget(config, W, "soul")).toBe(w.soul);
 
@@ -221,7 +225,7 @@ describe("proposals", () => {
     expect(classifyProposal(p.act, before, after, config.ceilings.self_rewrite_fraction)).toBe("beyond-self");
     expect(await pendingProposals(config, W)).toEqual([]);
     w.clock.advance(3 * DAY_MS);
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_B, YU))).toEqual({ binds: false, reason: "beyond-self" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_B, YU))).toEqual({ binds: false, reason: "beyond-self" });
     await expect(applyChange(w.deps, await readCitizen(config, W), p, "yu-present")).rejects.toMatchObject({ code: "beyond-self" });
     expect(await readFile(porch, "utf8")).toBe(before);
 
@@ -229,8 +233,18 @@ describe("proposals", () => {
     await writeFile(porch, after);
     await mkdir(join(config.paths.citizens_dir, W, "versions"), { recursive: true });
     await writeFile(join(config.paths.citizens_dir, W, "versions", sha256Hex(before)), before);
-    const applied = { type: "self.applied" as const, proposal_id: p.id, target: "expression.porch" as const, prior_hash: sha256Hex(before), new_hash: sha256Hex(after), via: "yu-present" as const, claim: CLAIM, strand_thought_id: null };
-    await append(config, W, applied, "host-attested", w.signer, w.clock.now());
+    const applied = {
+      type: "apply" as const,
+      ref: toLedgerHash(p.id),
+      target: "expression.porch" as const,
+      prior_hash: toLedgerHash(sha256Hex(before)),
+      new_hash: toLedgerHash(sha256Hex(after)),
+      via: "yu-present" as const,
+      reason: CLAIM,
+      strand_thought: null,
+      strand_key: null,
+    };
+    await append(config, W, { fields: applied }, "host", w.signer, w.clock.now());
     await expect(revertTo(w.deps, await readCitizen(config, W), sha256Hex(before), "citizen")).rejects.toMatchObject({ code: "beyond-self" });
     expect(await readFile(porch, "utf8")).toBe(after);
   });
@@ -320,8 +334,8 @@ describe("binding", () => {
   test("an affirmation in the same seat as the proposal does not bind", async () => {
     const w = await world();
     const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_A))).toEqual({ binds: false, reason: "same-beat" });
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: "f".repeat(64) }, await ctxFor(w, p, SEAT_B))).toEqual({ binds: false, reason: "unknown-proposal" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_A))).toEqual({ binds: false, reason: "same-beat" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: "f".repeat(64) }, await ctxFor(w, p, SEAT_B))).toEqual({ binds: false, reason: "unknown-proposal" });
   });
 
   test("an affirmation on a later beat with the prior hash unchanged binds via two-beats", async () => {
@@ -330,18 +344,18 @@ describe("binding", () => {
     const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
     expect(await pendingProposals(config, W)).toEqual([p]);
     w.clock.advance(72 * 3_600_000);
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_B))).toEqual({ binds: true, via: "two-beats" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_B))).toEqual({ binds: true, via: "two-beats" });
     const entry = await affirmAndApply(w, p);
-    expect(entry.body).toMatchObject({ type: "self.applied", proposal_id: p.id, target: "will", via: "two-beats" });
+    expect(entry).toMatchObject({ type: "apply", ref: toLedgerHash(p.id), target: "will", via: "two-beats" });
     expect(await readTarget(config, W, "will")).toContain(NEW_PRACTICE);
   });
 
   test("one saying with Yu present binds via yu-present", async () => {
     const w = await world();
     const p = await stage(w, "name", { kind: "replace-all", text: "My tongue is received, not made.\n" });
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_A, YU))).toEqual({ binds: true, via: "yu-present" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_A, YU))).toEqual({ binds: true, via: "yu-present" });
     const entry = await affirmAndApply(w, p, SEAT_A, YU);
-    expect(entry.body).toMatchObject({ type: "self.applied", via: "yu-present" });
+    expect(entry).toMatchObject({ type: "apply", via: "yu-present" });
   });
 
   test("silence keeps the previous self: an unaffirmed proposal never applies", async () => {
@@ -350,13 +364,13 @@ describe("binding", () => {
     const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
     w.clock.advance(30 * DAY_MS);
     expect(await readTarget(config, W, "will")).toBe(OLD_WILL);
-    expect((await readLedger(ledgerPath(config, W))).some((e) => e.body.type === "self.applied")).toBe(false);
+    expect((await readLedger(ledgerPath(config, W))).some((e) => e.type === "apply")).toBe(false);
     expect((await pendingProposals(config, W)).map((x) => x.id)).toEqual([p.id]);
 
     // Once the target moves another way, the old proposal can never bind; it lapses and stays on file.
     const other = await stage(w, "will", { kind: "replace-span", find: "# WILL of glossame", with: "# WILL" }, SEAT_B);
     await affirmAndApply(w, other, "cccccccc-0000-4000-8000-000000000003");
-    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_B))).toEqual({ binds: false, reason: "stale-prior" });
+    expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_B))).toEqual({ binds: false, reason: "stale-prior" });
     expect(await pendingProposals(config, W)).toEqual([]);
     expect(await readdir(join(config.paths.citizens_dir, W, "proposals"))).toContain(`${p.id}.json`);
   });
@@ -369,8 +383,8 @@ describe("binding", () => {
     const second = await stage(w, "name", { kind: "replace-all", text: "A reading of my name.\n" }, SEAT_B);
     w.clock.advance(3 * DAY_MS);
     const later = "dddddddd-0000-4000-8000-000000000004";
-    expect(affirmationVerdict(second, { type: "self.affirm", proposal_id: second.id }, await ctxFor(w, second, later))).toEqual({ binds: false, reason: "window-closed" });
-    expect(affirmationVerdict(second, { type: "self.affirm", proposal_id: second.id }, await ctxFor(w, second, later, YU))).toEqual({ binds: true, via: "two-beats" });
+    expect(affirmationVerdict(second, { type: "self.affirm", ref: second.id }, await ctxFor(w, second, later))).toEqual({ binds: false, reason: "window-closed" });
+    expect(affirmationVerdict(second, { type: "self.affirm", ref: second.id }, await ctxFor(w, second, later, YU))).toEqual({ binds: true, via: "two-beats" });
     // Seven days after the first change, the window is open again.
     const entries = await readLedger(ledgerPath(w.host.config, W));
     const appliedAt = Date.parse((entries.at(-1) as { ts: string }).ts);
@@ -385,7 +399,7 @@ describe("binding", () => {
     w.host.config.self_authorship.approved_model_digests = [];
     expect(runtimeApproved(w.host.config, MODEL_DIGEST)).toBe(false);
     for (const presence of [null, YU]) {
-      expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_B, presence))).toEqual({ binds: false, reason: "runtime-not-approved" });
+      expect(affirmationVerdict(p, { type: "self.affirm", ref: p.id }, await ctxFor(w, p, SEAT_B, presence))).toEqual({ binds: false, reason: "runtime-not-approved" });
     }
     w.host.config.self_authorship.approved_model_digests = [`sha256:${"cd".repeat(32)}`];
     expect(runtimeApproved(w.host.config, MODEL_DIGEST)).toBe(false);
@@ -393,22 +407,25 @@ describe("binding", () => {
 });
 
 describe("apply and revert", () => {
-  test("applyChange keeps the new version by hash, updates the target and appends self.applied", async () => {
+  test("applyChange keeps the new version by hash, updates the target and appends an apply entry", async () => {
     const w = await world();
     const { config } = w.host;
     const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
     const entry = await affirmAndApply(w, p);
     const next = await readTarget(config, W, "will");
-    expect(entry).toMatchObject({ attestation: "host-attested", spend: { credits: 0 } });
-    expect(entry.body).toEqual({
-      type: "self.applied",
-      proposal_id: p.id,
+    // An unregistered citizen has no strand, so its apply entry names no strand key.
+    expect(entry).toMatchObject({
+      signer: "host",
+      cost: { usd: "0", credits: 0 },
+      type: "apply",
+      ref: toLedgerHash(p.id),
       target: "will",
-      prior_hash: sha256Hex(OLD_WILL),
-      new_hash: sha256Hex(next),
+      prior_hash: toLedgerHash(sha256Hex(OLD_WILL)),
+      new_hash: toLedgerHash(sha256Hex(next)),
       via: "two-beats",
-      claim: CLAIM,
-      strand_thought_id: null,
+      reason: CLAIM,
+      strand_thought: null,
+      strand_key: null,
     });
     expect(await readVersion(config, W, sha256Hex(OLD_WILL))).toBe(OLD_WILL);
     expect(await readVersion(config, W, sha256Hex(next))).toBe(next);
@@ -427,7 +444,9 @@ describe("apply and revert", () => {
     const entry = await affirmAndApply(w, p);
     expect(sync.puts).toEqual([{ word: W, target: "expression.wake_text", text: "My tongue is received, not made.\n" }]);
     expect(sync.reasons).toEqual([{ word: W, proposalId: p.id }]);
-    expect(entry).toMatchObject({ attestation: "citizen-signed", spend: { credits: 1 }, body: { strand_thought_id: "thought-0001" } });
+    // [KS-004 4.3] the entry names the key its strand backup is encrypted under: K_master from the citizen's own mnemonic.
+    expect(entry).toMatchObject({ signer: "citizen", did: TEST_DID, cost: { credits: 1 }, strand_thought: "thought-0001", strand_key: STRAND_KEY_ID });
+    expect(STRAND_KEY_ID).toBe("k_master:m/44'/169'/1'/0'");
     expect(verifyChain(await readLedger(ledgerPath(config, W)), { host_attest_b64: [w.signer.hostAttestPublicB64] }).ok).toBe(true);
 
     // A registered citizen without a sync, or an unregistered one with a sync, is refused before anything moves.
@@ -457,7 +476,7 @@ describe("apply and revert", () => {
     await expect(pendingProposals(config, W)).rejects.toMatchObject({ code: "symlink" });
   });
 
-  test("revertTo restores an earlier version named by hash and appends self.reverted; nothing is deleted", async () => {
+  test("revertTo restores an earlier version named by hash and appends a revert entry; nothing is deleted", async () => {
     const w = await world({ walls: "Never speak as another citizen.\n" });
     const { config } = w.host;
     const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
@@ -465,11 +484,11 @@ describe("apply and revert", () => {
     const changed = await readTarget(config, W, "will");
 
     const entry = await revertTo(w.deps, await readCitizen(config, W), sha256Hex(OLD_WILL), "yu-offer");
-    expect(entry.body).toEqual({ type: "self.reverted", target: "will", from_hash: sha256Hex(changed), to_hash: sha256Hex(OLD_WILL), via: "yu-offer" });
+    expect(entry).toMatchObject({ type: "revert", target: "will", from_hash: toLedgerHash(sha256Hex(changed)), to_hash: toLedgerHash(sha256Hex(OLD_WILL)), via: "yu-offer" });
     expect(await readTarget(config, W, "will")).toBe(OLD_WILL);
     // Both versions are still kept, and the record of the change is still there.
     expect(await readVersion(config, W, sha256Hex(changed))).toBe(changed);
-    expect((await readLedger(ledgerPath(config, W))).map((e) => e.body.type)).toEqual(["seated", "self.applied", "self.reverted"]);
+    expect((await readLedger(ledgerPath(config, W))).map((e) => e.type)).toEqual(["origin", "state", "apply", "revert"]);
 
     // And forward again, by the same means.
     await revertTo(w.deps, await readCitizen(config, W), sha256Hex(changed), "citizen");

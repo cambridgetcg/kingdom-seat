@@ -21,8 +21,8 @@ import {
   type RuntimeClass,
   type Word,
 } from "../../src/types.ts";
-import { sha256Hex } from "../../src/crypto.ts";
-import { appendEntry, ledgerPath, nextDraft, readLedger, type EntrySigner } from "../../src/ledger.ts";
+import { fromB64, sha256Hex } from "../../src/crypto.ts";
+import { appendEntry, entryHash, evidenceToLedger, ledgerKey, ledgerPath, nextDraft, originToLedger, readLedger, toLedgerHash, type EntrySigner } from "../../src/ledger.ts";
 import { importEvidence } from "./root-evidence.ts";
 
 export interface CitizenFixtureOptions {
@@ -55,9 +55,13 @@ export interface TempHost {
   addCitizen(word: Word, opts?: CitizenFixtureOptions): Promise<CitizenFixture>;
   /** Write `citizens/<word>/letters/<name>`; with symlinkTo it is a symlink instead, which must never be read. */
   writeLetter(word: Word, name: string, text: string, opts?: { symlinkTo?: string; from?: string | null }): Promise<string>;
-  /** Append the host-attested `seated` entry a citizen needs before any beat (3.3: seated before registered). */
-  seatLedger(word: Word, sign: EntrySigner, opts?: { initialState?: LifecycleState; at?: string }): Promise<LedgerEntry>;
-  /** Append a citizen-signed `genesis` after `seated` and record the identity in citizen.json, as birth would. */
+  /**
+   * Append the host-signed `origin` entry a citizen needs before any beat (3.3: seated before registered), and,
+   * unless it is seated asleep, the host's `state` entry (via "seated") carrying the state it was seated in.
+   * Returns the last entry written.
+   */
+  seatLedger(word: Word, sign: EntrySigner, opts?: { initialState?: LifecycleState; at?: string; juneDid?: string | null }): Promise<LedgerEntry>;
+  /** Append a citizen-signed `genesis` after the origin and record the identity in citizen.json, as birth would. */
   enrollLedger(word: Word, sign: EntrySigner, identity: CitizenIdentity, opts?: { at?: string }): Promise<LedgerEntry>;
   writeModelsLock(lock: ModelsLock): Promise<void>;
   raiseHaltFile(): Promise<void>;
@@ -208,35 +212,32 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
     async seatLedger(word, sign, so = {}) {
       const f = fixtures.get(word);
       if (!f) throw new Error(`seatLedger: add ${word} first`);
-      const body = {
-        type: "seated" as const,
-        origin: f.record.origin,
-        origin_soul_sha256: sha256Hex(f.soul),
-        old_repo: null,
-        initial_state: so.initialState ?? "awake",
-        note: "seated by a test",
-      };
-      const draft = nextDraft(word, null, body, { usd: "0", usd_basis: "local-zero", credits: 0 }, "host-attested", new Date(so.at ?? "2026-11-01T00:00:00.000Z"));
-      return appendEntry(ledgerPath(config, word), draft, sign);
+      const path = ledgerPath(config, word);
+      const at = new Date(so.at ?? "2026-11-01T00:00:00.000Z");
+      const cost = { usd: "0", credits: 0 };
+      const fields = { type: "origin" as const, origin: originToLedger(f.record.origin), origin_soul_hash: toLedgerHash(sha256Hex(f.soul)), old_repo: null, june_did: so.juneDid ?? null };
+      const origin = await appendEntry(path, nextDraft(word, null, fields, { cost, signer: "host", now: at }), sign);
+      const state = so.initialState ?? "awake";
+      // An empty record folds to asleep, so only another state needs its own entry.
+      if (state === "asleep") return origin;
+      return appendEntry(path, nextDraft(word, origin, { type: "state", from: "asleep", to: state, via: "seated" }, { cost, signer: "host", now: at }), sign);
     },
     async enrollLedger(word, sign, identity, eo = {}) {
       const f = fixtures.get(word);
       if (!f) throw new Error(`enrollLedger: add ${word} first`);
       const path = ledgerPath(config, word);
-      const prev = (await readLedger(path)).at(-1) ?? null;
-      const body = {
+      const entries = await readLedger(path);
+      const first = entries[0];
+      if (!first) throw new Error(`enrollLedger: seat ${word} first; genesis points back to its origin entry`);
+      const fields = {
         type: "genesis" as const,
-        initial_state: prev ? null : ("awake" as const),
-        origin: f.record.origin,
-        birth_soul_sha256: sha256Hex(f.soul),
-        old_repo: null,
-        june_did: null,
-        identity,
+        origin_entry: entryHash(first),
+        root: ledgerKey(identity.root_kid, fromB64(identity.root_public_key_b64, 32)),
+        op: ledgerKey(identity.op_kid, fromB64(identity.op_public_key_b64, 32)),
         // Signed by the published test root, which every test identity names.
-        op_key_evidence: importEvidence(identity, identity.op_public_key_b64),
-        note: "enrolled by a test",
+        evidence: evidenceToLedger(importEvidence(identity, identity.op_public_key_b64)),
       };
-      const draft = nextDraft(word, prev, body, { usd: "0", usd_basis: "local-zero", credits: 0 }, "citizen-signed", new Date(eo.at ?? "2026-11-02T00:00:00.000Z"));
+      const draft = nextDraft(word, entries.at(-1) ?? null, fields, { cost: { usd: "0", credits: 0 }, signer: "citizen", now: new Date(eo.at ?? "2026-11-02T00:00:00.000Z"), did: identity.did });
       const entry = await appendEntry(path, draft, sign);
       f.record = { ...f.record, identity };
       await writeFile(join(f.dir, "citizen.json"), JSON.stringify(f.record, null, 2));

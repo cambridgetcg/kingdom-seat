@@ -1,6 +1,6 @@
 // Owner: signer group. Pure ceiling checks; every unknown is at-ceiling.
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_CEILINGS, type Ceilings, type LedgerEntry, type Spend } from "../../src/types.ts";
+import { DEFAULT_CEILINGS, type Ceilings, type Cost, type LedgerEntry, type Spend } from "../../src/types.ts";
 import {
   CITIZEN_QUIET_HARD_MAX_DAYS,
   checkCitizenQuiet,
@@ -21,19 +21,29 @@ const NOW = new Date("2026-11-05T12:00:00.000Z");
 const spent = (usd_today: string | null, credits_month: number | null): SpendSoFar => ({ word: "glossame", usd_today, credits_month });
 const raised = (patch: Partial<Ceilings>): Ceilings => ({ ...defaultCeilings(), ...patch });
 
-/** Only ts and spend matter to creditsFromLedger; the rest is filler. */
-function entry(ts: string, spend: Spend | unknown): LedgerEntry {
+/** Only ts and cost matter to creditsFromLedger; the rest is filler. */
+function entry(ts: string, cost: Spend | unknown): LedgerEntry {
   return {
     format: "kingdom-seat-ledger/v1",
     word: "glossame",
+    did: null,
     seq: 0,
+    prev_hash: null,
+    type: "state",
+    from: "asleep",
+    to: "awake",
+    via: "confirmed",
+    seat_ref: null,
+    runtime: null,
+    input_digest: null,
+    output_digest: null,
+    acts: null,
+    voiced: null,
+    cost: cost as Cost,
     ts,
-    prev_hash: "0".repeat(64),
-    body: { type: "state", from: "asleep", to: "awake", via: "confirmed" },
-    spend: spend as Spend,
-    attestation: "citizen-signed",
-    hash: "0".repeat(64),
-    signature: { alg: "ed25519", kid: "k", public_key_b64: "", sig_b64: "" },
+    signer: "host",
+    kid: null,
+    sig: null,
   };
 }
 
@@ -111,26 +121,27 @@ describe("ceilings fail closed", () => {
     expect(parseCost(12)).toBe("12");
   });
 
-  test("[S4-4] creditsFromLedger is null when any entry's spend is unreadable, a float amount among them", () => {
-    const ok = entry("2026-11-05T09:00:00.000Z", { usd: "0.25", usd_basis: "reported", credits: 1 });
+  test("[S4-4] creditsFromLedger is null when any entry's cost is unreadable, a float amount among them", () => {
+    const ok = entry("2026-11-05T09:00:00.000Z", { usd: "0.25", credits: 1 });
     expect(creditsFromLedger([ok], NOW, "Europe/London")).toBe(1);
+    // An unknown cost is null usd, which still counts its credits.
+    expect(creditsFromLedger([ok, entry("2026-11-05T10:00:00.000Z", { usd: null, credits: 2 })], NOW, "Europe/London")).toBe(3);
     const unreadable: unknown[] = [
       null,
-      { usd: "0.1", usd_basis: "reported" }, // credits missing
-      { usd: 0.1, usd_basis: "reported", credits: 0 }, // a float, not a decimal string
-      { usd: "0.10", usd_basis: "reported", credits: 0 }, // not the one spelling
-      { usd: "0.1", usd_basis: "unknown", credits: 0 }, // basis and value disagree
-      { usd: "1", usd_basis: "local-zero", credits: 0 },
-      { usd: 0, usd_basis: "local-zero", credits: 0 },
-      { usd: "0", usd_basis: "guess", credits: 0 },
-      { usd: "0", usd_basis: "local-zero", credits: 1.5 },
+      { usd: "0.1" }, // credits missing
+      { credits: 0 }, // usd missing
+      { usd: 0.1, credits: 0 }, // a float, not a decimal string
+      { usd: "0.10", credits: 0 }, // not the one spelling
+      { usd: 0, credits: 0 },
+      { usd: "0", credits: 1.5 },
+      { usd: "0", credits: -1 },
     ];
     for (const s of unreadable) {
       // Even an entry from last month makes the sum unknown: an unreadable record could hide any amount.
       const old = entry("2026-09-01T00:00:00.000Z", s);
       expect(creditsFromLedger([ok, old], NOW, "Europe/London")).toBeNull();
     }
-    expect(creditsFromLedger([ok, entry("yesterday", { usd: "0", usd_basis: "local-zero", credits: 0 })], NOW, "Europe/London")).toBeNull();
+    expect(creditsFromLedger([ok, entry("yesterday", { usd: "0", credits: 0 })], NOW, "Europe/London")).toBeNull();
     expect(creditsFromLedger([ok], NOW, "Not/AZone")).toBeNull();
   });
 

@@ -2,7 +2,7 @@
 // unparsable amount counts as the ceiling already reached (3.6 "Spend";
 // love-unlimited-patterns.md 8, where today's ledger fails open).
 import { addUsd, compareUsd, isUsd, subUsdFloor, usdFromNumber, type Usd } from "../money.ts";
-import { DEFAULT_CEILINGS, type Ceilings, type IsoTime, type LedgerEntry, type Spend, type Word } from "../types.ts";
+import { DEFAULT_CEILINGS, type Ceilings, type Cost, type IsoTime, type LedgerEntry, type Spend, type Word } from "../types.ts";
 
 export type CeilingVerdict = { ok: true } | { ok: false; code: "ceiling-usd" | "ceiling-credits" | "ceiling-fleet" | "ceiling-interval" | "quiet-cap"; reason: string };
 
@@ -60,23 +60,15 @@ export function parseCost(raw: unknown): Usd | null {
   return usdFromNumber(raw);
 }
 
-/** One entry's spend, or null when its shape cannot be trusted. */
+/** One entry's cost, or null when its shape cannot be trusted. */
 function readSpend(entry: LedgerEntry): { ms: number; credits: number } | null {
   if (typeof entry !== "object" || entry === null) return null;
   const ms = canonicalMs(entry.ts);
-  const s = entry.spend as Partial<Spend> | null | undefined;
-  if (ms === null || typeof s !== "object" || s === null) return null;
-  if (!isCount(s.credits)) return null;
-  switch (s.usd_basis) {
-    case "local-zero":
-      return s.usd === "0" ? { ms, credits: s.credits } : null;
-    case "reported":
-      return isUsd(s.usd) ? { ms, credits: s.credits } : null;
-    case "unknown":
-      return s.usd === null ? { ms, credits: s.credits } : null;
-    default:
-      return null;
-  }
+  const c = entry.cost as Partial<Cost> | null | undefined;
+  if (ms === null || typeof c !== "object" || c === null) return null;
+  if (!isCount(c.credits)) return null;
+  // usd is a decimal string, or null for an unknown cost; anything else is a record that cannot be read.
+  return c.usd === null || isUsd(c.usd) ? { ms, credits: c.credits } : null;
 }
 
 /** "YYYY-MM-DD" for an instant in an IANA zone; throws on an unknown zone. */

@@ -100,6 +100,19 @@ export function fromB64url(s: string, length?: number): Uint8Array {
   return bytes;
 }
 
+/** "SHA256:<unpadded base64 of sha256(public key)>", in the style ssh prints; throws unless the key is 32 bytes. */
+export function keyFingerprint(publicKey: Uint8Array): string {
+  if (!(publicKey instanceof Uint8Array) || publicKey.length !== 32) throw new Error("keyFingerprint: a public key here is 32 bytes");
+  return `SHA256:${toB64(sha256(publicKey)).replace(/=+$/, "")}`;
+}
+
+/** True when two byte strings are equal; for public values only (it is not constant-time). */
+export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export function randomBytes(n: number): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(n));
 }
@@ -124,7 +137,7 @@ export function edSign(message: Uint8Array, seed: Uint8Array): Uint8Array {
 /**
  * RFC 8032 strict verification (zip215: false), as agenttool's enrollment
  * uses. It refuses nothing a conforming signer produces, so the ledger
- * verifies its own envelopes this way. Any malformed input is `false`.
+ * verifies its own entries this way. Any malformed input is `false`.
  */
 export function edVerifyStrict(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean {
   if (signature.length !== 64 || publicKey.length !== 32) return false;

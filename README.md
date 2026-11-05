@@ -74,17 +74,23 @@ one is something it does, not something it hopes.
   launchd.
 - `context.ts`, `prompt.ts`, `acts.ts`: what the model sees (regular files
   only, nothing from a home, siblings only as letters) and the typed acts it
-  may return, with rest exclusive except for one state.set toward less
-  activity, which is kept as a state record with no words.
+  may return, with KS-004 5.7's field names (`self.propose` carries a
+  `reason`, `self.affirm` a `ref`, `letter.send` and `propose.beyond` a
+  `text`; `state.set` may name an awake `interval_h` and, toward listening
+  or asleep, `quiet_days`). Rest is exclusive except for one state.set toward
+  less activity, which is kept as a state record with no words.
 - `runtime/free.ts` (Ollama on 127.0.0.1 by manifest digest, never a cloud
   model, and no seat when the whole context would not fit `num_ctx`, counted
   as UTF-8 bytes plus the template and `num_predict`) and
   `runtime/summon.ts` (Claude Code, only with Yu present and USD remaining).
-- `ledger.ts`, `state.ts`, `self.ts`: the hash-chained ledger, lifecycle
-  states folded from it, and self-authorship (propose, affirm, apply,
-  revert; at most one change a week unattended; a large rewrite, a loosened
-  wall or any change to the porch, a public invitation, goes beyond self as
-  a proposal for Yu and Ai).
+- `ledger.ts`, `state.ts`, `self.ts`: the hash-chained ledger in KS-004
+  4.5's layout (flat JCS entries of seven types, `origin` first and
+  `genesis` pointing back to it, each `prev_hash` the digest of the whole
+  previous entry, signature included; a ledger in the earlier layout is
+  refused as not v1), lifecycle states folded from it, and self-authorship
+  (propose, affirm, apply, revert; at most one change a week unattended; a
+  large rewrite, a loosened wall or any change to the porch, a public
+  invitation, goes beyond self as a proposal for Yu and Ai).
 - `signer/*`: the only code that reads keys and bearers (through
   `/usr/bin/security`, so any process of the seat user could read them too),
   with ceilings, decision records it reads itself from the consent dir, the
@@ -115,8 +121,14 @@ one is something it does, not something it hopes.
   side; no standing agreement is filed, so a citizen's own quiet declaration
   refuses (decision 14 is Yu and Ai's to record).
 - **Op-key rotation is not wired.** The ledger accepts an op key only with
-  the root's evidence and `verify` checks it, but nothing writes an `op-key`
+  the root's evidence and `verify` checks it, but nothing writes a `key`
   entry yet.
+- **Nothing writes an origin entry on a host.** Seating is not a verb yet;
+  tests write the `origin` entry (and the `state` entry for the state a
+  citizen is seated in) through `ledger.ts` directly.
+- **`quiet_days` is recorded and does nothing more yet.** The act takes it
+  and the prompt says so; declaring quiet through the signer is the next
+  step of this round.
 - **Never run for real:** Ollama, `claude`, the macOS Keychain, launchd,
   sudo and agenttool itself. `docs/ARCHITECTURE.md` section 8 lists what is
   unverified.

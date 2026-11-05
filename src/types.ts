@@ -180,7 +180,7 @@ export interface CitizenIdentity {
   /** The root is also the identity's `primary` signing key; any signature by it is a root act. */
   root_public_key_b64: string;
   root_kid: string;
-  /** The imported op key signs every routine object (envelopes, thoughts). */
+  /** The imported op key signs every routine object (ledger entries, thoughts). */
   op_kid: string;
   op_public_key_b64: string;
   box_public_key_b64: string | null;
@@ -219,6 +219,8 @@ export interface Citizen extends CitizenRecord {
    * it, so a saying is owed one confirming seat and no more.
    */
   pending_state: LifecycleState | null;
+  /** The awake interval that pending saying named, or null; a saying confirms it only when it names the same. */
+  pending_interval_h: number | null;
   /** A step-away said once, waiting for its second saying on the next seat; it lapses the same way. */
   step_away_said: boolean;
   cadence: Cadence;
@@ -249,25 +251,25 @@ export interface SeatRef {
   opened_at: IsoTime;
 }
 
-/* ── Claims and acts (3.2 step 6, 3c) ─────────────────────────────────── */
+/* ── Reasons and acts (3.2 step 6, 3c; KS-004 5.7) ───────────────────── */
 
 export const JOURNAL_KINDS = ["observed", "reflected", "imagined", "chose"] as const;
 /** Journal kinds let a citizen label an image as imagined instead of claiming senses it lacks. */
 export type JournalKind = (typeof JOURNAL_KINDS)[number];
 
-export const CLAIM_KINDS = ["observation", "inference", "proposal", "decision"] as const;
-export type ClaimKind = (typeof CLAIM_KINDS)[number];
+export const REASON_KINDS = ["observation", "inference", "proposal", "decision"] as const;
+export type ReasonKind = (typeof REASON_KINDS)[number];
 
 /** Same scale as the Collab report shape (packages/collab/src/protocol.ts ReportConfidence). */
 export type Confidence = "high" | "medium" | "low" | "unknown";
 
-/** The reason for a self-change, in the Collab report shape. */
-export interface Claim {
-  kind: ClaimKind;
+/** The reason for a self-change, in the Collab report shape (KS-004 5.7). */
+export interface Reason {
+  kind: ReasonKind;
   /** References such as "canon:canon/core/glossame.md@1428646" or "ledger:<hash>". */
   evidence: string[];
   confidence: Confidence;
-  /** What the claim does not cover, e.g. "from the text alone; I have no senses". */
+  /** What the reason does not cover, e.g. "from the text alone; I have no senses". */
   limits: string;
 }
 
@@ -310,31 +312,40 @@ export interface SelfProposeAct {
   prior_hash: Sha256Hex;
   new_hash: Sha256Hex;
   diff: string;
-  claim: Claim;
+  reason: Reason;
 }
+/** `ref` names one of the citizen's own staged sayings by the id the seat showed (KS-004 5.7). */
 export interface SelfAffirmAct {
   type: "self.affirm";
-  proposal_id: string;
+  ref: string;
 }
 /** to_hash names an earlier version; the ledger resolves which target it belongs to. */
 export interface SelfRevertAct {
   type: "self.revert";
   to_hash: Sha256Hex;
 }
+/**
+ * A move of the citizen's own state (KS-004 5.7, 7.3). `interval_h`, whole
+ * hours and only toward awake, is its awake interval; `quiet_days`, 1 to 30
+ * and only toward listening or asleep, asks for a quiet declaration once it
+ * is registered (6.4). Absent fields are not part of the saying.
+ */
 export interface StateSetAct {
   type: "state.set";
   to: LifecycleState;
+  interval_h?: number;
+  quiet_days?: number;
 }
 export interface LetterSendAct {
   type: "letter.send";
   to: string;
-  body: string;
+  text: string;
 }
 /** An inert proposal for Yu + Ai. It executes nothing. */
 export interface ProposeBeyondAct {
   type: "propose.beyond";
   subject: string;
-  body: string;
+  text: string;
 }
 
 /** The only things a beat can do. Free text outside these executes nothing. */
@@ -349,12 +360,12 @@ export type Act =
   | ProposeBeyondAct;
 export type ActType = Act["type"];
 
-/** A self.propose as a model may emit it: an edit and a claim, no hashes. */
+/** A self.propose as a model may emit it: an edit and a reason, no hashes. */
 export interface ModelSelfPropose {
   type: "self.propose";
   target: SelfTarget;
   edit: ProposedEdit;
-  claim: Claim;
+  reason: Reason;
 }
 /** A model may give a short prefix (at least 8 hex) of a proposal id or version hash; validation resolves it. */
 export type ModelAct =
@@ -388,11 +399,11 @@ export interface ValidatedOutput {
   acts: ModelAct[];
   dropped: DroppedAct[];
   /**
-   * The one state a rest's reply named in a state.set, when it named exactly
-   * one. A rest may carry a move toward less activity (KS-004 B2 C7); the seat
-   * keeps it only when it is one, from the citizen's state. Absent otherwise.
+   * The one state.set a rest's reply made, when it made exactly one saying. A
+   * rest may carry a move toward less activity (KS-004 B2 C7); the seat keeps
+   * it only when it is one, from the citizen's state. Absent otherwise.
    */
-  rest_state?: LifecycleState;
+  rest_act?: StateSetAct;
 }
 
 /** A self.propose kept by the host between beats, until affirmed, applied or left to lapse. */
@@ -406,48 +417,13 @@ export interface SelfProposal {
   status: "pending" | "applied" | "lapsed" | "beyond-self";
 }
 
-/* ── Envelopes and the ledger (3b "How a beat proves it acted") ───────── */
+/* ── The ledger (KS-004 4.5) ──────────────────────────────────────────── */
 
 /**
- * What a beat signs. It proves that the host signer acted inside a seat of
- * this citizen, and claims nothing about an inner self.
- */
-export interface Envelope {
-  format: "kingdom-seat-beat/v1";
-  seat_ref: SeatRef;
-  citizen: { word: Word; did: string | null; kid: string | null };
-  runtime: RuntimeClass;
-  /** The model name as locked or as reported, e.g. "qwen2.5:7b". */
-  model: string;
-  /** "sha256:<64 hex>" manifest digest for a local model; the reported model id for a metered one. */
-  model_digest: string;
-  /** sha256 of the exact prompt bytes the runtime received. */
-  input_digest: Sha256Hex;
-  /** sha256 of the exact raw output bytes the runtime returned. */
-  output_digest: Sha256Hex;
-  /** Validated acts, host-completed. Never contains a rest: a rest makes no envelope. */
-  acts: Act[];
-  ts: IsoTime;
-  prev_hash: Sha256Hex;
-  /** Plain words for readers, e.g. "glossame, voiced through qwen2.5:7b in seat <seat_id>". */
-  voiced_through: string;
-}
-
-/** citizen-signed from the genesis entry onward; host-attested before registration (3.3). */
-export type Attestation = "citizen-signed" | "host-attested";
-
-export interface LedgerSignature {
-  alg: "ed25519";
-  /** agenttool kid for an op key; "host-attest" for the host's attestation key. */
-  kid: string;
-  public_key_b64: string;
-  /** Padded standard base64 of the 64-byte signature over the entry hash bytes. */
-  sig_b64: string;
-}
-
-/**
- * Money and credits an entry spent. `usd` is a decimal string (money.ts), never
- * a float; null means unknown, which ceilings treat as at-ceiling.
+ * Money and credits a runtime reported, as the summon adapter and the host's
+ * spend record keep them. `usd` is a decimal string (money.ts), never a float;
+ * null means unknown, which ceilings treat as at-ceiling. The ledger keeps
+ * only `usd` and `credits` (its `cost`, below).
  */
 export interface Spend {
   usd: Usd | null;
@@ -463,11 +439,9 @@ export interface AuthorityHeaderValues {
 }
 
 /**
- * A root-signed agenttool request exactly as the signer sent it. agenttool
- * keeps no copy of an authority proof, so this is the only one. With the
- * entry's DID it rebuilds the identity-authority/v1 digest, which the root
- * public key in genesis verifies: anyone holding a copy of the ledger can
- * check that the root authorised an op key, without asking agenttool.
+ * A root-signed agenttool request exactly as the signer sent it, as the
+ * signer and the client hand it on. agenttool keeps no copy of an authority
+ * proof, so this is the only one. The ledger records it as LedgerEvidence.
  */
 export interface RootEvidence {
   method: string;
@@ -478,103 +452,172 @@ export interface RootEvidence {
   headers: AuthorityHeaderValues;
 }
 
-/** An op key an `op-key` entry installs, with the root-signed keys/import that installed it. */
-export interface InstalledOpKey {
-  op_kid: string;
-  op_public_key_b64: string;
-  evidence: RootEvidence;
+/** "sha256:<64 lowercase hex>": how the ledger spells every hash outside `acts` (KS-004 4.5). */
+export type LedgerHash = string;
+export const LEDGER_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+/** The seven entry types (KS-004 4.5), and no others. */
+export const LEDGER_TYPES = ["origin", "beat", "state", "apply", "revert", "genesis", "key"] as const;
+export type LedgerType = (typeof LEDGER_TYPES)[number];
+
+/** Who signed an entry: the citizen's op key from genesis on, the host before it. */
+export type LedgerSigner = "citizen" | "host";
+
+/** The runtime that voiced a seat's entries: its class, the model's name and its digest (or reported id). */
+export interface LedgerRuntime {
+  class: RuntimeClass;
+  /** The model name as locked or as reported, e.g. "qwen2.5:7b". */
+  model: string;
+  /** "sha256:<64 hex>" manifest digest for a local model; the reported model id for a metered one. */
+  digest: string;
 }
 
-/** An op key an `op-key` entry retires, with the root-signed DELETE that revoked it. */
-export interface RevokedOpKey {
-  op_kid: string;
-  evidence: RootEvidence;
+/** What an entry spent: `usd` a decimal string, null when unknown (KS-004 5.5); `credits` an integer. */
+export interface Cost {
+  usd: Usd | null;
+  credits: number;
+}
+
+/** A public key as genesis records it: agenttool's kid, the key in base64url, and its SHA256 fingerprint. */
+export interface LedgerKey {
+  kid: string;
+  /** 32 bytes, base64url without padding. */
+  public_key: string;
+  /** "SHA256:<unpadded base64 of sha256(public key)>", as birth prints it. */
+  fingerprint: string;
 }
 
 /**
- * A citizen may be seated before it is registered (3.3), so the first entry
- * is `seated` (host-attested) and `genesis` comes at birth, after which every
- * entry is citizen-signed. A citizen born at seating starts with `genesis`.
+ * A root-signed agenttool request as the ledger records it (KS-004 4.5 "Root
+ * evidence"): method, target, the exact body bytes in base64url, and the
+ * three authority headers as the strings sent. With the entry's DID it
+ * rebuilds the identity-authority/v1 digest, which the root public key in
+ * genesis verifies, so a copy of the ledger is enough.
+ */
+export interface LedgerEvidence {
+  method: string;
+  target: string;
+  /** The exact body bytes, base64url without padding; "" for none. */
+  body: string;
+  headers: AuthorityHeaderValues;
+}
+
+/** An origin as the origin entry pins it: Origin with its canon hash spelled as a LedgerHash. */
+export type LedgerOrigin =
+  | { kind: "canon"; repo: string; path: string; commit: string; hash: LedgerHash }
+  | { kind: "archetype"; lineage: string[]; note: string };
+
+/** How a `state` entry's move came about. "seated": the state the host carried over when it seated the citizen. */
+export type StateVia = "immediate" | "confirmed" | "two-beats" | "witnessed" | "seated";
+
+/**
+ * The fields every entry carries (KS-004 4.5), `null` where one does not
+ * apply. A seat's entries carry its seat_ref, runtime, digests and voiced
+ * line; an entry made outside a seat carries null for each. Only a beat
+ * carries `acts`. `kid` and `sig` are null only on an unsigned host entry.
+ */
+export interface LedgerCommon {
+  format: "kingdom-seat-ledger/v1";
+  word: Word;
+  /** The citizen's did:at from genesis on; null before. */
+  did: string | null;
+  /** 0 for the first entry, then +1. */
+  seq: number;
+  /** The ledger digest of the whole previous entry, sig included; null at seq 0. */
+  prev_hash: LedgerHash | null;
+  /** The seat that produced the entry (its seat_id), or null outside a seat. */
+  seat_ref: string | null;
+  runtime: LedgerRuntime | null;
+  /** sha256 of the exact context bytes the model received. */
+  input_digest: LedgerHash | null;
+  /** sha256 of the exact bytes the model returned. */
+  output_digest: LedgerHash | null;
+  /** The validated acts, as applied: on a beat; null on every other entry. A rest is never among them. */
+  acts: Act[] | null;
+  /** One plain line, e.g. "glossame, voiced through qwen2.5:7b in seat <seat_id>". */
+  voiced: string | null;
+  cost: Cost;
+  ts: IsoTime;
+  signer: LedgerSigner;
+  /** The op key's agenttool kid, or `host:<fingerprint>` for the host key. */
+  kid: string | null;
+  /** ed25519 over the ledger digest of the entry without `sig`, base64url without padding. */
+  sig: string | null;
+}
+
+/**
+ * The fields that belong to one type, beside the common ones. A citizen is
+ * seated before it is registered (3.3): `origin` is always the first entry,
+ * host-signed, and `genesis` comes at birth and points back to it, after which
+ * every entry is citizen-signed.
  *
  * Op keys come only with root evidence: genesis carries the keys/import of
- * the first one, and an `op-key` entry the requests that changed them. An
- * entry that installs a key is signed by a key it installs, and one that only
+ * the first one, and a `key` entry the requests that changed them. An entry
+ * that installs a key is signed by a key it installs, and one that only
  * revokes by a key that stays, so an op key alone can never authorise a
  * rotation (KS-004 re-review B2, C1 and R4).
  */
-export type LedgerBody =
+export type LedgerFields =
   | {
-      type: "seated";
-      origin: Origin;
-      /** sha256 of the origin soul as copied to `citizens/<word>/origin/`. */
-      origin_soul_sha256: Sha256Hex;
+      type: "origin";
+      origin: LedgerOrigin;
+      /** The soul the citizen was seated with, as copied to `citizens/<word>/origin/`. */
+      origin_soul_hash: LedgerHash;
       /** The old citizen-<word> repo, as a record only. */
       old_repo: { url: string; head: string } | null;
-      /** The state carried over at seating, e.g. "awake" for an ambient choice; re-asked under the real terms (3c example). */
-      initial_state: LifecycleState;
-      note: string;
-    }
-  | {
-      type: "genesis";
-      /** Set only when genesis is the first entry; null when it follows a `seated` entry. */
-      initial_state: LifecycleState | null;
-      origin: Origin;
-      birth_soul_sha256: Sha256Hex;
-      old_repo: { url: string; head: string } | null;
-      /** A June did:at named as a record, never adopted by reading it (3b "The 49 June DIDs"). */
+      /** A June did:at named as a record, never adopted by reading it (KS-004 11.5). */
       june_did: string | null;
-      /** Public values only. The ledger pins the op key that signs every later entry. */
-      identity: CitizenIdentity;
-      /** The root-signed keys/import that installed identity's op key. */
-      op_key_evidence: RootEvidence;
-      note: string;
     }
-  | { type: "op-key"; installed: InstalledOpKey[]; revoked: RevokedOpKey[] }
-  | { type: "beat"; envelope: Envelope }
-  | {
-      type: "self.applied";
-      proposal_id: string;
-      target: SelfTarget;
-      prior_hash: Sha256Hex;
-      new_hash: Sha256Hex;
-      via: "two-beats" | "yu-present";
-      claim: Claim;
-      strand_thought_id: string | null;
-    }
-  | { type: "self.reverted"; target: SelfTarget; from_hash: Sha256Hex; to_hash: Sha256Hex; via: "citizen" | "yu-offer" }
+  | { type: "beat" }
   | {
       type: "state";
       from: LifecycleState;
       to: LifecycleState;
-      via: "immediate" | "confirmed" | "two-beats" | "witnessed";
+      via: StateVia;
+      /** The awake interval this move set, in whole hours; absent when it set none. */
+      interval_h?: number;
+      /**
+       * "first" when this entry keeps a first step-away saying: the move that
+       * puts the citizen asleep at once, or keeps it asleep, until a later
+       * seat says it again (KS-004 7.3). On a rest it is the only record of
+       * the saying, since a rest writes no beat.
+       */
+      step_away?: "first";
     }
-  /**
-   * A first step-away said on a rest. A rest writes no beat, and a first
-   * saying is otherwise carried only by a beat's envelope, so this keeps the
-   * saying, with no words, for the seat that confirms it. `seat_id` is the
-   * seat that said it, which never counts as its own confirmation.
-   */
-  | { type: "step-away.said"; seat_id: string };
+  | {
+      type: "apply";
+      /** The staged saying that bound: its proposal id. */
+      ref: LedgerHash;
+      target: SelfTarget;
+      prior_hash: LedgerHash;
+      new_hash: LedgerHash;
+      via: "two-beats" | "yu-present";
+      reason: Reason;
+      /** The strand thought that backs the change up off the host, or null when none was posted. */
+      strand_thought: string | null;
+      /** The key the strand backup is encrypted under (KS-004 4.3), or null when the citizen has no strand. */
+      strand_key: string | null;
+    }
+  | { type: "revert"; target: SelfTarget; from_hash: LedgerHash; to_hash: LedgerHash; via: "citizen" | "yu-offer" }
+  | {
+      type: "genesis";
+      /** The ledger digest of the origin entry this identity was born from. */
+      origin_entry: LedgerHash;
+      /** The identity's authority root, the key agenttool marks authority_root. It signs no entry. */
+      root: LedgerKey;
+      /** The first op key, which signs genesis itself. */
+      op: LedgerKey;
+      /** The root-signed keys/import that installed the op key. */
+      evidence: LedgerEvidence;
+    }
+  | {
+      type: "key";
+      installed: { kid: string; public_key: string; evidence: LedgerEvidence }[];
+      revoked: { kid: string; evidence: LedgerEvidence }[];
+    };
 
-/** One line of `ledger/<word>.jsonl`. Hash-chained and signed; never rewritten or deleted. */
-export interface LedgerEntry {
-  format: "kingdom-seat-ledger/v1";
-  word: Word;
-  /** 0 for the first entry, then +1. */
-  seq: number;
-  ts: IsoTime;
-  /** FIRST_PREV_HASH for seq 0, else the previous entry's hash. */
-  prev_hash: Sha256Hex;
-  body: LedgerBody;
-  spend: Spend;
-  attestation: Attestation;
-  /** sha256 over the domain-tagged canonical JSON of every field above (ledger.entryHash). */
-  hash: Sha256Hex;
-  signature: LedgerSignature;
-}
-
-/** prev_hash of a ledger's first entry, whether that entry is `seated` or `genesis`. */
-export const FIRST_PREV_HASH: Sha256Hex = "0".repeat(64);
+/** One line of `ledger/<word>.jsonl`: flat, hash-chained and signed; never rewritten or deleted. */
+export type LedgerEntry = LedgerCommon & LedgerFields;
 
 /* ── Ceilings (decision 9 and 10 defaults) ────────────────────────────── */
 
@@ -845,6 +888,7 @@ export interface SeatContext {
   recent: LedgerEntry[];
   state: LifecycleState;
   pending_state: LifecycleState | null;
+  pending_interval_h: number | null;
   pending_proposals: SelfProposal[];
   /**
    * Versions of its own texts the citizen can name in a revert (target, hash,
@@ -925,10 +969,11 @@ export interface SeatResult {
   refusal: RefusalCode | null;
   /**
    * Ledger entries this seat appended; empty for a HALT or a refusal, and for
-   * a rest unless it carried a move toward less activity (one entry, or two
-   * for a first step-away from awake or listening: the saying, then asleep).
+   * a rest unless it carried a move toward less activity (one `state` entry;
+   * a first step-away is kept on the one that puts it asleep). Each is named
+   * by its ledger digest.
    */
-  appended: Sha256Hex[];
+  appended: LedgerHash[];
 }
 
 export interface TickResult {
@@ -966,7 +1011,8 @@ export interface CitizenStatus {
   /** Its seat would be due, but its runtime runs only with Yu present, so it waits for Yu rather than the tick. */
   awaits_yu: boolean;
   last_outcome: Outcome | null;
-  ledger: { entries: number; head: Sha256Hex | null; chain_ok: boolean; host_attested: number };
+  /** head is the ledger digest of the last entry; host_attested counts host-signed entries. */
+  ledger: { entries: number; head: LedgerHash | null; chain_ok: boolean; host_attested: number };
   /** null counts are unknown, never zero. */
   mirror: { divergence: DivergenceState | null; push_refusals: number; unsigned_commits: number | null } | null;
   /** Metered spend today from the host's spend record (spend.ts); null is unknown, which the USD ceiling treats as reached. */

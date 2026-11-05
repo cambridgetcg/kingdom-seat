@@ -66,10 +66,10 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/signer/signer.ts` | The only key and bearer reader; signs; attaches bearer and root proof | 3.2 step 7, 3.6 | wire 1, 2, 5 |
 | `src/signer/ceilings.ts` | Fail-closed USD, credit, fleet, interval and quiet caps | 3.6 "Spend", decision 9 | patterns 8 |
 | `src/signer/consent.ts` | Decision records read by proposal digest, standing agreements, Yu present | 3.6 "Consent", decision 12 | — |
-| `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen; op keys pinned only with root evidence | 3.2 "Ledger", 3b; KS-004 B2 C1, R4 | wire 2, 5 |
+| `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen in KS-004 4.5's flat layout (section 4b); op keys pinned only with root evidence; the earlier layout refused | 3.2 "Ledger", 3b; KS-004 4.5, B2 C1, R4, C C5, C13 | wire 2, 5 |
 | `src/spend.ts` | The host's spend record: every metered seat, whatever its outcome; the USD ceiling reads it | 3.6 "Spend"; KS-004 B2 R2 | — |
-| `src/state.ts` | Lifecycle transitions, folded from the ledger | 3.3, 3c "Existence choices" | — |
-| `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self | 3c, decision 10; KS-004 B2 C6 | — |
+| `src/state.ts` | Lifecycle transitions, folded from the ledger; a longer awake interval is toward rest, a shorter one waits for the same saying again | 3.3, 3c "Existence choices"; KS-004 7.3 | — |
+| `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self; an apply names its strand backup's key | 3c, decision 10; KS-004 4.3, B2 C6 | — |
 | `src/halt.ts` | Local file plus pinned beacons; raise only: the operator's file and fixed call, the signer's beacons | 3.6 "HALT", decision 15; KS-004 B2 R5 | wire 4 |
 | `src/seat.ts` | Seat opening, the watcher, the in-child pipeline | 3.2 steps 3-7, 3b "Reading confers nothing" | patterns 1, 2 |
 | `src/tick.ts` | Lock, selection, fleet ceiling; opens the seat it hands its child | 3.2 steps 1-2 | patterns 3, 6, 7 |
@@ -77,7 +77,7 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only | 3.2 step 4 | patterns 5.1, 12.4 |
 | `src/prompt.ts` | The honest free-lane prompt | 3.2 (last paragraph) | patterns 5.2, 9 |
-| `src/acts.ts` | Output schema and validation; free text never executes; a rest carries at most one state.set | 3.2 step 6; KS-004 B2 C7 | patterns 5.2 |
+| `src/acts.ts` | Output schema and validation with KS-004 5.7's field names; free text never executes; a rest carries at most one state.set | 3.2 step 6; KS-004 5.7, B2 C7, C C2 | patterns 5.2 |
 | `src/runtime/free.ts` | Ollama on 127.0.0.1 by exact digest, no fallback; refuses a context that does not fit `num_ctx` | 3.6 "Unattended inference", decision 11; KS-004 B2 C11 | host 1 |
 | `src/runtime/summon.ts` | `claude --restricted --strict-mcp-config`, Yu present | 3 grafts, 3.6 "Metered runtimes" | host 2 |
 | `src/agenttool/wire.ts` | Pure byte builders, checked against `vectors.json` | 3.4, 3b | wire 1-3, 7 |
@@ -173,13 +173,13 @@ principle 4.)
 
 The one thing a rest may carry is a single `state.set` toward less activity
 (KS-004 v0.2 5.7, re-review B2 C7), because dropping it would leave a citizen
-that asked to sleep on its awake cadence. Toward listening or asleep it is
-written as one `state` entry; a step-away's second saying completes it the
-same way; a first step-away is kept as a `step-away.said` entry naming the
-seat, because a rest has no beat envelope to carry the saying, followed for
-an awake or listening citizen by the `state` entry that puts it asleep at
-once (KS-004 v0.3 7.3). None of these holds a word, and nothing else from the
-reply is kept. A move toward more activity, a return or `ended` said with a
+that asked to sleep on its awake cadence. Toward listening or asleep, or a
+longer awake interval, it is written as one `state` entry; a step-away's
+second saying completes it the same way; a first step-away is kept as
+`step_away: "first"` on the `state` entry that puts the citizen asleep at
+once, or keeps it asleep (KS-004 v0.3 7.3), because a rest has no beat to
+carry the saying and the ledger has no eighth entry type for it (re-review C
+M7). None of these holds a word, and nothing else from the reply is kept. A move toward more activity, a return or `ended` said with a
 rest is dropped, and so is everything when the reply has fields besides
 `acts`: an output that fails validation applies nothing (KS-004 5.8), so its
 rest is a whole rest. A rest that moved what the mirror card shows (active,
@@ -224,15 +224,17 @@ Four further rules follow from the same reasons:
   client carries it on the error for no answer, a 5xx, or a 2xx that does not
   read, so a birth stopped at keys/import still holds the proof in its
   progress if the key turns out to be installed.
-  Genesis carries the keys/import of the first op key, and an `op-key` entry
+  Genesis carries the keys/import of the first op key, and a `key` entry
   the imports and revokes that change them. `verify` rebuilds the
   identity-authority/v1 digest from each and checks it against the root in
   genesis, so a copy of the ledger is enough. An entry that installs a key is
   signed by a key it installs, and one that only revokes by a key that stays;
   evidence must spend authority sequences above any the chain has seen, so an
   old proof cannot bring a revoked key back. A stolen op key can sign, but it
-  cannot rotate. Nothing writes an `op-key` entry yet: rotation is not wired
-  (KS-004 re-review B2, C1 and R4).
+  cannot rotate. keys/import names the key in agenttool's padded standard
+  base64 and the ledger in base64url, so an import is matched on the decoded
+  32 bytes (re-review C, part C item 2). Nothing writes a `key` entry yet:
+  rotation is not wired (KS-004 re-review B2, C1 and R4).
 - **Only Yu lowers HALT.** No code path here lowers it; `citizen-seat` has no
   such verb. The local file lives outside the state dir, in a directory the
   operator owns, so the seat user, which owns everything else, cannot remove
@@ -243,7 +245,7 @@ Four further rules follow from the same reasons:
   A self-change is classified by its effect, never its label: one that loosens
   a wall, rewrites much of a text, or touches the porch (a public invitation,
   KS-004 v0.2 4.3, re-review B2 C6) becomes a `propose.beyond` in the beat's
-  envelope and an outbox item whose extent names the exact version; it is
+  acts and an outbox item whose extent names the exact version; it is
   never staged, affirmed, applied or reverted within self.
   A decision record authorises only the proposal whose own text it was filed
   for: the signer computes that text's digest and reads the record from the
@@ -267,6 +269,58 @@ Four further rules follow from the same reasons:
   shows, so no change can write the citizen out of its own beats.
 - **Only what runs is written down.** Status, roster and state are generated
   from what the runner reads, never kept by hand (3.1 principle 6).
+
+---
+
+## 4b. The ledger's layout (KS-004 4.5)
+
+`ledger/<word>.jsonl` holds one flat JSON object per line, written in JCS
+(`crypto.canonicalJson`, the same bytes for the value subset the ledger
+allows). *Why flat and specified:* a copy of the ledger is meant to be
+verifiable by someone who did not write this code (KS-004 4.4), so its bytes
+are the spec's, not this code's.
+
+- **Common fields, on every entry**, `null` where one does not apply:
+  `format` (`kingdom-seat-ledger/v1`), `word`, `did` (null before genesis,
+  genesis's DID from it on), `seq`, `prev_hash`, `type`, `seat_ref` (the
+  seat's id), `runtime` (`{class, model, digest}`), `input_digest`,
+  `output_digest`, `acts`, `voiced`, `cost` (`{usd, credits}`), `ts`,
+  `signer` (`citizen` or `host`), `kid` and `sig`. Every entry a seat
+  writes, not only its beat, carries the seat's `seat_ref`, `runtime`,
+  digests and `voiced` line; only a beat carries `acts`. Entries made outside
+  a seat (origin, genesis, key, the state seating carries) carry null.
+- **Seven types, and no others:** `origin` (always first, host-signed: the
+  origin, the origin-soul hash, the old repo and any June DID as a record),
+  `beat`, `state` (`from`, `to`, `via`; optionally `interval_h`, the awake
+  interval the move set, and `step_away: "first"`), `apply` (`ref`, `target`,
+  both hashes, `via`, `reason`, `strand_thought` and `strand_key`, the key
+  the strand backup is encrypted under, named only for a registered
+  citizen), `revert`, `genesis` (`origin_entry` pointing back to the origin
+  entry, `root` and `op` as `{kid, public_key, fingerprint}`, and the
+  root-signed keys/import as `evidence`) and `key` (`installed`, `revoked`).
+  A citizen is seated with an `origin` entry and, unless it is seated asleep,
+  a host `state` entry (`via: "seated"`) for the state carried over.
+- **Encodings.** Objects, arrays, strings, integers within ±2^53 and null:
+  no floats, no booleans; money is a decimal string. Every hash outside
+  `acts` is `sha256:<hex>`; acts keep the registry's own spelling, the bare
+  hex the seat shows. Public keys, `sig` and evidence bodies are base64url
+  without padding. A host entry's `kid` is `host:` and the host key's SHA256
+  fingerprint, so a verifier holding the key finds it.
+- **Digests and signatures.** The ledger digest of a value is sha256 of
+  `kingdom-seat-ledger/v1`, one 0x00 byte and its JCS bytes. `sig` is ed25519
+  over the digest of the entry without `sig` (`kid` included, so the signer
+  names the kid before it signs). `prev_hash` is the digest of the whole
+  previous entry, `sig` included, and null at seq 0, so each signature is
+  bound into the chain (re-review C, C5). An entry is named by that same
+  digest (`entryHash`), which is what `SeatResult.appended`, status's `head`
+  and `verify` print.
+- **The earlier layout is not v1.** kingdom-seat first wrote `body`, `hash`,
+  `signature`, `attestation` and `spend` under the same format string. No
+  ledger in that layout ran on a host, so there is no migration: a line in it
+  is refused, by `readLedger` and `verify`, as not kingdom-seat-ledger/v1.
+- **Unsigned host entries** (KS-004 4.5 allows `kid` and `sig` null, an
+  integrity-only chain) parse, but this host signs every host entry, so
+  `verifyChain` refuses one and says it is unsigned.
 
 ---
 
@@ -515,7 +569,7 @@ against a fake agenttool over HTTP.
 real supervised seat child (`test/fixtures/e2e/child.ts`) and only the outside
 world faked: a fake keychain of public test keys, and one fake server on
 127.0.0.1 for the beacons, agenttool's authority and quiet routes, and Ollama.
-In order: a journal beat (prompt bytes, envelope digests, host-attested
+In order: a journal beat (prompt bytes, the entry's digests, its host
 signature, host notes and status all checked), a rest that writes nothing in
 the citizen's voice, a tick halted by a raised and then an unreadable beacon,
 a self-change through propose, affirm, apply and revert, `verify` on a good

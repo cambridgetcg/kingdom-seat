@@ -38,6 +38,14 @@ export const THOUGHT_V2_DOMAIN = "strand-thought/v2";
 /** IDENTITY-SEED paths m/44'/169'/<purpose>'/0' (agenttool-wire.md section 3). */
 export const SEED_PURPOSE = Object.freeze({ root: 0, k_master: 1, k_vault: 2, box: 3 });
 
+/**
+ * The name an `apply` entry gives the key its strand backup is encrypted
+ * under (KS-004 4.3): K_master, derived from the citizen's own mnemonic at
+ * this path, so Yu's offline backup of the mnemonic can also decrypt the
+ * thoughts. A public name for the key, never the key or a hash of it.
+ */
+export const STRAND_KEY_ID = `k_master:m/44'/169'/${SEED_PURPOSE.k_master}'/0'`;
+
 /** The limits expression.ts:73-81 enforces, in UTF-16 code units (JavaScript `.length`). */
 export const EXPRESSION_LIMITS = Object.freeze({
   register: 500,

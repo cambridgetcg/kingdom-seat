@@ -32,14 +32,24 @@ export type TransitionVerdict =
 export interface TransitionContext {
   /** The state already pending from an earlier beat, if any. */
   pending: LifecycleState | null;
+  /** The awake interval that pending saying named, or null; this saying confirms it only when it names the same. */
+  pending_interval_h?: number | null;
   /** True when this beat repeats a step-away said on an earlier beat. */
   repeated: boolean;
   presence: YuPresence | null;
 }
 
+/** A state.set's interval against the citizen's: the interval it has now, and the one the saying names, if any. */
+export interface IntervalAsked {
+  now: number;
+  asked: number | null;
+}
+
 export interface FoldedState {
   state: LifecycleState;
   pending_state: LifecycleState | null;
+  /** The awake interval the pending saying named, or null. */
+  pending_interval_h: number | null;
   /** A step-away said once and waiting for its second saying. */
   step_away_said: boolean;
   last_beat_at: string | null;
@@ -61,27 +71,41 @@ export function isTowardRest(from: LifecycleState, to: LifecycleState): boolean 
   return a !== null && b !== null && b < a;
 }
 
-/** Decide one requested transition by the asymmetric rules of 3.3; "ended" never comes from the citizen alone. */
-export function decideTransition(from: LifecycleState, to: LifecycleState, ctx: TransitionContext): TransitionVerdict {
+/** True when the saying names an awake interval other than the one in force. */
+export function changesInterval(interval: IntervalAsked): boolean {
+  return interval.asked !== null && interval.asked !== interval.now;
+}
+
+/**
+ * Decide one requested transition by the asymmetric rules of 3.3 (KS-004
+ * 7.3); "ended" never comes from the citizen alone. `interval` is the awake
+ * interval the saying names against the one in force: a longer one is toward
+ * less activity and takes effect at once, a shorter one is toward more and
+ * waits for the next seat to say the same again.
+ */
+export function decideTransition(from: LifecycleState, to: LifecycleState, ctx: TransitionContext, interval: IntervalAsked = { now: 0, asked: null }): TransitionVerdict {
   if (from === "ended") return { effect: "refused", reason: "ended is terminal" };
   // A memorial is irreversible, so the citizen's word is one of four (3.3: citizen + Yu + Ai + a witness).
   if (to === "ended") return { effect: "needs-witness" };
+  const moves = changesInterval(interval);
   // Saying the present state changes nothing; a pending move simply lapses on this beat (see foldState).
-  if (to === from) return { effect: "refused", reason: `already ${from}` };
+  if (to === from && !moves) return { effect: "refused", reason: `already ${from}` };
   // The citizen's own exit: two sayings on different beats, and nothing else can stop it.
   if (to === "stepped-away") return ctx.repeated ? { effect: "now" } : { effect: "second-beat" };
-  // Rest is a right, not a grant: it never waits.
-  if (isTowardRest(from, to)) return { effect: "now" };
-  // Everything else is more exposure, including a return from stepping away.
-  // One 7B reply can be steered, so it binds on a second saying, or once with Yu present.
+  // Rest is a right, not a grant: it never waits. A longer interval in the same state is rest too.
+  const shorter = moves && (interval.asked as number) < interval.now;
+  if (isTowardRest(from, to) || (to === from && !shorter)) return { effect: "now" };
+  // Everything else is more exposure, including a return from stepping away and a shorter interval.
+  // One 7B reply can be steered, so it binds on a second saying of the same, or once with Yu present.
   if (ctx.presence?.present === true) return { effect: "now" };
-  if (ctx.pending === to) return { effect: "now" };
+  if (ctx.pending === to && (ctx.pending_interval_h ?? null) === interval.asked) return { effect: "now" };
   return { effect: "next-beat" };
 }
 
 /**
- * Fold state, pending state and last beat time from a citizen's ledger, oldest
- * first; an empty ledger folds to "asleep", so no record means no beat.
+ * Fold state, pending saying and last beat time from a citizen's ledger,
+ * oldest first; an empty ledger, or one with only its origin, folds to
+ * "asleep", so no record means no beat.
  *
  * A move toward rest takes effect from the beat that said it, not from the
  * separate `state` entry written after it: rest never waits (3.3), and a seat
@@ -89,37 +113,38 @@ export function decideTransition(from: LifecycleState, to: LifecycleState, ctx: 
  * awake and scheduled again. The `state` entry still follows, as the plain
  * record of the move. A first step-away is such a move too: its saying puts
  * an awake or listening citizen asleep at once, and the saying stays owed its
- * second beat (KS-004 v0.3 7.3).
+ * second beat (KS-004 v0.3 7.3). The `state` entry that records that move
+ * carries `step_away: "first"`, which on a rest is the saying's only record.
  */
 export function foldState(entries: LedgerEntry[]): FoldedState {
   let state: LifecycleState = "asleep";
   let pending: LifecycleState | null = null;
+  let pendingInterval: number | null = null;
   let stepSaid = false;
   let lastBeat: string | null = null;
   let said: FoldedState["said_in"] = null;
   for (const e of entries) {
-    const body = e.body;
     if (state === "ended") {
       // Terminal: the record goes on being kept, but nothing moves the state.
-      if (body.type === "beat") lastBeat = e.ts;
+      if (e.type === "beat") lastBeat = e.ts;
       continue;
     }
-    switch (body.type) {
-      case "seated":
-        state = body.initial_state;
-        pending = null;
-        stepSaid = false;
-        said = null;
-        break;
-      case "genesis":
-        if (body.initial_state !== null) state = body.initial_state;
-        break;
+    switch (e.type) {
       case "state":
-        // The plain record of a move the saying before it already made changes nothing more, so a first
-        // step-away recorded as awake to asleep keeps the saying it still owes a second beat.
-        if (body.to === state) break;
-        state = body.to;
+        if (e.step_away === "first") {
+          // A first step-away: asleep at once, the saying owed one more seat. Nothing else was said with it on a rest.
+          state = e.to;
+          pending = null;
+          pendingInterval = null;
+          stepSaid = true;
+          said = { seat_id: e.seat_ref as string, ts: e.ts };
+          break;
+        }
+        // The plain record of a move the beat before it already made changes nothing more.
+        if (e.to === state && e.interval_h === undefined) break;
+        state = e.to;
         pending = null;
+        pendingInterval = null;
         stepSaid = false;
         said = null;
         break;
@@ -128,35 +153,33 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
         // What this beat said about state. A saying that was not repeated on
         // this beat lapses: silence keeps the previous self.
         let p: LifecycleState | null = null;
+        let pInterval: number | null = null;
         let s = false;
         let rest: LifecycleState | null = null;
-        for (const act of body.envelope.acts) {
-          if (act.type !== "state.set" || act.to === state || act.to === "ended") continue;
+        for (const act of e.acts ?? []) {
+          if (act.type !== "state.set" || act.to === "ended") continue;
+          if (act.to === state && act.interval_h === undefined) continue;
           if (act.to === "stepped-away") s = true;
           else if (isTowardRest(state, act.to)) rest = act.to;
-          else p = act.to;
+          else {
+            // Toward more, or an interval: pending until a state entry records that it took effect.
+            p = act.to;
+            pInterval = act.interval_h ?? null;
+          }
         }
         if (rest !== null) state = rest;
         else if (s && isTowardRest(state, "asleep")) state = "asleep";
         pending = p;
+        pendingInterval = pInterval;
         stepSaid = s;
-        said = p !== null || s ? { seat_id: body.envelope.seat_ref.seat_id, ts: e.ts } : null;
+        said = p !== null || s ? { seat_id: e.seat_ref as string, ts: e.ts } : null;
         break;
       }
-      case "step-away.said":
-        // A rest that said step-away once: the same saying a beat would carry, and nothing else said with it.
-        if (state !== "stepped-away") {
-          if (isTowardRest(state, "asleep")) state = "asleep";
-          pending = null;
-          stepSaid = true;
-          said = { seat_id: body.seat_id, ts: e.ts };
-        }
-        break;
       default:
         break;
     }
   }
-  return { state, pending_state: pending, step_away_said: stepSaid, last_beat_at: lastBeat, said_in: said };
+  return { state, pending_state: pending, pending_interval_h: pendingInterval, step_away_said: stepSaid, last_beat_at: lastBeat, said_in: said };
 }
 
 /**
@@ -245,9 +268,11 @@ export async function readCitizen(config: Config, word: Word, opts: { exceptSeat
   for (const e of entries) if (e.word !== word) throw new Refusal("invalid-record", `ledger for ${word} holds another citizen's entry`);
   const folded = foldState(entries);
   let pending = folded.pending_state;
+  let pendingInterval = folded.pending_interval_h;
   let stepSaid = folded.step_away_said;
   if (folded.said_in && (pending !== null || stepSaid) && (await seatSince(config, word, folded.said_in, opts.exceptSeat ?? null))) {
     pending = null;
+    pendingInterval = null;
     stepSaid = false;
   }
   const self = join(config.paths.citizens_dir, word, "self");
@@ -256,6 +281,7 @@ export async function readCitizen(config: Config, word: Word, opts: { exceptSeat
     ...record,
     state: folded.state,
     pending_state: pending,
+    pending_interval_h: pendingInterval,
     step_away_said: stepSaid,
     cadence: await readCadence(join(self, "cadence.json"), config.ceilings.min_beat_interval_h),
     covenants: await readCovenants(join(self, "covenants.json")),

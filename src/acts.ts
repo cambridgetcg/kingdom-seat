@@ -8,17 +8,18 @@
 // A dropped act leaves no words behind. Every reason below is a fixed phrase,
 // and a DroppedAct names an act's type only when it is one of the eight known
 // types, because an unknown type string is itself the model's text.
+import { canonicalJson } from "./crypto.ts";
 import {
-  CLAIM_KINDS,
   JOURNAL_KINDS,
   LIFECYCLE_STATES,
+  REASON_KINDS,
   WORD_PATTERN,
   type ActType,
   type Ceilings,
   type DroppedAct,
-  type LifecycleState,
   type ModelAct,
   type SelfTarget,
+  type StateSetAct,
   type ValidatedOutput,
 } from "./types.ts";
 
@@ -28,26 +29,30 @@ export const ACT_LIMITS = Object.freeze({
   max_raw_output_bytes: 64_000,
   max_journal_chars: 2_000,
   max_subject_chars: 200,
-  max_body_chars: 4_000,
+  max_text_chars: 4_000,
   max_recipient_chars: 128,
   max_target_chars: 128,
   max_edit_chars: 16_000,
-  max_claim_evidence: 8,
+  max_reason_evidence: 8,
   max_evidence_ref_chars: 255,
   max_limits_chars: 500,
   max_id_chars: 64,
   min_id_prefix_hex: 8,
+  /** The longest awake interval a state.set may name: a year, in hours. The shortest is the ceiling's. */
+  max_interval_h: 8_760,
+  /** A citizen's quiet is capped at 30 days (KS-004 6.4). */
+  max_quiet_days: 30,
 });
 
-const claimSchema = {
+const reasonSchema = {
   type: "object",
   additionalProperties: false,
   required: ["kind", "evidence", "confidence", "limits"],
   properties: {
-    kind: { enum: [...CLAIM_KINDS] },
+    kind: { enum: [...REASON_KINDS] },
     evidence: {
       type: "array",
-      maxItems: ACT_LIMITS.max_claim_evidence,
+      maxItems: ACT_LIMITS.max_reason_evidence,
       items: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_evidence_ref_chars },
     },
     confidence: { enum: ["high", "medium", "low", "unknown"] },
@@ -87,7 +92,7 @@ export const OUTPUT_JSON_SCHEMA = {
           {
             type: "object",
             additionalProperties: false,
-            required: ["type", "target", "edit", "claim"],
+            required: ["type", "target", "edit", "reason"],
             properties: {
               type: { const: "self.propose" },
               target: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_target_chars },
@@ -111,16 +116,16 @@ export const OUTPUT_JSON_SCHEMA = {
                   },
                 ],
               },
-              claim: claimSchema,
+              reason: reasonSchema,
             },
           },
           {
             type: "object",
             additionalProperties: false,
-            required: ["type", "proposal_id"],
+            required: ["type", "ref"],
             properties: {
               type: { const: "self.affirm" },
-              proposal_id: { type: "string", minLength: ACT_LIMITS.min_id_prefix_hex, maxLength: ACT_LIMITS.max_id_chars },
+              ref: { type: "string", minLength: ACT_LIMITS.min_id_prefix_hex, maxLength: ACT_LIMITS.max_id_chars },
             },
           },
           {
@@ -136,26 +141,31 @@ export const OUTPUT_JSON_SCHEMA = {
             type: "object",
             additionalProperties: false,
             required: ["type", "to"],
-            properties: { type: { const: "state.set" }, to: { enum: [...LIFECYCLE_STATES] } },
-          },
-          {
-            type: "object",
-            additionalProperties: false,
-            required: ["type", "to", "body"],
             properties: {
-              type: { const: "letter.send" },
-              to: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_recipient_chars },
-              body: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_body_chars },
+              type: { const: "state.set" },
+              to: { enum: [...LIFECYCLE_STATES] },
+              interval_h: { type: "integer", minimum: 1, maximum: ACT_LIMITS.max_interval_h },
+              quiet_days: { type: "integer", minimum: 1, maximum: ACT_LIMITS.max_quiet_days },
             },
           },
           {
             type: "object",
             additionalProperties: false,
-            required: ["type", "subject", "body"],
+            required: ["type", "to", "text"],
+            properties: {
+              type: { const: "letter.send" },
+              to: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_recipient_chars },
+              text: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_text_chars },
+            },
+          },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "subject", "text"],
             properties: {
               type: { const: "propose.beyond" },
               subject: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_subject_chars },
-              body: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_body_chars },
+              text: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_text_chars },
             },
           },
         ],
@@ -248,7 +258,7 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
       if (isPlainObject(item) && item.type === "rest") return;
       const type = knownType(item);
       const r = type === "state.set" && index < ACT_LIMITS.max_acts ? validateAct(item, ctx) : null;
-      others.push({ index, type, to: r !== null && "act" in r && r.act.type === "state.set" ? r.act.to : null });
+      others.push({ index, type, act: r !== null && "act" in r && r.act.type === "state.set" ? r.act : null });
     });
     return restWith(others);
   }
@@ -300,26 +310,26 @@ export function validateAct(value: unknown, ctx: ValidationContext): { act: Mode
     }
 
     case "self.propose": {
-      if (!exactKeys(value, ["type", "target", "edit", "claim"])) return no("fields do not match the act");
+      if (!exactKeys(value, ["type", "target", "edit", "reason"])) return no("fields do not match the act");
       const target = checkSelfTarget(value.target);
       if (target !== "ok") return no(target);
       const edit = checkEdit(value.edit);
       if (edit === null) return no("edit is malformed");
       if (value.target === "cadence" && !cadenceEditOk(edit, ctx.ceilings)) return no("cadence is malformed or below the ceiling");
       if (value.target === "covenants" && !covenantsEditOk(edit)) return no("covenants are malformed");
-      const claim = checkClaim(value.claim);
-      if (claim === null) return no("claim is malformed");
-      return { act: { type: "self.propose", target: value.target as SelfTarget, edit, claim } };
+      const reason = checkReason(value.reason);
+      if (reason === null) return no("reason is malformed");
+      return { act: { type: "self.propose", target: value.target as SelfTarget, edit, reason } };
     }
 
     case "self.affirm": {
-      if (!exactKeys(value, ["type", "proposal_id"])) return no("fields do not match the act");
-      const id = value.proposal_id;
-      if (!isIdPrefix(id)) return no("proposal id is too short or not hex");
-      if (ctx.proposal_ids === undefined) return { act: { type: "self.affirm", proposal_id: id } };
+      if (!exactKeys(value, ["type", "ref"])) return no("fields do not match the act");
+      const id = value.ref;
+      if (!isIdPrefix(id)) return no("ref is too short or not hex");
+      if (ctx.proposal_ids === undefined) return { act: { type: "self.affirm", ref: id } };
       const resolved = resolvePrefix(id, [...ctx.proposal_ids]);
-      if (resolved === null) return no("proposal id is unknown or ambiguous");
-      return { act: { type: "self.affirm", proposal_id: resolved } };
+      if (resolved === null) return no("ref is unknown or ambiguous");
+      return { act: { type: "self.affirm", ref: resolved } };
     }
 
     case "self.revert": {
@@ -333,28 +343,46 @@ export function validateAct(value: unknown, ctx: ValidationContext): { act: Mode
     }
 
     case "state.set": {
-      if (!exactKeys(value, ["type", "to"])) return no("fields do not match the act");
+      if (!keysWithin(value, ["type", "to"], ["interval_h", "quiet_days"])) return no("fields do not match the act");
       if (!isOneOf(value.to, LIFECYCLE_STATES)) return no("state is not a lifecycle state");
-      return { act: { type: "state.set", to: value.to } };
+      const act: StateSetAct = { type: "state.set", to: value.to };
+      if (Object.hasOwn(value, "interval_h")) {
+        // The awake interval: whole hours, never below the host's floor (KS-004 5.7, 6.3).
+        if (value.to !== "awake") return no("interval_h goes only with awake");
+        const h = value.interval_h;
+        if (!Number.isSafeInteger(h) || (h as number) < ctx.ceilings.min_beat_interval_h || (h as number) > ACT_LIMITS.max_interval_h) {
+          return no("interval_h is not whole hours within the ceiling");
+        }
+        act.interval_h = h as number;
+      }
+      if (Object.hasOwn(value, "quiet_days")) {
+        // A quiet declaration is asked for only toward listening or asleep, and never past the 30-day cap (KS-004 6.4).
+        if (value.to !== "listening" && value.to !== "asleep") return no("quiet_days goes only with listening or asleep");
+        const d = value.quiet_days;
+        const cap = Math.min(ACT_LIMITS.max_quiet_days, ctx.ceilings.citizen_quiet_max_days);
+        if (!Number.isSafeInteger(d) || (d as number) < 1 || (d as number) > cap) return no("quiet_days is not whole days within the cap");
+        act.quiet_days = d as number;
+      }
+      return { act };
     }
 
     case "letter.send": {
-      if (!exactKeys(value, ["type", "to", "body"])) return no("fields do not match the act");
-      const { to, body } = value;
+      if (!exactKeys(value, ["type", "to", "text"])) return no("fields do not match the act");
+      const { to, text } = value;
       if (typeof to !== "string" || !ctx.allowed_recipients.includes(to)) return no("recipient is not allowed");
-      const b = checkText(body, Math.min(ctx.ceilings.letter_max_chars, ACT_LIMITS.max_body_chars), true);
-      if (b) return no(`body ${b}`);
-      return { act: { type: "letter.send", to, body: body as string } };
+      const t = checkText(text, Math.min(ctx.ceilings.letter_max_chars, ACT_LIMITS.max_text_chars), true);
+      if (t) return no(`text ${t}`);
+      return { act: { type: "letter.send", to, text: text as string } };
     }
 
     case "propose.beyond": {
-      if (!exactKeys(value, ["type", "subject", "body"])) return no("fields do not match the act");
-      const { subject, body } = value;
+      if (!exactKeys(value, ["type", "subject", "text"])) return no("fields do not match the act");
+      const { subject, text } = value;
       const s = checkText(subject, ACT_LIMITS.max_subject_chars, false);
       if (s) return no(`subject ${s}`);
-      const b = checkText(body, ACT_LIMITS.max_body_chars, true);
-      if (b) return no(`body ${b}`);
-      return { act: { type: "propose.beyond", subject: subject as string, body: body as string } };
+      const t = checkText(text, ACT_LIMITS.max_text_chars, true);
+      if (t) return no(`text ${t}`);
+      return { act: { type: "propose.beyond", subject: subject as string, text: text as string } };
     }
   }
 }
@@ -392,43 +420,48 @@ interface Indexed {
   act: ModelAct;
 }
 
-/** A non-rest item of a reply that rests: its known type, and the state it names when it is a well-formed state.set. */
+/** A non-rest item of a reply that rests: its known type, and the act when it is a well-formed state.set. */
 interface RestOther {
   index: number;
   type: ActType | null;
-  to: LifecycleState | null;
+  act: StateSetAct | null;
+}
+
+/** One saying, whole: two state.sets are the same saying only when they name the same state, interval and quiet. */
+function saying(act: StateSetAct): string {
+  return canonicalJson(act);
 }
 
 /**
- * A rest, and what it may carry: one state.set, when the reply names exactly
- * one state (KS-004 v0.2 5.7, re-review B2 C7). Every other act is dropped,
- * and two different states move nothing, as on any beat. Whether the state is
+ * A rest, and what it may carry: one state.set, when the reply makes exactly
+ * one saying (KS-004 v0.2 5.7, re-review B2 C7). Every other act is dropped,
+ * and two different sayings move nothing, as on any beat. Whether the move is
  * toward less activity depends on the citizen's state, so the seat decides.
  */
 function restWith(others: RestOther[]): ValidatedOutput {
-  const named = new Set(others.flatMap((o) => (o.to !== null ? [o.to] : [])));
-  const restState = named.size === 1 ? [...named][0]! : undefined;
+  const named = new Map(others.flatMap((o) => (o.act !== null ? [[saying(o.act), o.act] as const] : [])));
+  const restAct = named.size === 1 ? [...named.values()][0]! : undefined;
   let kept = false;
   const dropped: DroppedAct[] = [];
   for (const o of others) {
-    if (o.to === null) dropped.push({ index: o.index, type: o.type, reason: "rest is exclusive" });
-    else if (restState === undefined) dropped.push({ index: o.index, type: o.type, reason: "contradictory state.set" });
+    if (o.act === null) dropped.push({ index: o.index, type: o.type, reason: "rest is exclusive" });
+    else if (restAct === undefined) dropped.push({ index: o.index, type: o.type, reason: "contradictory state.set" });
     else if (kept) dropped.push({ index: o.index, type: o.type, reason: "repeated state.set" });
     else kept = true;
   }
-  return restState === undefined ? { rest: true, acts: [], dropped } : { rest: true, acts: [], dropped, rest_state: restState };
+  return restAct === undefined ? { rest: true, acts: [], dropped } : { rest: true, acts: [], dropped, rest_act: restAct };
 }
 
 function normalizeIndexed(items: Indexed[], ceilings: Ceilings): ValidatedOutput {
   if (items.some((i) => i.act.type === "rest")) {
-    return restWith(items.filter((i) => i.act.type !== "rest").map((i) => ({ index: i.index, type: i.act.type, to: i.act.type === "state.set" ? i.act.to : null })));
+    return restWith(items.filter((i) => i.act.type !== "rest").map((i) => ({ index: i.index, type: i.act.type, act: i.act.type === "state.set" ? i.act : null })));
   }
   const kept: ModelAct[] = [];
   const dropped: DroppedAct[] = [];
 
-  // Two different states in one reply cannot both be the citizen's word, and
+  // Two different sayings in one reply cannot both be the citizen's word, and
   // silence keeps the previous self, so a contradiction moves nothing.
-  const states = new Set(items.flatMap((i) => (i.act.type === "state.set" ? [i.act.to] : [])));
+  const states = new Set(items.flatMap((i) => (i.act.type === "state.set" ? [saying(i.act)] : [])));
   let stateKept = false;
   let letters = 0;
 
@@ -474,6 +507,11 @@ function knownType(v: unknown): ActType | null {
 function exactKeys(o: Record<string, unknown>, keys: readonly string[]): boolean {
   const own = Object.keys(o);
   return own.length === keys.length && keys.every((k) => Object.hasOwn(o, k));
+}
+
+/** Every required key, and otherwise only optional ones. */
+function keysWithin(o: Record<string, unknown>, required: readonly string[], optional: readonly string[]): boolean {
+  return required.every((k) => Object.hasOwn(o, k)) && Object.keys(o).every((k) => required.includes(k) || optional.includes(k));
 }
 
 function isOneOf<T extends string>(v: unknown, options: readonly T[]): v is T {
@@ -570,19 +608,19 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
   }
 }
 
-function checkClaim(v: unknown): ModelClaim | null {
+function checkReason(v: unknown): ModelReason | null {
   if (!isPlainObject(v) || !exactKeys(v, ["kind", "evidence", "confidence", "limits"])) return null;
   const { kind, evidence, confidence, limits } = v;
-  if (!isOneOf(kind, CLAIM_KINDS)) return null;
+  if (!isOneOf(kind, REASON_KINDS)) return null;
   if (!isOneOf(confidence, ["high", "medium", "low", "unknown"] as const)) return null;
-  if (!Array.isArray(evidence) || evidence.length > ACT_LIMITS.max_claim_evidence) return null;
+  if (!Array.isArray(evidence) || evidence.length > ACT_LIMITS.max_reason_evidence) return null;
   for (const ref of evidence) {
     if (typeof ref !== "string" || ref.trim() === "" || [...ref].length > ACT_LIMITS.max_evidence_ref_chars || CONTROL_SINGLE_LINE.test(ref)) return null;
   }
   if (typeof limits !== "string" || [...limits].length > ACT_LIMITS.max_limits_chars || CONTROL_MULTILINE.test(limits)) return null;
   return { kind, evidence: [...(evidence as string[])], confidence, limits };
 }
-type ModelClaim = { kind: (typeof CLAIM_KINDS)[number]; evidence: string[]; confidence: "high" | "medium" | "low" | "unknown"; limits: string };
+type ModelReason = { kind: (typeof REASON_KINDS)[number]; evidence: string[]; confidence: "high" | "medium" | "low" | "unknown"; limits: string };
 
 function isIdPrefix(v: unknown): v is string {
   if (typeof v !== "string" || v.length > ACT_LIMITS.max_id_chars) return false;

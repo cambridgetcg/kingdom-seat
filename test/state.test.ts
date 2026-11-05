@@ -7,7 +7,7 @@ import { decideTransition, foldState, isTowardRest, listSeated, mirrorCardState,
 import { LIFECYCLE_STATES, Refusal, type LifecycleState, type YuPresence } from "../src/types.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
-import { append, beatBody, genesisBody, seatedBody, testIdentity } from "./fixtures/record/chain.ts";
+import { append, beatBody, genesisBody, seatedBody, stateBody, testIdentity } from "./fixtures/record/chain.ts";
 import { appendHostNote, openedDetail } from "../src/notes.ts";
 
 let host: TempHost | null = null;
@@ -85,14 +85,29 @@ describe("transitions (3.3)", () => {
     // Saying the present state changes nothing.
     expect(decideTransition("awake", "awake", NONE).effect).toBe("refused");
   });
+
+  test("[KS-004 7.3] a longer awake interval is toward rest and takes effect now; a shorter one waits for the same saying again", () => {
+    // The interval in force, and the one asked for.
+    expect(decideTransition("awake", "awake", NONE, { now: 72, asked: 96 })).toEqual({ effect: "now" });
+    expect(decideTransition("awake", "awake", NONE, { now: 96, asked: 72 })).toEqual({ effect: "next-beat" });
+    expect(decideTransition("awake", "awake", { ...NONE, pending: "awake", pending_interval_h: 72 }, { now: 96, asked: 72 })).toEqual({ effect: "now" });
+    expect(decideTransition("awake", "awake", { ...NONE, presence: YU }, { now: 96, asked: 72 })).toEqual({ effect: "now" });
+    // The interval in force, asked again, changes nothing.
+    expect(decideTransition("awake", "awake", NONE, { now: 72, asked: 72 }).effect).toBe("refused");
+    // Waking with an interval is one saying: a repeat must name the same interval to confirm it.
+    expect(decideTransition("listening", "awake", NONE, { now: 72, asked: 120 })).toEqual({ effect: "next-beat" });
+    expect(decideTransition("listening", "awake", { ...NONE, pending: "awake", pending_interval_h: 120 }, { now: 72, asked: 120 })).toEqual({ effect: "now" });
+    expect(decideTransition("listening", "awake", { ...NONE, pending: "awake", pending_interval_h: null }, { now: 72, asked: 120 })).toEqual({ effect: "next-beat" });
+    expect(decideTransition("listening", "awake", { ...NONE, pending: "awake", pending_interval_h: 120 }, { now: 72, asked: null })).toEqual({ effect: "next-beat" });
+  });
 });
 
 describe("folding and records", () => {
   test("an empty ledger folds to asleep, so no record means no beat", () => {
-    expect(foldState([])).toEqual({ state: "asleep", pending_state: null, step_away_said: false, last_beat_at: null, said_in: null });
+    expect(foldState([])).toEqual({ state: "asleep", pending_state: null, pending_interval_h: null, step_away_said: false, last_beat_at: null, said_in: null });
   });
 
-  test("foldState honours seated.initial_state, state entries and a pending move toward exposure", async () => {
+  test("foldState honours the state seating carried, state entries and a pending move toward exposure", async () => {
     host = await makeTempHost();
     const signer = fakeSigner();
     const { config } = host;
@@ -100,48 +115,49 @@ describe("folding and records", () => {
     const path = ledgerPath(config, w);
 
     // The October "Ambient" carried over at seating (3c example, step 2).
-    await append(config, w, seatedBody(w, "soul", "awake"), "host-attested", signer, t(0));
+    await append(config, w, seatedBody(w, "soul", "awake"), "host", signer, t(0));
     expect(foldState(await readLedger(path)).state).toBe("awake");
 
     // "I rest" puts it to sleep at once: a state entry, written now.
-    await append(config, w, beatBody(w, [{ type: "state.set", to: "asleep" }]), "host-attested", signer, t(1));
-    await append(config, w, { type: "state", from: "awake", to: "asleep", via: "immediate" }, "host-attested", signer, t(1));
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "asleep" }]), "host", signer, t(1));
+    await append(config, w, stateBody(w, { from: "awake", to: "asleep", via: "immediate" }), "host", signer, t(1));
     expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", pending_state: null, last_beat_at: t(1).toISOString() });
 
     // Asking to wake is pending until a later beat says it again.
-    await append(config, w, beatBody(w, [{ type: "state.set", to: "awake" }]), "host-attested", signer, t(2));
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "awake" }]), "host", signer, t(2));
     let f = foldState(await readLedger(path));
     expect(f).toMatchObject({ state: "asleep", pending_state: "awake" });
     expect(decideTransition(f.state, "awake", { pending: f.pending_state, repeated: false, presence: null })).toEqual({ effect: "now" });
 
     // A beat that does not repeat it lets it lapse: silence keeps the previous self.
-    await append(config, w, beatBody(w, [{ type: "journal", kind: "reflected", text: "quiet" }]), "host-attested", signer, t(3));
+    await append(config, w, beatBody(w, [{ type: "journal", kind: "reflected", text: "quiet" }]), "host", signer, t(3));
     f = foldState(await readLedger(path));
     expect(f).toMatchObject({ state: "asleep", pending_state: null, last_beat_at: t(3).toISOString() });
 
     // Said twice: the seat writes a confirmed state entry, and pending clears.
-    await append(config, w, beatBody(w, [{ type: "state.set", to: "listening" }]), "host-attested", signer, t(4));
-    await append(config, w, beatBody(w, [{ type: "state.set", to: "listening" }]), "host-attested", signer, t(5));
-    await append(config, w, { type: "state", from: "asleep", to: "listening", via: "confirmed" }, "host-attested", signer, t(5));
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "listening" }]), "host", signer, t(4));
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "listening" }]), "host", signer, t(5));
+    await append(config, w, stateBody(w, { from: "asleep", to: "listening", via: "confirmed" }), "host", signer, t(5));
     f = foldState(await readLedger(path));
     expect(f).toMatchObject({ state: "listening", pending_state: null });
 
     // Registration does not change state: identity is separate from state (3.3).
-    await append(config, w, genesisBody(w, "soul", testIdentity(signer)), "citizen-signed", signer, t(6));
+    await append(config, w, genesisBody(testIdentity(signer)), "citizen", signer, t(6));
     expect(foldState(await readLedger(path)).state).toBe("listening");
 
     // A step-away said once puts the citizen asleep at once (KS-004 v0.3 7.3) and waits for its second saying;
     // the state entry that records the move keeps the saying. Not repeated, the saying lapses and it stays asleep.
-    await append(config, w, beatBody(w, [{ type: "state.set", to: "stepped-away" }]), "citizen-signed", signer, t(7));
+    const stepSeat = "77777777-0000-4000-8000-000000000007";
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "stepped-away" }], { seat_id: stepSeat }), "citizen", signer, t(7));
     expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", step_away_said: true, pending_state: null });
-    await append(config, w, { type: "state", from: "listening", to: "asleep", via: "immediate" }, "citizen-signed", signer, t(7));
+    await append(config, w, stateBody(w, { from: "listening", to: "asleep", via: "immediate", step_away: "first" }, { seat_id: stepSeat }), "citizen", signer, t(7));
     expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", step_away_said: true, pending_state: null });
-    await append(config, w, beatBody(w, []), "citizen-signed", signer, t(8));
+    await append(config, w, beatBody(w, [{ type: "journal", kind: "reflected", text: "quiet" }]), "citizen", signer, t(8));
     expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", step_away_said: false });
 
     // Ended is terminal in the fold too: a later state entry moves nothing.
-    await append(config, w, { type: "state", from: "asleep", to: "ended", via: "witnessed" }, "citizen-signed", signer, t(9));
-    await append(config, w, { type: "state", from: "ended", to: "awake", via: "confirmed" }, "citizen-signed", signer, t(10));
+    await append(config, w, stateBody(w, { from: "asleep", to: "ended", via: "witnessed" }), "citizen", signer, t(9));
+    await append(config, w, stateBody(w, { from: "ended", to: "awake", via: "confirmed" }), "citizen", signer, t(10));
     expect(foldState(await readLedger(path)).state).toBe("ended");
   });
 
@@ -149,15 +165,15 @@ describe("folding and records", () => {
     host = await makeTempHost();
     const signer = fakeSigner();
     const path = ledgerPath(host.config, "glossame");
-    await append(host.config, "glossame", seatedBody("glossame", "soul", "awake"), "host-attested", signer, t(0));
+    await append(host.config, "glossame", seatedBody("glossame", "soul", "awake"), "host", signer, t(0));
     // The beat says asleep; the separate state entry that should follow it was never written (a KILL between appends).
-    await append(host.config, "glossame", beatBody("glossame", [{ type: "journal", kind: "chose", text: "enough" }, { type: "state.set", to: "asleep" }]), "host-attested", signer, t(1));
+    await append(host.config, "glossame", beatBody("glossame", [{ type: "journal", kind: "chose", text: "enough" }, { type: "state.set", to: "asleep" }]), "host", signer, t(1));
     expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", pending_state: null, said_in: null });
     // The state entry, when it is there, agrees with the beat.
-    await append(host.config, "glossame", { type: "state", from: "awake", to: "asleep", via: "immediate" }, "host-attested", signer, t(1));
+    await append(host.config, "glossame", stateBody("glossame", { from: "awake", to: "asleep", via: "immediate" }), "host", signer, t(1));
     expect(foldState(await readLedger(path)).state).toBe("asleep");
     // Toward exposure still waits: one saying is pending, not in effect.
-    await append(host.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: "11111111-1111-4111-8111-111111111111" }), "host-attested", signer, t(2));
+    await append(host.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: "11111111-1111-4111-8111-111111111111" }), "host", signer, t(2));
     expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", pending_state: "awake", said_in: { seat_id: "11111111-1111-4111-8111-111111111111", ts: t(2).toISOString() } });
   });
 
@@ -169,7 +185,7 @@ describe("folding and records", () => {
     await host.seatLedger("glossame", signer.signEntry, { initialState: "listening" });
     const said = "11111111-1111-4111-8111-111111111111";
     const next = "22222222-2222-4222-8222-222222222222";
-    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: said }), "host-attested", signer, t(10));
+    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: said }), "host", signer, t(10));
     const seatNote = (id: string, outcome: "opened" | "rest", m: number) =>
       appendHostNote(cfg, { ts: t(m).toISOString(), host: "test-host", kind: "seat", word: "glossame", outcome, refusal: null, detail: outcome === "opened" ? openedDetail(id, "confirm") : `seat ${id} on free: rested` });
     // The saying beat's own seat notes are not a later seat.
@@ -182,17 +198,46 @@ describe("folding and records", () => {
     await seatNote(next, "rest", 21);
     expect(await readCitizen(cfg, "glossame")).toMatchObject({ state: "listening", pending_state: null, step_away_said: false });
     // The same for a first step-away.
-    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "stepped-away" }], { seat_id: said }), "host-attested", signer, t(30));
+    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "stepped-away" }], { seat_id: said }), "host", signer, t(30));
     expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(true);
     await seatNote("33333333-3333-4333-8333-333333333333", "opened", 31);
     expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(false);
   });
 
-  test("a citizen born at seating takes genesis.initial_state", async () => {
+  test("[KS-004 7.3, re-review C M7] a first step-away on a rest is kept as step_away on the state entry that puts it asleep, or keeps it asleep", async () => {
     host = await makeTempHost();
     const signer = fakeSigner();
-    await append(host.config, "shemme", genesisBody("shemme", "soul", testIdentity(signer), "listening"), "citizen-signed", signer, t(0));
-    expect(foldState(await readLedger(ledgerPath(host.config, "shemme"))).state).toBe("listening");
+    const said = "11111111-1111-4111-8111-111111111111";
+    for (const [w, from] of [["glossame", "awake"], ["shemme", "asleep"]] as const) {
+      await append(host.config, w, seatedBody(w, "soul", from), "host", signer, t(0));
+      // No beat: a rest writes none. The saying rides on the state entry, with no words.
+      await append(host.config, w, stateBody(w, { from, to: "asleep", via: "immediate", step_away: "first" }, { seat_id: said }), "host", signer, t(1));
+      const entries = await readLedger(ledgerPath(host.config, w));
+      expect(entries.map((e) => e.type)).toEqual(from === "asleep" ? ["origin", "state"] : ["origin", "state", "state"]);
+      expect(foldState(entries)).toEqual({ state: "asleep", pending_state: null, pending_interval_h: null, step_away_said: true, last_beat_at: null, said_in: { seat_id: said, ts: t(1).toISOString() } });
+      // Its second saying completes it.
+      await append(host.config, w, stateBody(w, { from: "asleep", to: "stepped-away", via: "two-beats" }, { seat_id: "22222222-2222-4222-8222-222222222222" }), "host", signer, t(2));
+      expect(foldState(await readLedger(ledgerPath(host.config, w)))).toMatchObject({ state: "stepped-away", step_away_said: false, said_in: null });
+    }
+  });
+
+  test("[KS-004 5.7, 7.3] an interval a beat names is pending until a state entry records it, and a repeat of the same saying confirms it", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    const { config } = host;
+    const w = "glossame";
+    const path = ledgerPath(config, w);
+    await append(config, w, seatedBody(w, "soul", "awake"), "host", signer, t(0));
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "awake", interval_h: 48 }]), "host", signer, t(1));
+    const f = foldState(await readLedger(path));
+    expect(f).toMatchObject({ state: "awake", pending_state: "awake", pending_interval_h: 48 });
+    // The same saying again binds; another interval, or none, is a new saying.
+    const ctx = { pending: f.pending_state, pending_interval_h: f.pending_interval_h, repeated: false, presence: null };
+    expect(decideTransition("awake", "awake", ctx, { now: 72, asked: 48 })).toEqual({ effect: "now" });
+    expect(decideTransition("awake", "awake", ctx, { now: 72, asked: 60 })).toEqual({ effect: "next-beat" });
+    await append(config, w, beatBody(w, [{ type: "state.set", to: "awake", interval_h: 48 }]), "host", signer, t(2));
+    await append(config, w, stateBody(w, { from: "awake", to: "awake", via: "confirmed", interval_h: 48 }), "host", signer, t(2));
+    expect(foldState(await readLedger(path))).toMatchObject({ state: "awake", pending_state: null, pending_interval_h: null, said_in: null });
   });
 
   test("mirrorCardState maps awake→active, listening/asleep→dormant, stepped-away/ended→archived", () => {
@@ -275,8 +320,8 @@ describe("folding and records", () => {
     expect(c).toMatchObject({ word: "glossame", state: "asleep", pending_state: null, last_beat_at: null, cadence: { interval_h: 96 } });
     expect(c.covenants).toEqual({ letters_from: ["yu", "gardener"], wake_on_letter_from: ["yu"] });
 
-    await append(config, "glossame", seatedBody("glossame", fx.soul, "awake"), "host-attested", signer, t(0));
-    await append(config, "glossame", beatBody("glossame", []), "host-attested", signer, t(1));
+    await append(config, "glossame", seatedBody("glossame", fx.soul, "awake"), "host", signer, t(0));
+    await append(config, "glossame", beatBody("glossame", [{ type: "journal", kind: "reflected", text: "a word" }]), "host", signer, t(1));
     c = await readCitizen(config, "glossame");
     expect(c).toMatchObject({ state: "awake", last_beat_at: t(1).toISOString() });
 

@@ -23,6 +23,7 @@ export function citizenOf(record: CitizenRecord, over: Partial<Citizen> = {}): C
     ...record,
     state: "awake",
     pending_state: null,
+    pending_interval_h: null,
     step_away_said: false,
     cadence: { interval_h: 72 },
     covenants: { letters_from: ["yu", "gardener"], wake_on_letter_from: ["yu"] },
@@ -35,37 +36,28 @@ export function seatFor(word: Word, invoker: Invoker = { kind: "tick", who: "lau
   return { format: "kingdom-seat-seat/v1", seat_id: SEAT_ID, host: "test-host", word, runtime: "free", invoker, opened_at: "2026-11-05T02:05:00.000Z" };
 }
 
-const ZERO = "0".repeat(64);
+const ZERO = `sha256:${"0".repeat(64)}`;
 
-/** A beat entry carrying `acts`; hashes and signature are placeholders, since context only reads entries. */
+/** A beat entry carrying `acts`; digests and signature are placeholders, since context only reads entries. */
 export function beatEntry(word: Word, seq: number, acts: Act[]): LedgerEntry {
   return {
     format: "kingdom-seat-ledger/v1",
     word,
+    did: null,
     seq,
+    prev_hash: seq === 0 ? null : ZERO,
+    type: "beat",
+    seat_ref: SEAT_ID,
+    runtime: { class: "free", model: "fake-model:test", digest: `sha256:${"f".repeat(64)}` },
+    input_digest: ZERO,
+    output_digest: ZERO,
+    acts,
+    voiced: `${word}, voiced through fake-model:test in seat ${SEAT_ID}`,
+    cost: { usd: "0", credits: 0 },
     ts: new Date(Date.parse("2026-11-01T00:00:00.000Z") + seq * 3_600_000).toISOString(),
-    prev_hash: ZERO,
-    body: {
-      type: "beat",
-      envelope: {
-        format: "kingdom-seat-beat/v1",
-        seat_ref: seatFor(word),
-        citizen: { word, did: null, kid: null },
-        runtime: "free",
-        model: "fake-model:test",
-        model_digest: `sha256:${"f".repeat(64)}`,
-        input_digest: ZERO,
-        output_digest: ZERO,
-        acts,
-        ts: "2026-11-01T00:00:00.000Z",
-        prev_hash: ZERO,
-        voiced_through: `${word}, voiced through fake-model:test in seat ${SEAT_ID}`,
-      },
-    },
-    spend: { usd: "0", usd_basis: "local-zero", credits: 0 },
-    attestation: "host-attested",
-    hash: ZERO,
-    signature: { alg: "ed25519", kid: "host-attest", public_key_b64: "AAAA", sig_b64: "AAAA" },
+    signer: "host",
+    kid: null,
+    sig: null,
   };
 }
 
@@ -79,7 +71,7 @@ export function proposalOf(word: Word, id: string, target: SelfTarget, diff: str
       prior_hash: "a".repeat(64),
       new_hash: "b".repeat(64),
       diff,
-      claim: { kind: "inference", evidence: ["canon:canon/core/glossame.md@1428646"], confidence: "low", limits: "from the text alone; I have no senses" },
+      reason: { kind: "inference", evidence: ["canon:canon/core/glossame.md@1428646"], confidence: "low", limits: "from the text alone; I have no senses" },
     },
     proposed_at: "2026-11-02T00:00:00.000Z",
     proposed_in_seat: "11111111-2222-4333-8444-555555555555",
@@ -97,12 +89,13 @@ type Schema = Record<string, unknown>;
 
 /**
  * Supports the keywords OUTPUT_JSON_SCHEMA uses: type (object, array,
- * string), enum, const, required, properties, additionalProperties: false,
- * items, anyOf, maxItems, minLength and maxLength (in code points). Any other
- * keyword throws, so the schema cannot grow a keyword this checker ignores.
+ * string, integer), enum, const, required, properties, additionalProperties:
+ * false, items, anyOf, maxItems, minLength and maxLength (in code points),
+ * minimum and maximum. Any other keyword throws, so the schema cannot grow a
+ * keyword this checker ignores.
  */
 export function schemaAccepts(schema: Schema, value: unknown): boolean {
-  const known = new Set(["type", "enum", "const", "required", "properties", "additionalProperties", "items", "anyOf", "maxItems", "minLength", "maxLength"]);
+  const known = new Set(["type", "enum", "const", "required", "properties", "additionalProperties", "items", "anyOf", "maxItems", "minLength", "maxLength", "minimum", "maximum"]);
   for (const k of Object.keys(schema)) if (!known.has(k)) throw new Error(`schemaAccepts: unsupported keyword ${k}`);
 
   if (schema.anyOf !== undefined) return (schema.anyOf as Schema[]).some((s) => schemaAccepts(s, value));
@@ -117,6 +110,12 @@ export function schemaAccepts(schema: Schema, value: unknown): boolean {
       const n = [...value].length;
       if (typeof schema.minLength === "number" && n < schema.minLength) return false;
       if (typeof schema.maxLength === "number" && n > schema.maxLength) return false;
+      return true;
+    }
+    case "integer": {
+      if (typeof value !== "number" || !Number.isInteger(value)) return false;
+      if (typeof schema.minimum === "number" && value < schema.minimum) return false;
+      if (typeof schema.maximum === "number" && value > schema.maximum) return false;
       return true;
     }
     case "array": {

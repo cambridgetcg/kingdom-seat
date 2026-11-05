@@ -482,10 +482,11 @@ async function verbVerify(ctx: Ctx, word: Word): Promise<ExitCode> {
   try {
     entries = await readLedger(ledgerPath(ctx.config, word));
   } catch (e) {
-    ctx.deps.out(`${word}: chain BROKEN: the ledger does not parse (${e instanceof Refusal ? e.code : "unreadable"})\n`);
+    // The reason is the parser's own fixed words (a field name, or that a line is in the earlier layout), never a line's content.
+    ctx.deps.out(`${word}: chain BROKEN: the ledger does not parse (${e instanceof Refusal ? `${e.code}: ${e.message}` : "unreadable"})\n`);
     return EXIT.ERROR;
   }
-  const hostAttested = entries.some((e) => e.attestation === "host-attested");
+  const hostAttested = entries.some((e) => e.signer === "host");
   let hostKeys: string[] = pinnedTrust(ctx.config)?.host_attest_b64 ?? [];
   if (hostAttested && hostKeys.length === 0) {
     // No pinned anchor: the signer reads its own key and returns only the public half; a locked keychain refuses the check.

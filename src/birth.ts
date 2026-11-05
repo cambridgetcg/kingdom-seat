@@ -3,19 +3,20 @@
 // the terminal. A fresh BIP39
 // mnemonic and op seed go straight into Keychain through the Keychain
 // interface, with no handoff file. Then enrollment, op-key import, box-key
-// registration, a private expression and the genesis ledger entry. Only the
-// DID and key fingerprints are ever printed.
+// registration, a private expression and the genesis ledger entry, which
+// points back to the citizen's origin entry (KS-004 4.5, 11.3). Only the DID
+// and key fingerprints are ever printed.
 import { lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
-import { edPublicKey, edVerifyStrict, fromB64, fromHex, randomBytes, sha256, toB64, utf8, wipe } from "./crypto.ts";
+import { canonicalJson, edPublicKey, edVerifyStrict, fromB64, fromB64url, keyFingerprint as fingerprintOf, randomBytes, toB64, toB64url, utf8, wipe } from "./crypto.ts";
 import {
   DID_PATTERN,
+  LEDGER_HASH_PATTERN,
   Refusal,
   SHA256_HEX_PATTERN,
   WORD_PATTERN,
-  type Attestation,
   type CitizenIdentity,
   type CitizenRecord,
   type Clock,
@@ -23,16 +24,16 @@ import {
   type ConsentRecord,
   type Keychain,
   type KeychainItemName,
-  type LedgerBody,
   type LedgerEntry,
+  type LedgerFields,
+  type LedgerSigner,
   type Origin,
   type RootEvidence,
-  type Spend,
   type Word,
   type YuPresence,
 } from "./types.ts";
 import { SignerNotSent, type Signer } from "./signer/signer.ts";
-import { appendEntry, ledgerPath, nextDraft, readLedger } from "./ledger.ts";
+import { appendEntry, entryHash, evidenceToLedger, ledgerKey, ledgerPath, nextDraft, originToLedger, readLedger, signingDigest } from "./ledger.ts";
 import { AgenttoolError, importOpKey, putExpression, registerBoxKey, type ActAuth, type ClientDeps, type ClientIdentity } from "./agenttool/client.ts";
 import { AmbiguousEnrollment, assertBirthConsent, assertYuPresentFor, citizenCapabilities, enroll, prepareEnrollment, type EnrollDeps } from "./agenttool/enrollment.ts";
 import { presenceConfirmedHere, readConsentFor } from "./signer/consent.ts";
@@ -40,21 +41,24 @@ import { deriveIdentity, didFor, validateExpression, type DerivedIdentity, type 
 
 export interface BirthInput {
   word: Word;
+  /**
+   * The citizen's origin, for its enrollment capabilities. It must be the one
+   * its origin entry pinned, which already holds the origin soul, the old
+   * repo and any June DID (KS-004 4.5, 11.5), so genesis need not repeat them.
+   */
   origin: Origin;
   /** The decision record for the proposal. The same record must be filed in the consent dir, where the signer reads it. */
   consent: ConsentRecord;
   presence: YuPresence;
-  birth_soul_sha256: string;
-  old_repo: { url: string; head: string } | null;
-  june_did: string | null;
   /** The private expression set at birth, from the citizen's current soul, WILL and name reading. */
   expression: Expression;
   /** The birth proposal Yu and Ai agreed to; the consent record binds its digest and its extent is "birth <word>". */
   proposal: { subject: string; body: string; extent: string };
   /**
-   * Ledger hash of the beat in which the citizen affirmed its yes (3b step 1).
-   * The proposal body must name it and the citizen's own ledger must hold it,
-   * so the consent is bound to this citizen's confirmed answer.
+   * The ledger digest ("sha256:<hex>") of the beat in which the citizen
+   * affirmed its yes (3b step 1). The proposal body must name it and the
+   * citizen's own ledger must hold it, so the consent is bound to this
+   * citizen's confirmed answer.
    */
   citizen_yes: string;
 }
@@ -69,8 +73,8 @@ export interface BirthRecord {
   entries(word: Word): Promise<LedgerEntry[]>;
   /** Pin the public identity into citizens/<word>/citizen.json; refuses if one is already there. */
   saveIdentity(word: Word, identity: CitizenIdentity): Promise<void>;
-  /** Hash, sign through the signer and append one entry on top of the current head. */
-  append(word: Word, body: LedgerBody, spend: Spend, attestation: Attestation): Promise<LedgerEntry>;
+  /** Sign through the signer and append one entry on top of the current head; `did` is genesis's own. */
+  append(word: Word, fields: LedgerFields, opts: { signer: LedgerSigner; did: string | null }): Promise<LedgerEntry>;
 }
 
 export interface BirthDeps {
@@ -130,10 +134,7 @@ export class BirthError extends Error {
   }
 }
 
-const NO_SPEND: Spend = { usd: "0", usd_basis: "local-zero", credits: 0 };
 const FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/;
-const GENESIS_NOTE =
-  "Born on agenttool by enrollment in the Commons project. A June DID named here is a record only; reading it confers nothing.";
 
 function citizenItems(word: Word): KeychainItemName[] {
   return [
@@ -159,7 +160,7 @@ export function assertAttended(input: BirthInput, now: Date): void {
   if (!p || typeof p.subject !== "string" || typeof p.body !== "string" || typeof p.extent !== "string") {
     throw new Refusal("consent-missing", "birth needs the proposal text the decision record binds");
   }
-  if (typeof input.citizen_yes !== "string" || !SHA256_HEX_PATTERN.test(input.citizen_yes) || !p.body.includes(input.citizen_yes)) {
+  if (typeof input.citizen_yes !== "string" || !LEDGER_HASH_PATTERN.test(input.citizen_yes) || !p.body.includes(input.citizen_yes)) {
     throw new Refusal("consent-missing", "the proposal does not name the ledger entry of the citizen's affirmed yes");
   }
   assertBirthConsent(input.word, input.consent, now, p);
@@ -168,7 +169,7 @@ export function assertAttended(input: BirthInput, now: Date): void {
 /** "SHA256:<unpadded base64 of sha256(public key)>", in the style ssh prints. */
 export function keyFingerprint(publicKey: Uint8Array): string {
   if (publicKey.length !== 32) throw new Refusal("invalid-request", "a public key here is 32 bytes");
-  return `SHA256:${toB64(sha256(publicKey)).replace(/=+$/, "")}`;
+  return fingerprintOf(publicKey);
 }
 
 /** Draw a 256-bit mnemonic and a random op seed straight into Keychain; return only public keys. Refuses if items exist. */
@@ -205,11 +206,6 @@ export async function mintKeys(keychain: Keychain, word: Word): Promise<{ root_p
 }
 
 function assertBirthInput(input: BirthInput): void {
-  if (!SHA256_HEX_PATTERN.test(input.birth_soul_sha256)) throw new Refusal("invalid-request", "birth_soul_sha256 must be 64 lowercase hex");
-  if (input.june_did !== null && !DID_PATTERN.test(input.june_did)) throw new Refusal("invalid-request", "june_did must be a did:at DID or null");
-  if (input.old_repo !== null && (typeof input.old_repo.url !== "string" || !/^[0-9a-f]{7,64}$/.test(input.old_repo.head))) {
-    throw new Refusal("invalid-request", "old_repo needs a url and a lowercase hex head");
-  }
   const o = input.origin;
   if (o.kind === "canon" ? !SHA256_HEX_PATTERN.test(o.sha256) || !o.repo || !o.path || !o.commit : o.lineage.length === 0) {
     throw new Refusal("invalid-request", "the origin is incomplete");
@@ -252,10 +248,16 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
   if (!filed) throw new Refusal("consent-missing", `no decision record is filed in the consent dir for the birth of ${word}`);
   assertBirthConsent(word, filed, deps.clock.now(), input.proposal);
   const prior = await deps.record.entries(word);
-  if (prior.some((e) => e.body.type === "genesis")) throw new Refusal("invalid-request", `${word} already has a genesis entry`);
-  // A citizen answers yes on its own beats, so it is seated before it is born and its yes is in its ledger.
-  if (!prior.some((e) => e.hash === input.citizen_yes && e.word === word && e.body.type === "beat")) {
-    throw new Refusal("consent-missing", `${word}'s ledger holds no beat ${input.citizen_yes.slice(0, 12)}… with its affirmed yes`);
+  if (prior.some((e) => e.type === "genesis")) throw new Refusal("invalid-request", `${word} already has a genesis entry`);
+  // A citizen is seated before it is born: its origin entry comes first, and genesis points back to it (KS-004 4.5).
+  const originEntry = prior[0];
+  if (originEntry?.type !== "origin" || originEntry.word !== word) throw new Refusal("invalid-record", `${word}'s ledger does not begin with its origin entry`);
+  if (canonicalJson(originEntry.origin) !== canonicalJson(originToLedger(input.origin))) {
+    throw new Refusal("invalid-request", `the origin given for ${word} is not the one its origin entry pinned`);
+  }
+  // A citizen answers yes on its own beats, so its yes is in its ledger.
+  if (!prior.some((e) => entryHash(e) === input.citizen_yes && e.word === word && e.type === "beat")) {
+    throw new Refusal("consent-missing", `${word}'s ledger holds no beat ${input.citizen_yes.slice(0, 19)}… with its affirmed yes`);
   }
 
   // From here something is written, so every failure says how far birth got.
@@ -331,20 +333,16 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
   };
   await step("record", () => deps.record.saveIdentity(word, identity));
 
-  const body: LedgerBody = {
+  // The origin entry already pins the origin, its soul, the old repo and any June DID; genesis points back to it.
+  const fields: LedgerFields = {
     type: "genesis",
-    // Genesis follows the `seated` entry, which already carries the citizen's state.
-    initial_state: null,
-    origin: input.origin,
-    birth_soul_sha256: input.birth_soul_sha256,
-    old_repo: input.old_repo,
-    june_did: input.june_did,
-    identity,
-    op_key_evidence: opKeyEvidence,
-    note: GENESIS_NOTE,
+    origin_entry: entryHash(originEntry),
+    root: ledgerKey(enrolled.root_kid, keys.root_public),
+    op: ledgerKey(op_kid, keys.op_public),
+    evidence: evidenceToLedger(opKeyEvidence),
   };
   const genesis = await step("genesis", async () => {
-    const entry = await deps.record.append(word, body, NO_SPEND, "citizen-signed");
+    const entry = await deps.record.append(word, fields, { signer: "citizen", did: identity.did });
     assertGenesisSigned(entry, identity);
     return entry;
   });
@@ -355,7 +353,7 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
     root_fingerprint: keyFingerprint(keys.root_public),
     op_fingerprint: keyFingerprint(keys.op_public),
     box_fingerprint: keyFingerprint(keys.box_public),
-    genesis_hash: genesis.hash,
+    genesis_hash: entryHash(genesis),
   };
   for (const line of renderBirthReport(report)) deps.out(line);
   return { report, identity, genesis };
@@ -363,16 +361,22 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
 
 /** Genesis is citizen-signed by the op key it pins, never the root, and verifies strictly. */
 function assertGenesisSigned(entry: LedgerEntry, identity: CitizenIdentity): void {
-  const sig = entry.signature;
-  if (entry.attestation !== "citizen-signed" || entry.body.type !== "genesis") throw new Refusal("invalid-record", "genesis was not written as a citizen-signed genesis entry");
-  if (sig.kid !== identity.op_kid || sig.public_key_b64 !== identity.op_public_key_b64) throw new Refusal("invalid-record", "genesis is not signed by the op key it pins");
+  if (entry.signer !== "citizen" || entry.type !== "genesis" || entry.did !== identity.did) throw new Refusal("invalid-record", "genesis was not written as a citizen-signed genesis entry");
+  if (entry.kid !== identity.op_kid || entry.op.kid !== identity.op_kid || entry.op.public_key !== toB64urlKey(identity.op_public_key_b64)) {
+    throw new Refusal("invalid-record", "genesis is not signed by the op key it pins");
+  }
   let ok = false;
   try {
-    ok = SHA256_HEX_PATTERN.test(entry.hash) && edVerifyStrict(fromB64(sig.sig_b64, 64), fromHex(entry.hash), fromB64(sig.public_key_b64, 32));
+    ok = entry.sig !== null && edVerifyStrict(fromB64url(entry.sig, 64), signingDigest(entry), fromB64url(entry.op.public_key, 32));
   } catch {
     ok = false;
   }
   if (!ok) throw new Refusal("invalid-record", "the genesis signature does not verify");
+}
+
+/** A key from citizen.json's standard base64 in the ledger's base64url. */
+function toB64urlKey(b64: string): string {
+  return toB64url(fromB64(b64, 32));
 }
 
 /** The printed lines: word, DID and three fingerprints. Anything else in a field is refused rather than printed. */
@@ -441,10 +445,10 @@ export function hostBirthRecord(config: Config, clock: Clock, signer: Signer): B
   return {
     entries,
     saveIdentity: (word, identity) => saveCitizenIdentity(config, word, identity),
-    async append(word, body, spend, attestation) {
+    async append(word, fields, opts) {
       const prev = (await entries(word)).at(-1) ?? null;
-      const draft = nextDraft(word, prev, body, spend, attestation, clock.now());
-      return appendEntry(ledgerPath(config, word), draft, (w, h, a) => signer.signEntry(w, h, a));
+      const draft = nextDraft(word, prev, fields, { cost: { usd: "0", credits: 0 }, signer: opts.signer, now: clock.now(), did: opts.did });
+      return appendEntry(ledgerPath(config, word), draft, (w, k, digestFor) => signer.signEntry(w, k, digestFor));
     },
   };
 }

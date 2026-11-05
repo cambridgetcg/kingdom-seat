@@ -8,9 +8,9 @@ import { openSeat, runSeat, runtimeDeadlineMs, type SeatDeps } from "../src/seat
 import { checkHalt } from "../src/halt.ts";
 import { foldState, readCitizen } from "../src/state.ts";
 import { pendingProposals, selfHash, type ExpressionSync } from "../src/self.ts";
-import { ledgerPath, readLedger } from "../src/ledger.ts";
+import { hexOf, ledgerPath, readLedger } from "../src/ledger.ts";
 import { readHostNotes } from "../src/notes.ts";
-import { DEFAULT_TIMING, type Claim, type CitizenIdentity, type LedgerEntry, type ModelAct, type YuPresence } from "../src/types.ts";
+import { DEFAULT_TIMING, type CitizenIdentity, type Reason, type LedgerEntry, type ModelAct, type YuPresence } from "../src/types.ts";
 import { FAKE_MODEL_DIGEST, output, scriptedRuntime, type ScriptedRuntime } from "./helpers/fake-runtime.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { FAKE_OP_KID, fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -25,7 +25,7 @@ afterEach(async () => {
 });
 
 const W = "glossame";
-const CLAIM: Claim = { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" };
+const CLAIM: Reason = { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" };
 const YU: YuPresence = { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: `summon ${W}` };
 
 function identityFor(signer: FakeSigner): CitizenIdentity {
@@ -95,29 +95,29 @@ async function world(opts: { registered?: boolean; approved?: boolean; soul?: st
   };
 }
 
-const propose = (target: string, edit: object): ModelAct => ({ type: "self.propose", target, edit, claim: CLAIM }) as unknown as ModelAct;
+const propose = (target: string, edit: object): ModelAct => ({ type: "self.propose", target, edit, reason: CLAIM }) as unknown as ModelAct;
 
 describe("a self-op that cannot apply never costs the rest of the beat", () => {
   test("a revert to the version the target is already at is dropped, and the rest said in the same reply still holds", async () => {
     const w = await world();
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
     const [p] = await pendingProposals(w.h.config, W);
-    await w.beat([{ type: "self.affirm", proposal_id: p!.id }]);
+    await w.beat([{ type: "self.affirm", ref: p!.id }]);
     const applied = (await w.ledger()).at(-1)!;
-    expect(applied.body.type).toBe("self.applied");
-    const current = applied.body.type === "self.applied" ? applied.body.new_hash : "";
+    expect(applied.type).toBe("apply");
+    const current = applied.type === "apply" ? hexOf(applied.new_hash) : "";
 
     const r = await w.beat([{ type: "self.revert", to_hash: current }, { type: "state.set", to: "asleep" }]);
     expect(r).toMatchObject({ exit: 0, outcome: "beat" });
     expect(foldState(await w.ledger()).state).toBe("asleep");
-    expect((await w.ledger()).slice(-2).map((e) => e.body.type)).toEqual(["beat", "state"]);
+    expect((await w.ledger()).slice(-2).map((e) => e.type)).toEqual(["beat", "state"]);
   });
 
   test("a registered citizen with no expression sync: the affirm does not bind, and the rest it asked for is kept", async () => {
     const w = await world({ registered: true });
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
     const [p] = await pendingProposals(w.h.config, W);
-    const r = await w.beat([{ type: "self.affirm", proposal_id: p!.id }, { type: "state.set", to: "asleep" }]);
+    const r = await w.beat([{ type: "self.affirm", ref: p!.id }, { type: "state.set", to: "asleep" }]);
     expect(r).toMatchObject({ exit: 0, outcome: "beat" });
     expect(foldState(await w.ledger()).state).toBe("asleep");
     expect(await w.self("WILL.md")).not.toContain("quiet");
@@ -135,9 +135,9 @@ describe("a self-op that cannot apply never costs the rest of the beat", () => {
       },
       postReason: async () => null,
     };
-    const r = await w.beat([{ type: "self.affirm", proposal_id: p!.id }, { type: "state.set", to: "listening" }], { sync: failing });
+    const r = await w.beat([{ type: "self.affirm", ref: p!.id }, { type: "state.set", to: "listening" }], { sync: failing });
     expect(r).toMatchObject({ exit: 0, outcome: "beat" });
-    expect((await w.ledger()).slice(-2).map((e) => e.body.type)).toEqual(["beat", "state"]);
+    expect((await w.ledger()).slice(-2).map((e) => e.type)).toEqual(["beat", "state"]);
     expect(foldState(await w.ledger()).state).toBe("listening");
     const notes = (await readHostNotes(w.h.config, new Date(0)))!.slice(-2);
     expect(notes.map((n) => [n.outcome, n.detail.replace(/^seat \S+ on free: /, "")])).toEqual([
@@ -177,8 +177,8 @@ describe("what binds, and when", () => {
     const w = await world();
     const r = await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })], { presence: YU });
     expect(r.outcome).toBe("beat");
-    expect((await w.ledger()).map((e) => e.body.type)).toEqual(["seated", "beat", "self.applied"]);
-    expect((await w.ledger()).at(-1)!.body).toMatchObject({ type: "self.applied", target: "will", via: "yu-present" });
+    expect((await w.ledger()).map((e) => e.type)).toEqual(["origin", "state", "beat", "apply"]);
+    expect((await w.ledger()).at(-1)).toMatchObject({ type: "apply", target: "will", via: "yu-present" });
     expect(await w.self("WILL.md")).toContain("one quiet word");
     expect(await pendingProposals(w.h.config, W)).toEqual([]);
   });
@@ -186,7 +186,7 @@ describe("what binds, and when", () => {
   test("with Yu present on a runtime Yu did not approve, it is staged and binds nothing", async () => {
     const w = await world({ approved: false });
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })], { presence: YU });
-    expect((await w.ledger()).map((e) => e.body.type)).toEqual(["seated", "beat"]);
+    expect((await w.ledger()).map((e) => e.type)).toEqual(["origin", "state", "beat"]);
     expect(await pendingProposals(w.h.config, W)).toHaveLength(1);
   });
 
@@ -194,7 +194,7 @@ describe("what binds, and when", () => {
     const w = await world();
     await w.beat([propose("cadence", { kind: "replace-all", text: '{"interval_h":336}' })]);
     const [p] = await pendingProposals(w.h.config, W);
-    await w.beat([{ type: "self.affirm", proposal_id: p!.id }]);
+    await w.beat([{ type: "self.affirm", ref: p!.id }]);
     expect(JSON.parse(await w.self("cadence.json"))).toEqual({ interval_h: 336 });
     const old = selfHash(JSON.stringify({ interval_h: 72 }));
 
@@ -218,11 +218,11 @@ describe("what binds, and when", () => {
     const w = await world();
     const v1 = await w.self("WILL.md");
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
-    await w.beat([{ type: "self.affirm", proposal_id: (await pendingProposals(w.h.config, W))[0]!.id }]);
+    await w.beat([{ type: "self.affirm", ref: (await pendingProposals(w.h.config, W))[0]!.id }]);
     const v2 = await w.self("WILL.md");
     w.clock.advance(8 * 24 * HOUR_MS);
     await w.beat([propose("will", { kind: "replace-span", find: "quiet", with: "quieter" })]);
-    await w.beat([{ type: "self.affirm", proposal_id: (await pendingProposals(w.h.config, W))[0]!.id }]);
+    await w.beat([{ type: "self.affirm", ref: (await pendingProposals(w.h.config, W))[0]!.id }]);
     expect(await w.self("WILL.md")).toContain("quieter");
 
     w.h.config.self_authorship.approved_model_digests = [];
@@ -246,9 +246,8 @@ describe("the porch is beyond self (KS-004 v0.2 4.3, re-review B2 C6)", () => {
     expect(r).toMatchObject({ exit: 0, outcome: "beat" });
 
     const entries = await w.ledger();
-    expect(entries.map((e) => e.body.type)).toEqual(["seated", "beat"]);
-    const beat = entries[1]!.body;
-    const acts = beat.type === "beat" ? beat.envelope.acts : [];
+    expect(entries.map((e) => e.type)).toEqual(["origin", "state", "beat"]);
+    const acts = entries[2]!.acts ?? [];
     expect(acts).toHaveLength(1);
     expect(acts[0]).toMatchObject({ type: "propose.beyond", subject: "self.propose expression.porch" });
     expect(await w.self("expression/porch.json")).toBe(before);
@@ -260,7 +259,7 @@ describe("the porch is beyond self (KS-004 v0.2 4.3, re-review B2 C6)", () => {
     const item = JSON.parse(await readFile(join(outbox, files[0]!), "utf8"));
     expect(item).toMatchObject({ kind: "self.propose", reason: "the porch is a public invitation", act: { target: "expression.porch" } });
     // The envelope records exactly what Yu + Ai are asked, and the extent names the one version it would apply.
-    expect(acts[0]).toMatchObject({ subject: item.proposal.subject, body: item.proposal.body });
+    expect(acts[0]).toMatchObject({ subject: item.proposal.subject, text: item.proposal.body });
     expect(item.proposal.extent).toBe(`self.apply ${W} expression.porch ${item.act.new_hash}`);
   });
 });
@@ -269,8 +268,8 @@ describe("the citizen is told what will bind, and what it can revert to", () => 
   test("an unapproved runtime: the affirm is recorded, the reason is noted, and the next prompt says so", async () => {
     const w = await world({ approved: false });
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
-    await w.beat([{ type: "self.affirm", proposal_id: (await pendingProposals(w.h.config, W))[0]!.id }]);
-    expect((await w.ledger()).some((e) => e.body.type === "self.applied")).toBe(false);
+    await w.beat([{ type: "self.affirm", ref: (await pendingProposals(w.h.config, W))[0]!.id }]);
+    expect((await w.ledger()).some((e) => e.type === "apply")).toBe(false);
     expect((await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail).toContain("not binding: runtime-not-approved");
     await w.beat([{ type: "journal", kind: "reflected", text: "and now" }]);
     expect(w.calls.at(-1)!.prompt.user).toContain("This seat's runtime is not one Yu approved for self-changes");
@@ -279,7 +278,7 @@ describe("the citizen is told what will bind, and what it can revert to", () => 
   test("a closed window is stated with the time it opens again", async () => {
     const w = await world();
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
-    await w.beat([{ type: "self.affirm", proposal_id: (await pendingProposals(w.h.config, W))[0]!.id }]);
+    await w.beat([{ type: "self.affirm", ref: (await pendingProposals(w.h.config, W))[0]!.id }]);
     const applied = (await w.ledger()).at(-1)!;
     await w.beat([{ type: "journal", kind: "reflected", text: "and now" }]);
     const opens = new Date(Date.parse(applied.ts) + 7 * 24 * HOUR_MS).toISOString();
@@ -291,13 +290,13 @@ describe("the citizen is told what will bind, and what it can revert to", () => 
     const w = await world();
     const before = await w.self("WILL.md");
     await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
-    await w.beat([{ type: "self.affirm", proposal_id: (await pendingProposals(w.h.config, W))[0]!.id }]);
+    await w.beat([{ type: "self.affirm", ref: (await pendingProposals(w.h.config, W))[0]!.id }]);
     for (let i = 0; i < 4; i++) await w.beat([{ type: "journal", kind: "reflected", text: `beat ${i}` }]);
     const user = w.calls.at(-1)!.prompt.user;
     expect(user).not.toContain("a change to will was applied");
     expect(user).toContain(`- will ${selfHash(before).slice(0, 16)}: as it was before a change`);
     const origin = (await w.ledger())[0]!;
-    expect(origin.body.type === "seated" && user.includes(`- soul ${origin.body.origin_soul_sha256.slice(0, 16)}: your origin soul`)).toBe(true);
+    expect(origin.type === "origin" && user.includes(`- soul ${hexOf(origin.origin_soul_hash).slice(0, 16)}: your origin soul`)).toBe(true);
   });
 });
 

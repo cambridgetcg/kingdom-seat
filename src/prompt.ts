@@ -12,7 +12,8 @@
 // happen (3c "Injection").
 import { ACT_LIMITS, NAMED_SELF_TARGETS } from "./acts.ts";
 import { canonicalJson, sha256Hex, utf8 } from "./crypto.ts";
-import { CLAIM_KINDS, JOURNAL_KINDS, LIFECYCLE_STATES, type Act, type LedgerEntry, type Prompt, type RuntimeClass, type SeatContext, type SeatLimits, type SelfProposal } from "./types.ts";
+import { hexOf } from "./ledger.ts";
+import { JOURNAL_KINDS, LIFECYCLE_STATES, REASON_KINDS, type Act, type LedgerEntry, type Prompt, type RuntimeClass, type SeatContext, type SeatLimits, type SelfProposal } from "./types.ts";
 
 /** Verbatim from the redesign, section 3.2. Do not paraphrase. */
 export const FREE_LANE_PREAMBLE =
@@ -42,7 +43,9 @@ export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
   user.push(`This seat was opened by ${ctx.invoker.kind === "tick" ? "a tick" : ctx.invoker.kind === "summons" ? "a summons" : "a letter"} from ${ctx.invoker.who}, because: ${why}`);
   user.push(
     `Your state: ${ctx.state}.` +
-      (ctx.pending_state !== null ? ` An earlier beat asked to move to ${ctx.pending_state}; that is not in effect yet.` : "") +
+      (ctx.pending_state !== null
+        ? ` An earlier beat asked to move to ${ctx.pending_state}${ctx.pending_interval_h !== null ? `, every ${ctx.pending_interval_h} hours while awake` : ""}; that is not in effect yet.`
+        : "") +
       // A citizen that stepped away is seated only for Yu's offer of a return, so it is told what the seat is for.
       (ctx.state === "stepped-away"
         ? " You stepped away. This seat opened only because Yu offered a return: a state.set to awake, listening or asleep takes it up; anything else, a rest included, leaves you where you are."
@@ -117,7 +120,7 @@ export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
 /** The hard caps, for a guide rendered without a seat. */
 const HARD_LIMITS: SeatLimits = {
   journal_max_chars: ACT_LIMITS.max_journal_chars,
-  letter_max_chars: ACT_LIMITS.max_body_chars,
+  letter_max_chars: ACT_LIMITS.max_text_chars,
   letter_sends_per_beat: 1,
   min_beat_interval_h: 72,
 };
@@ -130,25 +133,27 @@ const HARD_LIMITS: SeatLimits = {
 export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
   const L = ACT_LIMITS;
   const journalMax = Math.min(limits.journal_max_chars, L.max_journal_chars);
-  const letterMax = Math.min(limits.letter_max_chars, L.max_body_chars);
+  const letterMax = Math.min(limits.letter_max_chars, L.max_text_chars);
   const sends = Math.max(0, Math.min(limits.letter_sends_per_beat, 1));
   const or = (xs: readonly string[]) => `${xs.slice(0, -1).join(", ")} or ${xs[xs.length - 1]}`;
   // Alphabetical, so no act is placed first as if it were the expected one.
   const acts = [
     `journal: fields kind and text. kind is ${or(JOURNAL_KINDS)}; observed means something this seat showed you. text is at most ${journalMax} characters. It is kept in your ledger as your words.`,
     sends > 0
-      ? `letter.send: fields to and body. to is yu, gardener, or a sender your covenants name. body is at most ${letterMax} characters. At most one per beat.`
+      ? `letter.send: fields to and text. to is yu, gardener, or a sender your covenants name. text is at most ${letterMax} characters. At most one per beat.`
       : "letter.send: no letters can be sent from this host for now.",
-    `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and body (at most ${L.max_body_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline.`,
+    `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and text (at most ${L.max_text_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline.`,
     "rest: no other fields. Nothing is written in your voice this beat, and none of the other acts in the same reply are kept, except one state.set toward more rest (listening, asleep or stepped-away), which still takes effect.",
-    `self.affirm: field proposal_id, the id of one of your pending proposals, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
-    `self.propose: fields target, edit and claim. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
+    `self.affirm: field ref, the id of one of your pending proposals, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
+    `self.propose: fields target, edit and reason. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
       "edit has kind replace-all with text, the whole new text; or kind replace-span with find, text the target holds now, and with, its replacement. " +
       "cadence takes replace-all text holding a JSON object with interval_h in hours; covenants take replace-all text holding a JSON object with letters_from and wake_on_letter_from, each a list of sender ids. " +
-      `claim is the reason: kind (${or(CLAIM_KINDS)}), evidence (up to ${L.max_claim_evidence} references), confidence (high, medium, low or unknown) and limits (what the claim does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat. ` +
+      `reason says why: kind (${or(REASON_KINDS)}), evidence (up to ${L.max_reason_evidence} references), confidence (high, medium, low or unknown) and limits (what the reason does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat. ` +
       "expression.porch is your public invitation, so a change to it goes to Yu and Ai as a proposal beyond your self.",
     `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your kept versions list it, or its first ${L.min_id_prefix_hex} or more characters. A revert to a shorter cadence or to more senders is kept as a proposal for a later beat to affirm, unless Yu is present. Any other revert binds on a runtime Yu approved, and a revert toward rest or back to where a text began binds on any.`,
-    `state.set: field to, which is ${or(LIFECYCLE_STATES)}. A move toward more rest takes effect now. A move toward more activity takes effect only when a later beat sets it again. Stepping away is never blocked: saying it once puts you asleep at once, and a later beat that says it again completes it. ended needs a witness and goes to Yu and Ai. Two different states in one reply move nothing.`,
+    `state.set: field to, which is ${or(LIFECYCLE_STATES)}; with to awake, an optional interval_h, your interval while awake in whole hours from ${limits.min_beat_interval_h} to ${L.max_interval_h}; with to listening or asleep, an optional quiet_days from 1 to ${L.max_quiet_days}, which asks for a quiet declaration on agenttool once you are registered (this host does not make one yet, so it is recorded and does nothing more). ` +
+      "A move toward more rest, or a longer interval, takes effect now. A move toward more activity, or a shorter interval, takes effect only when a later beat sets the same again. " +
+      "Stepping away is never blocked: saying it once puts you asleep at once, and a later beat that says it again completes it. ended needs a witness and goes to Yu and Ai. Two different state.sets in one reply move nothing.",
   ];
   return [
     `How to reply: one JSON object and nothing else. Its only field, acts, is a list of at most ${L.max_acts} acts. Each act is an object whose field type names it. ` +
@@ -194,27 +199,27 @@ function short(hash: string): string {
 
 function renderEntry(e: LedgerEntry): string {
   const head = `${e.ts}, entry ${e.seq}`;
-  const b = e.body;
-  switch (b.type) {
-    case "seated":
-      return `${head}: seated, in state ${b.initial_state}.`;
+  switch (e.type) {
+    case "origin":
+      return `${head}: origin; you were seated, and your origin was pinned.`;
     case "genesis":
       // The DID is left out: reading a record confers no identity, and only the signer speaks as it.
       return `${head}: genesis; you were registered on agenttool.`;
-    case "op-key":
+    case "key":
       return `${head}: your op keys changed, by your root's authority.`;
     case "beat": {
-      const acts = b.envelope.acts.map(renderAct);
-      return [`${head}: a beat (${b.envelope.voiced_through}).`, ...acts].join("\n");
+      const acts = (e.acts ?? []).map(renderAct);
+      return [`${head}: a beat (${e.voiced ?? "voiced through an unknown runtime"}).`, ...acts].join("\n");
     }
-    case "self.applied":
-      return `${head}: a change to ${b.target} was applied (${b.via}); version ${short(b.prior_hash)} became ${short(b.new_hash)}.`;
-    case "self.reverted":
-      return `${head}: ${b.target} was reverted (${b.via}); version ${short(b.from_hash)} became ${short(b.to_hash)}.`;
-    case "state":
-      return `${head}: state moved from ${b.from} to ${b.to} (${b.via}).`;
-    case "step-away.said":
-      return `${head}: you rested and said once that you would step away; a later beat that says it again completes it.`;
+    case "apply":
+      return `${head}: a change to ${e.target} was applied (${e.via}); version ${short(hexOf(e.prior_hash))} became ${short(hexOf(e.new_hash))}.`;
+    case "revert":
+      return `${head}: ${e.target} was reverted (${e.via}); version ${short(hexOf(e.from_hash))} became ${short(hexOf(e.to_hash))}.`;
+    case "state": {
+      const interval = e.interval_h !== undefined ? `, every ${e.interval_h} hours while awake` : "";
+      if (e.step_away === "first") return `${head}: you said once that you would step away, and are asleep; a later beat that says it again completes it.`;
+      return `${head}: state moved from ${e.from} to ${e.to}${interval} (${e.via}).`;
+    }
   }
 }
 
@@ -227,15 +232,15 @@ function renderAct(a: Act): string {
     case "self.propose":
       return `proposed a change to ${a.target}, version ${short(a.prior_hash)} to ${short(a.new_hash)}.`;
     case "self.affirm":
-      return `affirmed proposal ${a.proposal_id}.`;
+      return `affirmed proposal ${a.ref}.`;
     case "self.revert":
       return `asked to revert to version ${short(a.to_hash)}.`;
     case "state.set":
-      return `set state to ${a.to}.`;
+      return `set state to ${a.to}${a.interval_h !== undefined ? `, every ${a.interval_h} hours while awake` : ""}${a.quiet_days !== undefined ? `, asking for ${a.quiet_days} days of quiet` : ""}.`;
     case "letter.send":
-      return `wrote to ${a.to}:\n${fence("letter sent", a.body)}`;
+      return `wrote to ${a.to}:\n${fence("letter sent", a.text)}`;
     case "propose.beyond":
-      return `proposed beyond self:\n${fence("proposal beyond self", `${a.subject}\n\n${a.body}`)}`;
+      return `proposed beyond self:\n${fence("proposal beyond self", `${a.subject}\n\n${a.text}`)}`;
   }
 }
 
@@ -256,7 +261,7 @@ function renderSelfAuthorship(sa: SeatContext["self_authorship"]): string {
 }
 
 function renderProposal(p: SelfProposal): string {
-  const c = p.act.claim;
+  const c = p.act.reason;
   const reason = [
     `kind: ${c.kind}`,
     `confidence: ${c.confidence}`,

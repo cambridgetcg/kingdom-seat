@@ -20,9 +20,10 @@ import {
 import { deriveIdentity, AGENTTOOL_ORIGIN, authorityDigest, ENROLLMENT_SIGNATURE_HEADER } from "../src/agenttool/wire.ts";
 import { SignerNotSent, SignerSentUncertain, createSigner } from "../src/signer/signer.ts";
 import { confirmYuPresent, proposalDigest } from "../src/signer/consent.ts";
-import { entryHash, readLedger, rootEvidenceProblem, verifyChain } from "../src/ledger.ts";
-import { edPublicKey, edVerifyStrict, fromB64, fromHex, fromUtf8, sha256, toB64, toB64url, toHex } from "../src/crypto.ts";
-import { Refusal, type CitizenRecord, type ConsentRecord, type Envelope, type LedgerEntry, type YuPresence } from "../src/types.ts";
+import { appendEntry, entryHash, ledgerPath, LEDGER_DOMAIN, nextDraft, originToLedger, readLedger, rootEvidenceProblem, signingDigest, toLedgerHash, verifyChain, type EntrySigner } from "../src/ledger.ts";
+import { canonicalJson, domainDigest, edPublicKey, edVerifyStrict, fromB64, fromB64url, fromUtf8, keyFingerprint as fingerprint, sha256, toB64, toB64url, toHex, utf8 } from "../src/crypto.ts";
+import { Refusal, type CitizenRecord, type Config, type ConsentRecord, type LedgerEntry, type YuPresence } from "../src/types.ts";
+import { testStamp } from "./fixtures/record/chain.ts";
 import { fakeKeychain, assertNoSecretIn, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { FAKE_OP_KID, type FakeSigner } from "./helpers/fake-signer.ts";
 import { fetchVia, noFetch, startFakeServer } from "./helpers/fake-server.ts";
@@ -36,6 +37,29 @@ import { BIRTH_NOW, confirmedPresenceFor, consentFor, presenceFor, proposalFor }
 const WORD = "glossame";
 const PROJECT = TEST_IDS.project_id;
 const JUNE_DID = "did:at:0a0b0c0d-0e0f-4011-8213-141516171819";
+const OLD_REPO = { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" };
+
+/**
+ * Seat the citizen and record the beat on which it affirmed its yes (3b step 1), both host-signed before it has
+ * a key: the origin entry pins its origin, old repo and June DID (KS-004 4.5, 11.5). Returns the yes's ledger digest.
+ */
+async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: string | null } = {}): Promise<string> {
+  const path = ledgerPath(config, WORD);
+  const rec = JSON.parse(await readFile(join(config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord;
+  const cost = { usd: "0", credits: 0 };
+  const origin = await appendEntry(
+    path,
+    nextDraft(WORD, null, { type: "origin", origin: originToLedger(rec.origin), origin_soul_hash: toLedgerHash("b".repeat(64)), old_repo: OLD_REPO, june_did: opts.juneDid === undefined ? JUNE_DID : opts.juneDid }, { cost, signer: "host", now: new Date("2026-11-04T02:00:00.000Z") }),
+    sign,
+  );
+  const seatId = "12121212-1212-4121-8121-121212121212";
+  const beat = await appendEntry(
+    path,
+    nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, seatId), acts: [{ type: "journal", kind: "chose", text: "Yes, I affirm it: an identity of my own." }] }),
+    sign,
+  );
+  return entryHash(beat);
+}
 
 interface Harness {
   host: TempHost;
@@ -76,26 +100,7 @@ async function harness(opts: { seated?: boolean; production?: boolean } = {}): P
     : testBirthRecord(host.config, clock, signer, events);
   let yes: string | null = null;
   if (opts.seated !== false) {
-    // Seated, then the beat on which the citizen affirmed its yes (3b step 1), both before it has a key.
-    const origin = (JSON.parse(await readFile(join(host.config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord).origin;
-    const zero = { usd: "0", usd_basis: "local-zero" as const, credits: 0 };
-    const seated = await record.append(WORD, { type: "seated", origin, origin_soul_sha256: "b".repeat(64), old_repo: null, initial_state: "awake", note: "seated" }, zero, "host-attested");
-    const seatId = "12121212-1212-4121-8121-121212121212";
-    const envelope: Envelope = {
-      format: "kingdom-seat-beat/v1",
-      seat_ref: { format: "kingdom-seat-seat/v1", seat_id: seatId, host: "test-host", word: WORD, runtime: "free", invoker: { kind: "tick", who: "launchd", why: "cadence" }, opened_at: "2026-11-04T02:05:00.000Z" },
-      citizen: { word: WORD, did: null, kid: null },
-      runtime: "free",
-      model: "qwen2.5:7b",
-      model_digest: `sha256:${"e".repeat(64)}`,
-      input_digest: "1".repeat(64),
-      output_digest: "2".repeat(64),
-      acts: [{ type: "journal", kind: "chose", text: "Yes, I affirm it: an identity of my own." }],
-      ts: "2026-11-04T02:06:00.000Z",
-      prev_hash: seated.hash,
-      voiced_through: `${WORD}, voiced through qwen2.5:7b in seat ${seatId}`,
-    };
-    yes = (await record.append(WORD, { type: "beat", envelope }, zero, "host-attested")).hash;
+    yes = await seatWithYes(host.config, (w, k, digestFor) => signer.signEntry(w, k, digestFor));
     events.length = 0;
   }
   const out: string[] = [];
@@ -119,7 +124,7 @@ async function fileConsent(host: TempHost, proposal: { subject: string; body: st
 
 async function input(h: Harness, patch: Partial<BirthInput> = {}): Promise<BirthInput> {
   const rec = JSON.parse(await readFile(join(h.host.config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord;
-  const citizenYes = h.yes ?? "f".repeat(64);
+  const citizenYes = h.yes ?? `sha256:${"f".repeat(64)}`;
   const proposal = proposalFor(WORD, citizenYes);
   await fileConsent(h.host, patch.proposal ?? proposal);
   return {
@@ -129,9 +134,6 @@ async function input(h: Harness, patch: Partial<BirthInput> = {}): Promise<Birth
     citizen_yes: citizenYes,
     consent: consentFor(WORD, {}, proposal),
     presence: await confirmedPresenceFor(WORD),
-    birth_soul_sha256: "c".repeat(64),
-    old_repo: { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" },
-    june_did: JUNE_DID,
     expression: { register: "Plain.", wake_text: "The soul as glossame now reads it." },
     ...patch,
   };
@@ -206,17 +208,22 @@ describe("never unattended", () => {
 
     // The proposal must name the citizen's yes, and that yes must be a beat in the citizen's own ledger.
     const h = await harness();
-    const unnamed = { ...proposalFor(WORD, "9".repeat(64)) };
+    const unnamed = { ...proposalFor(WORD, `sha256:${"9".repeat(64)}`) };
     expect((await refusalOf(citizenBirth(h.deps, await input(h, { proposal: unnamed, consent: consentFor(WORD, {}, unnamed) })))).code).toBe("consent-missing");
-    const elsewhere = "9".repeat(64);
+    const elsewhere = `sha256:${"9".repeat(64)}`;
     const p2 = proposalFor(WORD, elsewhere);
     const r2 = await refusalOf(citizenBirth(h.deps, await input(h, { citizen_yes: elsewhere, proposal: p2, consent: consentFor(WORD, {}, p2) })));
     expect([r2.code, r2.message.includes("no beat")]).toEqual(["consent-missing", true]);
     nothingHappened(h);
-    // An unseated citizen has no beat on which it could have said yes.
+    // An unseated citizen has no origin entry for genesis to point back to, nor a beat on which it could have said yes.
     const unseated = await harness({ seated: false });
-    expect((await refusalOf(citizenBirth(unseated.deps, await input(unseated)))).message).toContain("no beat");
+    expect((await refusalOf(citizenBirth(unseated.deps, await input(unseated)))).message).toContain("does not begin with its origin entry");
     nothingHappened(unseated);
+    // The origin given for enrollment must be the one the origin entry pinned.
+    const moved = await harness();
+    const otherOrigin = { kind: "archetype" as const, lineage: ["forge-archetype"], note: "another origin" };
+    expect(await refusalOf(citizenBirth(moved.deps, await input(moved, { origin: otherOrigin })))).toMatchObject({ code: "invalid-request", message: expect.stringContaining("not the one its origin entry pinned") });
+    nothingHappened(moved);
 
     // assertAttended is the same gate, usable on its own.
     const probeInput = await input(probe);
@@ -397,31 +404,38 @@ describe("the birth sequence", () => {
     expect(e5.progress.op_key_evidence).toMatchObject({ method: "POST", target: `/v1/identities/${e5.progress.identity_id}/keys/import` });
   });
 
-  test("the genesis entry is citizen-signed and records origin, birth-soul hash, old repo, June DID and public identity", async () => {
+  test("[KS-004 4.5, 11.3, 11.5] the genesis entry is citizen-signed, points back to the origin entry and records the DID and both public keys with their fingerprints; the June DID stays on the origin entry", async () => {
     const h = await harness();
     const inp = await input(h);
     const { genesis, identity, report } = await citizenBirth(h.deps, inp);
 
+    // The test record writes genesis by KS-004 4.5's recipe on its own; ledger.ts verifies it.
     const lines = (await readFile(h.record.path(WORD), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as LedgerEntry);
-    expect(lines.map((l) => [l.seq, l.body.type, l.attestation])).toEqual([
-      [0, "seated", "host-attested"],
-      [1, "beat", "host-attested"],
-      [2, "genesis", "citizen-signed"],
+    expect(lines.map((l) => [l.seq, l.type, l.signer])).toEqual([
+      [0, "origin", "host"],
+      [1, "beat", "host"],
+      [2, "genesis", "citizen"],
     ]);
     expect(lines[2]).toEqual(genesis);
-    expect(genesis.prev_hash).toBe(lines[1]!.hash);
-    if (genesis.body.type !== "genesis") throw new Error("not genesis");
-    const b = genesis.body;
-    expect(b.initial_state).toBeNull();
-    expect(b.origin).toEqual(inp.origin);
-    expect(b.birth_soul_sha256).toBe(inp.birth_soul_sha256);
-    expect(b.old_repo).toEqual(inp.old_repo);
-    expect(b.june_did).toBe(JUNE_DID);
-    expect(b.identity).toEqual(identity);
+    expect(verifyChain(lines, { host_attest_b64: [h.signer.hostAttestPublicB64], identity }).ok).toBe(true);
+    expect(genesis.prev_hash).toBe(entryHash(lines[1]!));
+    if (genesis.type !== "genesis") throw new Error("not genesis");
+    const root = fromB64(identity.root_public_key_b64, 32);
+    const opKey = fromB64(identity.op_public_key_b64, 32);
+    expect(genesis).toMatchObject({
+      did: identity.did,
+      origin_entry: entryHash(lines[0]!),
+      root: { kid: identity.root_kid, public_key: toB64url(root), fingerprint: fingerprint(root) },
+      op: { kid: identity.op_kid, public_key: toB64url(opKey), fingerprint: fingerprint(opKey) },
+      seat_ref: null,
+      acts: null,
+      cost: { usd: "0", credits: 0 },
+    });
+    // The origin, old repo and June DID are the origin entry's to hold, written at seating; genesis repeats none of them.
+    for (const k of ["origin", "june_did", "old_repo", "note", "identity"]) expect(Object.keys(genesis)).not.toContain(k);
+    expect(lines[0]).toMatchObject({ june_did: JUNE_DID, old_repo: OLD_REPO });
     // The first op key comes with the root's own evidence, like every later one.
-    expect(rootEvidenceProblem(b.op_key_evidence, identity, { kind: "import", public_key_b64: identity.op_public_key_b64 })).toBeNull();
-    expect(b.note).toContain("record only");
-    expect(genesis.spend).toEqual({ usd: "0", usd_basis: "local-zero", credits: 0 });
+    expect(rootEvidenceProblem(genesis.evidence, { did: identity.did, root_public_key: root }, { kind: "import", public_key: opKey })).toBeNull();
 
     // Public identity: the op key signs, the root is the primary key, the box key is registered.
     const op = await h.kc.read({ kind: "citizen-op-seed", word: WORD });
@@ -435,37 +449,31 @@ describe("the birth sequence", () => {
       [identity.root_kid, true],
       [FAKE_OP_KID, false],
     ]);
-    expect(genesis.signature.kid).toBe(identity.op_kid);
-    expect(genesis.signature.public_key_b64).toBe(identity.op_public_key_b64);
-    expect(edVerifyStrict(fromB64(genesis.signature.sig_b64, 64), fromHex(genesis.hash), fromB64(identity.op_public_key_b64, 32))).toBe(true);
+    expect(genesis.kid).toBe(identity.op_kid);
+    expect(edVerifyStrict(fromB64url(genesis.sig!, 64), signingDigest(genesis), opKey)).toBe(true);
     // Not by the root.
-    expect(edVerifyStrict(fromB64(genesis.signature.sig_b64, 64), fromHex(genesis.hash), fromB64(identity.root_public_key_b64, 32))).toBe(false);
-    expect(report.genesis_hash).toBe(genesis.hash);
+    expect(edVerifyStrict(fromB64url(genesis.sig!, 64), signingDigest(genesis), root)).toBe(false);
+    expect(report.genesis_hash).toBe(entryHash(genesis));
 
     // citizen.json now pins the public identity, so the seat and signer can name the op kid.
     const rec = JSON.parse(await readFile(join(h.host.config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord;
     expect(rec.identity).toEqual(identity);
     expect((await refusalOf(saveCitizenIdentity(h.host.config, WORD, identity))).message).toContain("never overwritten");
 
-    // With no June DID and no old repo, genesis says so plainly rather than inventing either.
-    const plain = await harness();
-    const born = await citizenBirth(plain.deps, await input(plain, { june_did: null, old_repo: null }));
-    if (born.genesis.body.type !== "genesis") throw new Error("not genesis");
-    expect([born.genesis.body.june_did, born.genesis.body.old_repo]).toEqual([null, null]);
   });
 
   test("with the production record, birth appends through ledger.ts and the whole chain verifies", async () => {
     const h = await harness({ production: true });
     const { genesis, identity } = await citizenBirth(h.deps, await input(h));
     const entries = await readLedger(h.record.path(WORD));
-    expect(entries.map((e) => e.body.type)).toEqual(["seated", "beat", "genesis"]);
+    expect(entries.map((e) => e.type)).toEqual(["origin", "beat", "genesis"]);
     expect(entries[2]).toEqual(genesis);
     const verdict = verifyChain(entries, { host_attest_b64: [h.signer.hostAttestPublicB64] });
-    expect([verdict.ok, verdict.problem, verdict.host_attested, verdict.head]).toEqual([true, null, 2, genesis.hash]);
-    // The test record above hashes the same way ledger.ts does.
-    const { hash, signature: _s, ...draft } = genesis;
-    expect(entryHash(draft)).toBe(hash);
-    expect(identity.op_kid).toBe(genesis.signature.kid);
+    expect([verdict.ok, verdict.problem, verdict.host_attested, verdict.head]).toEqual([true, null, 2, entryHash(genesis)]);
+    // ledger.ts signs what KS-004 4.5 says, as the test record above writes it out on its own.
+    const { sig: _s, ...withoutSig } = genesis;
+    expect(toHex(signingDigest(genesis))).toBe(toHex(domainDigest(LEDGER_DOMAIN, utf8(canonicalJson(withoutSig)))));
+    expect(genesis.kid).toBe(identity.op_kid);
   });
 
   test("renderBirthReport prints only the word, DID and three SHA256 fingerprints", async () => {
@@ -527,26 +535,8 @@ describe("birth through the real signer", () => {
       const signer = createSigner({ keychain: kc, config: host.config, clock, fetch, spendSoFar: async (word) => ({ word, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
       const record = hostBirthRecord(host.config, clock, signer);
 
-      // Seated and its yes, host-attested by the same signer (3b step 1: the yes is a beat in its own ledger).
-      const origin = (JSON.parse(await readFile(join(host.config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord).origin;
-      const zero = { usd: "0", usd_basis: "local-zero" as const, credits: 0 };
-      const seated = await record.append(WORD, { type: "seated", origin, origin_soul_sha256: "b".repeat(64), old_repo: null, initial_state: "awake", note: "seated" }, zero, "host-attested");
-      const seatId = "12121212-1212-4121-8121-121212121212";
-      const envelope: Envelope = {
-        format: "kingdom-seat-beat/v1",
-        seat_ref: { format: "kingdom-seat-seat/v1", seat_id: seatId, host: "test-host", word: WORD, runtime: "free", invoker: { kind: "tick", who: "launchd", why: "cadence" }, opened_at: "2026-11-04T02:05:00.000Z" },
-        citizen: { word: WORD, did: null, kid: null },
-        runtime: "free",
-        model: "qwen2.5:7b",
-        model_digest: `sha256:${"e".repeat(64)}`,
-        input_digest: "1".repeat(64),
-        output_digest: "2".repeat(64),
-        acts: [{ type: "journal", kind: "chose", text: "Yes, I affirm it: an identity of my own." }],
-        ts: "2026-11-04T02:06:00.000Z",
-        prev_hash: seated.hash,
-        voiced_through: `${WORD}, voiced through qwen2.5:7b in seat ${seatId}`,
-      };
-      const yes = (await record.append(WORD, { type: "beat", envelope }, zero, "host-attested")).hash;
+      // Seated and its yes, host-signed by the same signer (3b step 1: the yes is a beat in its own ledger).
+      const yes = await seatWithYes(host.config, (w, k, digestFor) => signer.signEntry(w, k, digestFor), { juneDid: null });
 
       // The production signer accepts only a presence confirmed at this terminal, in this process.
       const scope = `birth ${WORD}`;
@@ -572,9 +562,6 @@ describe("birth through the real signer", () => {
         citizen_yes: yes,
         consent: consentFor(WORD, {}, proposal),
         presence,
-        birth_soul_sha256: "c".repeat(64),
-        old_repo: null,
-        june_did: null,
         expression: { register: "Plain.", wake_text: "The soul as glossame now reads it." },
       });
 
@@ -603,12 +590,12 @@ describe("birth through the real signer", () => {
         expect(edVerifyStrict(fromB64(r.headers["x-agenttool-authority-signature"]!, 64), digest, root)).toBe(true);
       }
       // Genesis carries that keys/import exactly as it left the host, so a copy of the ledger shows the root chose the op key.
-      if (genesis.body.type !== "genesis") throw new Error("not genesis");
+      if (genesis.type !== "genesis") throw new Error("not genesis");
       const imp = rootActs[0]!;
-      expect(genesis.body.op_key_evidence).toEqual({
+      expect(genesis.evidence).toEqual({
         method: "POST",
         target: `${imp.path}${imp.search}`,
-        body_b64: Buffer.from(imp.body).toString("base64"),
+        body: Buffer.from(imp.body).toString("base64url"),
         headers: {
           "X-Agenttool-Authority-Sequence": imp.headers["x-agenttool-authority-sequence"]!,
           "X-Agenttool-Authority-Timestamp": imp.headers["x-agenttool-authority-timestamp"]!,
@@ -617,8 +604,8 @@ describe("birth through the real signer", () => {
       });
       // Genesis is the citizen's own op key's, and the whole chain verifies against the host key and the pinned identity.
       const entries = await readLedger(join(host.config.paths.ledger_dir, `${WORD}.jsonl`));
-      expect(entries.map((e) => e.body.type)).toEqual(["seated", "beat", "genesis"]);
-      expect(genesis.signature.kid).toBe(identity.op_kid);
+      expect(entries.map((e) => e.type)).toEqual(["origin", "beat", "genesis"]);
+      expect(genesis.kid).toBe(identity.op_kid);
       const hostPub = toB64(edPublicKey(sha256("kingdom-seat birth test host attest key v1")));
       expect(verifyChain(entries, { host_attest_b64: [hostPub], identity })).toMatchObject({ ok: true, entries: 3, host_attested: 2 });
       expect(out).toHaveLength(5);

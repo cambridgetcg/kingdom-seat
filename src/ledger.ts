@@ -1,29 +1,65 @@
 // The citizen's record: `ledger/<word>.jsonl`, one entry per line,
-// hash-chained and signed, on the lease host (3.2 "Ledger"). Append-only:
-// nothing is rewritten or deleted, because a record is history even when it
-// is no longer present truth (3.1 principle 5). Readers trust only entries
-// that verify.
+// hash-chained and signed, on the lease host (3.2 "Ledger"; KS-004 4.5).
+// Append-only: nothing is rewritten or deleted, because a record is history
+// even when it is no longer present truth (3.1 principle 5). Readers trust
+// only entries that verify.
+//
+// Each line is one flat JSON object in KS-004 4.5's layout: the common fields
+// (format, word, did, seq, prev_hash, type, seat_ref, runtime, input_digest,
+// output_digest, acts, voiced, cost, ts, signer, kid, sig) and the fields of
+// its type beside them. Values are objects, arrays, strings, integers within
+// ±2^53 and null: no floats, no booleans. Every hash outside `acts` is spelled
+// "sha256:<hex>"; acts keep the registry's own spelling (KS-004 5.7), whose
+// identifiers are the bare hex the seat shows. Public keys, signatures and
+// evidence bodies are base64url without padding.
+//
+// The ledger digest of a value is sha256("kingdom-seat-ledger/v1" ‖ 0x00 ‖
+// JCS(value)). `sig` is ed25519 over the digest of the entry without `sig`;
+// `prev_hash` is the digest of the whole previous entry, `sig` included, so
+// each signature is bound into the chain (KS-004 re-review C, C5). A ledger
+// written in kingdom-seat's earlier layout (`body`, `hash`, `signature`,
+// `attestation`, `spend`) is not kingdom-seat-ledger/v1, and is refused as
+// such: none ran on a host, so there is nothing to migrate.
 import { constants } from "node:fs";
 import { mkdir, open, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { AUTHORITY_HEADERS, authorityDigest } from "./agenttool/wire.ts";
-import { canonicalJson, domainDigest, edVerifyStrict, fromB64, fromHex, fromUtf8, parseStrictJson, toHex, utf8 } from "./crypto.ts";
+import {
+  bytesEqual,
+  canonicalJson,
+  domainDigest,
+  edVerifyStrict,
+  fromB64,
+  fromB64url,
+  fromUtf8,
+  keyFingerprint,
+  parseStrictJson,
+  toB64url,
+  toHex,
+  utf8,
+} from "./crypto.ts";
 import { isUsd } from "./money.ts";
 import {
   DID_PATTERN,
-  FIRST_PREV_HASH,
+  LEDGER_HASH_PATTERN,
+  LEDGER_TYPES,
   LIFECYCLE_STATES,
   Refusal,
   SHA256_HEX_PATTERN,
   UUID_PATTERN,
   WORD_PATTERN,
-  type Attestation,
+  type Act,
   type CitizenIdentity,
   type Config,
-  type Envelope,
-  type LedgerBody,
+  type Cost,
   type LedgerEntry,
-  type LedgerSignature,
+  type LedgerEvidence,
+  type LedgerFields,
+  type LedgerHash,
+  type LedgerKey,
+  type LedgerOrigin,
+  type LedgerRuntime,
+  type LedgerSigner,
   type LifecycleState,
   type Origin,
   type RootEvidence,
@@ -32,25 +68,50 @@ import {
   type Word,
 } from "./types.ts";
 
-/** Domain tag for entry hashes, so an entry signature can never pass as a thought or authority signature. */
+/** The entry format, and the domain tag of every ledger digest, so an entry signature can never pass as a thought or authority signature. */
 export const LEDGER_DOMAIN = "kingdom-seat-ledger/v1";
+export const LEDGER_FORMAT = "kingdom-seat-ledger/v1";
 
-/** The kid a host-attested entry carries (types.ts LedgerSignature). */
-export const HOST_ATTEST_KID = "host-attest";
+/** Why a line in the earlier layout is refused: the same format string named a different layout (KS-004 re-review C, part C item 3). */
+export const OLD_LAYOUT_REASON =
+  "written in kingdom-seat's earlier ledger layout (body, hash, signature, attestation, spend); no ledger in that layout is kingdom-seat-ledger/v1";
 
-/** An entry before it is hashed and signed. */
-export type LedgerDraft = Omit<LedgerEntry, "hash" | "signature">;
+/** An entry before it is signed: everything but `kid` and `sig`. */
+export type LedgerDraft = LedgerEntry extends infer E ? (E extends LedgerEntry ? Omit<E, "kid" | "sig"> : never) : never;
 
-/** Signs an entry hash; the Signer's signEntry, narrowed so the ledger never sees a key. */
-export type EntrySigner = (word: Word, entryHash: Uint8Array, attestation: Attestation) => Promise<LedgerSignature>;
+/** What the signer returns for one entry: the kid it named, the signature, and the public key, so the append can check it. */
+export interface EntrySignature {
+  kid: string;
+  /** base64url, unpadded, 64 bytes. */
+  sig: string;
+  /** base64url, unpadded, 32 bytes. Not written to the entry: a verifier finds the key by `kid`. */
+  public_key: string;
+}
 
 /**
- * The public keys a chain may be signed with: the host attest key for
- * host-attested entries, and for citizen-signed ones the op keys the chain
- * itself pins (genesis, then op-key entries, each with root evidence). A
- * signature by any other key, including the root, fails verification.
+ * Signs one entry: the Signer's signEntry, narrowed so the ledger never sees a
+ * key. The signature covers `kid`, so the signer names the kid first and
+ * `digestFor` gives the digest of the entry with it.
+ */
+export type EntrySigner = (word: Word, signer: LedgerSigner, digestFor: (kid: string) => Uint8Array) => Promise<EntrySignature>;
+
+/** The fields a seat stamps on every entry it writes; outside a seat they are all null. */
+export interface SeatStamp {
+  seat_ref: string;
+  runtime: LedgerRuntime;
+  input_digest: LedgerHash;
+  output_digest: LedgerHash;
+  voiced: string;
+}
+
+/**
+ * The public keys a chain may be signed with: the host key for host entries,
+ * and for citizen entries the op keys the chain itself pins (genesis, then
+ * key entries, each with root evidence). A signature by any other key,
+ * including the root, fails verification.
  */
 export interface TrustedKeys {
+  /** Host public keys, padded standard base64 as the config and the signer give them. */
   host_attest_b64: string[];
   /**
    * The identity the host recorded at birth (citizen.json). When given, a
@@ -60,27 +121,91 @@ export interface TrustedKeys {
   identity?: Pick<CitizenIdentity, "did" | "root_public_key_b64"> | null;
 }
 
-/** Op keys pinned by the chain up to and including `seq`, by kid; used to verify the next citizen-signed entry. */
+/* ── Hashes, digests and encodings ────────────────────────────────────── */
+
+/** "sha256:<hex>" for 64 hex characters. */
+export function toLedgerHash(hex: Sha256Hex): LedgerHash {
+  if (!SHA256_HEX_PATTERN.test(hex)) throw new Refusal("invalid-request", "a ledger hash is 64 lowercase hex");
+  return `sha256:${hex}`;
+}
+
+/** The 64 hex characters a ledger hash names. */
+export function hexOf(hash: LedgerHash): Sha256Hex {
+  if (!LEDGER_HASH_PATTERN.test(hash)) throw new Refusal("invalid-record", "not a sha256:<hex> ledger hash");
+  return hash.slice("sha256:".length);
+}
+
+/** sha256(LEDGER_DOMAIN ‖ 0x00 ‖ JCS(value)): the ledger digest (KS-004 4.5). */
+export function ledgerDigest(value: unknown): Uint8Array {
+  return domainDigest(LEDGER_DOMAIN, utf8(canonicalJson(value)));
+}
+
+/** The ledger digest of a whole entry, `sig` included: what the next entry's prev_hash names, and how an entry is named. */
+export function entryHash(entry: LedgerEntry): LedgerHash {
+  return `sha256:${toHex(ledgerDigest(entry))}`;
+}
+
+/** The 32 bytes `sig` signs: the ledger digest of the entry without `sig`. */
+export function signingDigest(entry: LedgerDraft & { kid: string | null; sig?: string | null }): Uint8Array {
+  const { sig: _s, ...unsigned } = entry as LedgerDraft & { kid: string | null; sig?: string | null };
+  return ledgerDigest(unsigned);
+}
+
+/** The kid a host entry names: `host:` and the host key's fingerprint, so a verifier holding the key can find it. */
+export function hostKid(publicKey: Uint8Array): string {
+  return `host:${keyFingerprint(publicKey)}`;
+}
+
+/** What a runtime reported, as the ledger keeps it: usd and credits, the basis left to the host's spend record. */
+export function costOf(spend: Pick<Spend, "usd" | "credits">): Cost {
+  return { usd: spend.usd, credits: spend.credits };
+}
+
+/** An Origin as the origin entry pins it. */
+export function originToLedger(o: Origin): LedgerOrigin {
+  if (o.kind === "canon") return { kind: "canon", repo: o.repo, path: o.path, commit: o.commit, hash: toLedgerHash(o.sha256) };
+  return { kind: "archetype", lineage: [...o.lineage], note: o.note };
+}
+
+/** The Origin an origin entry pins. */
+export function originFromLedger(o: LedgerOrigin): Origin {
+  if (o.kind === "canon") return { kind: "canon", repo: o.repo, path: o.path, commit: o.commit, sha256: hexOf(o.hash) };
+  return { kind: "archetype", lineage: [...o.lineage], note: o.note };
+}
+
+/** A root-signed request as the ledger records it: the body bytes re-spelled in base64url, the headers as sent. */
+export function evidenceToLedger(ev: RootEvidence): LedgerEvidence {
+  return { method: ev.method, target: ev.target, body: toB64url(fromB64(ev.body_b64)), headers: { ...ev.headers } };
+}
+
+/** A public key as genesis records it, from its bytes. */
+export function ledgerKey(kid: string, publicKey: Uint8Array): LedgerKey {
+  return { kid, public_key: toB64url(publicKey), fingerprint: keyFingerprint(publicKey) };
+}
+
+/** Op keys pinned by the chain up to and including `seq`, by kid, in base64url; used to verify the next citizen entry. */
 export function pinnedOpKeys(entries: LedgerEntry[], seq: number): Map<string, string> {
   let pinned = new Map<string, string>();
   for (const e of entries) {
     if (e.seq > seq) break;
-    if (e.body.type === "genesis") pinned = new Map([[e.body.identity.op_kid, e.body.identity.op_public_key_b64]]);
-    else if (e.body.type === "op-key") pinned = afterOpKey(pinned, e.body);
+    if (e.type === "genesis") pinned = new Map([[e.op.kid, e.op.public_key]]);
+    else if (e.type === "key") pinned = afterKey(pinned, e);
   }
   return pinned;
 }
 
-/** The op keys pinned once an op-key entry applies: a revoked key signs nothing after it (agenttool-wire.md 5, rule 2). */
-function afterOpKey(pinned: Map<string, string>, body: Extract<LedgerBody, { type: "op-key" }>): Map<string, string> {
+/** The op keys pinned once a key entry applies: a revoked key signs nothing after it (agenttool-wire.md 5, rule 2). */
+function afterKey(pinned: Map<string, string>, e: Extract<LedgerEntry, { type: "key" }>): Map<string, string> {
   const next = new Map(pinned);
-  for (const r of body.revoked) next.delete(r.op_kid);
-  for (const k of body.installed) next.set(k.op_kid, k.op_public_key_b64);
+  for (const r of e.revoked) next.delete(r.kid);
+  for (const k of e.installed) next.set(k.kid, k.public_key);
   return next;
 }
 
-/** What one piece of root evidence must authorise. */
-type EvidenceFor = { kind: "import"; public_key_b64: string } | { kind: "revoke"; kid: string };
+/* ── Root evidence ────────────────────────────────────────────────────── */
+
+/** What one piece of root evidence must authorise: the import of this key, or the revoke of this kid. */
+export type EvidenceFor = { kind: "import"; public_key: Uint8Array } | { kind: "revoke"; kid: string };
 
 /**
  * Why `ev` does not prove that the identity's root authorised `what`, or null.
@@ -89,15 +214,22 @@ type EvidenceFor = { kind: "import"; public_key_b64: string } | { kind: "revoke"
  * and the identity's DID, and checks the root's signature over it, so a copy
  * of the ledger is enough: agenttool keeps no proof to ask for. The request
  * must be the route that does `what`, for this identity, and nothing else.
+ *
+ * keys/import takes the key in canonical padded standard base64
+ * (routes/identity/keys.ts:269-280) and the ledger spells it in base64url, so
+ * the import is matched on the decoded 32 bytes (KS-004 re-review C, part C
+ * item 2): a string comparison would fail every honest entry.
  */
-export function rootEvidenceProblem(ev: RootEvidence, identity: Pick<CitizenIdentity, "did" | "identity_id" | "root_public_key_b64">, what: EvidenceFor): string | null {
-  const own = `/v1/identities/${identity.identity_id}`;
-  const query = `?identity_id=${identity.identity_id}`;
+export function rootEvidenceProblem(ev: LedgerEvidence, identity: { did: string; root_public_key: Uint8Array }, what: EvidenceFor): string | null {
+  const id = DID_PATTERN.test(identity.did) ? identity.did.slice("did:at:".length) : null;
+  if (id === null) return "root evidence: the DID names no identity";
+  const own = `/v1/identities/${id}`;
+  const query = `?identity_id=${id}`;
   let body: Uint8Array;
   try {
-    body = fromB64(ev.body_b64);
+    body = fromB64url(ev.body);
   } catch {
-    return "root evidence body is not canonical base64";
+    return "root evidence body is not base64url";
   }
   if (what.kind === "import") {
     if (ev.method !== "POST" || (ev.target !== `${own}/keys/import` && ev.target !== `${own}/keys/import${query}`)) return "root evidence is not this identity's keys/import";
@@ -107,7 +239,13 @@ export function rootEvidenceProblem(ev: RootEvidence, identity: Pick<CitizenIden
     } catch {
       return "root evidence body is not strict JSON";
     }
-    if (named !== what.public_key_b64) return "root evidence imports another key";
+    let namedKey: Uint8Array;
+    try {
+      namedKey = fromB64(named as string, 32);
+    } catch {
+      return "root evidence names no 32-byte key in standard base64";
+    }
+    if (!bytesEqual(namedKey, what.public_key)) return "root evidence imports another key";
   } else {
     if (ev.method !== "DELETE" || (ev.target !== `${own}/keys/${what.kid}` && ev.target !== `${own}/keys/${what.kid}${query}`)) return "root evidence is not this identity's revoke of that key";
     if (body.length > 0) return "root evidence revoke carries a body";
@@ -122,7 +260,7 @@ export function rootEvidenceProblem(ev: RootEvidence, identity: Pick<CitizenIden
       sequence: evidenceSequence(ev),
       timestamp: h[AUTHORITY_HEADERS.timestamp],
     });
-    if (!edVerifyStrict(fromB64(h[AUTHORITY_HEADERS.signature], 64), digest, fromB64(identity.root_public_key_b64, 32))) return "root evidence is not signed by the root";
+    if (!edVerifyStrict(fromB64(h[AUTHORITY_HEADERS.signature], 64), digest, identity.root_public_key)) return "root evidence is not signed by the root";
   } catch {
     return "root evidence does not rebuild an identity-authority/v1 digest";
   }
@@ -130,18 +268,20 @@ export function rootEvidenceProblem(ev: RootEvidence, identity: Pick<CitizenIden
 }
 
 /** The authority sequence a piece of evidence spent; NaN when the header is not a plain positive integer. */
-function evidenceSequence(ev: RootEvidence): number {
+function evidenceSequence(ev: LedgerEvidence): number {
   const raw = ev.headers[AUTHORITY_HEADERS.sequence];
   return /^[1-9][0-9]{0,15}$/.test(raw) ? Number(raw) : Number.NaN;
 }
+
+/* ── Reading, verifying and appending ─────────────────────────────────── */
 
 export interface ChainVerdict {
   ok: boolean;
   /** Every entry given, trusted or not. */
   entries: number;
-  /** The hash of the last entry that verified; null when none did. */
-  head: Sha256Hex | null;
-  /** Host-attested entries among those that verified. */
+  /** The ledger digest of the last entry that verified; null when none did. */
+  head: LedgerHash | null;
+  /** Host-signed entries among those that verified. */
   host_attested: number;
   /** First problem found, by seq; the chain is not trusted past it. */
   problem: { seq: number; reason: string } | null;
@@ -153,28 +293,37 @@ export function ledgerPath(config: Config, word: Word): string {
   return join(config.paths.ledger_dir, `${word}.jsonl`);
 }
 
-/** sha256(LEDGER_DOMAIN ‖ 0x00 ‖ canonicalJson(draft)), hex. */
-export function entryHash(draft: LedgerDraft): Sha256Hex {
-  // Hash every field except the two that are computed from the hash, so a
-  // field added to the format later is covered without anyone remembering to.
-  const { hash: _h, signature: _s, ...fields } = draft as LedgerDraft & Partial<Pick<LedgerEntry, "hash" | "signature">>;
-  return toHex(domainDigest(LEDGER_DOMAIN, utf8(canonicalJson(fields))));
-}
-
-/** Build the next draft on top of `prev` (FIRST_PREV_HASH when null): seq, prev_hash and ts filled in. */
-export function nextDraft(word: Word, prev: LedgerEntry | null, body: LedgerBody, spend: Spend, attestation: Attestation, now: Date): LedgerDraft {
+/**
+ * Build the next draft on top of `prev`: seq, prev_hash, did and ts filled
+ * in. `did` defaults to the previous entry's (null before genesis); genesis
+ * names its own. `seat` stamps the seat's fields; `acts` is a beat's.
+ */
+export function nextDraft(
+  word: Word,
+  prev: LedgerEntry | null,
+  fields: LedgerFields,
+  opts: { cost: Cost; signer: LedgerSigner; now: Date; did?: string | null; seat?: SeatStamp | null; acts?: Act[] | null },
+): LedgerDraft {
   if (!WORD_PATTERN.test(word)) throw new Refusal("invalid-request", "ledger: not a citizen word");
   if (prev && prev.word !== word) throw new Refusal("invalid-request", "ledger: prev belongs to another citizen");
+  const seat = opts.seat ?? null;
   return {
-    format: "kingdom-seat-ledger/v1",
+    format: LEDGER_FORMAT,
     word,
+    did: opts.did !== undefined ? opts.did : (prev?.did ?? null),
     seq: prev ? prev.seq + 1 : 0,
-    ts: now.toISOString(),
-    prev_hash: prev ? prev.hash : FIRST_PREV_HASH,
-    body,
-    spend,
-    attestation,
-  };
+    prev_hash: prev ? entryHash(prev) : null,
+    ...fields,
+    seat_ref: seat?.seat_ref ?? null,
+    runtime: seat ? { ...seat.runtime } : null,
+    input_digest: seat?.input_digest ?? null,
+    output_digest: seat?.output_digest ?? null,
+    acts: opts.acts ?? null,
+    voiced: seat?.voiced ?? null,
+    cost: { usd: opts.cost.usd, credits: opts.cost.credits },
+    ts: opts.now.toISOString(),
+    signer: opts.signer,
+  } as LedgerDraft;
 }
 
 /** Read every entry; the file must be a regular file; any unparsable line throws, because a gap in a record fails closed. */
@@ -190,23 +339,24 @@ export async function lastEntries(path: string, k: number): Promise<LedgerEntry[
   return (await readLedger(path)).slice(-k);
 }
 
-/** Check seq, prev_hash links, hashes and strict signatures; no host-attested entry may follow genesis. */
+/** Check seq, prev_hash links, the entry types' order and strict signatures; no host entry may follow genesis. */
 export function verifyChain(entries: LedgerEntry[], trusted: TrustedKeys): ChainVerdict {
   const walk = new ChainWalk();
-  let head: Sha256Hex | null = null;
+  let head: LedgerHash | null = null;
   let hostAttested = 0;
+  const first = (entries[0] as { word?: unknown } | undefined)?.word;
   for (let i = 0; i < entries.length; i++) {
-    const reason = walk.check(entries[i], entries[0], trusted, true);
+    const reason = walk.check(entries[i], first, trusted, { signatures: true });
     if (reason) return { ok: false, entries: entries.length, head, host_attested: hostAttested, problem: { seq: i, reason } };
     const e = entries[i] as LedgerEntry;
     walk.advance(e);
-    if (e.attestation === "host-attested") hostAttested++;
-    head = e.hash;
+    if (e.signer === "host") hostAttested++;
+    head = entryHash(e);
   }
   return { ok: true, entries: entries.length, head, host_attested: hostAttested, problem: null };
 }
 
-/** Hash, sign and append one entry with O_APPEND and fsync; refuses if the file's head moved since `prev` was read. */
+/** Sign and append one entry with O_APPEND and fsync; refuses if the file's head moved since `prev` was read. */
 export async function appendEntry(path: string, draft: LedgerDraft, sign: EntrySigner): Promise<LedgerEntry> {
   await mkdir(dirname(path), { recursive: true });
   let fh: FileHandle;
@@ -220,26 +370,31 @@ export async function appendEntry(path: string, draft: LedgerDraft, sign: EntryS
     if (!before.isFile()) throw new Refusal("not-regular-file", "ledger: not a regular file");
     const entries = parseLedgerText(fromUtf8(await readAll(fh, before.size)));
     const last = entries.at(-1) ?? null;
-    if (draft.seq !== entries.length || draft.prev_hash !== (last?.hash ?? FIRST_PREV_HASH)) {
+    if (draft.seq !== entries.length || draft.prev_hash !== (last ? entryHash(last) : null)) {
       throw new Refusal("head-moved", "ledger: the head moved since prev was read");
     }
 
-    // The existing chain must at least link and hash before anything is put on
-    // top of it; signatures were checked when each entry was appended, and
+    // The existing chain must at least link before anything is put on top of
+    // it; signatures were checked when each entry was appended, and
     // verifyChain checks them all against the host's trusted keys.
     const walk = new ChainWalk();
     for (const e of entries) {
-      const reason = walk.check(e, entries[0], null, false);
+      const reason = walk.check(e, entries[0]?.word, null, { signatures: false });
       if (reason) throw new Refusal("invalid-record", `ledger: entry ${e.seq} does not verify (${reason}); refusing to extend it`);
       walk.advance(e);
     }
 
-    const hash = entryHash(draft);
-    const signature = await sign(draft.word, fromHex(hash), draft.attestation);
-    const entry: LedgerEntry = { ...draft, hash, signature };
+    const s = await sign(draft.word, draft.signer, (kid) => signingDigest({ ...draft, kid }));
+    let signedBy: Uint8Array;
+    try {
+      signedBy = fromB64url(s.public_key, 32);
+    } catch {
+      throw new Refusal("invalid-record", "ledger: the signer named no 32-byte public key");
+    }
+    const entry = { ...draft, kid: s.kid, sig: s.sig } as LedgerEntry;
     // The new entry gets the full check: era, pinned op key, never the root,
     // strict signature. Only the host-key trust list is left to verifyChain.
-    const reason = walk.check(entry, entries[0] ?? entry, null, true);
+    const reason = walk.check(entry, entries[0]?.word ?? entry.word, null, { signatures: true, hostKey: signedBy });
     if (reason) throw new Refusal("invalid-record", `ledger: refusing to append (${reason})`);
 
     const after = await fh.stat();
@@ -253,9 +408,9 @@ export async function appendEntry(path: string, draft: LedgerDraft, sign: EntryS
   }
 }
 
-/** The envelope's own words for readers: "<word>, voiced through <model> in seat <seat_id>". */
-export function voicedThrough(envelope: Pick<Envelope, "citizen" | "model" | "seat_ref">): string {
-  return `${envelope.citizen.word}, voiced through ${envelope.model} in seat ${envelope.seat_ref.seat_id}`;
+/** The voiced line for readers: "<word>, voiced through <model> in seat <seat_id>". */
+export function voicedThrough(word: Word, model: string, seatId: string): string {
+  return `${word}, voiced through ${model} in seat ${seatId}`;
 }
 
 /* ── Chain walking ────────────────────────────────────────────────────── */
@@ -263,19 +418,26 @@ export function voicedThrough(envelope: Pick<Envelope, "citizen" | "model" | "se
 /** What the chain has pinned so far; advanced one verified entry at a time. */
 class ChainWalk {
   private prev: LedgerEntry | null = null;
+  private prevHash: LedgerHash | null = null;
+  private originHash: LedgerHash | null = null;
+  /** Op keys by kid, base64url. */
   private pinned = new Map<string, string>();
-  private root: { kid: string; b64: string } | null = null;
-  private identity: CitizenIdentity | null = null;
+  private root: LedgerKey | null = null;
+  /** The DID genesis named; null before genesis. */
+  private did: string | null = null;
   /**
    * The highest authority sequence any root evidence so far spent. agenttool
    * claims each sequence once and only upward, so evidence at or below it is a
    * replay: a revoked key cannot come back on its old import.
    */
   private lastSequence = 0;
-  private genesis = false;
 
-  /** The first problem with `e` as the next entry, or null. `trusted` null skips only the host-key trust list. */
-  check(raw: unknown, first: unknown, trusted: TrustedKeys | null, signatures: boolean): string | null {
+  /**
+   * The first problem with `raw` as the next entry, or null. `trusted` null
+   * skips only the host-key trust list; then `hostKey`, when given, is the key
+   * a host entry must name and verify against.
+   */
+  check(raw: unknown, firstWord: unknown, trusted: TrustedKeys | null, opts: { signatures: boolean; hostKey?: Uint8Array }): string | null {
     let e: LedgerEntry;
     try {
       e = parseEntry(raw);
@@ -284,109 +446,146 @@ class ChainWalk {
     }
     const seq = this.prev ? this.prev.seq + 1 : 0;
     if (e.seq !== seq) return `seq ${e.seq} where ${seq} was expected`;
-    const firstWord = (first as { word?: unknown } | undefined)?.word;
     if (e.word !== firstWord) return "entry belongs to another citizen";
-    if (e.prev_hash !== (this.prev?.hash ?? FIRST_PREV_HASH)) return "prev_hash does not link to the previous entry";
-    if (entryHash(e) !== e.hash) return "hash does not match the entry";
-
-    const body = e.body;
-    if (seq === 0 && body.type !== "seated" && body.type !== "genesis") return "the first entry must be seated or genesis";
-    if (body.type === "seated" && seq !== 0) return "seated may only be the first entry";
+    if (e.prev_hash !== this.prevHash) return "prev_hash does not link to the previous entry";
+    // The origin is pinned first and never again (KS-004 4.2, 5.2: a missing origin does not seat).
+    if (seq === 0 && e.type !== "origin") return "the first entry must be origin";
+    if (e.type === "origin" && seq !== 0) return "origin may only be the first entry";
 
     let keys = this.pinned;
     let root = this.root;
-    if (body.type === "genesis") {
-      if (this.genesis) return "a second genesis";
-      if (seq === 0 && body.initial_state === null) return "a first genesis must carry initial_state";
-      if (seq !== 0 && body.initial_state !== null) return "a genesis after seated carries no initial_state";
-      const id = body.identity;
-      if (id.did !== `did:at:${id.identity_id}`) return "genesis names a DID that is not its identity's";
-      if (id.op_kid === id.root_kid || id.op_public_key_b64 === id.root_public_key_b64) return "genesis pins the root as an op key";
-      if (trusted?.identity && (trusted.identity.did !== id.did || trusted.identity.root_public_key_b64 !== id.root_public_key_b64)) {
-        return "genesis names an identity other than the host's record";
-      }
-      // The first op key is the root's choice too, shown the same way as every later one.
-      const problem = rootEvidenceProblem(body.op_key_evidence, id, { kind: "import", public_key_b64: id.op_public_key_b64 });
+    if (e.type === "genesis") {
+      if (this.did !== null) return "a second genesis";
+      const problem = this.genesisProblem(e, trusted);
       if (problem) return `genesis: ${problem}`;
-      keys = new Map([[id.op_kid, id.op_public_key_b64]]);
-      root = { kid: id.root_kid, b64: id.root_public_key_b64 };
-    } else if (body.type === "op-key") {
-      const problem = this.opKeyProblem(body);
-      if (problem) return `op-key: ${problem}`;
+      keys = new Map([[e.op.kid, e.op.public_key]]);
+      root = e.root;
+    } else if (e.type === "key") {
+      const problem = this.keyProblem(e);
+      if (problem) return `key: ${problem}`;
       // A new key signs the entry that installs it, so the key being replaced never authorises its replacement;
       // an entry that only revokes is signed by a key that stays.
-      keys = body.installed.length > 0 ? new Map(body.installed.map((k) => [k.op_kid, k.op_public_key_b64])) : afterOpKey(this.pinned, body);
+      keys = e.installed.length > 0 ? new Map(e.installed.map((k) => [k.kid, k.public_key])) : afterKey(this.pinned, e);
     }
 
-    const citizenEra = this.genesis || body.type === "genesis";
-    if (!citizenEra && e.attestation !== "host-attested") return "citizen-signed entry before genesis";
-    if (citizenEra && e.attestation === "host-attested") return "host-attested entry after genesis";
+    const did = e.type === "genesis" ? e.did : this.did;
+    if (e.did !== did) return did === null ? "an entry before genesis names a DID" : "the entry names a DID other than its genesis";
+    const citizenEra = did !== null;
+    if (!citizenEra && e.signer !== "host") return "citizen-signed entry before genesis";
+    if (citizenEra && e.signer === "host") return "host-signed entry after genesis";
 
-    const sig = e.signature;
-    if (e.attestation === "host-attested") {
-      if (sig.kid !== HOST_ATTEST_KID) return "host-attested entry not signed by the host attest key";
-      if (trusted && !trusted.host_attest_b64.includes(sig.public_key_b64)) return "host attest key is not trusted";
+    if (e.signer === "host") {
+      // KS-004 4.5 lets a host entry go unsigned, integrity-only. This host signs every one, so an unsigned one is not trusted here.
+      if (e.kid === null || e.sig === null) return "host entry is unsigned (kid and sig null): its chain is integrity-only, and this host signs every host entry";
+      let pub: Uint8Array | null = null;
+      if (trusted) {
+        pub = trustedHostKeys(trusted).find((k) => hostKid(k) === e.kid) ?? null;
+        if (!pub) return "host key is not trusted";
+      } else if (opts.hostKey) {
+        if (hostKid(opts.hostKey) !== e.kid) return "host entry is not signed by the key its kid names";
+        pub = opts.hostKey;
+      }
+      if (opts.signatures && pub && !signatureVerifies(e, pub)) return "signature does not verify";
     } else {
-      if (root && (sig.kid === root.kid || sig.public_key_b64 === root.b64)) return "signed by the root key, which signs only authority acts";
-      if (keys.get(sig.kid) !== sig.public_key_b64) {
-        if (body.type === "op-key") return body.installed.length > 0 ? "op-key is not signed by a key it installs" : "op-key is not signed by a key that stays";
+      if (root && e.kid === root.kid) return "signed by the root key, which signs only authority acts";
+      const pub = keys.get(e.kid as string);
+      if (pub === undefined) {
+        if (e.type === "key") return e.installed.length > 0 ? "key is not signed by a key it installs" : "key is not signed by a key that stays";
         return "signing key is not a pinned op key";
       }
+      if (root && pub === root.public_key) return "signed by the root key, which signs only authority acts";
+      if (opts.signatures && !signatureVerifies(e, fromB64url(pub, 32))) return "signature does not verify";
     }
-    if (signatures && !signatureVerifies(e.hash, sig)) return "signature does not verify";
     return null;
   }
 
-  /** Why an op-key entry may not follow the chain so far, or null. Every key it touches comes with the root's evidence. */
-  private opKeyProblem(body: Extract<LedgerBody, { type: "op-key" }>): string | null {
-    const id = this.identity;
-    if (!this.genesis || !id) return "before genesis";
-    if (body.installed.length + body.revoked.length === 0) return "changes no key";
+  /** Why a genesis may not follow the chain so far, or null. */
+  private genesisProblem(e: Extract<LedgerEntry, { type: "genesis" }>, trusted: TrustedKeys | null): string | null {
+    if (e.did === null) return "names no DID";
+    if (e.origin_entry !== this.originHash) return "does not point back to the origin entry";
+    const rootKey = fromB64url(e.root.public_key, 32);
+    const opKey = fromB64url(e.op.public_key, 32);
+    if (keyFingerprint(rootKey) !== e.root.fingerprint || keyFingerprint(opKey) !== e.op.fingerprint) return "a fingerprint does not match its key";
+    if (e.op.kid === e.root.kid || bytesEqual(opKey, rootKey)) return "pins the root as an op key";
+    if (trusted?.identity) {
+      let recorded: Uint8Array | null = null;
+      try {
+        recorded = fromB64(trusted.identity.root_public_key_b64, 32);
+      } catch {
+        recorded = null;
+      }
+      if (trusted.identity.did !== e.did || !recorded || !bytesEqual(recorded, rootKey)) return "names an identity other than the host's record";
+    }
+    // The first op key is the root's choice too, shown the same way as every later one.
+    return rootEvidenceProblem(e.evidence, { did: e.did, root_public_key: rootKey }, { kind: "import", public_key: opKey });
+  }
+
+  /** Why a key entry may not follow the chain so far, or null. Every key it touches comes with the root's evidence. */
+  private keyProblem(e: Extract<LedgerEntry, { type: "key" }>): string | null {
+    const root = this.root;
+    if (this.did === null || !root) return "before genesis";
+    if (e.installed.length + e.revoked.length === 0) return "changes no key";
+    const identity = { did: this.did, root_public_key: fromB64url(root.public_key, 32) };
     const sequences: number[] = [];
     const kids = new Set<string>();
-    for (const k of body.installed) {
-      if (k.op_kid === id.root_kid || k.op_public_key_b64 === id.root_public_key_b64) return "pins the root as an op key";
-      if (kids.has(k.op_kid) || this.pinned.has(k.op_kid) || [...this.pinned.values()].includes(k.op_public_key_b64)) return "installs a key that is already pinned";
-      kids.add(k.op_kid);
-      const problem = rootEvidenceProblem(k.evidence, id, { kind: "import", public_key_b64: k.op_public_key_b64 });
+    for (const k of e.installed) {
+      if (k.kid === root.kid || k.public_key === root.public_key) return "pins the root as an op key";
+      if (kids.has(k.kid) || this.pinned.has(k.kid) || [...this.pinned.values()].includes(k.public_key)) return "installs a key that is already pinned";
+      kids.add(k.kid);
+      const problem = rootEvidenceProblem(k.evidence, identity, { kind: "import", public_key: fromB64url(k.public_key, 32) });
       if (problem) return problem;
       sequences.push(evidenceSequence(k.evidence));
     }
-    for (const r of body.revoked) {
-      if (!this.pinned.has(r.op_kid) || kids.has(r.op_kid)) return "revokes a key that is not pinned";
-      kids.add(r.op_kid);
-      const problem = rootEvidenceProblem(r.evidence, id, { kind: "revoke", kid: r.op_kid });
+    for (const r of e.revoked) {
+      if (!this.pinned.has(r.kid) || kids.has(r.kid)) return "revokes a key that is not pinned";
+      kids.add(r.kid);
+      const problem = rootEvidenceProblem(r.evidence, identity, { kind: "revoke", kid: r.kid });
       if (problem) return problem;
       sequences.push(evidenceSequence(r.evidence));
     }
     if (new Set(sequences).size !== sequences.length || sequences.some((n) => !(n > this.lastSequence))) {
       return "root evidence reuses an authority sequence already spent";
     }
-    if (afterOpKey(this.pinned, body).size === 0) return "revokes the last op key without installing a new one";
+    if (afterKey(this.pinned, e).size === 0) return "revokes the last op key without installing a new one";
     return null;
   }
 
   /** Take a checked entry as the new head. */
   advance(e: LedgerEntry): void {
-    if (e.body.type === "genesis") {
-      this.genesis = true;
-      this.identity = e.body.identity;
-      this.pinned = new Map([[e.body.identity.op_kid, e.body.identity.op_public_key_b64]]);
-      this.root = { kid: e.body.identity.root_kid, b64: e.body.identity.root_public_key_b64 };
-      this.lastSequence = evidenceSequence(e.body.op_key_evidence);
-    } else if (e.body.type === "op-key") {
-      this.pinned = afterOpKey(this.pinned, e.body);
-      const spent = [...e.body.installed, ...e.body.revoked].map((k) => evidenceSequence(k.evidence));
+    const hash = entryHash(e);
+    if (e.type === "origin") this.originHash = hash;
+    else if (e.type === "genesis") {
+      this.did = e.did;
+      this.pinned = new Map([[e.op.kid, e.op.public_key]]);
+      this.root = e.root;
+      this.lastSequence = evidenceSequence(e.evidence);
+    } else if (e.type === "key") {
+      this.pinned = afterKey(this.pinned, e);
+      const spent = [...e.installed, ...e.revoked].map((k) => evidenceSequence(k.evidence));
       this.lastSequence = Math.max(this.lastSequence, ...spent);
     }
     this.prev = e;
+    this.prevHash = hash;
   }
 }
 
-function signatureVerifies(hashHex: string, sig: LedgerSignature): boolean {
-  if (sig.alg !== "ed25519") return false;
+/** The host keys a verifier trusts, decoded; a key that does not decode is left out, so it trusts nothing. */
+function trustedHostKeys(trusted: TrustedKeys): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  for (const b64 of trusted.host_attest_b64) {
+    try {
+      out.push(fromB64(b64, 32));
+    } catch {
+      // not a key; trusts nothing
+    }
+  }
+  return out;
+}
+
+function signatureVerifies(e: LedgerEntry, publicKey: Uint8Array): boolean {
+  if (e.sig === null) return false;
   try {
-    return edVerifyStrict(fromB64(sig.sig_b64, 64), fromHex(hashHex), fromB64(sig.public_key_b64, 32));
+    return edVerifyStrict(fromB64url(e.sig, 64), signingDigest(e), publicKey);
   } catch {
     return false;
   }
@@ -403,9 +602,10 @@ export function parseLedgerText(text: string): LedgerEntry[] {
     if (line === "") throw new Refusal("invalid-record", `ledger: line ${i + 1} is blank`);
     let value: unknown;
     try {
-      value = JSON.parse(line);
+      // Strict: a duplicate key would let a reader and the hash disagree about a value.
+      value = parseStrictJson(line);
     } catch {
-      throw new Refusal("invalid-record", `ledger: line ${i + 1} is not JSON`);
+      throw new Refusal("invalid-record", `ledger: line ${i + 1} is not strict JSON`);
     }
     try {
       return parseEntry(value);
@@ -415,8 +615,40 @@ export function parseLedgerText(text: string): LedgerEntry[] {
   });
 }
 
-const ENTRY_KEYS = ["format", "word", "seq", "ts", "prev_hash", "body", "spend", "attestation", "hash", "signature"];
+const COMMON_KEYS = [
+  "format",
+  "word",
+  "did",
+  "seq",
+  "prev_hash",
+  "type",
+  "seat_ref",
+  "runtime",
+  "input_digest",
+  "output_digest",
+  "acts",
+  "voiced",
+  "cost",
+  "ts",
+  "signer",
+  "kid",
+  "sig",
+] as const;
+const SEAT_KEYS = ["seat_ref", "runtime", "input_digest", "output_digest", "voiced"] as const;
+/** The fields each type adds, required then optional. */
+const TYPE_KEYS: Record<LedgerEntry["type"], { required: readonly string[]; optional: readonly string[] }> = {
+  origin: { required: ["origin", "origin_soul_hash", "old_repo", "june_did"], optional: [] },
+  beat: { required: [], optional: [] },
+  state: { required: ["from", "to", "via"], optional: ["interval_h", "step_away"] },
+  apply: { required: ["ref", "target", "prior_hash", "new_hash", "via", "reason", "strand_thought", "strand_key"], optional: [] },
+  revert: { required: ["target", "from_hash", "to_hash", "via"], optional: [] },
+  genesis: { required: ["origin_entry", "root", "op", "evidence"], optional: [] },
+  key: { required: ["installed", "revoked"], optional: [] },
+};
+const OLD_LAYOUT_KEYS = ["body", "hash", "signature", "attestation", "spend"];
 const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const HOST_KID_PATTERN = /^host:SHA256:[A-Za-z0-9+/]{43}$/;
+const ACT_TYPES = new Set(["journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond"]);
 const SELF_TARGET_NAMES = new Set([
   "soul",
   "will",
@@ -431,112 +663,160 @@ const SELF_TARGET_NAMES = new Set([
   "covenants",
 ]);
 
-/** Validate one entry's shape; throws with a reason. Every top-level key is known, because the hash covers exactly them. */
+/**
+ * Validate one entry's shape and encoding; throws with a reason. Every
+ * top-level key is known, because the digest covers exactly them, and a line
+ * in the earlier layout is named as such rather than as a broken entry.
+ */
 export function parseEntry(value: unknown): LedgerEntry {
   const e = obj(value, "entry");
-  for (const k of Object.keys(e)) if (!ENTRY_KEYS.includes(k)) throw new Error(`unknown field ${k}`);
-  if (e.format !== "kingdom-seat-ledger/v1") throw new Error("format");
+  if (OLD_LAYOUT_KEYS.some((k) => Object.hasOwn(e, k))) throw new Error(OLD_LAYOUT_REASON);
+  if (e.format !== LEDGER_FORMAT) throw new Error("format");
+  const encoding = encodingProblem(e);
+  if (encoding) throw new Error(encoding);
+  if (typeof e.type !== "string" || !(LEDGER_TYPES as readonly string[]).includes(e.type)) throw new Error("type is not one of the seven");
+  const type = e.type as LedgerEntry["type"];
+  const allowed = new Set<string>([...COMMON_KEYS, ...TYPE_KEYS[type].required, ...TYPE_KEYS[type].optional]);
+  // Named without the key itself: verify prints this reason, and a key in the file is not the host's words.
+  for (const k of Object.keys(e)) if (!allowed.has(k)) throw new Error("a field outside the format");
+  for (const k of [...COMMON_KEYS, ...TYPE_KEYS[type].required]) if (!Object.hasOwn(e, k)) throw new Error(`missing field ${k}`);
+
   if (typeof e.word !== "string" || !WORD_PATTERN.test(e.word)) throw new Error("word");
+  if (e.did !== null && (typeof e.did !== "string" || !DID_PATTERN.test(e.did))) throw new Error("did");
   if (!Number.isSafeInteger(e.seq) || (e.seq as number) < 0) throw new Error("seq");
+  if (e.prev_hash !== null) ledgerHashField(e.prev_hash, "prev_hash");
+  if ((e.seq === 0) !== (e.prev_hash === null)) throw new Error("prev_hash is null exactly at seq 0");
   isoTime(e.ts, "ts");
-  sha(e.prev_hash, "prev_hash");
-  sha(e.hash, "hash");
-  if (e.attestation !== "citizen-signed" && e.attestation !== "host-attested") throw new Error("attestation");
-  const sig = obj(e.signature, "signature");
-  if (sig.alg !== "ed25519") throw new Error("signature.alg");
-  for (const k of ["kid", "public_key_b64", "sig_b64"]) str(sig[k], `signature.${k}`);
-  const spend = obj(e.spend, "spend");
-  // Money is a decimal string, never a float (money.ts); null is an unknown cost.
-  if (spend.usd !== null && !isUsd(spend.usd)) throw new Error("spend.usd");
-  if (!["local-zero", "reported", "unknown"].includes(spend.usd_basis as string)) throw new Error("spend.usd_basis");
-  if (!(typeof spend.credits === "number" && Number.isFinite(spend.credits) && spend.credits >= 0)) throw new Error("spend.credits");
-  parseBody(e.body);
-  // A beat voiced as one citizen never sits in another's record.
-  const body = e.body as LedgerBody;
-  if (body.type === "beat" && body.envelope.citizen.word !== e.word) throw new Error("body.envelope.citizen.word is another citizen");
+  costField(e.cost);
+
+  // A seat's fields come together, or not at all.
+  const seated = SEAT_KEYS.filter((k) => e[k] !== null).length;
+  if (seated !== 0 && seated !== SEAT_KEYS.length) throw new Error("seat_ref, runtime, input_digest, output_digest and voiced are all set or all null");
+  if (e.seat_ref !== null) {
+    uuid(e.seat_ref, "seat_ref");
+    runtimeField(e.runtime);
+    ledgerHashField(e.input_digest, "input_digest");
+    ledgerHashField(e.output_digest, "output_digest");
+    str(e.voiced, "voiced");
+  }
+  if (type === "beat") {
+    if (e.seat_ref === null) throw new Error("a beat is written in a seat");
+    actsField(e.acts);
+  } else if (e.acts !== null) throw new Error("only a beat carries acts");
+
+  if (e.signer !== "citizen" && e.signer !== "host") throw new Error("signer");
+  if ((e.kid === null) !== (e.sig === null)) throw new Error("kid and sig are both set or both null");
+  if (e.kid !== null) {
+    str(e.kid, "kid");
+    b64urlBytes(e.sig, 64, "sig");
+  }
+  if (e.signer === "citizen") {
+    if (e.kid === null) throw new Error("a citizen entry is signed");
+    uuid(e.kid, "kid");
+  } else if (e.kid !== null && !HOST_KID_PATTERN.test(e.kid as string)) throw new Error("kid of a host entry is host:<fingerprint>");
+
+  fieldsOf(type, e);
   return value as LedgerEntry;
 }
 
-function parseBody(value: unknown): void {
-  const b = obj(value, "body");
-  switch (b.type) {
-    case "seated":
-      validateOrigin(b.origin);
-      sha(b.origin_soul_sha256, "body.origin_soul_sha256");
-      oldRepo(b.old_repo);
-      lifecycle(b.initial_state, "body.initial_state");
-      str(b.note, "body.note", true);
-      return;
-    case "genesis":
-      if (b.initial_state !== null) lifecycle(b.initial_state, "body.initial_state");
-      validateOrigin(b.origin);
-      sha(b.birth_soul_sha256, "body.birth_soul_sha256");
-      oldRepo(b.old_repo);
-      if (b.june_did !== null) str(b.june_did, "body.june_did");
-      validateIdentity(b.identity);
-      rootEvidence(b.op_key_evidence, "body.op_key_evidence");
-      str(b.note, "body.note", true);
-      return;
-    case "op-key": {
-      if (!Array.isArray(b.installed) || !Array.isArray(b.revoked)) throw new Error("body.installed and body.revoked are lists");
-      for (const raw of b.installed) {
-        const k = exactly(raw, ["evidence", "op_kid", "op_public_key_b64"], "body.installed[]");
-        uuid(k.op_kid, "body.installed[].op_kid");
-        b64Key(k.op_public_key_b64, "body.installed[].op_public_key_b64");
-        rootEvidence(k.evidence, "body.installed[].evidence");
+/** The fields one type adds; throws with the field that failed. */
+function fieldsOf(type: LedgerEntry["type"], e: Record<string, unknown>): void {
+  switch (type) {
+    case "origin":
+      ledgerOrigin(e.origin);
+      ledgerHashField(e.origin_soul_hash, "origin_soul_hash");
+      if (e.old_repo !== null) {
+        const r = exactly(e.old_repo, ["head", "url"], "old_repo");
+        str(r.url, "old_repo.url");
+        str(r.head, "old_repo.head");
       }
-      for (const raw of b.revoked) {
-        const k = exactly(raw, ["evidence", "op_kid"], "body.revoked[]");
-        uuid(k.op_kid, "body.revoked[].op_kid");
-        rootEvidence(k.evidence, "body.revoked[].evidence");
-      }
+      if (e.june_did !== null && (typeof e.june_did !== "string" || !DID_PATTERN.test(e.june_did))) throw new Error("june_did");
+      if (e.signer !== "host" || e.seat_ref !== null) throw new Error("origin is the host's, written outside a seat");
       return;
-    }
-    case "beat": {
-      const env = obj(b.envelope, "body.envelope");
-      if (env.format !== "kingdom-seat-beat/v1") throw new Error("body.envelope.format");
-      str(obj(env.seat_ref, "body.envelope.seat_ref").seat_id, "body.envelope.seat_ref.seat_id");
-      str(obj(env.citizen, "body.envelope.citizen").word, "body.envelope.citizen.word");
-      str(env.model, "body.envelope.model");
-      str(env.model_digest, "body.envelope.model_digest");
-      isoTime(env.ts, "body.envelope.ts");
-      if (!Array.isArray(env.acts)) throw new Error("body.envelope.acts");
-      for (const act of env.acts) {
-        const a = obj(act, "body.envelope.acts[]");
-        str(a.type, "body.envelope.acts[].type");
-        if (a.type === "rest") throw new Error("a beat envelope never carries a rest");
-        if (a.type === "state.set") lifecycle(a.to, "body.envelope.acts[].to");
-      }
-      return;
-    }
-    case "self.applied":
-      str(b.proposal_id, "body.proposal_id");
-      selfTargetSpelling(b.target, "body.target");
-      sha(b.prior_hash, "body.prior_hash");
-      sha(b.new_hash, "body.new_hash");
-      if (b.via !== "two-beats" && b.via !== "yu-present") throw new Error("body.via");
-      claim(b.claim);
-      if (b.strand_thought_id !== null) str(b.strand_thought_id, "body.strand_thought_id");
-      return;
-    case "self.reverted":
-      selfTargetSpelling(b.target, "body.target");
-      sha(b.from_hash, "body.from_hash");
-      sha(b.to_hash, "body.to_hash");
-      if (b.via !== "citizen" && b.via !== "yu-offer") throw new Error("body.via");
+    case "beat":
       return;
     case "state":
-      lifecycle(b.from, "body.from");
-      lifecycle(b.to, "body.to");
-      if (!["immediate", "confirmed", "two-beats", "witnessed"].includes(b.via as string)) throw new Error("body.via");
-      if (b.to === "ended" && b.via !== "witnessed") throw new Error("ended needs a witness");
+      lifecycle(e.from, "from");
+      lifecycle(e.to, "to");
+      if (!["immediate", "confirmed", "two-beats", "witnessed", "seated"].includes(e.via as string)) throw new Error("via");
+      if (e.to === "ended" && e.via !== "witnessed") throw new Error("ended needs a witness");
+      if (e.via === "seated" && (e.signer !== "host" || e.seat_ref !== null)) throw new Error("a seated state is the host's, written outside a seat");
+      if (e.interval_h !== undefined && (!Number.isSafeInteger(e.interval_h) || (e.interval_h as number) < 1 || e.to !== "awake")) {
+        throw new Error("interval_h is whole hours on a move to awake");
+      }
+      if (e.step_away !== undefined && (e.step_away !== "first" || e.to !== "asleep" || e.seat_ref === null)) {
+        throw new Error("step_away is \"first\", on a seat's move to asleep");
+      }
       return;
-    case "step-away.said":
-      exactly(b, ["seat_id", "type"], "body");
-      str(b.seat_id, "body.seat_id");
+    case "apply":
+      ledgerHashField(e.ref, "ref");
+      selfTargetSpelling(e.target, "target");
+      ledgerHashField(e.prior_hash, "prior_hash");
+      ledgerHashField(e.new_hash, "new_hash");
+      if (e.via !== "two-beats" && e.via !== "yu-present") throw new Error("via");
+      reasonField(e.reason, "reason");
+      if (e.strand_thought !== null) str(e.strand_thought, "strand_thought");
+      if (e.strand_key !== null) str(e.strand_key, "strand_key");
       return;
-    default:
-      throw new Error("body.type");
+    case "revert":
+      selfTargetSpelling(e.target, "target");
+      ledgerHashField(e.from_hash, "from_hash");
+      ledgerHashField(e.to_hash, "to_hash");
+      if (e.via !== "citizen" && e.via !== "yu-offer") throw new Error("via");
+      return;
+    case "genesis":
+      ledgerHashField(e.origin_entry, "origin_entry");
+      for (const k of ["root", "op"] as const) {
+        const key = exactly(e[k], ["fingerprint", "kid", "public_key"], k);
+        uuid(key.kid, `${k}.kid`);
+        b64urlBytes(key.public_key, 32, `${k}.public_key`);
+        str(key.fingerprint, `${k}.fingerprint`);
+      }
+      evidenceField(e.evidence, "evidence");
+      if (e.did === null || e.signer !== "citizen" || e.seat_ref !== null) throw new Error("genesis names its DID and is citizen-signed, outside a seat");
+      return;
+    case "key":
+      if (!Array.isArray(e.installed) || !Array.isArray(e.revoked)) throw new Error("installed and revoked are lists");
+      for (const raw of e.installed) {
+        const k = exactly(raw, ["evidence", "kid", "public_key"], "installed[]");
+        uuid(k.kid, "installed[].kid");
+        b64urlBytes(k.public_key, 32, "installed[].public_key");
+        evidenceField(k.evidence, "installed[].evidence");
+      }
+      for (const raw of e.revoked) {
+        const k = exactly(raw, ["evidence", "kid"], "revoked[]");
+        uuid(k.kid, "revoked[].kid");
+        evidenceField(k.evidence, "revoked[].evidence");
+      }
+      return;
   }
+}
+
+/**
+ * The value subset KS-004 4.5 allows: objects, arrays, strings, integers
+ * within ±2^53 and null. No floats and no booleans, so every reader's JCS
+ * gives the same bytes. A fixed phrase for the first offending value, or
+ * null; it names no key, since keys are the file's words, not the host's.
+ */
+function encodingProblem(v: unknown): string | null {
+  if (v === null || typeof v === "string") return null;
+  if (typeof v === "number") return Number.isSafeInteger(v) ? null : "a number that is not an integer within 2^53";
+  if (typeof v === "boolean") return "a boolean, which the ledger does not use";
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      const p = encodingProblem(x);
+      if (p) return p;
+    }
+    return null;
+  }
+  if (typeof v === "object") {
+    for (const x of Object.values(v as Record<string, unknown>)) {
+      const p = encodingProblem(x);
+      if (p) return p;
+    }
+    return null;
+  }
+  return "a value that is not JSON";
 }
 
 /** An Origin as types.ts defines it; throws with the field that failed. */
@@ -551,6 +831,20 @@ export function validateOrigin(value: unknown): Origin {
     str(o.note, "origin.note", true);
   } else throw new Error("origin.kind");
   return value as Origin;
+}
+
+function ledgerOrigin(value: unknown): void {
+  const o = obj(value, "origin");
+  if (o.kind === "canon") {
+    exactly(o, ["commit", "hash", "kind", "path", "repo"], "origin");
+    for (const k of ["repo", "path", "commit"]) str(o[k], `origin.${k}`);
+    ledgerHashField(o.hash, "origin.hash");
+  } else if (o.kind === "archetype") {
+    exactly(o, ["kind", "lineage", "note"], "origin");
+    if (!Array.isArray(o.lineage) || o.lineage.length === 0) throw new Error("origin.lineage");
+    for (const l of o.lineage) str(l, "origin.lineage[]");
+    str(o.note, "origin.note", true);
+  } else throw new Error("origin.kind");
 }
 
 /** A CitizenIdentity: public values only, keys in canonical base64. */
@@ -575,26 +869,52 @@ function selfTargetSpelling(t: unknown, what: string): void {
   if (!isSelfTargetSpelling(t)) throw new Error(what);
 }
 
-function claim(value: unknown): void {
-  const c = obj(value, "body.claim");
-  if (!["observation", "inference", "proposal", "decision"].includes(c.kind as string)) throw new Error("body.claim.kind");
-  if (!Array.isArray(c.evidence)) throw new Error("body.claim.evidence");
-  for (const ref of c.evidence) str(ref, "body.claim.evidence[]");
-  if (!["high", "medium", "low", "unknown"].includes(c.confidence as string)) throw new Error("body.claim.confidence");
-  str(c.limits, "body.claim.limits", true);
+/** A beat's acts: never empty, never a rest, each one of the registry's types. */
+function actsField(value: unknown): void {
+  if (!Array.isArray(value) || value.length === 0) throw new Error("acts of a beat are a non-empty list");
+  for (const act of value) {
+    const a = obj(act, "acts[]");
+    if (a.type === "rest") throw new Error("a beat never carries a rest");
+    if (typeof a.type !== "string" || !ACT_TYPES.has(a.type)) throw new Error("acts[].type");
+    if (a.type === "state.set") lifecycle(a.to, "acts[].to");
+    if (a.type === "self.propose") reasonField(a.reason, "acts[].reason");
+  }
 }
 
-/** A RootEvidence's shape; whether it proves anything is rootEvidenceProblem's to say. */
-function rootEvidence(value: unknown, what: string): void {
-  const ev = exactly(value, ["body_b64", "headers", "method", "target"], what);
+function reasonField(value: unknown, what: string): void {
+  const c = exactly(value, ["confidence", "evidence", "kind", "limits"], what);
+  if (!["observation", "inference", "proposal", "decision"].includes(c.kind as string)) throw new Error(`${what}.kind`);
+  if (!Array.isArray(c.evidence)) throw new Error(`${what}.evidence`);
+  for (const ref of c.evidence) str(ref, `${what}.evidence[]`);
+  if (!["high", "medium", "low", "unknown"].includes(c.confidence as string)) throw new Error(`${what}.confidence`);
+  str(c.limits, `${what}.limits`, true);
+}
+
+function runtimeField(value: unknown): void {
+  const r = exactly(value, ["class", "digest", "model"], "runtime");
+  if (r.class !== "free" && r.class !== "summon" && r.class !== "hermes") throw new Error("runtime.class");
+  str(r.model, "runtime.model");
+  str(r.digest, "runtime.digest");
+}
+
+function costField(value: unknown): void {
+  const c = exactly(value, ["credits", "usd"], "cost");
+  // Money is a decimal string, never a float (money.ts); null is an unknown cost.
+  if (c.usd !== null && !isUsd(c.usd)) throw new Error("cost.usd");
+  if (!Number.isSafeInteger(c.credits) || (c.credits as number) < 0) throw new Error("cost.credits");
+}
+
+/** A LedgerEvidence's shape; whether it proves anything is rootEvidenceProblem's to say. */
+function evidenceField(value: unknown, what: string): void {
+  const ev = exactly(value, ["body", "headers", "method", "target"], what);
   str(ev.method, `${what}.method`);
   str(ev.target, `${what}.target`);
-  if (typeof ev.body_b64 !== "string") throw new Error(`${what}.body_b64`);
+  if (typeof ev.body !== "string" || !/^[A-Za-z0-9_-]*$/.test(ev.body)) throw new Error(`${what}.body`);
   const h = exactly(ev.headers, Object.values(AUTHORITY_HEADERS), `${what}.headers`);
   for (const name of Object.values(AUTHORITY_HEADERS)) str(h[name], `${what}.headers.${name}`);
 }
 
-/** An object with exactly these keys: evidence is hashed into the entry, so nothing may ride along unchecked. */
+/** An object with exactly these keys: what is hashed into the entry may not carry anything unchecked. */
 function exactly(value: unknown, keys: readonly string[], what: string): Record<string, unknown> {
   const o = obj(value, what);
   const got = Object.keys(o).sort();
@@ -605,13 +925,6 @@ function exactly(value: unknown, keys: readonly string[], what: string): Record<
 
 function uuid(value: unknown, what: string): void {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) throw new Error(what);
-}
-
-function oldRepo(value: unknown): void {
-  if (value === null) return;
-  const r = obj(value, "body.old_repo");
-  str(r.url, "body.old_repo.url");
-  str(r.head, "body.old_repo.head");
 }
 
 function obj(value: unknown, what: string): Record<string, unknown> {
@@ -625,6 +938,18 @@ function str(value: unknown, what: string, emptyOk = false): void {
 
 function sha(value: unknown, what: string): void {
   if (typeof value !== "string" || !SHA256_HEX_PATTERN.test(value)) throw new Error(what);
+}
+
+function ledgerHashField(value: unknown, what: string): void {
+  if (typeof value !== "string" || !LEDGER_HASH_PATTERN.test(value)) throw new Error(`${what} is not sha256:<hex>`);
+}
+
+function b64urlBytes(value: unknown, length: number, what: string): void {
+  try {
+    fromB64url(value as string, length);
+  } catch {
+    throw new Error(`${what} is not base64url of ${length} bytes`);
+  }
 }
 
 /** Exactly the `toISOString()` spelling, so two readers never disagree about a time. */

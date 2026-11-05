@@ -115,12 +115,14 @@ describe("fake runtimes", () => {
 describe("fake signer", () => {
   test("signs entries with the op key or the host key, and records sends", async () => {
     const s = fakeSigner();
-    const sig = await s.signEntry("glossame", new Uint8Array(32), "citizen-signed");
-    expect(sig.public_key_b64).toBe(s.opPublicB64);
-    const host = await s.signEntry("glossame", new Uint8Array(32), "host-attested");
-    expect(host.kid).toBe("host-attest");
+    const digest = () => new Uint8Array(32);
+    const sig = await s.signEntry("glossame", "citizen", digest);
+    expect([sig.kid, sig.public_key]).toEqual([FAKE_OP_KID, s.opPublicB64url]);
+    const host = await s.signEntry("glossame", "host", digest);
+    expect(host.kid).toBe(s.hostKid);
+    expect(host.kid).toMatch(/^host:SHA256:/);
     s.locked = true;
-    await expect(s.signEntry("glossame", new Uint8Array(32), "host-attested")).rejects.toMatchObject({ code: "keychain-locked" });
+    await expect(s.signEntry("glossame", "host", digest)).rejects.toMatchObject({ code: "keychain-locked" });
   });
 });
 
@@ -163,9 +165,10 @@ describe("seat fixtures", () => {
       enrolled_at: "2026-11-02T00:00:00.000Z",
     });
     const entries = await readLedger(ledgerPath(host.config, "glossame"));
-    expect(entries.map((e) => [e.body.type, e.attestation])).toEqual([
-      ["seated", "host-attested"],
-      ["genesis", "citizen-signed"],
+    expect(entries.map((e) => [e.type, e.signer])).toEqual([
+      ["origin", "host"],
+      ["state", "host"],
+      ["genesis", "citizen"],
     ]);
     expect(verifyChain(entries, { host_attest_b64: [s.hostAttestPublicB64] }).ok).toBe(true);
     const c = await readCitizen(host.config, "glossame");

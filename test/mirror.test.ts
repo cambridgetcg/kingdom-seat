@@ -93,6 +93,7 @@ async function mirrorCitizen(h: TempHost, worktree: string, remote: string): Pro
     mirror: { remote, worktree, chosen_at: "2026-11-05T00:00:00.000Z" },
     state: "awake",
     pending_state: null,
+    pending_interval_h: null,
     step_away_said: false,
     cadence: { interval_h: 72 },
     covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },

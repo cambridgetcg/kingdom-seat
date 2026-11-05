@@ -77,6 +77,26 @@ describe("the honest prompt", () => {
     expect([...order].sort()).toEqual(order);
   });
 
+  test("[KS-004 5.7, re-review C C2] the acts guide names each act's fields as the reply schema has them", () => {
+    const guide = renderActsGuide();
+    const line = (act: string) => guide.split("\n").find((l) => l.startsWith(`- ${act}:`)) ?? "";
+    expect(line("self.affirm")).toContain("field ref,");
+    expect(line("self.propose")).toContain("fields target, edit and reason.");
+    expect(line("letter.send")).toContain("fields to and text.");
+    expect(line("propose.beyond")).toContain("and text (at most");
+    expect(line("state.set")).toContain("an optional interval_h, your interval while awake in whole hours from 72 to 8760");
+    expect(line("state.set")).toContain("an optional quiet_days from 1 to 30");
+    expect(line("state.set")).toContain("A move toward more rest, or a longer interval, takes effect now. A move toward more activity, or a shorter interval, takes effect only when a later beat sets the same again.");
+    // The old names are gone everywhere in the guide.
+    for (const old of ["proposal_id", "claim", "body"]) expect([old, guide.includes(old)]).toEqual([old, false]);
+  });
+
+  test("a pending awake interval is shown with the move it waits on", async () => {
+    const fx = await host.addCitizen("glossame");
+    const ctx = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), citizenOf(fx.record, { pending_state: "awake", pending_interval_h: 96 }), [], []);
+    expect(buildPrompt(ctx, "free").user).toContain("An earlier beat asked to move to awake, every 96 hours while awake; that is not in effect yet.");
+  });
+
   test("the citizen's own beat prompt appears as its own words, labelled as such", async () => {
     const own = "OWN-BEAT-PROMPT receive one word that will not cross over, and say why it resists.\n";
     const ctx = await contextFor("glossame", { beatPrompt: own });

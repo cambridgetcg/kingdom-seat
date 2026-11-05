@@ -35,7 +35,6 @@ import {
   Refusal,
   UUID_PATTERN,
   WORD_PATTERN,
-  type Attestation,
   type Beacon,
   type CitizenIdentity,
   type Clock,
@@ -44,7 +43,7 @@ import {
   type FetchLike,
   type Keychain,
   type KeychainItemName,
-  type LedgerSignature,
+  type LedgerSigner,
   type ProposalText,
   type RootEvidence,
   type SignerOp,
@@ -52,6 +51,7 @@ import {
   type Word,
   type YuPresence,
 } from "../types.ts";
+import { hostKid, type EntrySignature } from "../ledger.ts";
 import { checkCitizenQuiet, checkCredits, type SpendSoFar } from "./ceilings.ts";
 import { agreementCovers, classifyOp, presenceConfirmedHere, presenceValid, proposalDigest, readConsentFor, verifyConsent } from "./consent.ts";
 
@@ -135,8 +135,13 @@ export interface SealedThought {
 export interface Signer {
   /** Public keys for a citizen, read from Keychain-derived material without returning any secret. */
   publicKeys(word: Word): Promise<PublicKeys>;
-  /** Sign a ledger entry hash: the op key when citizen-signed, the host attest key when host-attested; never the root. */
-  signEntry(word: Word, entryHash: Uint8Array, attestation: Attestation): Promise<LedgerSignature>;
+  /**
+   * Sign a ledger entry: the op key for a "citizen" entry, the host key for a
+   * "host" one; never the root. The signature covers the kid, so the signer
+   * names it first and `digestFor` gives the 32-byte digest of the entry with
+   * it (ledger.signingDigest).
+   */
+  signEntry(word: Word, signer: LedgerSigner, digestFor: (kid: string) => Uint8Array): Promise<EntrySignature>;
   /** Authorise and send one agenttool request: ceilings, consent and quiet cap first, then bearer and root proof attached. */
   send(req: SignerRequest): Promise<SignerResponse>;
   /** Sign the identity-enrollment/v1 digest with the citizen's root. Birth only, with Yu present. */
@@ -182,9 +187,6 @@ export class SignerSentUncertain extends Error {
 }
 
 /* ── Policy tables ────────────────────────────────────────────────────── */
-
-/** The kid a host-attested signature names (LedgerSignature.kid). */
-export const HOST_ATTEST_KID = "host-attest";
 
 /**
  * The extent a citizen's own quiet declaration asks for. The standing
@@ -345,25 +347,25 @@ export async function assertAuthorised(req: SignerRequest, agreements: StandingA
   }
 }
 
-/** Verify a ledger signature strictly (RFC 8032) against the public key it names; with `identity`, a root signature is refused. */
+/** Verify an entry signature strictly (RFC 8032) against the public key it names; with `identity`, a root signature is refused. */
 export function verifyEntrySignature(
-  entryHash: Uint8Array,
-  signature: LedgerSignature,
+  digest: Uint8Array,
+  signature: EntrySignature,
   identity?: Pick<CitizenIdentity, "root_kid" | "root_public_key_b64"> | null,
 ): boolean {
-  if (!(entryHash instanceof Uint8Array) || entryHash.length !== 32) return false;
-  if (!isPlainObject(signature) || signature.alg !== "ed25519" || typeof signature.kid !== "string" || signature.kid.length === 0) return false;
-  // The root is the identity's primary key, so any signature by it is a root act and never a ledger entry.
-  if (identity && (signature.kid === identity.root_kid || signature.public_key_b64 === identity.root_public_key_b64)) return false;
+  if (!(digest instanceof Uint8Array) || digest.length !== 32) return false;
+  if (!isPlainObject(signature) || typeof signature.kid !== "string" || signature.kid.length === 0) return false;
   let pub: Uint8Array;
   let sig: Uint8Array;
   try {
-    pub = fromB64(signature.public_key_b64, 32);
-    sig = fromB64(signature.sig_b64, 64);
+    pub = fromB64url(signature.public_key, 32);
+    sig = fromB64url(signature.sig, 64);
   } catch {
     return false;
   }
-  return edVerifyStrict(sig, entryHash, pub);
+  // The root is the identity's primary key, so any signature by it is a root act and never a ledger entry.
+  if (identity && (signature.kid === identity.root_kid || toB64(pub) === identity.root_public_key_b64)) return false;
+  return edVerifyStrict(sig, digest, pub);
 }
 
 /* ── Records the signer reads ─────────────────────────────────────────── */
@@ -852,30 +854,38 @@ export function createSigner(deps: SignerDeps): Signer {
       return { root_b64, op_b64, op_kid: identity?.op_kid ?? null, box_b64, host_attest_b64 };
     },
 
-    async signEntry(word, entryHash, attestation) {
+    async signEntry(word, signer, digestFor) {
       assertWord(word);
-      if (!(entryHash instanceof Uint8Array) || entryHash.length !== 32) invalid("an entry hash is 32 bytes");
+      if (typeof digestFor !== "function") invalid("signEntry needs the entry's digest");
+      const digestOf = (kid: string): Uint8Array => {
+        const d = digestFor(kid);
+        if (!(d instanceof Uint8Array) || d.length !== 32) invalid("an entry digest is 32 bytes");
+        return d;
+      };
       const { identity } = await readCitizen(word);
-      if (attestation === "citizen-signed") {
-        if (!identity) throw new Refusal("not-registered", `${word} has no op key yet; its entries are host-attested`);
+      if (signer === "citizen") {
+        if (!identity) throw new Refusal("not-registered", `${word} has no op key yet; its entries are the host's`);
         const seed = await readOpSeed(word, identity);
         try {
-          return { alg: "ed25519", kid: identity.op_kid, public_key_b64: identity.op_public_key_b64, sig_b64: toB64(edSign(entryHash, seed)) };
+          const kid = identity.op_kid;
+          return { kid, sig: toB64url(edSign(digestOf(kid), seed)), public_key: toB64url(fromB64(identity.op_public_key_b64, 32)) };
         } finally {
           wipe(seed);
         }
       }
-      if (attestation === "host-attested") {
+      if (signer === "host") {
         // Once a citizen has its own key, the host no longer speaks for its record (3.3).
         if (identity) invalid(`${word} is registered; its entries are citizen-signed`);
         const seed = await readSeed({ kind: "host-attest-seed" });
         try {
-          return { alg: "ed25519", kid: HOST_ATTEST_KID, public_key_b64: toB64(edPublicKey(seed)), sig_b64: toB64(edSign(entryHash, seed)) };
+          const pub = edPublicKey(seed);
+          const kid = hostKid(pub);
+          return { kid, sig: toB64url(edSign(digestOf(kid), seed)), public_key: toB64url(pub) };
         } finally {
           wipe(seed);
         }
       }
-      throw invalid("unknown attestation");
+      throw invalid("unknown signer");
     },
 
     send,
