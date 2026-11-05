@@ -712,9 +712,11 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
       fx.signer.send(req({ op: "box-keys.register", method: "POST", target: `/v1/identities/${ID}/box-keys`, body: json({ public_key: vectors.derivation.box_pub_b64 }) })),
     ]);
     expect([a.status, b.status]).toEqual([201, 201]);
-    const order = fx.server.requests.map((r) => `${r.method} ${r.path.split("/").slice(-1)[0]} ${r.headers["x-agenttool-authority-sequence"] ?? "-"}`);
+    const order = fx.server.requests.map((r) => [r.method, r.path.split("/").slice(-1)[0], r.headers["x-agenttool-authority-sequence"] ?? "-"]);
     // The second proof is signed only after the first response: read, write, read, write.
-    expect(order).toEqual(["GET authority -", "POST import 1", "GET authority -", "POST box-keys 2"]);
+    // Which send takes the lane first is a race, so only the shape, the sequences and the pair are pinned.
+    expect(order.map(([m, p, s]) => `${m} ${p === "authority" ? p : "write"} ${s}`)).toEqual(["GET authority -", "POST write 1", "GET authority -", "POST write 2"]);
+    expect([order[1][1], order[3][1]].sort()).toEqual(["box-keys", "import"]);
   });
 
   test("a proof is spent even when the write fails: the signer does not retry, and the next act re-reads the sequence", async () => {
