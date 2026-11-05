@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import { fromUtf8, toHex, utf8 } from "../../src/crypto.ts";
 import { Refusal, type KeychainItemName } from "../../src/types.ts";
-import { classifySecurityFailure, itemAccount, macosKeychain, readArgv, writeCommand, type MacosKeychainOptions } from "../../src/signer/keychain.ts";
+import { KEYCHAIN_READER, classifySecurityFailure, itemAccount, macosKeychain, readArgv, writeCommand, type MacosKeychainOptions } from "../../src/signer/keychain.ts";
 import { recordingRunner, type RecordedCommand } from "../helpers/fake-runtime.ts";
 
 const SECRET = utf8("at_test_bearer_never_real_0123456789");
@@ -52,11 +52,16 @@ describe("macosKeychain", () => {
     expect(call.stdin!.every((b) => b === 0)).toBe(true);
   });
 
-  test("writeCommand carries -X hex, -T for the trusted app and the explicit keychain, with no -U", () => {
+  test("writeCommand carries -X hex, -T for the reader that actually reads and the trusted app, and the explicit keychain, with no -U", () => {
     const line = fromUtf8(writeCommand(BASE, OP, SEED));
+    // Every read is asked by /usr/bin/security, so the ACL names it explicitly instead of
+    // depending on what -T does to the creator's entry; the trusted app is kept for a future signer.
     expect(line).toBe(
-      `add-generic-password -s "${BASE.service}" -a "citizen/glossame/op-seed" -T "${BASE.trustedApp}" -X ${toHex(SEED)} "${BASE.keychainPath}"\n`,
+      `add-generic-password -s "${BASE.service}" -a "citizen/glossame/op-seed" -T "/usr/bin/security" -T "${BASE.trustedApp}" -X ${toHex(SEED)} "${BASE.keychainPath}"\n`,
     );
+    expect(readArgv(BASE, OP)[0]).toBe(KEYCHAIN_READER);
+    // Named once, even when the trusted app is the reader itself.
+    expect(fromUtf8(writeCommand({ ...BASE, trustedApp: "/usr/bin/security" }, OP, SEED))).toContain(' -T "/usr/bin/security" -X ');
     expect(line).not.toContain(" -U");
     expect(line).not.toContain(" -w");
     expect(line.split("\n")).toHaveLength(2);

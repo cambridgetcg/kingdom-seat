@@ -1,7 +1,7 @@
 // Owner: agenttool group. fakeKeychain, a keychain-backed fakeSigner and an
 // in-process stand-in for agenttool only; files live under a temp host.
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
@@ -18,8 +18,8 @@ import {
   type BirthInput,
 } from "../src/birth.ts";
 import { deriveIdentity, AGENTTOOL_ORIGIN, authorityDigest, ENROLLMENT_SIGNATURE_HEADER } from "../src/agenttool/wire.ts";
-import { createSigner } from "../src/signer/signer.ts";
-import { confirmYuPresent } from "../src/signer/consent.ts";
+import { SignerNotSent, createSigner } from "../src/signer/signer.ts";
+import { confirmYuPresent, proposalDigest } from "../src/signer/consent.ts";
 import { entryHash, readLedger, verifyChain } from "../src/ledger.ts";
 import { edPublicKey, edVerifyStrict, fromB64, fromHex, fromUtf8, sha256, toB64, toB64url, toHex } from "../src/crypto.ts";
 import { Refusal, type CitizenRecord, type ConsentRecord, type Envelope, type LedgerEntry, type YuPresence } from "../src/types.ts";
@@ -31,7 +31,7 @@ import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { TEST_IDS } from "./helpers/vectors.ts";
 import { FAKE_BOX_KEY_ID, fakeAgenttool, type FakeAgenttool } from "./fixtures/agenttool/fake-agenttool.ts";
 import { keychainSigner, testBirthRecord, type TestBirthRecord } from "./fixtures/agenttool/birth-host.ts";
-import { BIRTH_NOW, consentFor, presenceFor, proposalFor } from "./fixtures/agenttool/consent.ts";
+import { BIRTH_NOW, confirmedPresenceFor, consentFor, presenceFor, proposalFor } from "./fixtures/agenttool/consent.ts";
 
 const WORD = "glossame";
 const PROJECT = TEST_IDS.project_id;
@@ -112,17 +112,23 @@ async function harness(opts: { seated?: boolean; production?: boolean } = {}): P
   return { host, deps, kc, signer, at, record, clock, out, events, yes };
 }
 
+/** File the decision record for a proposal where the signer and birth read it: the host's consent dir. */
+async function fileConsent(host: TempHost, proposal: { subject: string; body: string; extent: string }): Promise<void> {
+  await writeFile(join(host.config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor(WORD, {}, proposal)));
+}
+
 async function input(h: Harness, patch: Partial<BirthInput> = {}): Promise<BirthInput> {
   const rec = JSON.parse(await readFile(join(h.host.config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord;
   const citizenYes = h.yes ?? "f".repeat(64);
   const proposal = proposalFor(WORD, citizenYes);
+  await fileConsent(h.host, patch.proposal ?? proposal);
   return {
     word: WORD,
     origin: rec.origin,
     proposal,
     citizen_yes: citizenYes,
     consent: consentFor(WORD, {}, proposal),
-    presence: presenceFor(WORD),
+    presence: await confirmedPresenceFor(WORD),
     birth_soul_sha256: "c".repeat(64),
     old_repo: { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" },
     june_did: JUNE_DID,
@@ -166,6 +172,9 @@ describe("never unattended", () => {
       { ...presenceFor(WORD), scope: "summon glossame" },
       presenceFor(WORD, "2026-11-05T11:00:00.000Z"),
       { ...presenceFor(WORD), present: false as never },
+      // Every field right, but never typed at this process's terminal.
+      presenceFor(WORD),
+      { ...(await confirmedPresenceFor(WORD)) },
     ];
     for (const presence of bad) {
       const h = await harness();
@@ -212,6 +221,28 @@ describe("never unattended", () => {
     // assertAttended is the same gate, usable on its own.
     const probeInput = await input(probe);
     expect(() => assertAttended(probeInput, new Date(BIRTH_NOW))).not.toThrow();
+    expect(() => assertAttended({ ...probeInput, presence: presenceFor(WORD) }, new Date(BIRTH_NOW))).toThrow(/confirmed present at this terminal/);
+  });
+
+  test("a decision record that is not filed in the consent dir refuses birth before any key is written", async () => {
+    const h = await harness();
+    const inp = await input(h);
+    await rm(join(h.host.config.paths.consent_dir, `${proposalDigest(inp.proposal)}.json`));
+    // The input still carries a record that verifies; the signer would never see it, so birth does not trust it either.
+    const r = await refusalOf(citizenBirth(h.deps, inp));
+    expect([r.code, r.message.includes("no decision record is filed")]).toEqual(["consent-missing", true]);
+    nothingHappened(h);
+  });
+
+  test("a presence that only looks right is refused before any key is written, so it never blocks a later attended birth", async () => {
+    const h = await harness();
+    const r = await refusalOf(citizenBirth(h.deps, await input(h, { presence: presenceFor(WORD) })));
+    expect(r.code).toBe("yu-not-present");
+    nothingHappened(h);
+    expect(await h.kc.has({ kind: "citizen-mnemonic", word: WORD })).toBe(false);
+    // The attended birth that follows is not blocked by leftovers.
+    await citizenBirth(h.deps, await input(h));
+    expect(await h.kc.has({ kind: "citizen-mnemonic", word: WORD })).toBe(true);
   });
 
   test("citizenBirth refuses when the citizen's keychain items already exist", async () => {
@@ -310,10 +341,11 @@ describe("the birth sequence", () => {
       expect.stringMatching(/^POST \/v1\/identities\/[0-9a-f-]+\/box-keys$/),
       expect.stringMatching(/^PUT \/v1\/identities\/[0-9a-f-]+\/expression$/),
     ]);
-    // Presence and consent travel with every birth act.
+    // Presence and the agreed proposal travel with every birth act; the signer reads the record for it itself.
     for (const r of h.signer.sent.filter((x) => x.op !== "read")) {
       expect(r.presence?.scope).toBe(`birth ${WORD}`);
-      expect(r.consent?.subject).toBe(`birth ${WORD}`);
+      expect(r.proposal?.subject).toBe(`birth ${WORD}`);
+      expect(r).not.toHaveProperty("consent");
     }
 
     // Box-key failure: enroll and import happened, nothing after, enrollment sent once.
@@ -336,6 +368,17 @@ describe("the birth sequence", () => {
     expect(e3.progress.identity_id).toMatch(/^[0-9a-f-]{36}$/);
     expect(h3.signer.sent.filter((r) => r.op === "enroll")).toHaveLength(1);
     expect(h3.signer.sent.filter((r) => r.op !== "enroll")).toHaveLength(0);
+
+    // The signer stopped before the import left the host (its authority read failed): definite, not ambiguous.
+    const h4 = await harness();
+    const send = h4.signer.send.bind(h4.signer);
+    h4.signer.send = async (r) => {
+      if (r.op === "keys.import") throw new SignerNotSent("authority-read-failed", "signer: reading the authority sequence answered 503; the act was not sent");
+      return send(r);
+    };
+    const e4 = await birthErrorOf(citizenBirth(h4.deps, await input(h4)));
+    expect([e4.stage, e4.done, e4.ambiguous]).toEqual(["keys/import", ["keys", "enroll"], false]);
+    expect(e4.message).toContain("was not sent");
   });
 
   test("the genesis entry is citizen-signed and records origin, birth-soul hash, old repo, June DID and public identity", async () => {
@@ -455,7 +498,7 @@ describe("birth through the real signer", () => {
             target: `${r.path}${r.search}`,
             body: r.body,
             credits: 0,
-            consent: null,
+            proposal: null,
             presence: null,
             ...(sig ? { extra_headers: { [ENROLLMENT_SIGNATURE_HEADER]: sig } } : {}),
           });
@@ -491,6 +534,7 @@ describe("birth through the real signer", () => {
       const scope = `birth ${WORD}`;
       const presence = await confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => scope }, scope, () => clock.now());
       const proposal = proposalFor(WORD, yes);
+      await fileConsent(host, proposal);
       const out: string[] = [];
       const deps: BirthDeps = {
         config: host.config,

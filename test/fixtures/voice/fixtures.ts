@@ -23,6 +23,7 @@ export function citizenOf(record: CitizenRecord, over: Partial<Citizen> = {}): C
     ...record,
     state: "awake",
     pending_state: null,
+    step_away_said: false,
     cadence: { interval_h: 72 },
     covenants: { letters_from: ["yu", "gardener"], wake_on_letter_from: ["yu"] },
     last_beat_at: null,

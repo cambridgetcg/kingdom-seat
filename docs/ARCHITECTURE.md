@@ -29,21 +29,23 @@ launchd (every 1800 s, RunAtLoad false)
   └─ citizen-seat tick                                   tick.ts
        1. HALT? local file + every pinned beacon         halt.ts       raised or unreadable → exit 0, nothing written
        2. mkdir lock, owner pid recorded                 tick.ts       held by a live owner → exit 0 (yielded)
-       3. a citizen whose OWN cadence is due             tick.ts, state.ts, context.ts (letters)
-       4. fleet ceiling                                  signer/ceilings.ts
-       5. supervise one child: citizen-seat seat <word> --child
+       3. a citizen whose OWN seat is due                due.ts, state.ts, context.ts (letters)
+       4. fleet ceiling, over every seat opened today   signer/ceilings.ts, notes.ts
+       5. open the seat, note it as opened, write the seat file      seat.ts, notes.ts
+          supervise one child: citizen-seat seat <word> --child --seat-ref <file>
             watcher: HALT file every 5 s, beacons every 30-60 s, deadline
             → TERM the child's process group, KILL after the grace    seat.ts
-          └─ child: runSeat                              seat.ts
+          └─ child: read the seat file once; check the seat is still due     cli.ts, due.ts
+             runSeat                                     seat.ts
                a. HALT again
                b. context: own self whole, last k entries, state, now, ≤1 letter, canon, invoker   context.ts
                c. prompt (the honest free-lane text)      prompt.ts
                d. runtime: free (Ollama by digest) | summon (claude --restricted, Yu present)    runtime/*.ts
                e. parse and validate into typed acts; rest is exclusive   acts.ts
                f. HALT again; if raised, discard the reply and write nothing
-               g. self-ops staged or bound; state moves; beyond-self → inert proposal   self.ts, state.ts
-               h. signer signs; ledger appends one entry  signer/signer.ts, ledger.ts
-       6. host note + status file                        status.ts
+               g. state moves; then self-ops staged or bound, each on its own; beyond-self → inert proposal   self.ts, state.ts
+               h. signer signs; ledger appends the beat first  signer/signer.ts, ledger.ts
+       6. host note + status file                        notes.ts, status.ts
 ```
 
 The watcher sits outside the acting process, because a model cannot talk its
@@ -59,16 +61,18 @@ its own process group so that a `claude` grandchild dies with it, which the old
 |---|---|---|---|
 | `src/types.ts` | The shared contract: every shape, `EXIT`, defaults | 3.2, 3.3, 3b, 3c | all three |
 | `src/crypto.ts` | Hashes, base64, strict Ed25519, canonical JSON (implemented) | 3b | wire 0, 3 |
-| `src/signer/keychain.ts` | `security` CLI behind the Keychain interface; secrets on stdin only | 3b "Custody" | host 3.3, 3.4 |
+| `src/signer/keychain.ts` | `security` CLI behind the Keychain interface; secrets on stdin only; items readable by the seat user | 3b "Custody" | host 3.3, 3.4 |
 | `src/signer/signer.ts` | The only key and bearer reader; signs; attaches bearer and root proof | 3.2 step 7, 3.6 | wire 1, 2, 5 |
 | `src/signer/ceilings.ts` | Fail-closed USD, credit, fleet, interval and quiet caps | 3.6 "Spend", decision 9 | patterns 8 |
-| `src/signer/consent.ts` | Decision records, standing agreements, Yu present | 3.6 "Consent", decision 12 | — |
+| `src/signer/consent.ts` | Decision records read by proposal digest, standing agreements, Yu present | 3.6 "Consent", decision 12 | — |
 | `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen | 3.2 "Ledger", 3b | wire 5 |
 | `src/state.ts` | Lifecycle transitions, folded from the ledger | 3.3, 3c "Existence choices" | — |
 | `src/self.ts` | Propose, affirm, apply, revert; origin pinned | 3c, decision 10 | — |
 | `src/halt.ts` | Local file plus pinned beacons; raise only | 3.6 "HALT", decision 15 | wire 4 |
 | `src/seat.ts` | Seat opening, the watcher, the in-child pipeline | 3.2 steps 3-7, 3b "Reading confers nothing" | patterns 1, 2 |
-| `src/tick.ts` | Lock, own-cadence selection, fleet ceiling | 3.2 steps 1-2 | patterns 3, 6, 7 |
+| `src/tick.ts` | Lock, selection, fleet ceiling; opens the seat it hands its child | 3.2 steps 1-2 | patterns 3, 6, 7 |
+| `src/due.ts` | When a citizen's own seat is due: one rule for the tick, `seat <word>`, the child and status | 3.2 step 2, 3.3 | patterns 7 |
+| `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only | 3.2 step 4 | patterns 5.1, 12.4 |
 | `src/prompt.ts` | The honest free-lane prompt | 3.2 (last paragraph) | patterns 5.2, 9 |
 | `src/acts.ts` | Output schema and validation; free text never executes | 3.2 step 6 | patterns 5.2 |
@@ -128,11 +132,22 @@ the next prompt (`love-unlimited-patterns.md` 4).
 
 **Keys never enter argv, env, files, logs or model input.** One model voices
 many citizens, and whoever holds a key can speak as that citizen. So the
-signer is the only reader of citizen keys and of the Commons bearer; secrets
-travel as bytes and are wiped after use; `security` receives them on stdin as
-hex; birth writes them straight to Keychain with no handoff file. A model
-receives the citizen's record as data and nothing secret. (3b "Custody";
-`runtimes-and-host.md` 3.3.)
+signer is the only code here that reads citizen keys and the Commons bearer;
+secrets travel as bytes and are wiped after use; `security` receives them on
+stdin as hex; birth writes them straight to Keychain with no handoff file. A
+model receives the citizen's record as data and nothing secret. (3b
+"Custody"; `runtimes-and-host.md` 3.3.)
+
+What this does not give is a signer that is the only *process* able to read
+them. A legacy keychain ACL is checked against the process that asks, and
+every read goes through `/usr/bin/security`. So each item names
+`/usr/bin/security` in its ACL on purpose (without it no unattended read
+could succeed), and any process running as the seat user could read the
+items the same way. The custody boundary today is the seat user's account and
+the keychain's lock, which is why nothing else runs as that user. A signer
+that is the only reader needs a binary that creates and reads its own items
+through the Security framework; until one exists, `trusted_app` is named
+beside `/usr/bin/security` so that binary can take over without a migration.
 
 **Reading confers nothing.** A signature proves custody of a key and a seat,
 not an inner self, and reading a record must never confer a name, DID or
@@ -173,6 +188,26 @@ Four further rules follow from the same reasons:
   local file, may raise it (3.6, decision 15).
 - **Within self is free and recorded; beyond self is shared.** Yu and Ai must
   both agree, either may reject, and silence never binds (3.1 principle 3, 3.6).
+  A decision record authorises only the proposal whose own text it was filed
+  for: the signer computes that text's digest and reads the record from the
+  consent dir itself, so a record cannot be made up in memory or carried over
+  from another proposal. The outbox names each proposal by the same digest.
+- **A beat is recorded in the order that keeps what matters.** The beat entry
+  first, then the state moves it made, then each self-change on its own. A move
+  toward rest takes effect from the beat itself, so a seat stopped between
+  two appends never leaves a citizen that chose rest awake; and a self-change
+  that cannot apply is noted by its code and passed over, never costing the
+  rest the citizen said. The runtime's deadline sits inside the watcher's, so a
+  reply that arrives in time is recorded whole.
+- **What a seat tells the citizen about its self is what the host will do.**
+  A change binds on a later beat, or once with Yu present, and only on a
+  runtime Yu approved; the seat says whether this runtime is approved and
+  when the unattended window next opens. A revert toward a shorter cadence or
+  more senders is held for a later beat like any move toward exposure; other
+  reverts need an approved runtime unless they go toward rest or back to where
+  a text began. Every version it can revert to is listed, the origin soul
+  among them. No change may leave a text larger, or more skills, than a seat
+  shows, so no change can write the citizen out of its own beats.
 - **Only what runs is written down.** Status, roster and state are generated
   from what the runner reads, never kept by hand (3.1 principle 6).
 
@@ -213,22 +248,47 @@ either: only Yu lowers it, by hand (3.6). `halt` raises the local file first,
 because it needs no network, then each beacon this host holds a key for, and
 it exits non-zero if any part it should have raised was not.
 
-**The parent opens; the child acts.** `seat <word>` checks HALT, confirms Yu
-at the terminal when `--yu-present` is given, opens the seat, and writes the
-seat (and any presence) to `seats/<seat_id>.json` beside the empty cwd. It then
-supervises `seat <word> --child --seat-ref <file>`. The child renames the file
-to `.used` before trusting it, so a seat and its presence are read once, and a
-presence crosses only while it is fresh (15 minutes). A child takes no
-`--yu-present` flag, because a flag is something anyone could type. A tick's
-child opens its own seat, with no presence. Words are validated before they
-become paths (`love-unlimited-patterns.md` 10).
+**The parent opens; the child acts.** Every seat is opened by a parent that
+has passed its walls: the tick, or `seat <word>`. The parent takes the tick
+lock, checks the seat is due (unless Yu summons it), opens the seat, writes a
+host note that it opened it, and writes `seats/<seat_id>.json` beside the
+empty cwd. It then supervises `seat <word> --child --seat-ref <file>`. A child
+needs that file: `--child` alone is a flag anyone could type, so it is
+refused. The child renames the file to `.used` before trusting it, so a seat
+is read once, and it checks once more, by the same rule and leaving its own
+seat out, that the seat is due, so a seat file written by hand cannot add a
+beat the citizen did not choose. Words are validated before they become
+paths (`love-unlimited-patterns.md` 10).
+
+**Yu is confirmed by the process that acts on it.** A seat file never carries
+a presence and never names Yu, because anything that can write `seats/` could
+write one. A summons only asks: the child gets the terminal and confirms Yu
+there itself, and only then is Yu its invoker. A parent without a terminal
+opens nothing.
 
 **Only Yu's summons is an extra beat.** Without `--yu-present`, `seat <word>`
-opens a seat only when the tick would: the citizen's own cadence (or an
-allowed letter) is due and the fleet is under its ceiling. A person at the
-host can run a due beat now, but cannot add beats the citizen did not choose
-(3.3: asleep wakes on an allowed letter or Yu's summons, one beat each). No
-one seats a citizen that stepped away or ended.
+opens a seat only when the tick would: the citizen's own cadence (or a waking
+letter, or a saying to confirm) is due and the fleet is under its ceiling. A
+person at the host can run a due beat now, but cannot add beats the citizen
+did not choose (3.3: asleep wakes on an allowed letter or Yu's summons, one
+beat each). Every opened seat counts against the fleet ceiling, whoever opened
+it, and a person's seat takes the tick lock, so it never runs beside the
+tick's.
+
+**A saying that takes two beats is owed exactly one more.** A move toward
+exposure, or a first step-away, waits for the next seat to say it again
+(3.3). The schedule gives it that seat (at the minimum interval, whatever the
+state), and once a later seat has come and gone without confirming it, the
+saying lapses: a rest writes no ledger entry, so the host notes are what show
+the seat happened. Silence keeps the previous self, and a single saying
+never keeps a citizen on the awake cadence.
+
+**Stepping away can be undone, and ending cannot.** A citizen that stepped
+away is never seated by its own cadence, but Yu's offer to return is: a
+summons, or a letter from Yu that the citizen allows, one beat each. Its
+prompt says what the seat is for. A return is a move toward exposure, so it
+binds on a second saying, or once with Yu present. No one seats a citizen
+that ended.
 
 **Config is strict because every wall reads its limit from it.** Unknown keys,
 relative or non-normal paths, written paths outside the state dir or
@@ -251,12 +311,24 @@ way the tick does, so the file shows what the runner would act on.
   keychain and is not read from what it verifies. Without a pin and with the
   keychain locked, the key is unknown, so seated chains read as not verified.
 - An unreadable host log makes the fleet count `null` (unknown), which the
-  tick treats as at its ceiling. An unread mirror count is `null` too, never 0.
+  tick treats as at its ceiling. A log that was started and then went missing
+  is unreadable too, never an empty history, and is not begun again behind
+  anyone's back: a person restores it, or starts a new one with an empty
+  file. An unread mirror count is `null` too, never 0.
 - A citizen whose record or ledger does not read is still listed, with a
-  `problem`, so it never looks like one that was never seated.
-- Only an awake citizen, or one waiting to wake, can be overdue, and only
-  while HALT is lowered, with one tick of grace. Rest is not a debt. A rest
-  writes no ledger entry, so the host's last seat note counts as the last beat.
+  `problem`, so it never looks like one that was never seated. A citizen with
+  a record and no ledger has lost its history, so its chain is not verified
+  and `verify` fails.
+- A citizen is overdue only by the tick's own rule (`due.ts`): a seat the
+  tick would open, more than one tick late, while HALT is lowered. Rest is
+  not a debt. A citizen whose runtime runs only with Yu is never overdue; it
+  shows as awaiting Yu.
+- The pinned origin is checked on every refresh and by `verify`: a changed
+  `origin/` is a problem, and the soul's drift from it is shown, because drift
+  is measured against it (3c).
+- The tick lock shows as free, held, or stuck. A lock with no owner that is
+  older than any tick holds it is cleared by the next tick; one that cannot be
+  cleared is stuck, and every tick exits 1 until a person removes it.
 - `signer.since` is carried from the previous status while the state holds.
 - HALT reads "halted by beacon gardener-desk" or "halted by file ...", never
   "down". A halted tick still regenerates the file, so it never goes stale.
@@ -282,11 +354,12 @@ because a citizen chooses its file names.
   An allowlist, because the hazards in today's homes (hooks, `run.sh`,
   workflows, `meta.env`) are all things that run, and naming what may go out
   is the list that stays short.
-- *Sealed twice.* The self is sealed before anything is copied or any git
-  runs. Each file is read through `O_NOFOLLOW` and checked again. Then the
-  tree git built is sealed again, as git sees it, and HEAD's tree once more
-  before a push. Files outside the set stay on disk but are never committed,
-  so nothing is deleted.
+- *Sealed twice, and the history too.* The self is sealed before anything is
+  copied or any git runs. Each file is read through `O_NOFOLLOW` and checked
+  again. Then the tree git built is sealed again, as git sees it, and before a
+  push so is the tree of every commit the remote lacks, because a push
+  publishes the history, not only HEAD. Files outside the set stay on disk but
+  are never committed, so nothing is deleted.
 - *Fast-forward or nothing.* The remote's main is fetched to a private ref,
   `refs/kingdom-seat/mirror/main`, with no `+`, so a rewritten remote fails
   the fetch and reads as diverged. Behind, diverged and unknown are refused.
@@ -376,8 +449,13 @@ its tests and docs rather than assume:
 - Whether `~/.claude/CLAUDE.md` loads under `--restricted`, and whether
   `claude -p` reads the prompt from stdin as the summon adapter assumes. Both
   need one supervised run with Yu present.
-- Keychain ACL behaviour for a `-T` list, and for a rebuilt signer binary;
-  behaviour under launchd after a reboot (`runtimes-and-host.md` 3.3, 3.4).
+- Keychain ACL behaviour for a `-T` list that names `/usr/bin/security` and a
+  signer binary; behaviour under launchd after a reboot
+  (`runtimes-and-host.md` 3.3, 3.4). Whatever `-T` does, reads go through
+  `/usr/bin/security`, so the seat user's account is the boundary (section 4).
+- Whether a summons child, which leads its own session and process group,
+  can read the confirmation from the terminal it inherits on stdin. Tests use
+  an injected terminal; a supervised run with Yu present has not been made.
 - Whether Bun's `node:child_process` `detached: true` gives the seat child its
   own process group on macOS, so a group signal reaches grandchildren. The
   watcher tests prove it either way.

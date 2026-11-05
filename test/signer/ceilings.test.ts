@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_CEILINGS, type Ceilings, type LedgerEntry, type Spend } from "../../src/types.ts";
 import {
+  CITIZEN_QUIET_HARD_MAX_DAYS,
   checkCitizenQuiet,
   checkCredits,
   checkFleet,
@@ -194,5 +195,16 @@ describe("citizen quiet cap", () => {
     }
     expect(checkCitizenQuiet("2999-12-31T00:00:00.000Z", NOW, d)).toMatchObject({ ok: false, code: "quiet-cap" });
     expect(checkCitizenQuiet(ahead(DAY_MS), NOW, raised({ citizen_quiet_max_days: Number.NaN }))).toMatchObject({ ok: false });
+  });
+
+  test("[S4-5] a Config that names a cap above 30 days is still held to 30, whoever built it", () => {
+    // parseConfig refuses such a value; a signer built from a hand-made Config must not trust it either.
+    const loose = raised({ citizen_quiet_max_days: 365 });
+    expect(CITIZEN_QUIET_HARD_MAX_DAYS).toBe(30);
+    expect(checkCitizenQuiet(ahead(200 * DAY_MS), NOW, loose)).toMatchObject({ ok: false, code: "quiet-cap" });
+    expect(checkCitizenQuiet(ahead(30 * DAY_MS + 1), NOW, loose)).toMatchObject({ ok: false, code: "quiet-cap" });
+    expect(checkCitizenQuiet(ahead(30 * DAY_MS), NOW, loose)).toEqual({ ok: true });
+    // A lower cap is honoured as written.
+    expect(checkCitizenQuiet(ahead(8 * DAY_MS), NOW, raised({ citizen_quiet_max_days: 7 }))).toMatchObject({ ok: false, code: "quiet-cap" });
   });
 });

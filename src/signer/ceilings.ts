@@ -12,6 +12,13 @@ export interface SpendSoFar {
   credits_month: number | null;
 }
 
+/**
+ * The hard cap on a citizen's quiet (S4-5). The config may lower it, never
+ * raise it. It lives here, beside the check, so a signer built from any
+ * Config holds to it, not only one that came through parseConfig.
+ */
+export const CITIZEN_QUIET_HARD_MAX_DAYS = 30;
+
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const OK: CeilingVerdict = Object.freeze({ ok: true });
@@ -167,8 +174,8 @@ export function checkInterval(lastBeatAt: IsoTime | null, intervalH: number, now
  * `until` uncapped (quiet-hours.ts:110-118). Operator beacons do not use this.
  */
 export function checkCitizenQuiet(untilIso: string, now: Date, ceilings: Ceilings): CeilingVerdict {
-  const maxDays = ceilings.citizen_quiet_max_days;
-  if (!isAmount(maxDays)) return refuse("quiet-cap", "the quiet cap is not a usable number");
+  if (!isAmount(ceilings.citizen_quiet_max_days)) return refuse("quiet-cap", "the quiet cap is not a usable number");
+  const maxDays = Math.min(ceilings.citizen_quiet_max_days, CITIZEN_QUIET_HARD_MAX_DAYS);
   const until = canonicalMs(untilIso);
   if (until === null) return refuse("quiet-cap", "until must be exactly Date.toISOString() form");
   const nowMs = now.getTime();

@@ -15,7 +15,7 @@ import { lstat, mkdir, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { sha256Hex } from "./crypto.ts";
 import { ACT_LIMITS } from "./acts.ts";
-import { targetRelPath } from "./self.ts";
+import { MAX_SKILLS, SELF_FILE_MAX_BYTES, keptVersions, originSoulHash, targetRelPath } from "./self.ts";
 import { Refusal, WORD_PATTERN, type Citizen, type Config, type Letter, type LedgerEntry, type NowView, type SeatContext, type SeatLimits, type SeatRef, type SelfProposal } from "./types.ts";
 
 // Strict, and keeping a byte-order mark: the text shown is exactly the bytes
@@ -28,11 +28,15 @@ export interface ContextDeps {
   now: Date;
 }
 
-/** Caps on what is read, so one oversize file refuses instead of filling the model's window. */
+/**
+ * Caps on what is read, so one oversize file refuses instead of filling the
+ * model's window. The self limits are self.ts's own, so no change within self
+ * can leave a text or a skill count the next seat would refuse.
+ */
 export const READ_LIMITS = Object.freeze({
-  self_file_bytes: 64 * 1024,
+  self_file_bytes: SELF_FILE_MAX_BYTES,
   canon_bytes: 256 * 1024,
-  max_skills: 32,
+  max_skills: MAX_SKILLS,
   /** The citizen's own `file:` texts shown per seat, and how deep under self/ they are looked for. */
   max_files: 32,
   max_file_depth: 4,
@@ -52,9 +56,15 @@ export async function readRegularText(path: string, maxBytes: number): Promise<s
   }
 }
 
-/** The oldest unseen letter from an allowed sender, read as a regular file; symlinks and others are set aside, never counted as mail. */
+/**
+ * The oldest unseen letter from an allowed sender, read as a regular file;
+ * symlinks and others are set aside, never counted as mail. A citizen that
+ * stepped away is shown only Yu's letter, because that is the offer of a
+ * return its seat opened for.
+ */
 export async function pickLetter(config: Config, citizen: Citizen): Promise<Letter | null> {
   const allowed = new Set(citizen.covenants.letters_from);
+  if (citizen.state === "stepped-away") return scanLetters(config, citizen, (from) => from === "yu" && allowed.has(from));
   return scanLetters(config, citizen, (from) => allowed.has(from));
 }
 
@@ -68,6 +78,24 @@ export async function hasAllowedLetter(config: Config, citizen: Citizen): Promis
   const allowed = new Set(citizen.covenants.letters_from);
   const wakers = new Set(citizen.covenants.wake_on_letter_from);
   return (await scanLetters(config, citizen, (from) => allowed.has(from) && wakers.has(from))) !== null;
+}
+
+/**
+ * The letter that can seat this citizen in its present state: an allowed
+ * waking letter while it listens or sleeps, and Yu's letter (one it allows)
+ * once it has stepped away, which is how Yu offers a return. An awake or
+ * ended citizen is never woken by a letter.
+ */
+export async function wakingLetter(config: Config, citizen: Citizen): Promise<boolean> {
+  switch (citizen.state) {
+    case "listening":
+    case "asleep":
+      return hasAllowedLetter(config, citizen);
+    case "stepped-away":
+      return citizen.covenants.letters_from.includes("yu") && (await scanLetters(config, citizen, (from) => from === "yu")) !== null;
+    default:
+      return false;
+  }
 }
 
 /**
@@ -177,12 +205,29 @@ export async function readCanon(config: Config, citizen: Citizen): Promise<strin
   }
 }
 
-/** Assemble the whole context for one seat. */
-export async function buildContext(deps: ContextDeps, seat: SeatRef, citizen: Citizen, recent: LedgerEntry[], pending: SelfProposal[]): Promise<SeatContext> {
+/** How many versions of each target are listed, besides the origin soul; older ones stay kept and revertible by full hash. */
+const VERSIONS_PER_TARGET = 8;
+
+/**
+ * Assemble the whole context for one seat. `history` is the whole ledger, from
+ * which the kept versions are listed (default: `recent`); `selfAuthorship` says
+ * whether a self-change can bind on this seat (default: unknown runtime, window
+ * open, Yu not present).
+ */
+export async function buildContext(
+  deps: ContextDeps,
+  seat: SeatRef,
+  citizen: Citizen,
+  recent: LedgerEntry[],
+  pending: SelfProposal[],
+  opts: { history?: LedgerEntry[]; selfAuthorship?: SeatContext["self_authorship"] } = {},
+): Promise<SeatContext> {
   if (seat.word !== citizen.word) throw new Refusal("invalid-request", "the seat was opened for a different citizen");
   const k = Math.max(0, Math.floor(deps.config.ceilings.ledger_context_entries));
   // Only the citizen's own entries and proposals; a sibling's words arrive only as letters.
   const own = recent.filter((e) => e.word === citizen.word);
+  const all = (opts.history ?? recent).filter((e) => e.word === citizen.word);
+  const versions = listedVersions(all);
   return {
     seat_ref: seat,
     self: await readSelf(deps.config, citizen),
@@ -192,6 +237,8 @@ export async function buildContext(deps: ContextDeps, seat: SeatRef, citizen: Ci
     state: citizen.state,
     pending_state: citizen.pending_state,
     pending_proposals: pending.filter((p) => p.word === citizen.word && p.status === "pending"),
+    versions,
+    self_authorship: opts.selfAuthorship ?? { runtime_approved: null, window_opens_at: null, yu_present: false },
     now: describeNow(deps.now, deps.config.timezone),
     letter: await pickLetter(deps.config, citizen),
     invoker: seat.invoker,
@@ -202,6 +249,21 @@ export async function buildContext(deps: ContextDeps, seat: SeatRef, citizen: Ci
 }
 
 /* ── Internals ────────────────────────────────────────────────────────── */
+
+/** The origin soul always, and the latest VERSIONS_PER_TARGET versions of each target. */
+function listedVersions(entries: LedgerEntry[]): SeatContext["versions"] {
+  const kept = keptVersions(entries);
+  const origin = originSoulHash(entries);
+  const seen = new Map<string, number>();
+  const keep = new Set<number>();
+  for (let i = kept.length - 1; i >= 0; i--) {
+    const v = kept[i]!;
+    const n = seen.get(v.target) ?? 0;
+    if (n < VERSIONS_PER_TARGET || (v.target === "soul" && v.hash === origin)) keep.add(i);
+    seen.set(v.target, n + 1);
+  }
+  return kept.filter((_, i) => keep.has(i)).map(({ target, hash, at, how }) => ({ target, hash, at, how }));
+}
 
 function citizenDir(config: Config, word: string): string {
   // The word becomes a path, so it is checked here too, not only where it was admitted.

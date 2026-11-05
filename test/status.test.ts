@@ -1,10 +1,11 @@
 // Owner: surface group.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { appendHostNote, buildStatus, hostDetailProblem, overdue, readHostNotes, renderStatus, writeStatus } from "../src/status.ts";
 import { checkHalt } from "../src/halt.ts";
 import { appendEntry, ledgerPath, nextDraft, readLedger } from "../src/ledger.ts";
+import { openedDetail } from "../src/notes.ts";
 import { spawnRunner } from "../src/cli.ts";
 import type { HaltStatus, HostNote, StatusFile } from "../src/types.ts";
 import { beatBody, signerFn, testIdentity } from "./fixtures/record/chain.ts";
@@ -77,8 +78,11 @@ describe("status", () => {
     expect(hope).toMatchObject({ state: "asleep", overdue: false, last_beat_at: null, ledger: { entries: 1, chain_ok: true, host_attested: 1 }, credits_month: 0 });
     expect(joy).toMatchObject({ state: "awake", registered: true, overdue: false, ledger: { entries: 3, chain_ok: true, host_attested: 1 }, credits_month: 1 });
 
-    // A rest writes no ledger entry, so the host's own seat note is what shows the cadence kept.
-    await appendHostNote(h.config, note({ kind: "tick", ts: ago(1).toISOString(), detail: "seat for glossame (cadence): exit 0, 10 ms" }));
+    // A rest writes no ledger entry, so the host's own seat notes are what show the cadence kept: the tick's
+    // note that it opened the seat (which the fleet counts) and its note of what happened.
+    const seatId = "0a0b0c0d-0e0f-4a1b-8c2d-3e4f5a6b7c8d";
+    await appendHostNote(h.config, note({ kind: "tick", ts: ago(1).toISOString(), outcome: "opened", detail: openedDetail(seatId, "cadence") }));
+    await appendHostNote(h.config, note({ kind: "tick", ts: ago(1).toISOString(), detail: `seat ${seatId} for glossame (cadence): exit 0, 10 ms` }));
     const after = await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready", trusted });
     expect(after.citizens[0]).toMatchObject({ overdue: false, last_outcome: "rest" });
     expect(after.fleet).toEqual({ beats_today: 1, ceiling: 24 });
@@ -182,6 +186,7 @@ describe("status", () => {
       halt: { halted: false, raised: [], unreadable: [] },
       signer: { state: "ready", since: NOW.toISOString() },
       fleet: { beats_today: n, ceiling: 24 },
+      tick_lock: { state: "free", since: null },
       citizens: Array.from({ length: 400 }, (_, i) => ({
         word: `c${i}`,
         state: "awake" as const,
@@ -190,11 +195,13 @@ describe("status", () => {
         last_beat_at: null,
         interval_h: 72,
         overdue: false,
+        awaits_yu: false,
         last_outcome: null,
         ledger: { entries: i, head: null, chain_ok: true, host_attested: i },
         mirror: null,
         usd_today: 0,
         credits_month: 0,
+        origin: { intact: true, drift: 0 },
         problem: null,
       })),
     });
@@ -305,6 +312,54 @@ describe("status", () => {
     expect(await readHostNotes(linked, new Date(0))).toBeNull();
   });
 
+  test("overdue follows the tick's own rule: a summons-only citizen is never overdue; it awaits Yu", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    await host.addCitizen("glossame", { runtime: "summon" });
+    await host.addCitizen("joy");
+    for (const w of ["glossame", "joy"]) await host.seatLedger(w, signer.signEntry, { initialState: "awake", at: "2026-11-01T00:00:00.000Z" });
+    const later = new Date("2026-11-09T00:00:00.000Z");
+    const s = await buildStatus({ config: host.config, now: later, halt: LOWERED, signerState: "ready" });
+    const [g, joy] = s.citizens;
+    // The tick never seats a summons citizen unattended, so no beat is owed by it.
+    expect(g).toMatchObject({ word: "glossame", runtime: "summon", overdue: false, awaits_yu: true });
+    expect(joy).toMatchObject({ word: "joy", runtime: "free", overdue: true, awaits_yu: false });
+    expect(renderStatus(s)).toContain("glossame: awake | summon | not registered | no beat yet | every 72 h | awaits Yu");
+  });
+
+  test("a host log that was started and is now missing is unreadable, never an empty history", async () => {
+    host = await makeTempHost();
+    const cfg = host.config;
+    await appendHostNote(cfg, note({ kind: "tick", outcome: "opened", detail: openedDetail("0a0b0c0d-0e0f-4a1b-8c2d-3e4f5a6b7c8d", "cadence") }));
+    expect(await readHostNotes(cfg, new Date(0))).toHaveLength(1);
+    // Rotated or deleted: the count of today's seats and every rest-based cadence would start from nothing.
+    await Bun.$`mv ${cfg.paths.host_log} ${cfg.paths.host_log}.1`.quiet();
+    expect(await readHostNotes(cfg, new Date(0))).toBeNull();
+    const s = await buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready" });
+    expect(s.fleet.beats_today).toBeNull();
+    // And it is not begun again behind anyone's back: the next note is refused until a person restores or restarts it.
+    await expect(appendHostNote(cfg, note())).rejects.toThrow(/started and is now missing/);
+    expect(await Bun.file(cfg.paths.host_log).exists()).toBe(false);
+    // A person starting a new log does so on purpose, with an empty file.
+    await writeFile(cfg.paths.host_log, "");
+    await appendHostNote(cfg, note());
+    expect(await readHostNotes(cfg, new Date(0))).toHaveLength(1);
+  });
+
+  test("the tick lock shows as free, held by its owner, or stuck once it outlives any tick with no owner", async () => {
+    host = await makeTempHost();
+    const cfg = host.config;
+    const gen = async () => (await buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready" })).tick_lock;
+    expect(await gen()).toEqual({ state: "free", since: null });
+    await mkdir(cfg.paths.lock_dir);
+    await writeFile(join(cfg.paths.lock_dir, "owner.json"), JSON.stringify({ pid: 4242, started_at: NOW.toISOString() }));
+    expect(await gen()).toEqual({ state: "held", since: NOW.toISOString() });
+    await Bun.$`rm ${join(cfg.paths.lock_dir, "owner.json")}`.quiet();
+    const old = new Date(Date.now() - 24 * HOUR_MS);
+    await utimes(cfg.paths.lock_dir, old, old);
+    expect(await gen()).toEqual({ state: "stuck", since: old.toISOString() });
+  });
+
   test("renderStatus prints one line per citizen plus HALT and signer lines", async () => {
     host = await makeTempHost();
     const signer = fakeSigner();
@@ -314,13 +369,15 @@ describe("status", () => {
     }
     const s = await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "ready", trusted: { host_attest_b64: [signer.hostAttestPublicB64] } });
     const lines = renderStatus(s).trimEnd().split("\n");
-    expect(lines).toHaveLength(6);
+    expect(lines).toHaveLength(7);
     expect(lines[1]).toBe("HALT: not halted");
     expect(lines[2]).toMatch(/^signer: ready since /);
     expect(lines[3]).toBe("fleet: 0 of 24 beats today");
-    expect(lines[4]).toStartWith("glossame: awake | free | not registered | no beat yet | every 72 h |");
-    expect(lines[4]).toContain("chain ok, 1 host-attested");
-    expect(lines[5]).toStartWith("joy: awake");
+    expect(lines[4]).toBe("tick lock: free");
+    expect(lines[5]).toStartWith("glossame: awake | free | not registered | no beat yet | every 72 h |");
+    expect(lines[5]).toContain("chain ok, 1 host-attested");
+    expect(lines[5]).toContain("origin intact, soul drift 0%");
+    expect(lines[6]).toStartWith("joy: awake");
 
     const empty = renderStatus({ ...s, citizens: [] }).trimEnd().split("\n");
     expect(empty.at(-1)).toBe("no citizens seated");

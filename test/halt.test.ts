@@ -182,7 +182,7 @@ describe("raising", () => {
     ]);
     expect(signer.sent).toHaveLength(1);
     const req = signer.sent[0]!;
-    expect(req).toMatchObject({ op: "quiet.start.beacon", word: null, operator: "halt-herald", method: "POST", credits: 0, consent: null });
+    expect(req).toMatchObject({ op: "quiet.start.beacon", word: null, operator: "halt-herald", method: "POST", credits: 0, proposal: null });
     expect(req.target).toBe(`/v1/quiet-hours/start?identity_id=${HERALD!.identity_id}`);
     expect(JSON.parse(new TextDecoder().decode(req.body))).toEqual({ until: BEACON_UNTIL, reason: "" });
     expect(BEACON_UNTIL).toBe("2999-12-31T00:00:00.000Z");

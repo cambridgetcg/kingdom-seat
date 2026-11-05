@@ -13,10 +13,11 @@ import {
   type ConsentRecord,
   type FetchLike,
   type Origin,
+  type ProposalText,
   type Word,
   type YuPresence,
 } from "../types.ts";
-import type { Signer } from "../signer/signer.ts";
+import { SignerNotSent, type Signer } from "../signer/signer.ts";
 import { presenceValid, proposalDigest, verifyConsent } from "../signer/consent.ts";
 import { AgenttoolError, NO_RESPONSE, errorCode, readPublicAgent } from "./client.ts";
 import {
@@ -71,6 +72,16 @@ export class AmbiguousEnrollment extends Error {
 /** Refuse an intent this close to the server's freshness edge rather than send one that may arrive stale. */
 const FRESHNESS_MARGIN_MS = 30_000;
 
+/**
+ * How long past the freshness window a 404 must wait before it reads as
+ * "absent". The server checks freshness against its own clock and commits
+ * after that check, so an intent can still land a little after the window
+ * closes on this host's clock: by however far the two clocks differ, plus the
+ * time the commit takes. Two minutes covers both with room; until then a 404
+ * only means "not yet".
+ */
+export const ENROLLMENT_ABSENCE_MARGIN_MS = 120_000;
+
 /** The scope Yu confirms and the extent a birth's decision record covers; the signer checks the same string. */
 export function birthScope(word: Word): string {
   return `birth ${word}`;
@@ -94,7 +105,7 @@ export function assertBirthConsent(
   word: Word,
   consent: ConsentRecord | null | undefined,
   now: Date,
-  proposal?: { subject: string; body: string; extent: string },
+  proposal?: ProposalText,
 ): void {
   if (!consent || typeof consent !== "object") throw new Refusal("consent-missing", `birth of ${word} needs a decision record`);
   if (consent.extent !== birthScope(word)) throw new Refusal("consent-missing", `the decision record does not cover "${birthScope(word)}"`);
@@ -157,11 +168,17 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
-/** Have the root sign the digest, relay POST /v1/identities/enroll once, and parse the 201; never retried. */
-export async function enroll(deps: EnrollDeps, word: Word, prepared: PreparedEnrollment, presence: YuPresence, consent: ConsentRecord): Promise<EnrollResult> {
+/**
+ * Have the root sign the digest, relay POST /v1/identities/enroll once, and
+ * parse the 201; never retried. `consent` is checked here against the
+ * proposal's own digest before the root signs anything; the signer then reads
+ * the record filed for `proposal` itself before it relays.
+ */
+export async function enroll(deps: EnrollDeps, word: Word, prepared: PreparedEnrollment, presence: YuPresence, consent: ConsentRecord, proposal: ProposalText): Promise<EnrollResult> {
   const now = deps.clock.now();
   assertYuPresentFor(word, presence, now);
-  assertBirthConsent(word, consent, now);
+  if (!proposal || typeof proposal !== "object") throw new Refusal("consent-missing", `birth of ${word} names no proposal`);
+  assertBirthConsent(word, consent, now, proposal);
 
   // The bytes sent must be exactly the bytes these fields serialise to, for this word and this project.
   const f = prepared.fields;
@@ -198,13 +215,13 @@ export async function enroll(deps: EnrollDeps, word: Word, prepared: PreparedEnr
       target: ENROLLMENT_PATH,
       body: prepared.body,
       credits: 0,
-      consent,
+      proposal: { subject: proposal.subject, body: proposal.body, extent: proposal.extent },
       presence,
       extra_headers: { [ENROLLMENT_SIGNATURE_HEADER]: signature },
     });
   } catch (e) {
-    // A wall refused before sending: definite. Anything else may have reached the server.
-    if (e instanceof Refusal) throw e;
+    // A wall refused, or the signer stopped before sending: definite. Anything else may have reached the server.
+    if (e instanceof Refusal || e instanceof SignerNotSent) throw e;
     throw new AmbiguousEnrollment(f.identity_id, f.signing_key_id, NO_RESPONSE, "enrollment got no response; read the chosen identity before preparing a new intent");
   }
   if (res.status === 201) return parseEnrollResponse(res.json, prepared);
@@ -243,14 +260,16 @@ export function parseEnrollResponse(json: unknown, prepared: PreparedEnrollment)
 
 /**
  * After an ambiguous result: does the chosen identity now exist? Read, never
- * re-send. "absent" is only reported once the intent's freshness window has
- * closed, because a delayed request could still land until then; a public
- * read can confirm existence but never absence (it may be cached).
+ * re-send. "absent" is only reported once the intent's freshness window and
+ * ENROLLMENT_ABSENCE_MARGIN_MS have both passed, because a delayed request,
+ * a server clock behind this one, or a commit still in flight could make it
+ * land until then; a public read can confirm existence but never absence (it
+ * may be cached).
  */
 export async function resolveAmbiguous(deps: EnrollDeps, identityId: string, prepared?: PreparedEnrollment): Promise<"exists" | "absent" | "unknown"> {
   if (typeof identityId !== "string" || !UUID_PATTERN.test(identityId)) throw new Refusal("invalid-request", "identity id must be a lowercase UUID");
   const now = deps.clock.now().getTime();
-  const windowOpen = prepared ? now - Date.parse(prepared.fields.timestamp) <= ENROLLMENT_WINDOW_MS : true;
+  const windowOpen = prepared ? now - Date.parse(prepared.fields.timestamp) <= ENROLLMENT_WINDOW_MS + ENROLLMENT_ABSENCE_MARGIN_MS : true;
   try {
     const res = await deps.signer.send({
       op: "read",
@@ -260,7 +279,7 @@ export async function resolveAmbiguous(deps: EnrollDeps, identityId: string, pre
       target: `/v1/identities/${identityId}/authority`,
       body: new Uint8Array(),
       credits: 0,
-      consent: null,
+      proposal: null,
       presence: null,
     });
     const j = res.json as Record<string, unknown> | null;

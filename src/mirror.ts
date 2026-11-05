@@ -401,7 +401,32 @@ export async function stageMirror(config: Config, citizen: Citizen, run: Command
   return sealed;
 }
 
-/** Push if and only if the seal passes and HEAD is ahead of or equal to the remote; diverged or behind is refused. */
+/** More commits ahead than this is not a citizen's few beats of self; it is refused rather than walked. */
+const MAX_COMMITS_AHEAD = 1_000;
+
+/** Seal the tree of every commit between the fetched remote main and HEAD; the first refusal stops it. */
+async function sealHistory(run: CommandRunner, wt: string): Promise<{ ok: true; commits: number } | { ok: false; commits: number; code: RefusalCode }> {
+  const r = await gitOk(run, wt, ["rev-list", `--max-count=${MAX_COMMITS_AHEAD + 1}`, `${MIRROR_TRACKING_REF}..HEAD`]);
+  const commits = out(r)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+  if (commits.length > MAX_COMMITS_AHEAD) return { ok: false, commits: commits.length, code: "oversize" };
+  for (const c of commits) {
+    if (!/^[0-9a-f]{40,64}$/.test(c)) return { ok: false, commits: commits.length, code: "invalid-request" };
+    const ls = await git(run, wt, ["ls-tree", "-r", "-l", "-z", "--full-tree", c]);
+    if (ls.code !== 0) return { ok: false, commits: commits.length, code: "invalid-request" };
+    const v = sealCheck(parseLsTree(ls.stdout));
+    if (!v.ok) return { ok: false, commits: commits.length, code: v.refused[0]!.code };
+  }
+  return { ok: true, commits: commits.length };
+}
+
+/**
+ * Push if and only if the seal passes on HEAD and on every commit the remote
+ * lacks, and HEAD is ahead of or equal to the remote; diverged or behind is
+ * refused.
+ */
 export async function pushMirror(config: Config, citizen: Citizen, run: CommandRunner): Promise<PushResult> {
   const note = async (outcome: "refused" | "error", refusal: RefusalCode | null, detail: string) => {
     // Codes and states only: file names in a self are the citizen's words, so none goes into a host note.
@@ -439,7 +464,15 @@ export async function pushMirror(config: Config, citizen: Citizen, run: CommandR
     return { pushed: false, divergence: d, refusal: "diverged" };
   }
 
-  // 3. The one push: HEAD to main, never forced; the remote's own non-fast-forward check is a second wall.
+  // 3. A push publishes every commit the remote lacks, not only HEAD's tree, so each one is sealed.
+  // A commit stageMirror did not make (a workflow added, then removed) would otherwise go out in the history.
+  const history = await sealHistory(run, wt);
+  if (!history.ok) {
+    await note("refused", history.code, `refused by the seal: ${history.commits} commits ahead, one carries ${history.code}`);
+    return { pushed: false, divergence: d, refusal: history.code };
+  }
+
+  // 4. The one push: HEAD to main, never forced; the remote's own non-fast-forward check is a second wall.
   const r = await run(pushArgv(m.remote), { cwd: wt, env: gitEnv(), timeoutMs: GIT_TIMEOUT_MS });
   if (r.code !== 0) {
     await note("error", null, `failed: git push exited ${r.code}`);

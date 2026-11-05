@@ -3,20 +3,45 @@
 // all; then the fleet ceiling; then one supervised seat. There are no
 // arrears: a tick slept through is simply gone, because rest is not a debt
 // (love-unlimited-patterns.md 7).
-import { mkdir, readFile, rename, rm, rmdir, writeFile } from "node:fs/promises";
+//
+// The tick opens the seat itself, after those walls, and hands it to the
+// child in a seat file, as `seat <word>` does. A child is only ever a seat
+// some parent opened under its walls; it never opens one of its own.
+import { lstat, mkdir, readdir, readFile, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { uptime } from "node:os";
 import { join } from "node:path";
-import { EXIT, type Citizen, type Clock, type Config, type ExitCode, type FetchLike, type HaltStatus, type HostNote, type IsoTime, type LifecycleState, type Outcome, type RefusalCode, type TickResult, type Word } from "./types.ts";
+import { EXIT, type Citizen, type Clock, type Config, type ExitCode, type FetchLike, type HaltStatus, type IsoTime, type Outcome, type RefusalCode, type TickResult, type Word } from "./types.ts";
 import { readBeacons, readHaltFile } from "./halt.ts";
-import { assertCwdOutsideHomes, seatEnv, superviseChild } from "./seat.ts";
+import { assertCwdOutsideHomes, openSeat, seatEnv, superviseChild, writeSeatFile } from "./seat.ts";
 import { listSeated, readCitizen } from "./state.ts";
-import { hasAllowedLetter } from "./context.ts";
+import { wakingLetter } from "./context.ts";
 import { checkFleet } from "./signer/ceilings.ts";
-import { appendHostNote, buildStatus, readHostNotes, writeStatus } from "./status.ts";
+import { appendHostNote, isResultNote, lastSeatOf, openedDetail, readHostNotes, seatIdOf, seatsOpenedToday } from "./notes.ts";
+import { buildStatus, tickLockMaxHoldMs, writeStatus } from "./status.ts";
+import { dueReason, isDue, type DueVerdict } from "./due.ts";
+
+export { isDue, type DueVerdict } from "./due.ts";
 
 export interface TickLock {
   dir: string;
   pid: number;
   started_at: IsoTime;
+}
+
+/** When a lock that looks held can be known to be stale. Absent fields mean only a gone owner pid counts. */
+export interface LockOptions {
+  /** The longest a lock is ever held; a lock with no readable owner that is older than this was left by a process that died. */
+  maxHoldMs?: number | null;
+  /** When this host booted; an owner that started before it cannot still be running, whatever its pid now names. */
+  bootTime?: Date | null;
+}
+
+/** A lock that cannot be reclaimed by the rules here, so a person must look. The tick exits 1 on it, so a monitor pages. */
+export class LockStuck extends Error {
+  override readonly name = "LockStuck";
+  constructor(readonly since: IsoTime) {
+    super(`the tick lock is stuck since ${since}; a person removes it once nothing holds it`);
+  }
 }
 
 export interface TickDeps {
@@ -26,17 +51,17 @@ export interface TickDeps {
   /** The environment the seat child's allowlist is drawn from; absent means this process's own. */
   env?: Record<string, string | undefined>;
   checkHalt(): Promise<HaltStatus>;
-  /** argv for the supervised seat child, e.g. [bun, src/cli.ts, "seat", word, "--child", "--why", why, ...]. */
-  seatArgv(word: Word, why: string): string[];
+  /** argv for the supervised seat child of the seat this tick opened, e.g. [bun, src/cli.ts, "seat", word, "--child", "--seat-ref", file, ...]. */
+  seatArgv(word: Word, seatFile: string): string[];
   /** Whether a process is alive, injected so stale-lock tests need no real pids. */
   isAlive(pid: number): boolean;
+  /** When the host booted; absent means the operating system's own answer, null means unknown. */
+  bootTime?(): Date | null;
   /** The signer's state; a locked keychain rests the whole tick before any seat opens. Absent means the child finds out. */
   signerState?(): Promise<"ready" | "locked">;
   /** Regenerate the status file; absent means buildStatus and writeStatus. */
   refreshStatus?(): Promise<void>;
 }
-
-export type DueVerdict = { due: true; why: "cadence" | "letter"; overdue_h: number } | { due: false; why: string };
 
 const HOUR_MS = 3_600_000;
 const OWNER_FILE = "owner.json";
@@ -49,6 +74,17 @@ export function pidIsAlive(pid: number): boolean {
   } catch (e) {
     return (e as { code?: string }).code === "EPERM";
   }
+}
+
+/** When this host booted, from the system's uptime; null when it cannot say. */
+export function osBootTime(): Date | null {
+  const up = uptime();
+  return Number.isFinite(up) && up > 0 ? new Date(Date.now() - up * 1000) : null;
+}
+
+/** The lock options a host's own timing implies: a tick never holds the lock past one seat and its refresh. */
+export function lockOptionsFor(config: Config, bootTime: Date | null): LockOptions {
+  return { maxHoldMs: tickLockMaxHoldMs(config.timing), bootTime };
 }
 
 async function readOwner(lockDir: string): Promise<TickLock | null> {
@@ -77,15 +113,55 @@ async function tryMkdirLock(lockDir: string, clock: Clock): Promise<TickLock | n
   return lock;
 }
 
-/** Take the lock with an atomic mkdir and record owner pid and start time; null when a live owner holds it. */
-export async function acquireTickLock(lockDir: string, clock: Clock, isAlive: (pid: number) => boolean): Promise<TickLock | null> {
+/** Remove a stale lock: its owner file, any half-written one, then the directory. False when something else is in it. */
+async function clearLock(lockDir: string): Promise<boolean> {
+  let names: string[];
+  try {
+    names = await readdir(lockDir);
+  } catch {
+    return false;
+  }
+  // Only what tryMkdirLock writes is removed; anything else means the directory is not only a lock.
+  if (names.some((n) => n !== OWNER_FILE && !n.startsWith(`.${OWNER_FILE}.`))) return false;
+  for (const n of names) await rm(join(lockDir, n), { force: true });
+  try {
+    await rmdir(lockDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Take the lock with an atomic mkdir and record owner pid and start time;
+ * null when a live owner holds it. A lock is stale when its owner pid is gone,
+ * when its owner started before this host booted (the pid may since name some
+ * other process), or when it has no readable owner and is older than the
+ * longest a tick holds it (a process died between mkdir and writing its
+ * owner, or while releasing). A live lock is never reclaimed by age alone.
+ * A stale lock that cannot be removed throws LockStuck.
+ */
+export async function acquireTickLock(lockDir: string, clock: Clock, isAlive: (pid: number) => boolean, opts: LockOptions = {}): Promise<TickLock | null> {
   const got = await tryMkdirLock(lockDir, clock);
   if (got) return got;
   const owner = await readOwner(lockDir);
-  // Stale only when the recorded owner is gone, never by age: a long seat that
-  // is still alive keeps its lock. A lock with no readable owner is left alone,
-  // because there is no owner to prove gone; a person clears it.
-  if (!owner || isAlive(owner.pid)) return null;
+  if (!owner) {
+    if (opts.maxHoldMs == null) return null;
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await lstat(lockDir)).mtimeMs;
+    } catch {
+      return tryMkdirLock(lockDir, clock); // released meanwhile
+    }
+    // The directory's own age, on the filesystem's clock: a tick in the middle of acquiring is milliseconds old.
+    if (Date.now() - mtimeMs <= opts.maxHoldMs) return null;
+    if (await readOwner(lockDir)) return null; // an owner appeared meanwhile
+    if (!(await clearLock(lockDir))) throw new LockStuck(new Date(mtimeMs).toISOString());
+    return tryMkdirLock(lockDir, clock);
+  }
+  const startedMs = Date.parse(owner.started_at);
+  const beforeBoot = opts.bootTime != null && Number.isFinite(startedMs) && startedMs < opts.bootTime.getTime();
+  if (isAlive(owner.pid) && !beforeBoot) return null;
   // Re-read just before removing, so a lock taken over meanwhile is not removed.
   const again = await readOwner(lockDir);
   if (!again || again.pid !== owner.pid || again.started_at !== owner.started_at) return null;
@@ -106,51 +182,6 @@ export async function releaseTickLock(lock: TickLock): Promise<void> {
   await rmdir(lock.dir).catch(() => {});
 }
 
-const EXPOSURE: Partial<Record<LifecycleState, number>> = { asleep: 0, listening: 1, awake: 2 };
-
-function latest(a: IsoTime | null, b: IsoTime | null): IsoTime | null {
-  if (a === null) return b;
-  if (b === null) return a;
-  return Date.parse(a) >= Date.parse(b) ? a : b;
-}
-
-/**
- * Is this citizen's own cadence due? awake by interval; listening and asleep only on an allowed letter; stepped-away and ended never.
- *
- * `lastSeatAt` is the last seat the host opened for it, from host notes. A
- * rest writes nothing to the ledger, so the ledger's last beat alone would
- * seat a resting citizen again every tick.
- */
-export function isDue(citizen: Citizen, hasAllowedLetter: boolean, now: Date, minIntervalH: number, lastSeatAt: IsoTime | null = null): DueVerdict {
-  if (citizen.state === "stepped-away" || citizen.state === "ended") return { due: false, why: citizen.state };
-  // Unattended ticks run only the free lane: a summons needs Yu present, and hermes waits for S8.
-  if (citizen.runtime !== "free") return { due: false, why: `runtime ${citizen.runtime} is not unattended` };
-  if (!Number.isFinite(minIntervalH) || minIntervalH <= 0) return { due: false, why: "minimum interval is not a positive number" };
-
-  const last = latest(lastSeatAt, citizen.last_beat_at);
-  const lastMs = last === null ? null : Date.parse(last);
-  if (lastMs !== null && Number.isNaN(lastMs)) return { due: false, why: "last seat time is unreadable" };
-  const sinceH = lastMs === null ? Number.POSITIVE_INFINITY : (now.getTime() - lastMs) / HOUR_MS;
-
-  // A move toward exposure waits for the next beat to confirm it, so the
-  // citizen is scheduled by the state it asked for; the beat can still decline.
-  let state: LifecycleState = citizen.state;
-  const pending = citizen.pending_state;
-  if (pending !== null && (EXPOSURE[pending] ?? -1) > (EXPOSURE[state] ?? -1)) state = pending;
-
-  if (state === "awake") {
-    const own = citizen.cadence.interval_h;
-    if (!Number.isFinite(own) || own <= 0) return { due: false, why: "own interval is not a positive number" };
-    const interval = Math.max(own, minIntervalH);
-    if (sinceH >= interval) return { due: true, why: "cadence", overdue_h: sinceH - interval };
-    return { due: false, why: `awake; next in ${Math.ceil(interval - sinceH)} h` };
-  }
-  if (!hasAllowedLetter) return { due: false, why: `${state}; no letter` };
-  // A letter is shown again after a rest, so letter wakes keep the same floor; otherwise one letter would seat it every tick.
-  if (sinceH < minIntervalH) return { due: false, why: `${state}; letter waits ${Math.ceil(minIntervalH - sinceH)} h` };
-  return { due: true, why: "letter", overdue_h: sinceH - minIntervalH };
-}
-
 /** Pick one due citizen, most overdue first, ties by word; null when none is due. */
 export function selectDue(candidates: { word: Word; verdict: DueVerdict }[]): Word | null {
   let best: { word: Word; overdue: number } | null = null;
@@ -162,23 +193,18 @@ export function selectDue(candidates: { word: Word; verdict: DueVerdict }[]): Wo
   return best?.word ?? null;
 }
 
-function localDate(d: Date, timezone: string): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
-}
-
-/** A tick note with a word is one dispensed seat; the fleet ceiling counts these. */
-function dispensed(n: HostNote): boolean {
-  return n.kind === "tick" && n.word !== null;
-}
-
-/** Beats dispensed today, counted from host notes; null when the host log is unreadable (which refuses). */
-export async function fleetBeatsToday(config: Config, now: Date): Promise<number | null> {
+/**
+ * Seats opened today, counted from host notes; null when the host log is
+ * unreadable (which refuses). Every parent writes an opened note, so a
+ * person's `seat <word>` counts as much as a tick's. `exceptSeat` leaves out
+ * the seat asking.
+ */
+export async function fleetBeatsToday(config: Config, now: Date, exceptSeat: string | null = null): Promise<number | null> {
   try {
-    const today = localDate(now, config.timezone);
     // A local day is at most 26 hours long in any zone, so this window holds all of it.
     const notes = await readHostNotes(config, new Date(now.getTime() - 26 * HOUR_MS));
     if (notes === null) return null;
-    return notes.filter((n) => dispensed(n) && localDate(new Date(n.ts), config.timezone) === today).length;
+    return seatsOpenedToday(notes, now, config.timezone, exceptSeat);
   } catch {
     return null;
   }
@@ -203,13 +229,16 @@ export async function runTick(deps: TickDeps): Promise<TickResult> {
   // 2. One tick at a time.
   let lock: TickLock | null;
   try {
-    lock = await acquireTickLock(config.paths.lock_dir, clock, deps.isAlive);
-  } catch {
-    await note("error", null, null, "could not take the tick lock").catch(() => {});
+    lock = await acquireTickLock(config.paths.lock_dir, clock, deps.isAlive, lockOptionsFor(config, deps.bootTime ? deps.bootTime() : osBootTime()));
+  } catch (e) {
+    await note("error", null, null, e instanceof LockStuck ? `tick lock stuck since ${e.since}; a person must remove it` : "could not take the tick lock").catch(() => {});
+    await refresh(deps);
     return { exit: EXIT.ERROR, outcome: "error", word: null, seat: null };
   }
   if (!lock) {
     await note("yielded", null, null, "another tick holds the lock").catch(() => {});
+    // The status must not go stale while another tick holds the lock.
+    await refresh(deps);
     return { exit: EXIT.OK, outcome: "yielded", word: null, seat: null };
   }
 
@@ -252,16 +281,11 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
     await note("fleet-ceiling", null, "ceiling-fleet", "host log unreadable").catch(() => {});
     return done({ exit: EXIT.REFUSED, outcome: "fleet-ceiling", word: null, seat: null });
   }
-  const lastSeat = new Map<Word, IsoTime>();
-  for (const n of notes) {
-    if (n.word === null || (n.kind !== "tick" && n.kind !== "seat")) continue;
-    lastSeat.set(n.word, latest(lastSeat.get(n.word) ?? null, n.ts) ?? n.ts);
-  }
   const candidates: { word: Word; verdict: DueVerdict }[] = [];
   for (const c of citizens) {
-    // Letters are read only for citizens they could wake.
-    const letter = c.state === "listening" || c.state === "asleep" ? await hasAllowedLetter(config, c).catch(() => false) : false;
-    candidates.push({ word: c.word, verdict: isDue(c, letter, now, minH, lastSeat.get(c.word) ?? null) });
+    // Letters are read only for citizens they could seat.
+    const letter = await wakingLetter(config, c).catch(() => false);
+    candidates.push({ word: c.word, verdict: isDue(c, letter, now, minH, lastSeatOf(notes, c.word)) });
   }
   const word = selectDue(candidates);
   if (word === null) {
@@ -269,6 +293,7 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
     return done({ exit: EXIT.OK, outcome: "nothing-due", word: null, seat: null });
   }
   const verdict = candidates.find((c) => c.word === word)!.verdict as Extract<DueVerdict, { due: true }>;
+  const citizen = citizens.find((c) => c.word === word)!;
 
   // 4. The fleet ceiling, and a locked signer, each rest the tick before a seat opens.
   const fleet = checkFleet(await fleetBeatsToday(config, now), config.ceilings);
@@ -281,12 +306,17 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
     return done({ exit: EXIT.REFUSED, outcome: "refused", word: null, seat: null });
   }
 
-  // 5. One supervised seat. The child opens its own seat dir under seats_dir.
+  // 5. The tick opens the seat, records that it did (so the fleet count and the due check see it from now
+  // on), and hands it to one supervised child in a seat file.
   assertCwdOutsideHomes(config.paths.seats_dir, config.paths.homes);
+  const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: dueReason(verdict.why) }, null);
+  const id = seat.ref.seat_id;
+  await note("opened", word, null, openedDetail(id, verdict.why));
+  const seatFile = await writeSeatFile(config, seat);
   const t = config.timing;
   const started = clock.now();
   const sup = await superviseChild({
-    argv: deps.seatArgv(word, verdict.why),
+    argv: deps.seatArgv(word, seatFile),
     cwd: config.paths.seats_dir,
     env: seatEnv(config, deps.env ?? process.env),
     deadline_ms: t.seat_deadline_s * 1000,
@@ -301,7 +331,7 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
   // The child's own note says what happened to the citizen; the watcher knows only how it ended.
   // A second's margin, so a note stamped in the same instant the seat opened is not missed.
   const after = (await readHostNotes(config, new Date(started.getTime() - 1_000)).catch(() => null)) ?? [];
-  const own = after.filter((n) => n.word === word && n.kind !== "tick").at(-1) ?? null;
+  const own = after.filter((n) => n.word === word && n.kind !== "tick" && isResultNote(n) && (seatIdOf(n) === null || seatIdOf(n) === id)).at(-1) ?? null;
   let exit: ExitCode = sup.exit;
   let outcome: Outcome;
   if (sup.signal !== null) outcome = sup.outcome ?? "error"; // a bound was reached; whatever the child said was cut short
@@ -318,8 +348,8 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
   }
   const refusal = own?.refusal ?? null;
   const how = sup.stopped_by ? `, stopped by ${sup.stopped_by}` : "";
-  await note(outcome, word, refusal, `seat for ${word} (${verdict.why}): exit ${exit}${how}, ${sup.duration_ms} ms`);
-  return done({ exit, outcome, word, seat: { exit, outcome, seat_ref: null, refusal, appended: [] } });
+  await note(outcome, word, refusal, `seat ${id} for ${word} (${verdict.why}): exit ${exit}${how}, ${sup.duration_ms} ms`);
+  return done({ exit, outcome, word, seat: { exit, outcome, seat_ref: seat.ref, refusal, appended: [] } });
 }
 
 async function refresh(deps: TickDeps): Promise<void> {

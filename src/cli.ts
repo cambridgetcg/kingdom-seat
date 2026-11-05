@@ -12,31 +12,32 @@
 // `seat <word>` opens the seat in this process and runs the pipeline in a
 // supervised child (`seat <word> --child --seat-ref <file>`), so the watcher
 // holding the deadline and HALT is never the process the model's reply flows
-// through. The tick does the same through tick.ts.
-import { constants } from "node:fs";
-import { open, rename } from "node:fs/promises";
+// through. The tick does the same through tick.ts. A child runs only a seat a
+// parent opened under its walls, and confirms Yu itself when a summons asks.
+import { lstat } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { checkHalt, describeHalt, raiseHalt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, defaultConfigPath, loadConfig } from "./config.ts";
-import { parseStrictJson } from "./crypto.ts";
-import { ledgerPath, readLedger, readRegularText, verifyChain } from "./ledger.ts";
+import { ledgerPath, readLedger, verifyChain } from "./ledger.ts";
 import { pushMirror, stageMirror } from "./mirror.ts";
-import { openSeat, runSeat, seatEnv, superviseChild, type OpenSeat } from "./seat.ts";
+import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
 import { createSigner, type Signer } from "./signer/signer.ts";
 import { macosKeychain } from "./signer/keychain.ts";
 import { checkFleet, spendFromLedger } from "./signer/ceilings.ts";
-import { confirmYuPresent, presenceValid, type TtyIO } from "./signer/consent.ts";
+import { confirmYuPresent, type TtyIO } from "./signer/consent.ts";
 import { freeRuntime, loadModelsLock } from "./runtime/free.ts";
 import { summonRuntime } from "./runtime/summon.ts";
 import { listSeated, readCitizen, readCitizenRecord } from "./state.ts";
-import { appendHostNote, buildStatus, readHostNotes, renderStatus, writeStatus } from "./status.ts";
-import { fleetBeatsToday, isDue, pidIsAlive, runTick } from "./tick.ts";
-import { hasAllowedLetter } from "./context.ts";
+import { buildStatus, renderStatus, writeStatus } from "./status.ts";
+import { appendHostNote, isResultNote, lastSeatOf, openedDetail, readHostNotes, seatIdOf, seatsOpenedToday } from "./notes.ts";
+import { LockStuck, acquireTickLock, lockOptionsFor, osBootTime, pidIsAlive, releaseTickLock, runTick } from "./tick.ts";
+import { isDue } from "./due.ts";
+import { wakingLetter } from "./context.ts";
+import { driftFromOrigin, originIntact } from "./self.ts";
 import {
   EXIT,
   Refusal,
-  UUID_PATTERN,
   WORD_PATTERN,
   type Citizen,
   type Clock,
@@ -51,10 +52,11 @@ import {
   type Outcome,
   type RuntimeAdapter,
   type RuntimeClass,
-  type SeatRef,
   type Word,
   type YuPresence,
 } from "./types.ts";
+
+export { SEAT_FILE_FORMAT, readSeatFile, seatFilePath, writeSeatFile } from "./seat.ts";
 
 export type Command =
   | { verb: "tick"; config: string | null }
@@ -170,8 +172,11 @@ export function parseArgs(argv: string[]): Command {
       const yu_present = flags.get("--yu-present") === true;
       const seat_ref_path = (flags.get("--seat-ref") as string | undefined) ?? null;
       if (seat_ref_path !== null && (!child || !isAbsolute(seat_ref_path))) throw new UsageError("--seat-ref is an absolute path, given only with --child");
-      // A child learns of Yu's presence only from the seat file its parent wrote, never from a flag anyone could type.
-      if (child && yu_present) throw new UsageError("--yu-present is for the person at the terminal, not for --child");
+      // A child runs only a seat some parent opened after its walls passed (due, fleet ceiling, lock), so it
+      // needs the seat file that parent wrote; `--child` alone is a flag anyone could type.
+      if (child && seat_ref_path === null) throw new UsageError("--child runs only a seat a parent opened: --seat-ref <file> is required");
+      // The seat file names the runtime and why; a child confirms Yu itself when a summons asks, never from a flag.
+      if (child && (yu_present || flags.has("--why") || flags.has("--runtime"))) throw new UsageError("--child takes only --seat-ref and --config; the seat file says the rest");
       // Refused here, before any config is read or anything runs.
       if (rt === "summon" && !yu_present && !child) {
         throw new Refusal("yu-not-present", "a summons runs only with Yu present: pass --yu-present and confirm at the terminal");
@@ -198,6 +203,8 @@ export interface CliDeps {
   /** argv for a supervised seat child of this program. */
   seatArgv(configPath: string, word: Word, extra: string[]): string[];
   isAlive(pid: number): boolean;
+  /** When the host booted, so a lock left from before a reboot is known to be stale; null when unknown. */
+  bootTime(): Date | null;
 }
 
 const STD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -278,6 +285,7 @@ export function realDeps(over: Partial<CliDeps> = {}): CliDeps {
     runtime: (config, seat) => productionRuntime(config, seat, deps),
     seatArgv: (configPath, word, extra) => [process.execPath, CLI_PATH, "seat", word, "--child", ...extra, "--config", configPath],
     isAlive: pidIsAlive,
+    bootTime: osBootTime,
   };
   return Object.assign(deps, over);
 }
@@ -305,89 +313,6 @@ async function productionRuntime(config: Config, seat: OpenSeat, deps: CliDeps):
     case "hermes":
       throw new Refusal("runtime-not-approved", "the hermes runtime class is reserved for S8");
   }
-}
-
-/* ── Seat files: how a parent hands an opened seat to its child ───────── */
-
-export const SEAT_FILE_FORMAT = "kingdom-seat-seatfile/v1";
-
-interface SeatFile {
-  format: typeof SEAT_FILE_FORMAT;
-  seat_ref: SeatRef;
-  presence: YuPresence | null;
-}
-
-/** `<seats_dir>/<seat_id>.json`, beside the seat's cwd rather than in it, so the cwd stays empty for the model. */
-export function seatFilePath(config: Config, seatId: string): string {
-  if (!UUID_PATTERN.test(seatId)) throw new Refusal("invalid-request", "seat_id is not a lowercase UUID");
-  return join(config.paths.seats_dir, `${seatId}.json`);
-}
-
-export async function writeSeatFile(config: Config, seat: OpenSeat): Promise<string> {
-  const path = seatFilePath(config, seat.ref.seat_id);
-  const file: SeatFile = { format: SEAT_FILE_FORMAT, seat_ref: seat.ref, presence: seat.presence };
-  const fh = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-  try {
-    await fh.writeFile(`${JSON.stringify(file, null, 2)}\n`);
-  } finally {
-    await fh.close();
-  }
-  return path;
-}
-
-function isIso(v: unknown): v is string {
-  return typeof v === "string" && v.length === 24 && new Date(Date.parse(v)).toISOString() === v;
-}
-
-/**
- * Read the seat a parent opened, once. The file is renamed to `.used` before
- * it is trusted, so the same seat (and any presence in it) cannot be read twice.
- * A presence crosses only this way, and only while it is fresh.
- */
-export async function readSeatFile(config: Config, path: string, word: Word, now: Date): Promise<{ ref: SeatRef; presence: YuPresence | null }> {
-  const bad = (why: string) => new Refusal("invalid-request", `seat file ${why}`);
-  const name = basename(path);
-  const m = /^([0-9a-f-]{36})\.json$/.exec(name);
-  if (dirname(path) !== config.paths.seats_dir || !m || !UUID_PATTERN.test(m[1]!)) throw bad("must be <seats_dir>/<seat_id>.json");
-  const used = `${path}.used`;
-  try {
-    await rename(path, used);
-  } catch {
-    throw bad("is missing or was already used");
-  }
-  const text = await readRegularText(used, { missing: "throw", maxBytes: 64 * 1024 });
-  let v: unknown;
-  try {
-    v = parseStrictJson(text ?? "");
-  } catch {
-    throw bad("is not strict JSON");
-  }
-  const o = v as Partial<SeatFile> | null;
-  if (!o || typeof o !== "object" || Object.keys(o).sort().join(",") !== "format,presence,seat_ref" || o.format !== SEAT_FILE_FORMAT) throw bad("has the wrong shape");
-  const ref = o.seat_ref as SeatRef;
-  const inv = ref?.invoker as Invoker | undefined;
-  if (
-    !ref ||
-    ref.format !== "kingdom-seat-seat/v1" ||
-    ref.seat_id !== m[1] ||
-    ref.word !== word ||
-    ref.host !== config.host ||
-    (ref.runtime !== "free" && ref.runtime !== "summon") ||
-    !isIso(ref.opened_at) ||
-    !inv ||
-    !["tick", "summons", "letter"].includes(inv.kind) ||
-    typeof inv.who !== "string" ||
-    typeof inv.why !== "string"
-  ) {
-    throw bad("does not describe this seat");
-  }
-  let presence: YuPresence | null = null;
-  if (o.presence !== null) {
-    const scope = `summon ${word}`;
-    if (!presenceValid(o.presence ?? null, scope, now)) throw new Refusal("yu-not-present", "the presence in the seat file is not a fresh confirmation for this summons");
-    presence = Object.freeze({ present: true, via: "tty-confirm", confirmed_at: o.presence!.confirmed_at, scope });
-  }
-  return { ref, presence };
 }
 
 /* ── Verbs ────────────────────────────────────────────────────────────── */
@@ -496,6 +421,13 @@ async function verbStatus(ctx: Ctx, json: boolean): Promise<ExitCode> {
 
 async function verbVerify(ctx: Ctx, word: Word): Promise<ExitCode> {
   const record = await readCitizenRecord(ctx.config, word);
+  // A citizen with a record has a ledger from its seating on; a missing one is a lost history, never "0 entries, ok".
+  try {
+    await lstat(ledgerPath(ctx.config, word));
+  } catch {
+    ctx.deps.out(`${word}: chain BROKEN: no ledger, though citizen.json says it is seated\n`);
+    return EXIT.ERROR;
+  }
   let entries;
   try {
     entries = await readLedger(ledgerPath(ctx.config, word));
@@ -514,7 +446,13 @@ async function verbVerify(ctx: Ctx, word: Word): Promise<ExitCode> {
     ctx.deps.out(`${word}: chain BROKEN at seq ${v.problem!.seq}: ${v.problem!.reason}\n`);
     return EXIT.ERROR;
   }
-  ctx.deps.out(`${word}: chain ok, ${v.entries} entries, ${v.host_attested} host-attested, head ${v.head ?? "none"}\n`);
+  // The origin is what drift is measured against (3c), so a changed origin/ fails verification like a broken chain.
+  if (!(await originIntact(ctx.config, word, entries))) {
+    ctx.deps.out(`${word}: origin CHANGED: origin/ no longer matches the soul and canon its record pinned\n`);
+    return EXIT.ERROR;
+  }
+  const drift = await driftFromOrigin(ctx.config, word).then((d) => `${Math.round(d.fraction * 100)}%`).catch(() => "unknown");
+  ctx.deps.out(`${word}: chain ok, ${v.entries} entries, ${v.host_attested} host-attested, head ${v.head ?? "none"}; origin intact, soul drift ${drift}\n`);
   return EXIT.OK;
 }
 
@@ -544,8 +482,9 @@ async function verbTick(ctx: Ctx): Promise<ExitCode> {
     fetch: ctx.deps.fetch,
     env: ctx.deps.env,
     checkHalt: () => checkHalt({ config: ctx.config, fetch: ctx.deps.fetch, now: () => now(ctx) }),
-    seatArgv: (word, why) => ctx.deps.seatArgv(ctx.configPath, word, ["--why", why]),
+    seatArgv: (word, seatFile) => ctx.deps.seatArgv(ctx.configPath, word, ["--seat-ref", seatFile]),
     isAlive: ctx.deps.isAlive,
+    bootTime: ctx.deps.bootTime,
     signerState: () => signer.state(),
     refreshStatus: async () => {
       await refreshStatus(ctx, signer);
@@ -563,25 +502,33 @@ async function verbTick(ctx: Ctx): Promise<ExitCode> {
 
 /**
  * Without Yu, a seat opens only when the tick would open it: the citizen's own
- * cadence (or an allowed letter) is due and the fleet is under its ceiling. A
- * person at the host can run a due beat now, but cannot add beats the citizen
- * did not choose. Only Yu's summons is an extra beat (3.3: one beat each).
+ * cadence (or a waking letter, or a saying to confirm) is due and the fleet is
+ * under its ceiling. A person at the host can run a due beat now, but cannot
+ * add beats the citizen did not choose. Only Yu's summons is an extra beat
+ * (3.3: one beat each). `exceptSeat` is the seat asking, which the child's own
+ * check leaves out of what it counts.
  */
-async function assertOwnBeatDue(ctx: Ctx, citizen: Citizen): Promise<void> {
+async function assertOwnBeatDue(ctx: Ctx, citizen: Citizen, exceptSeat: string | null = null): Promise<void> {
   const { config } = ctx;
   const t = now(ctx);
   const minH = config.ceilings.min_beat_interval_h;
-  const notes = await readHostNotes(config, new Date(t.getTime() - Math.max(minH, citizen.cadence.interval_h) * 3_600_000));
+  // 26 h covers a local day for the fleet count; the cadence window covers the last seat.
+  const notes = await readHostNotes(config, new Date(t.getTime() - Math.max(minH, citizen.cadence.interval_h, 26) * 3_600_000));
   if (notes === null) throw new Refusal("ceiling-fleet", "the host log is unreadable, so no one can say who was seated when");
-  const lastSeat = notes.filter((n) => n.word === citizen.word && (n.kind === "tick" || n.kind === "seat")).at(-1)?.ts ?? null;
-  const letter = citizen.state === "listening" || citizen.state === "asleep" ? await hasAllowedLetter(config, citizen).catch(() => false) : false;
-  const due = isDue(citizen, letter, t, minH, lastSeat);
+  const letter = await wakingLetter(config, citizen).catch(() => false);
+  const due = isDue(citizen, letter, t, minH, lastSeatOf(notes, citizen.word, exceptSeat));
   if (!due.due) throw new Refusal("window-closed", `${citizen.word} is not due (${due.why}); only Yu's summons (--yu-present) seats it now`);
-  const fleet = checkFleet(await fleetBeatsToday(config, t), config.ceilings);
+  const fleet = checkFleet(seatsOpenedToday(notes, t, config.timezone, exceptSeat), config.ceilings);
   if (!fleet.ok) throw new Refusal(fleet.code, fleet.reason);
 }
 
-/** Interactive: open the seat here, confirm Yu at the terminal if asked, and supervise the pipeline in a child. */
+/**
+ * Interactive: open the seat here and supervise the pipeline in a child. The
+ * seat is opened under the tick lock, so a person's seat and the tick's never
+ * run at once, and recorded as opened before the child starts, so the fleet
+ * ceiling and the due check count it. With --yu-present the child gets the
+ * terminal and confirms Yu itself; this process never holds a presence for it.
+ */
 async function verbSeatParent(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>): Promise<ExitCode> {
   const { config } = ctx;
   const halt = await haltNow(ctx);
@@ -590,59 +537,107 @@ async function verbSeatParent(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>)
     return EXIT.OK;
   }
   const citizen = await readCitizen(config, cmd.word);
-  // A citizen that stepped away, or ended, is not seated by anyone; Yu's offer to return goes by letter.
-  if (citizen.state === "stepped-away" || citizen.state === "ended") {
-    throw new Refusal("window-closed", `${cmd.word} is ${citizen.state}; no seat opens for it`);
+  // An ended citizen is a memorial; no seat opens for it. A citizen that stepped away is seated only by
+  // Yu's offer to return: a summons, or Yu's letter, which assertOwnBeatDue counts as due.
+  if (citizen.state === "ended") throw new Refusal("window-closed", `${cmd.word} has ended; no seat opens for it`);
+  // Yu is confirmed by the child at this terminal; with no terminal there is no one to confirm, so nothing opens.
+  if (cmd.yu_present && !ctx.deps.tty.isTTY) throw new Refusal("yu-not-present", "stdin is not a terminal, so Yu cannot be confirmed present");
+
+  let lock;
+  try {
+    lock = await acquireTickLock(config.paths.lock_dir, ctx.deps.clock, ctx.deps.isAlive, lockOptionsFor(config, ctx.deps.bootTime()));
+  } catch (e) {
+    if (e instanceof LockStuck) await note(ctx, "error", null, "error", null, `tick lock stuck since ${e.since}; a person must remove it`);
+    throw e;
   }
-  if (!cmd.yu_present) await assertOwnBeatDue(ctx, citizen);
-  let presence: YuPresence | null = null;
-  if (cmd.yu_present) presence = await confirmYuPresent(ctx.deps.tty, `summon ${cmd.word}`, () => now(ctx));
-  const invoker: Invoker = {
-    kind: "summons",
-    who: presence ? "yu" : "host",
-    why: cmd.why || (presence ? "Yu summoned this seat at the host" : "a person at the host opened this seat"),
-  };
-  const seat = await openSeat(config, ctx.deps.clock, citizen, cmd.runtime, invoker, presence);
-  const seatFile = await writeSeatFile(config, seat);
-  const t = config.timing;
-  const started = now(ctx);
-  const sup = await superviseChild({
-    argv: ctx.deps.seatArgv(ctx.configPath, cmd.word, ["--seat-ref", seatFile]),
-    cwd: config.paths.seats_dir,
-    env: seatEnv(config, ctx.deps.env),
-    deadline_ms: t.seat_deadline_s * 1000,
-    term_grace_ms: t.term_grace_s * 1000,
-    halt_file_poll_ms: t.halt_file_poll_s * 1000,
-    beacon_poll_min_ms: t.beacon_poll_min_s * 1000,
-    beacon_poll_max_ms: t.beacon_poll_max_s * 1000,
-    readHaltFile: () => readHaltFile(config.paths.halt_file, now(ctx)),
-    readBeacons: (signal) => readBeacons({ config, fetch: ctx.deps.fetch, now: () => now(ctx) }, signal),
-  });
-  // The child's own note says what happened to the citizen; the watcher knows only how it ended.
-  const own = ((await readHostNotes(config, new Date(started.getTime() - 1_000))) ?? []).filter((n) => n.word === cmd.word && n.kind !== "tick").at(-1) ?? null;
-  const outcome: Outcome = sup.signal !== null ? (sup.outcome ?? "error") : (own?.outcome ?? sup.outcome ?? "error");
-  if (sup.signal !== null) await note(ctx, "seat", cmd.word, outcome, null, `seat ${seat.ref.seat_id} stopped by ${sup.stopped_by ?? "the watcher"} (${sup.signal})`);
+  if (!lock) {
+    ctx.deps.out(`seat ${cmd.word}: yielded; a tick or another seat holds the lock, so try again shortly (exit 0)\n`);
+    return EXIT.OK;
+  }
+  let sup;
+  let outcome: Outcome;
+  let exit: ExitCode;
+  try {
+    if (!cmd.yu_present) await assertOwnBeatDue(ctx, citizen);
+    const invoker: Invoker = {
+      kind: "summons",
+      // "yu" only once the child has confirmed Yu; the file never names Yu.
+      who: "host",
+      why: cmd.why || (cmd.yu_present ? "Yu summoned this seat at the host" : "a person at the host opened this seat"),
+    };
+    const seat = await openSeat(config, ctx.deps.clock, citizen, cmd.runtime, invoker, null, { yuRequested: cmd.yu_present });
+    const id = seat.ref.seat_id;
+    await note(ctx, "seat", cmd.word, "opened", null, openedDetail(id, cmd.yu_present ? "yu-summons" : "by-hand"));
+    const seatFile = await writeSeatFile(config, seat);
+    const t = config.timing;
+    const started = now(ctx);
+    sup = await superviseChild({
+      argv: ctx.deps.seatArgv(ctx.configPath, cmd.word, ["--seat-ref", seatFile]),
+      cwd: config.paths.seats_dir,
+      env: seatEnv(config, ctx.deps.env),
+      stdin: cmd.yu_present ? "inherit" : "ignore",
+      deadline_ms: t.seat_deadline_s * 1000,
+      term_grace_ms: t.term_grace_s * 1000,
+      halt_file_poll_ms: t.halt_file_poll_s * 1000,
+      beacon_poll_min_ms: t.beacon_poll_min_s * 1000,
+      beacon_poll_max_ms: t.beacon_poll_max_s * 1000,
+      readHaltFile: () => readHaltFile(config.paths.halt_file, now(ctx)),
+      readBeacons: (signal) => readBeacons({ config, fetch: ctx.deps.fetch, now: () => now(ctx) }, signal),
+    });
+    // The child's own note says what happened to the citizen; the watcher knows only how it ended.
+    const after = (await readHostNotes(config, new Date(started.getTime() - 1_000))) ?? [];
+    const own = after.filter((n) => n.word === cmd.word && n.kind !== "tick" && isResultNote(n) && (seatIdOf(n) === null || seatIdOf(n) === id)).at(-1) ?? null;
+    exit = sup.exit;
+    if (sup.signal !== null) outcome = sup.outcome ?? "error";
+    else if (own) outcome = own.outcome;
+    else if (sup.outcome !== null) outcome = sup.outcome;
+    else {
+      // Exit 0 and no note: runSeat writes nothing only when it met HALT. Check rather than assume, as the tick does.
+      const h = await haltNow(ctx);
+      if (!h || h.halted) outcome = "halted";
+      else {
+        outcome = "error";
+        exit = EXIT.ERROR;
+      }
+    }
+    // The host's own record of how the seat ended, whatever the child managed to write.
+    const how = sup.stopped_by ? `, stopped by ${sup.stopped_by} (${sup.signal})` : "";
+    await note(ctx, "seat", cmd.word, outcome, own?.refusal ?? null, `seat ${id} ended: exit ${exit}${how}, ${sup.duration_ms} ms`);
+  } finally {
+    await releaseTickLock(lock);
+  }
   if (outcome === "beat") await mirrorAfterBeat(ctx, cmd.word);
   await refreshStatus(ctx, makeSigner(ctx)).catch(() => {});
-  ctx.deps.out(`seat ${cmd.word}: ${outcome} (exit ${sup.exit})\n`);
-  return sup.exit;
+  ctx.deps.out(`seat ${cmd.word}: ${outcome} (exit ${exit})\n`);
+  return exit;
 }
 
-/** The child: run the pipeline for a seat its parent opened (or, under a tick, open it here). */
+/**
+ * The child: run the pipeline for a seat its parent opened. A summons is
+ * confirmed here, at the terminal, by the process that acts on it. Any other
+ * seat is checked once more against the tick's own rule, leaving this seat
+ * out, so a hand-written seat file cannot add beats the citizen did not choose.
+ */
 async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>): Promise<ExitCode> {
   const { config } = ctx;
-  const citizen = await readCitizen(config, cmd.word);
-  let seat: OpenSeat;
-  if (cmd.seat_ref_path) {
-    // The seat file, written by the parent that opened the seat, is what names the runtime.
-    const { ref, presence } = await readSeatFile(config, cmd.seat_ref_path, cmd.word, now(ctx));
-    seat ={ ref, citizen, cwd: join(config.paths.seats_dir, ref.seat_id), presence };
+  // The seat file, written by the parent that opened the seat, is what names the runtime and the invoker.
+  const opened = await readSeatFile(config, cmd.seat_ref_path!, cmd.word);
+  const citizen = await readCitizen(config, cmd.word, { exceptSeat: opened.ref.seat_id });
+  if (citizen.state === "ended") throw new Refusal("window-closed", `${cmd.word} has ended; no seat opens for it`);
+  let ref = opened.ref;
+  let presence: YuPresence | null = null;
+  if (opened.yu_requested) {
+    presence = await confirmYuPresent(ctx.deps.tty, `summon ${cmd.word}`, () => now(ctx));
+    ref = { ...ref, invoker: { ...ref.invoker, who: "yu" } };
   } else {
-    const invoker: Invoker = { kind: "tick", who: "launchd", why: cmd.why === "letter" ? "a letter from someone you allow arrived" : cmd.why === "cadence" || cmd.why === "" ? "your own cadence is due" : cmd.why };
-    seat = await openSeat(config, ctx.deps.clock, citizen, cmd.runtime, invoker, null);
+    await assertOwnBeatDue(ctx, citizen, ref.seat_id);
   }
+  const seat: OpenSeat = { ref, citizen, cwd: join(config.paths.seats_dir, ref.seat_id), presence };
   const signer = makeSigner(ctx);
   const runtime = await ctx.deps.runtime(config, seat, signer);
+  // The free lane is pinned by digest, so the prompt can say before the reply whether a self-change could bind.
+  const lock = ref.runtime === "free" ? await loadModelsLock(config.paths.models_lock).catch(() => null) : null;
+  const pinned = lock?.models[0]?.digest;
   const result = await runSeat(seat, {
     config,
     clock: ctx.deps.clock,
@@ -652,6 +647,7 @@ async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>):
     checkHalt: () => checkHalt({ config, fetch: ctx.deps.fetch, now: () => now(ctx) }),
     // No adapter yet carries a bound self-change to a registered citizen's expression; self.ts then refuses rather than skip it.
     expressionSync: null,
+    modelDigest: pinned && /^[0-9a-f]{64}$/.test(pinned) ? `sha256:${pinned}` : null,
   });
   return result.exit;
 }

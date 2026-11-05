@@ -5,7 +5,7 @@ import { constants } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalJson, domainDigest, parseStrictJson, toHex, utf8 } from "../crypto.ts";
-import { Refusal, SHA256_HEX_PATTERN, type ConsentClass, type ConsentRecord, type SignerOp, type StandingAgreement, type YuPresence } from "../types.ts";
+import { Refusal, SHA256_HEX_PATTERN, type ConsentClass, type ConsentRecord, type ProposalText, type SignerOp, type StandingAgreement, type YuPresence } from "../types.ts";
 
 export type ConsentVerdict = { ok: true; via: ConsentRecord["yu"]["via"] } | { ok: false; code: "consent-missing" | "consent-rejected"; reason: string };
 
@@ -94,7 +94,7 @@ export function consentRecordProblem(v: unknown): string | null {
 }
 
 /** The sha256 a consent record binds to: domain-tagged canonical JSON of the proposal. */
-export function proposalDigest(proposal: { subject: string; body: string; extent: string }): string {
+export function proposalDigest(proposal: ProposalText): string {
   const { subject, body, extent } = proposal;
   if (typeof subject !== "string" || typeof body !== "string" || typeof extent !== "string") {
     throw new Error("proposalDigest: subject, body and extent must be strings");
@@ -134,12 +134,42 @@ export function verifyConsent(record: ConsentRecord, proposalSha256: string, now
   return { ok: true, via: record.yu.via };
 }
 
-/** Does a standing agreement cover this op at this extent? Anything beyond its extent is a new proposal. */
+/**
+ * Does a standing agreement cover this op at this extent? Anything beyond its
+ * extent is a new proposal. The record is checked against the digest of the
+ * agreement's own proposal text, never against the digest the record names,
+ * so a record bound to some other proposal (or to none) covers nothing.
+ */
 export function agreementCovers(agreement: StandingAgreement, op: SignerOp, extent: string, now: Date): boolean {
   if (!isPlainObject(agreement) || !Array.isArray(agreement.covers) || !agreement.covers.includes(op)) return false;
   // Extents are compared exactly. A looser match would let an agreement be read as covering more than was agreed.
   if (typeof extent !== "string" || agreement.extent !== extent || agreement.consent?.extent !== agreement.extent) return false;
-  return verifyConsent(agreement.consent, agreement.consent.proposal_sha256, now).ok;
+  const p = agreement.proposal;
+  if (!isPlainObject(p) || typeof p.subject !== "string" || typeof p.body !== "string" || p.extent !== agreement.extent) return false;
+  return verifyConsent(agreement.consent, proposalDigest(p), now).ok;
+}
+
+/**
+ * The decision record filed for exactly this proposal text: the digest is
+ * computed here, from the text, and the record is read from
+ * `<dir>/<digest>.json` as a regular file. Null when none is filed, or the
+ * file is not a well-formed record bound to that digest. A caller never hands
+ * a record in; it can only name the proposal.
+ */
+export async function readConsentFor(dir: string, proposal: ProposalText): Promise<ConsentRecord | null> {
+  let digest: string;
+  try {
+    digest = proposalDigest(proposal);
+  } catch {
+    return null;
+  }
+  try {
+    const st = await lstat(dir);
+    if (!st.isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return readRecord(join(dir, `${digest}.json`), `${digest}.json`);
 }
 
 /** Load decision records from the consent dir: regular files only, strict JSON, invalid ones skipped and reported. */

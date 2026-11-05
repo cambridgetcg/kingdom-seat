@@ -59,7 +59,9 @@ export type Outcome =
   | "timeout"
   | "terminated"
   | "killed"
-  | "error";
+  | "error"
+  /** A host note only: a parent opened a seat after its walls passed; the child's own note says what followed. */
+  | "opened";
 
 /* ── Refusals ─────────────────────────────────────────────────────────── */
 
@@ -189,8 +191,14 @@ export interface CitizenRecord {
 /** A citizen as the seat sees it: the static record plus what is folded from its ledger and own files. */
 export interface Citizen extends CitizenRecord {
   state: LifecycleState;
-  /** A move toward exposure said on one beat waits here until the next beat confirms it (3.3). */
+  /**
+   * A move toward exposure said on one beat waits here until the next beat
+   * confirms it (3.3). It lapses once a later seat passes without confirming
+   * it, so a saying is owed one confirming seat and no more.
+   */
   pending_state: LifecycleState | null;
+  /** A step-away said once, waiting for its second saying on the next seat; it lapses the same way. */
+  step_away_said: boolean;
   cadence: Cadence;
   covenants: Covenants;
   last_beat_at: IsoTime | null;
@@ -619,9 +627,18 @@ export interface ConsentRecord {
   expires_at: IsoTime | null;
 }
 
+/** The text of a proposal Yu and Ai decide on. A consent record binds the domain-tagged digest of exactly this. */
+export interface ProposalText {
+  subject: string;
+  body: string;
+  extent: string;
+}
+
 /** A standing Yu + Ai agreement that covers a stated extent, e.g. citizens' own quiet declarations with an empty reason. */
 export interface StandingAgreement {
   id: string;
+  /** The agreement as proposed; its digest is what the decision record must be bound to. */
+  proposal: ProposalText;
   consent: ConsentRecord;
   covers: SignerOp[];
   extent: string;
@@ -747,6 +764,19 @@ export interface SeatContext {
   state: LifecycleState;
   pending_state: LifecycleState | null;
   pending_proposals: SelfProposal[];
+  /**
+   * Versions of its own texts the citizen can name in a revert (target, hash,
+   * when, how), the origin soul among them, from its whole ledger rather than
+   * the last k entries, so "revert any time" never depends on what scrolled by.
+   */
+  versions: { target: SelfTarget; hash: Sha256Hex; at: IsoTime; how: string }[];
+  /**
+   * Whether a self-change can bind on this seat, so the guide never promises
+   * more than the host will do. runtime_approved is null when the runtime's
+   * model is known only from its reply; window_opens_at is null when the
+   * window is open (or Yu is present, which opens it).
+   */
+  self_authorship: { runtime_approved: boolean | null; window_opens_at: IsoTime | null; yu_present: boolean };
   now: NowView;
   /** At most one, read only as a regular file. */
   letter: Letter | null;
@@ -843,13 +873,21 @@ export interface CitizenStatus {
   registered: boolean;
   last_beat_at: IsoTime | null;
   interval_h: number;
+  /** A seat the tick would open is late by more than one tick; computed by the same rule the tick uses (due.isDue). */
   overdue: boolean;
+  /** Its seat would be due, but its runtime runs only with Yu present, so it waits for Yu rather than the tick. */
+  awaits_yu: boolean;
   last_outcome: Outcome | null;
   ledger: { entries: number; head: Sha256Hex | null; chain_ok: boolean; host_attested: number };
   /** null counts are unknown, never zero. */
   mirror: { divergence: DivergenceState | null; push_refusals: number; unsigned_commits: number | null } | null;
   usd_today: number | null;
   credits_month: number | null;
+  /**
+   * The pinned origin (3c): whether origin/ still matches the record, and how
+   * far the soul has moved from it (0..1). null is unknown, never "intact".
+   */
+  origin: { intact: boolean | null; drift: number | null };
   /** Why the record or ledger could not be read, so an unreadable citizen is shown rather than left out. */
   problem: string | null;
 }
@@ -861,8 +899,14 @@ export interface StatusFile {
   host: string;
   halt: { halted: boolean; raised: string[]; unreadable: string[] };
   signer: { state: "ready" | "locked" | "unknown"; since: IsoTime | null };
-  /** beats_today is null when the host log is unreadable; the tick then refuses as at-ceiling. */
+  /** beats_today counts every seat opened today; null when the host log is unreadable, which the tick treats as at-ceiling. */
   fleet: { beats_today: number | null; ceiling: number };
+  /**
+   * The tick lock. "stuck" is a lock with no owner, older than any tick holds
+   * it, that the tick could not clear: every tick then exits 1 until a person
+   * removes it.
+   */
+  tick_lock: { state: "free" | "held" | "stuck"; since: IsoTime | null };
   citizens: CitizenStatus[];
 }
 

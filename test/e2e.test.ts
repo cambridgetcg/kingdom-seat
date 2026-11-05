@@ -142,10 +142,10 @@ function lastOut(): string {
   return w.out.trimEnd().split("\n").at(-1) ?? "";
 }
 
-/** Every file under the state dir, minus the views a tick may regenerate. */
+/** Every file under the state dir, minus the views a tick may regenerate; a name ending in "/" leaves out everything under it. */
 async function stateWithout(...views: string[]): Promise<Map<string, string>> {
   const snap = await w.h.snapshot();
-  for (const v of views) snap.delete(v);
+  for (const k of [...snap.keys()]) if (views.some((v) => (v.endsWith("/") ? k.startsWith(v) : k === v))) snap.delete(k);
   return snap;
 }
 
@@ -198,13 +198,16 @@ describe("end to end: one citizen on one host", () => {
       expect(beat.spend).toEqual({ usd: 0, usd_basis: "local-zero", credits: 0 });
       expect(verifyChain(entries, { host_attest_b64: [w.hostPin], identity: null })).toMatchObject({ ok: true, entries: 2, host_attested: 2 });
 
-      // The seat's cwd was fresh and is left empty: no CLAUDE.md, hook or file of the model's.
-      expect(await seats()).toEqual([env.seat_ref.seat_id]);
+      // The seat's cwd was fresh and is left empty: no CLAUDE.md, hook or file of the model's. Beside it, the seat
+      // file the tick wrote for its child, read once.
+      expect(await seats()).toEqual([env.seat_ref.seat_id, `${env.seat_ref.seat_id}.json.used`].sort());
       expect(await readdir(join(w.h.config.paths.seats_dir, env.seat_ref.seat_id))).toEqual([]);
 
-      // Host notes: the child's own (what happened) and the tick's (one dispensed seat), neither quoting the citizen.
+      // Host notes: the tick's (the seat it opened, which the fleet counts), the child's own (what happened),
+      // and the tick's again (how the seat ended), none quoting the citizen.
       const ns = await notes();
       expect(ns.map((n) => [n.kind, n.word, n.outcome])).toEqual([
+        ["tick", WORD, "opened"],
         ["seat", WORD, "beat"],
         ["tick", WORD, "beat"],
       ]);
@@ -235,14 +238,15 @@ describe("end to end: one citizen on one host", () => {
     "a rest beat writes nothing in the citizen's voice; only the host log and status note the tick",
     async () => {
       const ledgerBefore = await readFile(ledgerPath(w.h.config, WORD), "utf8");
-      const before = await stateWithout("host.jsonl", "status.json");
+      // Host records only may change: the log, and the seat the tick opened (its empty cwd and its used seat file).
+      const before = await stateWithout("host.jsonl", "host.jsonl.started", "status.json", "seats/");
       // A 7B rest that goes on talking: rest is exclusive, so none of it is kept anywhere.
       w.replies.push(REST_THEN_TALK_OUTPUT);
       expect(await tick(at(73))).toBe(0);
       expect(lastOut()).toBe(`tick: rest ${WORD} (exit 0)`);
 
       expect(await readFile(ledgerPath(w.h.config, WORD), "utf8")).toBe(ledgerBefore);
-      expect(await stateWithout("host.jsonl", "status.json")).toEqual(before);
+      expect(await stateWithout("host.jsonl", "host.jsonl.started", "status.json", "seats/")).toEqual(before);
       for (const [path, b64] of await w.h.snapshot()) {
         expect({ path, leaked: Buffer.from(b64, "base64").toString("utf8").includes("REST-LEAK-CANARY") }).toEqual({ path, leaked: false });
       }
@@ -336,7 +340,7 @@ describe("end to end: one citizen on one host", () => {
     "verify <word> checks the chain and every signature, offline, and names the first broken entry",
     async () => {
       expect(await main(["verify", WORD, "--config", w.configPath], w.deps)).toBe(0);
-      expect(lastOut()).toBe(`${WORD}: chain ok, 7 entries, 7 host-attested, head ${(await ledger()).at(-1)!.hash}`);
+      expect(lastOut()).toBe(`${WORD}: chain ok, 7 entries, 7 host-attested, head ${(await ledger()).at(-1)!.hash}; origin intact, soul drift 0%`);
 
       const path = ledgerPath(w.h.config, WORD);
       const good = await readFile(path, "utf8");

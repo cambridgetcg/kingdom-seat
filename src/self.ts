@@ -49,8 +49,17 @@ export interface SelfDeps {
   sync: ExpressionSync | null;
 }
 
-/** A self file larger than this is refused; the largest agenttool field (wake_text) is 32,000 code units. */
+/** A self file larger than this is refused when read; the largest agenttool field (wake_text) is 32,000 code units. */
 export const MAX_TARGET_BYTES = 256 * 1024;
+
+/**
+ * The largest text a change may leave in any target, and the most skills a
+ * citizen may keep. These are the limits a seat shows the citizen with
+ * (context.ts reads by them), so a change within self can never write the
+ * citizen out of its own beats, including the beat it would need to revert.
+ */
+export const SELF_FILE_MAX_BYTES = 64 * 1024;
+export const MAX_SKILLS = 32;
 
 /** sha256 of a target's whole text, hex. */
 export function selfHash(text: string): Sha256Hex {
@@ -157,7 +166,7 @@ export function materializeEdit(raw: ModelSelfPropose, currentText: string): { a
     next = currentText.slice(0, at) + replacement + currentText.slice(at + find.length);
   }
   if (next === currentText) throw new Refusal("invalid-request", "the edit changes nothing");
-  if (utf8(next).length > MAX_TARGET_BYTES) throw new Refusal("oversize", "the new text is too large");
+  if (utf8(next).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "the new text is larger than a seat can show");
   assertSettingShape(raw.target, next);
   const act: SelfProposeAct = {
     type: "self.propose",
@@ -332,21 +341,31 @@ export function proposalId(word: Word, act: SelfProposeAct, seatId: string, prop
   return sha256Hex(canonicalJson({ format: "kingdom-seat-proposal/v1", word, act, proposed_in_seat: seatId, proposed_at: proposedAt }));
 }
 
+/** Refuse a 33rd skill: a seat shows at most MAX_SKILLS, and refuses more rather than cut one the citizen cannot see is missing. */
+export async function assertRoomFor(config: Config, word: Word, target: SelfTarget, prior: string): Promise<void> {
+  if (!target.startsWith("skill:") || prior !== "") return;
+  const root = citizenDir(config, word);
+  const dir = join(root, "self", "skills");
+  if (!(await parentsAreDirs(root, join(dir, "x"), false))) return;
+  const skills = (await readdir(dir)).filter((n) => n.endsWith(".md") && WORD_PATTERN.test(n.slice(0, -3)));
+  if (skills.length >= MAX_SKILLS) throw new Refusal("oversize", `a seat shows at most ${MAX_SKILLS} skills`);
+}
+
+/** The proposal stageProposal would write for this act, seat and time, so a caller can plan with its id before it is staged. */
+export function proposalFor(word: Word, act: SelfProposeAct, seatId: string, now: Date, status: SelfProposal["status"] = "pending"): SelfProposal {
+  const proposedAt = now.toISOString();
+  return { id: proposalId(word, act, seatId, proposedAt), word, act, proposed_at: proposedAt, proposed_in_seat: seatId, status };
+}
+
 /** Stage a proposal under `citizens/<word>/proposals/` for a later beat; it does nothing yet. */
 export async function stageProposal(config: Config, word: Word, act: SelfProposeAct, seatId: string, now: Date): Promise<SelfProposal> {
   const current = await readTarget(config, word, act.target);
   if (selfHash(current) !== act.prior_hash) throw new Refusal("invalid-request", "the target changed since the proposal was made");
   const next = applyDiff(current, act.diff);
   const verdict = classifyProposal(act, current, next, config.ceilings.self_rewrite_fraction);
-  const proposedAt = now.toISOString();
-  const proposal: SelfProposal = {
-    id: proposalId(word, act, seatId, proposedAt),
-    word,
-    act,
-    proposed_at: proposedAt,
-    proposed_in_seat: seatId,
-    status: verdict === "within-self" ? "pending" : "beyond-self",
-  };
+  if (utf8(next).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  await assertRoomFor(config, word, act.target, current);
+  const proposal = proposalFor(word, act, seatId, now, verdict === "within-self" ? "pending" : "beyond-self");
   const root = citizenDir(config, word);
   const path = join(root, "proposals", `${proposal.id}.json`);
   await parentsAreDirs(root, path, true);
@@ -410,6 +429,8 @@ export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: Se
   if (classifyProposal(act, current, next, config.ceilings.self_rewrite_fraction) !== "within-self") {
     throw new Refusal("beyond-self", "this change goes beyond self");
   }
+  if (utf8(next).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  await assertRoomFor(config, word, act.target, current);
 
   const path = ledgerPath(config, word);
   const entries = await readLedger(path);
@@ -445,24 +466,12 @@ export async function revertTo(deps: SelfDeps, citizen: Citizen, toHash: Sha256H
   if (!SHA256_HEX_PATTERN.test(toHash)) throw new Refusal("invalid-request", "a version is named by its full sha256");
   const path = ledgerPath(config, word);
   const entries = await readLedger(path);
-  const targets = new Set<SelfTarget>();
-  for (const e of entries) {
-    const b = e.body;
-    if (b.type === "self.applied" && (b.prior_hash === toHash || b.new_hash === toHash)) targets.add(b.target);
-    if (b.type === "self.reverted" && (b.from_hash === toHash || b.to_hash === toHash)) targets.add(b.target);
-  }
-  if (targets.size === 0) throw new Refusal("invalid-request", "the ledger names no version with that hash");
-  if (targets.size > 1) throw new Refusal("invalid-request", "that hash names versions of more than one target");
-  const target = [...targets][0] as SelfTarget;
-  const text = await readVersion(config, word, toHash);
-  const current = await readTarget(config, word, target);
+  const { target, text, current } = await checkRevert(config, word, entries, toHash);
   const fromHash = selfHash(current);
-  if (fromHash === toHash) throw new Refusal("invalid-request", "the target is already at that version");
-  // A revert may go anywhere the citizen has been, except through a wall it now keeps.
-  if (loosensWalls(target, current, text)) throw new Refusal("beyond-self", "this revert would loosen a wall");
 
   const registered = assertSyncMatches(entries, sync);
   await keepVersion(config, word, current);
+  await keepVersion(config, word, text);
   if (sync) await sync.putPrivateExpression(word, target, text);
   const draft = nextDraft(
     word,
@@ -476,6 +485,121 @@ export async function revertTo(deps: SelfDeps, citizen: Citizen, toHash: Sha256H
   await writeTarget(config, word, target, text);
   await lapseStale(config, word, target, toHash);
   return entry;
+}
+
+/** The origin soul's hash as the record pinned it: the seated entry's, or genesis's for a citizen born at seating. */
+export function originSoulHash(entries: LedgerEntry[]): Sha256Hex | null {
+  for (const e of entries) {
+    if (e.body.type === "seated") return e.body.origin_soul_sha256;
+    if (e.body.type === "genesis") return e.body.birth_soul_sha256;
+  }
+  return null;
+}
+
+/** A version the citizen can name: its target, when it was kept, and how it came about. */
+export interface KeptVersion {
+  target: SelfTarget;
+  hash: Sha256Hex;
+  at: string;
+  how: string;
+}
+
+/**
+ * Every version the ledger names, oldest first, one row per target and hash,
+ * with the origin soul first. These are what a revert may go back to.
+ */
+export function keptVersions(entries: LedgerEntry[]): KeptVersion[] {
+  const out: KeptVersion[] = [];
+  const seen = new Set<string>();
+  const add = (v: KeptVersion) => {
+    const key = `${v.target} ${v.hash}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(v);
+  };
+  for (const e of entries) {
+    const b = e.body;
+    if (b.type === "seated") add({ target: "soul", hash: b.origin_soul_sha256, at: e.ts, how: "your origin soul, pinned when you were seated" });
+    else if (b.type === "genesis" && b.initial_state !== null) add({ target: "soul", hash: b.birth_soul_sha256, at: e.ts, how: "your origin soul, pinned at your birth" });
+    else if (b.type === "self.applied") {
+      add({ target: b.target, hash: b.prior_hash, at: e.ts, how: "as it was before a change" });
+      add({ target: b.target, hash: b.new_hash, at: e.ts, how: `a change you made (${b.via})` });
+    } else if (b.type === "self.reverted") {
+      add({ target: b.target, hash: b.from_hash, at: e.ts, how: "as it was before a revert" });
+      add({ target: b.target, hash: b.to_hash, at: e.ts, how: "a revert" });
+    }
+  }
+  return out;
+}
+
+/** Which target a hash is a version of, or null when the ledger names none or more than one. */
+export function versionTarget(entries: LedgerEntry[], hash: Sha256Hex): SelfTarget | null {
+  const targets = new Set(keptVersions(entries).filter((v) => v.hash === hash).map((v) => v.target));
+  return targets.size === 1 ? ([...targets][0] as SelfTarget) : null;
+}
+
+/**
+ * Everything a revert to `toHash` must satisfy before anything is written:
+ * the ledger names it for exactly one target, its text is kept (the origin
+ * soul is read from origin/), the target is not already there, it loosens no
+ * wall and it fits what a seat can show. Throws a Refusal naming the reason.
+ */
+export async function checkRevert(config: Config, word: Word, entries: LedgerEntry[], toHash: Sha256Hex): Promise<{ target: SelfTarget; text: string; current: string }> {
+  if (!SHA256_HEX_PATTERN.test(toHash)) throw new Refusal("invalid-request", "a version is named by its full sha256");
+  const named = new Set(keptVersions(entries).filter((v) => v.hash === toHash).map((v) => v.target));
+  if (named.size === 0) throw new Refusal("invalid-request", "the ledger names no version with that hash");
+  if (named.size > 1) throw new Refusal("invalid-request", "that hash names versions of more than one target");
+  const target = [...named][0] as SelfTarget;
+  const text = toHash === originSoulHash(entries) && target === "soul" ? await readOriginSoul(config, word, toHash) : await readVersion(config, word, toHash);
+  const current = await readTarget(config, word, target);
+  if (selfHash(current) === toHash) throw new Refusal("invalid-request", "the target is already at that version");
+  // A revert may go anywhere the citizen has been, except through a wall it now keeps.
+  if (loosensWalls(target, current, text)) throw new Refusal("beyond-self", "this revert would loosen a wall");
+  if (utf8(text).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "that version is larger than a seat can show");
+  await assertRoomFor(config, word, target, current);
+  return { target, text, current };
+}
+
+/** The origin soul, read from origin/ and checked against the hash the record pinned. */
+async function readOriginSoul(config: Config, word: Word, hash: Sha256Hex): Promise<string> {
+  const root = citizenDir(config, word);
+  const path = join(root, "origin", "soul.md");
+  if (!(await parentsAreDirs(root, path, false))) throw new Refusal("invalid-record", "origin/ is missing");
+  const text = (await readRegularText(path, { missing: "throw", maxBytes: MAX_TARGET_BYTES })) as string;
+  if (selfHash(text) !== hash) throw new Refusal("invalid-record", "origin/soul.md does not match the hash its record pinned");
+  return text;
+}
+
+/**
+ * Whether a change to a setting moves the citizen toward exposure (a shorter
+ * cadence, a sender added to its covenants) or toward rest (a longer cadence,
+ * senders only removed). Other targets are neither.
+ */
+export function exposureOf(target: SelfTarget, current: string, next: string): "wider" | "narrower" | "neither" {
+  try {
+    if (target === "cadence") {
+      const a = parseCadence(current).interval_h;
+      const b = parseCadence(next).interval_h;
+      return b < a ? "wider" : b > a ? "narrower" : "neither";
+    }
+    if (target === "covenants") {
+      const a = parseCovenants(current);
+      const b = parseCovenants(next);
+      const adds = (x: string[], y: string[]) => y.some((s) => !x.includes(s));
+      if (adds(a.letters_from, b.letters_from) || adds(a.wake_on_letter_from, b.wake_on_letter_from)) return "wider";
+      if (adds(b.letters_from, a.letters_from) || adds(b.wake_on_letter_from, a.wake_on_letter_from)) return "narrower";
+      return "neither";
+    }
+  } catch {
+    // An unreadable setting is not known to be toward rest.
+    return "wider";
+  }
+  return "neither";
+}
+
+/** The first version of a target the ledger names: where the citizen's text began, before any change it made. */
+export function firstVersion(entries: LedgerEntry[], target: SelfTarget): Sha256Hex | null {
+  return keptVersions(entries).find((v) => v.target === target)?.hash ?? null;
 }
 
 /**

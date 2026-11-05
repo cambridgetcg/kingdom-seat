@@ -2,6 +2,17 @@
 // signer and citizen-birth hold one. Secrets cross the process boundary on a
 // pipe, never in argv or env (runtimes-and-host.md 3.3), and a locked
 // keychain after a reboot is a normal, fail-closed state (3.4).
+//
+// What this does not do: make the signer the only reader. A legacy keychain
+// ACL is checked against the process that asks, and every read here is asked
+// by /usr/bin/security, not by the signer. So the items are ACL'd to
+// /usr/bin/security on purpose (otherwise no unattended read could succeed),
+// and any process running as the seat user can read them the same way. The
+// custody boundary is the seat user's account and its keychain's lock, not a
+// binary. Making the signer the only reader needs a signer binary that creates
+// and reads its items itself through the Security framework (SecItemAdd,
+// SecItemCopyMatching); that is not built yet. The trusted_app entry is kept
+// on every item so such a signer can read them without a migration.
 import { utf8, wipe } from "../crypto.ts";
 import { Refusal, WORD_PATTERN, type CommandRunner, type Keychain, type KeychainItemName } from "../types.ts";
 
@@ -12,7 +23,11 @@ export interface MacosKeychainOptions {
   service: string;
   /** Always /usr/bin/security; launchd's PATH is not trusted. */
   securityPath: "/usr/bin/security";
-  /** The signer binary that items are ACL'd to with -T; null refuses every write. */
+  /**
+   * The future signer binary, named with -T beside /usr/bin/security so it can
+   * read the items once it reads them itself. It does not narrow who can read
+   * them today (see the note at the top). Null refuses every write.
+   */
   trustedApp: string | null;
   /** Injected so tests can check argv and stdin without touching a real keychain. */
   run: CommandRunner;
@@ -79,16 +94,20 @@ function hasArgv(opts: Pick<MacosKeychainOptions, "keychainPath" | "service" | "
 
 const HEX = utf8("0123456789abcdef");
 
+/** The program every read in this module goes through, and so the one the ACL must trust for a read to succeed unattended. */
+export const KEYCHAIN_READER = "/usr/bin/security";
+
 /** The stdin command line for writing one item via `security -i`; the secret travels here as hex, never in argv. */
 export function writeCommand(opts: Pick<MacosKeychainOptions, "keychainPath" | "service" | "trustedApp">, item: KeychainItemName, secret: Uint8Array): Uint8Array {
   if (opts.trustedApp === null) throw new Refusal("invalid-request", "no trusted signer binary is configured, so no item may be written");
   assertAbsolute(opts.trustedApp, "the trusted app");
   assertAbsolute(opts.keychainPath, "the keychain path");
   if (!(secret instanceof Uint8Array) || secret.length === 0) throw new Refusal("invalid-request", "a secret must be non-empty bytes");
-  // No -U: an existing item is never overwritten. -T names the one binary that may read it silently.
-  const head = utf8(
-    `add-generic-password -s ${quotable(opts.service, "the service")} -a ${quotable(itemAccount(item), "the account")} -T ${quotable(opts.trustedApp, "the trusted app")} -X `,
-  );
+  // No -U: an existing item is never overwritten. Reads go through /usr/bin/security, so it is named
+  // explicitly rather than left to whatever -T does to the creator's own entry: the item is then
+  // readable unattended, by design, by any process of the seat user.
+  const apps = [...new Set([KEYCHAIN_READER, opts.trustedApp])].map((a) => `-T ${quotable(a, "the trusted app")}`).join(" ");
+  const head = utf8(`add-generic-password -s ${quotable(opts.service, "the service")} -a ${quotable(itemAccount(item), "the account")} ${apps} -X `);
   const tail = utf8(` ${quotable(opts.keychainPath, "the keychain path")}\n`);
   // The hex is written straight into the buffer, so the secret never exists as an unwipeable string.
   const out = new Uint8Array(head.length + secret.length * 2 + tail.length);
@@ -127,7 +146,11 @@ function failure(verb: string, code: number, stderr: string): Error {
   return new Error(`${verb}: security exited ${code}`);
 }
 
-/** A Keychain that reads with `security find-generic-password -w` and writes through `security -i` on stdin with -X hex. */
+/**
+ * A Keychain that reads with `security find-generic-password -w` and writes
+ * through `security -i` on stdin with -X hex. Anything running as the seat
+ * user can read these items the same way; see the note at the top.
+ */
 export function macosKeychain(opts: MacosKeychainOptions): Keychain {
   if (opts.securityPath !== "/usr/bin/security") throw new Error("macosKeychain: securityPath must be /usr/bin/security");
   assertAbsolute(opts.keychainPath, "the keychain path");

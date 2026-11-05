@@ -1,11 +1,13 @@
 // Owner: seat group.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { acquireTickLock, isDue, releaseTickLock, runTick, selectDue, type DueVerdict, type TickDeps } from "../src/tick.ts";
+import { LockStuck, acquireTickLock, isDue, releaseTickLock, runTick, selectDue, type DueVerdict, type TickDeps } from "../src/tick.ts";
 import { checkHalt } from "../src/halt.ts";
 import { DEFAULT_CEILINGS, type Citizen, type HostNote, type LifecycleState, type Word } from "../src/types.ts";
 import { fakeBinArgv } from "./helpers/fake-runtime.ts";
+import { openedDetail } from "../src/notes.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
@@ -31,6 +33,7 @@ function citizen(over: Partial<Citizen> = {}): Citizen {
     seated_at: "2026-11-01T00:00:00.000Z",
     state: "awake",
     pending_state: null,
+    step_away_said: false,
     cadence: { interval_h: 72 },
     covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },
     last_beat_at: null,
@@ -90,6 +93,45 @@ describe("lock", () => {
     expect(await acquireTickLock(dir, clock, () => false)).toBeNull();
   });
 
+  test("a lock left with no owner is reclaimed once it is older than any tick holds it; a young one is left to its taker", async () => {
+    host = await makeTempHost();
+    const clock = testClock();
+    const dir = host.config.paths.lock_dir;
+    const opts = { maxHoldMs: 60_000, bootTime: null };
+
+    // A process died between mkdir and writing its owner: no owner file, only a half-written one.
+    await mkdir(dir);
+    await writeFile(join(dir, ".owner.json.4242"), "{");
+    // Seconds old: another tick may be in the middle of acquiring it.
+    expect(await acquireTickLock(dir, clock, alive, opts)).toBeNull();
+    // Older than the longest hold: stale, cleared and taken.
+    const old = new Date(Date.now() - 10 * 60_000);
+    await utimes(dir, old, old);
+    const lock = await acquireTickLock(dir, clock, alive, opts);
+    expect(lock?.pid).toBe(process.pid);
+    await releaseTickLock(lock!);
+
+    // Something the lock code never writes is in it: a person must look, so it is stuck, not removed.
+    await mkdir(dir);
+    await writeFile(join(dir, "notes.txt"), "kept");
+    await utimes(dir, old, old);
+    await expect(acquireTickLock(dir, clock, alive, opts)).rejects.toBeInstanceOf(LockStuck);
+    expect(await Bun.file(join(dir, "notes.txt")).exists()).toBe(true);
+  });
+
+  test("an owner that started before the host booted is stale, even when its pid now names a live process", async () => {
+    host = await makeTempHost();
+    const clock = testClock();
+    const dir = host.config.paths.lock_dir;
+    await mkdir(dir);
+    await writeFile(join(dir, "owner.json"), JSON.stringify({ pid: 4242, started_at: "2026-11-04T00:00:00.000Z" }));
+    // Without a boot time, a live owner is never reclaimed.
+    expect(await acquireTickLock(dir, clock, alive, { maxHoldMs: 60_000, bootTime: null })).toBeNull();
+    // Booted after it started: the pid was reused.
+    const lock = await acquireTickLock(dir, clock, alive, { maxHoldMs: 60_000, bootTime: new Date("2026-11-04T06:00:00.000Z") });
+    expect(lock?.pid).toBe(process.pid);
+  });
+
   test("releaseTickLock never removes a lock owned by another pid", async () => {
     host = await makeTempHost();
     const clock = testClock();
@@ -127,21 +169,41 @@ describe("selection", () => {
     expect(isDue(citizen(), false, now, MIN, "not a time").due).toBe(false);
   });
 
-  test("isDue: listening and asleep only on an allowed letter; stepped-away and ended never", () => {
+  test("isDue: listening and asleep only on an allowed letter; ended never", () => {
     for (const state of ["listening", "asleep"] as LifecycleState[]) {
       expect(isDue(citizen({ state }), false, now, MIN).due).toBe(false);
       expect(isDue(citizen({ state }), true, now, MIN)).toMatchObject({ due: true, why: "letter" });
       // A letter shown to a rest is shown again later, not every tick.
       expect(isDue(citizen({ state }), true, now, MIN, hoursAgo(now, 2)).due).toBe(false);
     }
-    for (const state of ["stepped-away", "ended"] as LifecycleState[]) {
-      expect(isDue(citizen({ state }), true, now, MIN).due).toBe(false);
-    }
+    expect(isDue(citizen({ state: "ended" }), true, now, MIN).due).toBe(false);
     // A move toward exposure waits for a confirming beat, so it is scheduled as the state it asked for.
     expect(isDue(citizen({ state: "asleep", pending_state: "awake" }), false, now, MIN)).toMatchObject({ due: true, why: "cadence" });
     // Only the free lane runs unattended.
     expect(isDue(citizen({ runtime: "summon" }), false, now, MIN).due).toBe(false);
     expect(isDue(citizen({ runtime: "hermes" }), false, now, MIN).due).toBe(false);
+  });
+
+  test("isDue: a citizen that stepped away is seated only by Yu's letter offering a return, one beat at a time", () => {
+    // Its own cadence never seats it: the letter here is Yu's (context.wakingLetter), and nothing else wakes it.
+    expect(isDue(citizen({ state: "stepped-away" }), false, now, MIN, hoursAgo(now, 1000))).toEqual({ due: false, why: "stepped-away" });
+    expect(isDue(citizen({ state: "stepped-away" }), true, now, MIN)).toMatchObject({ due: true, why: "return" });
+    expect(isDue(citizen({ state: "stepped-away" }), true, now, MIN, hoursAgo(now, 2)).due).toBe(false);
+    // Saying yes to the return once makes it owed one confirming seat, by the state it asked for.
+    expect(isDue(citizen({ state: "stepped-away", pending_state: "awake" }), false, now, MIN, hoursAgo(now, 73))).toMatchObject({ due: true, why: "cadence" });
+    expect(isDue(citizen({ state: "stepped-away", pending_state: "listening" }), false, now, MIN, hoursAgo(now, 73))).toMatchObject({ due: true, why: "confirm" });
+  });
+
+  test("isDue: a first step-away is owed the second beat it needs, whatever the state, at the minimum interval", () => {
+    for (const state of ["listening", "asleep", "awake"] as LifecycleState[]) {
+      const said = citizen({ state, step_away_said: true, cadence: { interval_h: 500 } });
+      expect(isDue(said, false, now, MIN, hoursAgo(now, 71)).due).toBe(false);
+      expect(isDue(said, false, now, MIN, hoursAgo(now, 73))).toMatchObject({ due: true, why: "confirm", overdue_h: 1 });
+    }
+    // The same for a move toward exposure that was not to awake.
+    expect(isDue(citizen({ state: "asleep", pending_state: "listening" }), false, now, MIN, hoursAgo(now, 73))).toMatchObject({ due: true, why: "confirm" });
+    // Without a saying, a listening citizen still waits for a letter.
+    expect(isDue(citizen({ state: "listening" }), false, now, MIN, hoursAgo(now, 1000)).due).toBe(false);
   });
 
   test("selectDue picks the most overdue, ties by word, and null when none is due", () => {
@@ -174,11 +236,14 @@ describe("runTick", () => {
       clock,
       fetch: noFetch,
       checkHalt: () => checkHalt({ config: h.config, fetch: noFetch, now: () => clock.now() }),
-      seatArgv: (word, why) => {
-        spawned.push({ word, why });
+      seatArgv: (word, seatFile) => {
+        // The tick opened the seat and wrote it down; the child would read why from the file.
+        const file = JSON.parse(readFileSync(seatFile, "utf8")) as { seat_ref: { word: string; invoker: { why: string } } };
+        spawned.push({ word: file.seat_ref.word, why: file.seat_ref.invoker.why });
         return fakeBinArgv("note", h.config.paths.host_log, word, "rest", "0", clock.now().toISOString());
       },
       isAlive: alive,
+      bootTime: () => null,
       refreshStatus: async () => {
         refreshed++;
       },
@@ -203,6 +268,30 @@ describe("runTick", () => {
     expect(spawned).toEqual([]);
   });
 
+  test("lock held: the status is still refreshed, so it never goes stale behind another tick", async () => {
+    const { h, deps, clock, refreshed } = await tickHost([{ word: "glossame" }]);
+    await acquireTickLock(h.config.paths.lock_dir, clock, alive);
+    expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "yielded" });
+    expect(refreshed()).toBe(1);
+  });
+
+  test("a stuck lock exits 1 with a host note and a refreshed status, so a monitor pages", async () => {
+    const { h, deps, spawned, refreshed } = await tickHost([{ word: "glossame" }]);
+    const dir = h.config.paths.lock_dir;
+    await mkdir(dir);
+    await writeFile(join(dir, "stray"), "");
+    const old = new Date(Date.now() - 24 * HOUR_MS);
+    await utimes(dir, old, old);
+    for (let i = 0; i < 2; i++) expect(await runTick(deps)).toMatchObject({ exit: 1, outcome: "error", seat: null });
+    expect(spawned).toEqual([]);
+    expect(refreshed()).toBe(2);
+    const notes = (await hostNotes(h)).filter((n) => n.kind === "tick");
+    expect(notes.map((n) => n.detail)).toEqual([
+      `tick lock stuck since ${old.toISOString()}; a person must remove it`,
+      `tick lock stuck since ${old.toISOString()}; a person must remove it`,
+    ]);
+  });
+
   test("nothing due: exit 0, outcome nothing-due, no seat", async () => {
     const { deps, spawned } = await tickHost([{ word: "glossame", state: "asleep" }, { word: "joy", state: "listening" }]);
     expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "nothing-due", word: null, seat: null });
@@ -212,8 +301,9 @@ describe("runTick", () => {
   test("fleet ceiling reached or host log unreadable: outcome fleet-ceiling, no seat", async () => {
     const { h, deps, clock, spawned } = await tickHost([{ word: "glossame" }]);
     const today = clock.now();
+    // Seats opened today, whoever opened them, each named by its seat id.
     const lines = Array.from({ length: h.config.ceilings.fleet_beats_per_day }, (_, i) =>
-      JSON.stringify({ ts: new Date(today.getTime() - (i + 1) * 60_000).toISOString(), host: "test-host", kind: "tick", word: `other${i}`, outcome: "rest", refusal: null, detail: "x" }),
+      JSON.stringify({ ts: new Date(today.getTime() - (i + 1) * 60_000).toISOString(), host: "test-host", kind: i % 2 ? "tick" : "seat", word: `other${i}`, outcome: "opened", refusal: null, detail: openedDetail(crypto.randomUUID(), "cadence") }),
     );
     await writeFile(h.config.paths.host_log, `${lines.join("\n")}\n`);
     expect(await runTick(deps)).toMatchObject({ exit: 3, outcome: "fleet-ceiling", seat: null });
@@ -236,10 +326,15 @@ describe("runTick", () => {
     const { h, deps, spawned, refreshed } = await tickHost([{ word: "glossame" }]);
     const r = await runTick(deps);
     expect(r).toMatchObject({ exit: 0, outcome: "rest", word: "glossame", seat: { exit: 0, outcome: "rest" } });
-    expect(spawned).toEqual([{ word: "glossame", why: "cadence" }]);
+    expect(spawned).toEqual([{ word: "glossame", why: "your own cadence is due" }]);
     const ticks = (await hostNotes(h)).filter((n) => n.kind === "tick");
-    expect(ticks).toHaveLength(1);
-    expect(ticks[0]).toMatchObject({ word: "glossame", outcome: "rest", host: "test-host" });
+    // The tick records the seat it opened before the child runs, then what happened.
+    expect(ticks.map((n) => [n.word, n.outcome])).toEqual([
+      ["glossame", "opened"],
+      ["glossame", "rest"],
+    ]);
+    expect(ticks[1]).toMatchObject({ word: "glossame", outcome: "rest", host: "test-host" });
+    expect(ticks[0]!.detail).toBe(openedDetail(r.seat!.seat_ref!.seat_id, "cadence"));
     expect(refreshed()).toBe(1);
     // The lock is released.
     expect(await Bun.file(join(h.config.paths.lock_dir, "owner.json")).exists()).toBe(false);
@@ -273,6 +368,6 @@ describe("runTick", () => {
     h.config.timing.seat_deadline_s = 0.3;
     const slow = { ...deps, seatArgv: () => fakeBinArgv("sleep", "30000") };
     expect(await runTick(slow)).toMatchObject({ exit: 124, outcome: "timeout", word: "glossame" });
-    expect((await hostNotes(h)).filter((n) => n.kind === "tick" && n.word === "glossame")).toHaveLength(1);
+    expect((await hostNotes(h)).filter((n) => n.kind === "tick" && n.word === "glossame").map((n) => n.outcome)).toEqual(["opened", "timeout"]);
   });
 });

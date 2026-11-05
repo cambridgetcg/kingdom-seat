@@ -1,19 +1,22 @@
 // The generated status file (3.2 "Status file", 3.1 principle 6): written
 // from what the runner reads, never kept by hand. Per citizen it shows the
-// last beat against its interval, divergence, push refusals, unsigned commits
-// and spend. REGISTRY probes it. Host notes are the host's record of ticks,
-// rests and refusals; they never carry a citizen's voice or a model's words.
+// last beat against its interval (by the tick's own rule), divergence, push
+// refusals, unsigned commits, spend and the pinned origin. REGISTRY probes
+// it. Host notes, which it reads, live in notes.ts.
 import { constants } from "node:fs";
-import { chmod, mkdir, open, rename, rm } from "node:fs/promises";
+import { chmod, lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { NO_BEACONS_ID } from "./halt.ts";
 import { ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
 import { countUnsigned, localDivergence } from "./mirror.ts";
 import { spendFromLedger } from "./signer/ceilings.ts";
 import { foldState, listSeated, readCitizen, readCitizenRecord } from "./state.ts";
+import { wakingLetter } from "./context.ts";
+import { isDue } from "./due.ts";
+import { isResultNote, lastSeatOf, readHostNotes, seatsOpenedToday } from "./notes.ts";
+import { driftFromOrigin, originIntact } from "./self.ts";
 import {
   Refusal,
-  WORD_PATTERN,
   type Citizen,
   type CitizenRecord,
   type CitizenStatus,
@@ -24,9 +27,8 @@ import {
   type HostNote,
   type IsoTime,
   type LedgerEntry,
-  type Outcome,
-  type RefusalCode,
   type StatusFile,
+  type Timing,
   type Word,
 } from "./types.ts";
 
@@ -47,183 +49,8 @@ export interface StatusDeps {
 
 /* ── Host notes ───────────────────────────────────────────────────────── */
 
-const NOTE_KINDS = ["tick", "seat", "halt", "refusal", "push", "signer", "error"] as const satisfies readonly HostNote["kind"][];
-const OUTCOMES = [
-  "beat",
-  "rest",
-  "halted",
-  "nothing-due",
-  "yielded",
-  "fleet-ceiling",
-  "refused",
-  "invalid-output",
-  "timeout",
-  "terminated",
-  "killed",
-  "error",
-] as const satisfies readonly Outcome[];
-const REFUSAL_CODES = [
-  "halted",
-  "keychain-locked",
-  "keychain-missing",
-  "ceiling-usd",
-  "ceiling-credits",
-  "ceiling-fleet",
-  "ceiling-interval",
-  "quiet-cap",
-  "consent-missing",
-  "consent-rejected",
-  "beyond-self",
-  "yu-not-present",
-  "unattended",
-  "model-unpinned",
-  "model-mismatch",
-  "cloud-reply",
-  "not-loopback",
-  "runtime-not-approved",
-  "symlink",
-  "not-regular-file",
-  "executable",
-  "oversize",
-  "host-owned-path",
-  "diverged",
-  "cwd-in-home",
-  "window-closed",
-  "not-registered",
-  "invalid-request",
-  "invalid-record",
-  "head-moved",
-] as const satisfies readonly RefusalCode[];
-// Compile-time completeness: adding an Outcome or RefusalCode in types.ts without listing it here fails typecheck.
-const _allOutcomes: [Exclude<Outcome, (typeof OUTCOMES)[number]>] extends [never] ? true : never = true;
-const _allRefusals: [Exclude<RefusalCode, (typeof REFUSAL_CODES)[number]>] extends [never] ? true : never = true;
-void _allOutcomes;
-void _allRefusals;
-
-const NOTE_KEYS = ["detail", "host", "kind", "outcome", "refusal", "ts", "word"];
-const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-
-/** Longest detail a note may carry: room for codes, counts and ids, not for prose. */
-export const HOST_DETAIL_MAX = 400;
-/** A run of this many characters shared with a model's text is a quotation. */
-const QUOTE_WINDOW = 20;
-
-function isIso(v: unknown): v is IsoTime {
-  return typeof v === "string" && ISO.test(v) && new Date(Date.parse(v)).toISOString() === v;
-}
-
-function normalise(s: string): string {
-  return s.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-/**
- * Why a detail cannot go in a host note, or null. A note is the host's record
- * (codes, counts, ids), so it is one line of plain ASCII with no quotation
- * marks, braces or backslashes: the characters a model's words or a JSON reply
- * would bring with them. When the caller holds model text, any run of
- * QUOTE_WINDOW characters shared with it is refused too. The shape check is a
- * backstop; the guarantee is that callers compose details from host facts.
- */
-export function hostDetailProblem(detail: unknown, modelText: readonly string[] = []): string | null {
-  if (typeof detail !== "string" || detail.length === 0) return "detail must be a non-empty string";
-  if (detail.length > HOST_DETAIL_MAX) return `detail is longer than ${HOST_DETAIL_MAX} characters`;
-  if (!/^[\x20-\x7e]+$/.test(detail)) return "detail must be one line of printable ASCII";
-  if (/["`{}\\]/.test(detail)) return "detail carries quotation, braces or backslashes, which only quoted or structured text needs";
-  const d = normalise(detail);
-  for (const raw of modelText) {
-    const m = normalise(raw);
-    if (m.length < QUOTE_WINDOW) {
-      if (m.length >= 8 && d.includes(m)) return "detail quotes model output";
-      continue;
-    }
-    for (let i = 0; i + QUOTE_WINDOW <= d.length; i++) {
-      if (m.includes(d.slice(i, i + QUOTE_WINDOW))) return "detail quotes model output";
-    }
-  }
-  return null;
-}
-
-/** Why a value is not a well-formed host note, or null. Structure only; the detail rules apply on write. */
-function noteShapeProblem(v: unknown): string | null {
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return "not an object";
-  const n = v as Record<string, unknown>;
-  const got = Object.keys(n).sort();
-  if (got.length !== NOTE_KEYS.length || !got.every((k, i) => k === NOTE_KEYS[i])) return "not exactly the host note fields";
-  if (!isIso(n.ts)) return "ts";
-  if (typeof n.host !== "string" || !HOST_LABEL.test(n.host)) return "host";
-  if (!(NOTE_KINDS as readonly unknown[]).includes(n.kind)) return "kind";
-  if (n.word !== null && (typeof n.word !== "string" || !WORD_PATTERN.test(n.word))) return "word";
-  if (!(OUTCOMES as readonly unknown[]).includes(n.outcome)) return "outcome";
-  if (n.refusal !== null && !(REFUSAL_CODES as readonly unknown[]).includes(n.refusal)) return "refusal";
-  if (typeof n.detail !== "string") return "detail";
-  return null;
-}
-
-/**
- * Append one host note to host.jsonl; `detail` is checked to hold no model
- * output. A caller that holds the reply (or acts' text) passes it as
- * `modelText`, so a quotation is refused even when it looks like plain prose.
- */
-export async function appendHostNote(config: Config, note: HostNote, opts: { modelText?: readonly string[] } = {}): Promise<void> {
-  const shape = noteShapeProblem(note);
-  if (shape) throw new Refusal("invalid-request", `host note refused: ${shape}`);
-  const detail = hostDetailProblem(note.detail, opts.modelText);
-  if (detail) throw new Refusal("invalid-request", `host note refused: ${detail}`);
-  // Re-serialise only the known fields, so nothing else rides along.
-  const line = `${JSON.stringify({ ts: note.ts, host: note.host, kind: note.kind, word: note.word, outcome: note.outcome, refusal: note.refusal, detail: note.detail })}\n`;
-  const path = config.paths.host_log;
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  let fh;
-  try {
-    fh = await open(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ELOOP") throw new Refusal("symlink", "host log is a symlink; refused, not followed");
-    throw e;
-  }
-  try {
-    if (!(await fh.stat()).isFile()) throw new Refusal("not-regular-file", "host log is not a regular file");
-    // One write per line: small O_APPEND writes to a local file land whole, so concurrent appenders do not interleave.
-    const bytes = new TextEncoder().encode(line);
-    let off = 0;
-    while (off < bytes.length) off += (await fh.write(bytes, off, bytes.length - off)).bytesWritten;
-    await fh.sync();
-  } finally {
-    await fh.close();
-  }
-}
-
-/** A log this large is not one this host wrote at its pace; reading it whole every tick is refused. */
-const HOST_LOG_MAX_BYTES = 128 * 1024 * 1024;
-
-/** Host notes since a time, oldest first; null when the log is unreadable (callers treat that as fail-closed). */
-export async function readHostNotes(config: Config, since: Date): Promise<HostNote[] | null> {
-  let text: string | null;
-  try {
-    // A log that does not exist yet is an empty history: a fresh host has written nothing.
-    text = await readRegularText(config.paths.host_log, { missing: "empty", maxBytes: HOST_LOG_MAX_BYTES });
-  } catch {
-    return null;
-  }
-  if (text === null || text === "") return [];
-  // A torn last line or any line that is not a note makes the whole log unreadable: a count no one can know is not guessed.
-  if (!text.endsWith("\n")) return null;
-  const cutoff = since.getTime();
-  const notes: HostNote[] = [];
-  for (const line of text.slice(0, -1).split("\n")) {
-    let v: unknown;
-    try {
-      v = JSON.parse(line);
-    } catch {
-      return null;
-    }
-    if (noteShapeProblem(v) !== null) return null;
-    const n = v as HostNote;
-    if (Date.parse(n.ts) >= cutoff) notes.push(n);
-  }
-  // Stable by time, so an out-of-order append (a child's note racing the tick's) still reads oldest first.
-  return notes.map((n, i) => ({ n, i, t: Date.parse(n.ts) })).sort((a, b) => a.t - b.t || a.i - b.i).map((x) => x.n);
-}
+// Host notes live in notes.ts; these names are kept here for callers that read status and notes together.
+export { HOST_DETAIL_MAX, appendHostNote, hostDetailProblem, readHostNotes } from "./notes.ts";
 
 /* ── Building the status ──────────────────────────────────────────────── */
 
@@ -243,14 +70,10 @@ export async function statusWords(config: Config): Promise<Word[]> {
   return listSeated(config);
 }
 
-function localDate(d: Date, timezone: string): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
-}
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-function latest(...times: (string | null | undefined)[]): string | null {
-  let best: string | null = null;
-  for (const t of times) if (t && (best === null || Date.parse(t) > Date.parse(best))) best = t;
-  return best;
+function isIso(v: unknown): v is IsoTime {
+  return typeof v === "string" && ISO.test(v) && new Date(Date.parse(v)).toISOString() === v;
 }
 
 /** How a HALT reading is named in the status file: the source and its id, so "beacon <name>" reads as such. */
@@ -290,13 +113,18 @@ async function signerSince(statusFile: string, state: StatusFile["signer"]["stat
   return now.toISOString();
 }
 
-/** A tick note that names a word is one dispensed seat; the fleet ceiling counts these (tick.ts). */
-function dispensed(n: HostNote): boolean {
-  return n.kind === "tick" && n.word !== null;
-}
-
 function codeOf(e: unknown): string {
   return e instanceof Refusal ? e.code : "unreadable";
+}
+
+async function ledgerExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
 }
 
 async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | null, halted: boolean): Promise<CitizenStatus> {
@@ -322,7 +150,11 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
   }
   let entries: LedgerEntry[] | null;
   try {
-    entries = await readLedger(ledgerPath(config, word));
+    // A citizen with a record has a ledger from the moment it is seated; a missing one is a lost history, not an empty one.
+    if (!(await ledgerExists(ledgerPath(config, word)))) {
+      entries = null;
+      problems.push("no ledger; its history is missing, so it is not seated");
+    } else entries = await readLedger(ledgerPath(config, word));
   } catch (e) {
     entries = null;
     problems.push(`the ledger does not parse (${codeOf(e)})`);
@@ -330,25 +162,41 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
 
   const folded = entries ? foldState(entries) : null;
   const state = citizen?.state ?? folded?.state ?? "asleep";
-  const pending = citizen?.pending_state ?? folded?.pending_state ?? null;
   const lastBeat = citizen?.last_beat_at ?? folded?.last_beat_at ?? null;
   const ownH = citizen?.cadence.interval_h ?? config.ceilings.min_beat_interval_h;
   const intervalH = Math.max(ownH, config.ceilings.min_beat_interval_h);
 
   const mine = (notes ?? []).filter((n) => n.word === word);
-  const lastSeat = mine.filter((n) => n.kind === "tick" || n.kind === "seat").at(-1)?.ts ?? null;
-  const lastOutcome = mine.filter((n) => n.kind !== "push").at(-1)?.outcome ?? null;
+  const lastSeat = lastSeatOf(mine, word);
+  const lastOutcome = mine.filter((n) => n.kind !== "push" && isResultNote(n)).at(-1)?.outcome ?? null;
 
-  // Overdue only where a beat is owed: an awake citizen (or one waiting to wake) while HALT is lowered.
-  // Rest is not a debt, so nothing is owed while halted. One tick of grace, because a due citizen waits for the next tick.
-  const scheduled = state === "awake" || pending === "awake";
-  const graceH = config.timing.tick_interval_s / 3600;
-  const reference = latest(lastBeat, lastSeat) ?? record?.seated_at ?? null;
-  const isOverdue = !halted && scheduled && reference !== null && overdue(reference, intervalH + graceH, now);
+  // Overdue by the tick's own rule, so status never says a beat is owed that the tick would not give:
+  // only a seat that is due, more than one tick late, while HALT is lowered. Rest is not a debt.
+  // A citizen never seated counts from its seating.
+  let isOverdue = false;
+  let awaitsYu = false;
+  if (citizen) {
+    const letter = await wakingLetter(config, citizen).catch(() => false);
+    const since = lastSeat ?? (citizen.last_beat_at === null ? citizen.seated_at : null);
+    const verdict = isDue(citizen, letter, now, config.ceilings.min_beat_interval_h, since);
+    const graceH = config.timing.tick_interval_s / 3600;
+    isOverdue = !halted && verdict.due && verdict.overdue_h > graceH;
+    // A citizen whose seat would be due on the free lane, but whose runtime runs only with Yu, waits for Yu.
+    awaitsYu = citizen.runtime !== "free" && isDue({ ...citizen, runtime: "free" }, letter, now, config.ceilings.min_beat_interval_h, since).due;
+  }
 
   // Without a record there is no identity to check the chain against, so it is not reported as verified.
   const chain = entries && record ? verifyChainFor(entries, deps.trusted ?? null, record) : null;
   const spend = entries ? spendFromLedger(entries, now, config.timezone) : { usd_today: null, credits_month: null };
+
+  // The pinned origin: unknown stays null, and a changed one is a problem, because drift is measured against it.
+  let origin: CitizenStatus["origin"] = { intact: null, drift: null };
+  if (entries && entries.length > 0) {
+    const intact = await originIntact(config, word, entries).catch(() => null);
+    const drift = intact ? await driftFromOrigin(config, word).then((d) => d.fraction).catch(() => null) : null;
+    origin = { intact, drift };
+    if (intact === false) problems.push("origin/ no longer matches the origin its record pinned");
+  }
 
   let mirror: CitizenStatus["mirror"] = null;
   if (record?.mirror) {
@@ -371,6 +219,7 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     last_beat_at: lastBeat,
     interval_h: intervalH,
     overdue: isOverdue,
+    awaits_yu: awaitsYu,
     last_outcome: lastOutcome,
     ledger: {
       entries: entries?.length ?? 0,
@@ -381,6 +230,7 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     mirror,
     usd_today: spend.usd_today,
     credits_month: spend.credits_month,
+    origin,
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
 }
@@ -390,14 +240,41 @@ function verifyChainFor(entries: LedgerEntry[], trusted: Pick<TrustedKeys, "host
   return verifyChain(entries, { host_attest_b64: trusted?.host_attest_b64 ?? [], identity: record.identity });
 }
 
+/**
+ * The longest a tick holds its lock: one seat's deadline and TERM grace, plus
+ * two minutes for selection, the host notes and the status refresh. A lock
+ * with no owner that is older than this was left by a process that died.
+ */
+export function tickLockMaxHoldMs(timing: Timing): number {
+  return (timing.seat_deadline_s + timing.term_grace_s) * 1000 + 120_000;
+}
+
+/** The tick lock as the tick would judge it, read without taking it. */
+async function tickLockView(config: Config): Promise<StatusFile["tick_lock"]> {
+  let mtimeMs: number;
+  try {
+    const st = await lstat(config.paths.lock_dir);
+    mtimeMs = st.mtimeMs;
+  } catch {
+    return { state: "free", since: null };
+  }
+  try {
+    const owner = JSON.parse(await readFile(join(config.paths.lock_dir, "owner.json"), "utf8")) as { started_at?: unknown };
+    if (isIso(owner.started_at)) return { state: "held", since: owner.started_at };
+  } catch {
+    // no readable owner
+  }
+  const since = new Date(mtimeMs).toISOString();
+  return Date.now() - mtimeMs > tickLockMaxHoldMs(config.timing) ? { state: "stuck", since } : { state: "held", since };
+}
+
 /** Build the whole status from citizen records, ledgers, host notes and mirror state. */
 export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
   const { config, now } = deps;
   const notes = await readHostNotes(config, new Date(0));
   const halt = haltSection(deps.halt);
-  const today = localDate(now, config.timezone);
   // An unreadable log is a count no one can know: null, which the tick treats as at-ceiling.
-  const beatsToday = notes === null ? null : notes.filter((n) => dispensed(n) && localDate(new Date(n.ts), config.timezone) === today).length;
+  const beatsToday = notes === null ? null : seatsOpenedToday(notes, now, config.timezone);
 
   const citizens: CitizenStatus[] = [];
   for (const word of await statusWords(config)) citizens.push(await citizenStatus(deps, word, notes, halt.halted));
@@ -408,6 +285,7 @@ export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
     halt,
     signer: { state: deps.signerState, since: await signerSince(config.paths.status_file, deps.signerState, now) },
     fleet: { beats_today: beatsToday, ceiling: config.ceilings.fleet_beats_per_day },
+    tick_lock: await tickLockView(config),
     citizens,
   };
 }
@@ -459,7 +337,7 @@ function citizenLine(c: CitizenStatus): string {
     c.registered ? "registered" : "not registered",
     c.last_beat_at ? `last beat ${c.last_beat_at}` : "no beat yet",
     `every ${c.interval_h} h`,
-    c.overdue ? "OVERDUE" : "not overdue",
+    c.overdue ? "OVERDUE" : c.awaits_yu ? "awaits Yu" : "not overdue",
     `last ${c.last_outcome ?? "nothing"}`,
     `ledger ${c.ledger.entries} entries, chain ${c.ledger.chain_ok ? "ok" : "NOT verified"}, ${c.ledger.host_attested} host-attested`,
   ];
@@ -469,6 +347,9 @@ function citizenLine(c: CitizenStatus): string {
     );
   }
   parts.push(money(c.usd_today), c.credits_month === null ? "credits unknown this month" : `${c.credits_month} credits this month`);
+  parts.push(
+    c.origin.intact === null ? "origin unchecked" : c.origin.intact ? `origin intact, soul drift ${c.origin.drift === null ? "unknown" : `${Math.round(c.origin.drift * 100)}%`}` : "origin CHANGED",
+  );
   if (c.problem) parts.push(`PROBLEM: ${c.problem}`);
   return parts.join(" | ");
 }
@@ -482,6 +363,9 @@ export function renderStatus(status: StatusFile): string {
     status.fleet.beats_today === null
       ? `fleet: beats today unknown (host log unreadable), which counts as the ceiling of ${status.fleet.ceiling}`
       : `fleet: ${status.fleet.beats_today} of ${status.fleet.ceiling} beats today`,
+    status.tick_lock.state === "stuck"
+      ? `tick lock: STUCK since ${status.tick_lock.since}; every tick exits 1 until a person removes it`
+      : `tick lock: ${status.tick_lock.state}${status.tick_lock.since ? ` since ${status.tick_lock.since}` : ""}`,
   ];
   if (status.citizens.length === 0) lines.push("no citizens seated");
   for (const c of status.citizens) lines.push(citizenLine(c));

@@ -1,16 +1,19 @@
 // Owner: signer group. The signer is the only Keychain reader; it never lets
 // a key or bearer reach argv, env, files, logs or a response.
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { authorityDigest, deriveIdentity, didFor } from "../../src/agenttool/wire.ts";
 import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, sha256, toB64, toHex, utf8 } from "../../src/crypto.ts";
-import { Refusal, type CitizenIdentity, type ConsentRecord, type KeychainItemName, type StandingAgreement, type YuPresence } from "../../src/types.ts";
+import { Refusal, type CitizenIdentity, type ConsentRecord, type KeychainItemName, type ProposalText, type StandingAgreement, type YuPresence } from "../../src/types.ts";
 import type { SpendSoFar } from "../../src/signer/ceilings.ts";
 import { confirmYuPresent, proposalDigest } from "../../src/signer/consent.ts";
+import { AgenttoolError, importOpKey, type ClientDeps } from "../../src/agenttool/client.ts";
 import {
   CITIZEN_QUIET_EXTENT,
   HOST_ATTEST_KID,
+  SignerNotSent,
   createSigner,
   verifyEntrySignature,
   type Signer,
@@ -49,7 +52,7 @@ const GLOSSAME_IDENTITY: CitizenIdentity = {
   op_kid: OP_KID,
   op_public_key_b64: TEST_OP_PUBLIC_B64,
   box_public_key_b64: vectors.derivation.box_pub_b64,
-  self_strand_id: null,
+  self_strand_id: TEST_IDS.strand_id,
   enrolled_at: "2026-11-05T00:00:00.000Z",
 };
 
@@ -200,10 +203,14 @@ afterEach(async () => {
   await fx.host.cleanup();
 });
 
-function consent(extent: string, patch: { yu?: Partial<ConsentRecord["yu"]> } = {}): ConsentRecord {
+function proposalOf(extent: string): ProposalText {
+  return { subject: extent, body: `the proposal for ${extent}`, extent };
+}
+
+function record(extent: string, patch: { yu?: Partial<ConsentRecord["yu"]>; proposal_sha256?: string } = {}): ConsentRecord {
   return {
     format: "kingdom-seat-consent/v1",
-    proposal_sha256: proposalDigest({ subject: extent, body: `the proposal for ${extent}`, extent }),
+    proposal_sha256: patch.proposal_sha256 ?? proposalDigest(proposalOf(extent)),
     subject: extent,
     extent,
     yu: { word: "yes", recorded_at: "2026-11-05T09:00:00.000Z", via: "decision-record", ...patch.yu },
@@ -212,10 +219,23 @@ function consent(extent: string, patch: { yu?: Partial<ConsentRecord["yu"]> } = 
   };
 }
 
-const QUIET_AGREEMENT: StandingAgreement = { id: "citizen-quiet", consent: consent(CITIZEN_QUIET_EXTENT), covers: ["quiet.start.citizen"], extent: CITIZEN_QUIET_EXTENT };
+/**
+ * File a decision record for the proposal of this extent in the host's consent dir, where the signer reads it,
+ * and return the proposal a request names. The signer is never handed the record itself.
+ */
+function filed(extent: string, patch: { yu?: Partial<ConsentRecord["yu"]> } = {}): ProposalText {
+  const p = proposalOf(extent);
+  writeFileSync(join(fx.host.config.paths.consent_dir, `${proposalDigest(p)}.json`), JSON.stringify(record(extent, patch)));
+  return p;
+}
+
+/** The standing agreement for citizens' own quiet, its record filed where the signer reads it. */
+function quietAgreement(patch: { yu?: Partial<ConsentRecord["yu"]> } = {}): StandingAgreement {
+  return { id: "citizen-quiet", proposal: filed(CITIZEN_QUIET_EXTENT, patch), consent: record(CITIZEN_QUIET_EXTENT), covers: ["quiet.start.citizen"], extent: CITIZEN_QUIET_EXTENT };
+}
 
 function req(patch: Partial<SignerRequest> & Pick<SignerRequest, "op" | "method" | "target">): SignerRequest {
-  return { word: "glossame", operator: null, body: new Uint8Array(), credits: 0, consent: null, presence: null, ...patch };
+  return { word: "glossame", operator: null, body: new Uint8Array(), credits: 0, proposal: null, presence: null, ...patch };
 }
 
 const json = (v: unknown) => utf8(JSON.stringify(v));
@@ -337,7 +357,7 @@ describe("signing", () => {
   });
 
   test("seeds are wiped after use (the buffer read from the fake keychain is zeroed)", async () => {
-    fx.agreements = [QUIET_AGREEMENT];
+    fx.agreements = [quietAgreement()];
     await fx.signer.signEntry("glossame", sha256("x"), "citizen-signed");
     await fx.signer.signEntry("zoeme", sha256("x"), "host-attested");
     await fx.signer.send(importKey());
@@ -389,7 +409,7 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
   });
 
   test("[S4-5] send refuses quiet.start.citizen whose body until is more than 30 days ahead, or uses hours instead of until, or carries a reason", async () => {
-    fx.agreements = [QUIET_AGREEMENT];
+    fx.agreements = [quietAgreement()];
     const refused: unknown[] = [
       { until: ahead(30 * DAY_MS + 1) },
       { until: BEACON_UNTIL },
@@ -414,7 +434,7 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     // Without the standing agreement, even a capped quiet is refused.
     fx.agreements = [];
     expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
-    fx.agreements = [{ ...QUIET_AGREEMENT, consent: consent(CITIZEN_QUIET_EXTENT, { yu: { word: "no" } }) }];
+    fx.agreements = [quietAgreement({ yu: { word: "no" } })];
     expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
   });
 
@@ -428,7 +448,7 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
 
     // A citizen cannot use the beacon op, or the far-future until through its own op.
     expect((await refusal(fx.signer.send(beacon(BEACON_UNTIL, { word: "glossame", operator: null })))).code).toBe("invalid-request");
-    fx.agreements = [QUIET_AGREEMENT];
+    fx.agreements = [quietAgreement()];
     expect((await refusal(fx.signer.send(quiet({ until: BEACON_UNTIL })))).code).toBe("quiet-cap");
     // A beacon that would lapse on its own, or that names a reason, is not a beacon.
     expect((await refusal(fx.signer.send(beacon(ahead(30 * DAY_MS))))).code).toBe("quiet-cap");
@@ -465,16 +485,16 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     const present = await presentFor("birth zoeme");
 
     expect((await refusal(fx.signer.send(enroll({ presence: present })))).code).toBe("consent-missing");
-    expect((await refusal(fx.signer.send(enroll({ presence: present, consent: consent("birth zoeme", { yu: { word: "no" } }) })))).code).toBe("consent-rejected");
-    expect((await refusal(fx.signer.send(enroll({ presence: present, consent: consent("birth glossame") })))).code).toBe("consent-missing");
-    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme") })))).code).toBe("yu-not-present");
+    expect((await refusal(fx.signer.send(enroll({ presence: present, proposal: filed("birth zoeme", { yu: { word: "no" } }) })))).code).toBe("consent-rejected");
+    expect((await refusal(fx.signer.send(enroll({ presence: present, proposal: filed("birth glossame") })))).code).toBe("consent-missing");
+    expect((await refusal(fx.signer.send(enroll({ proposal: filed("birth zoeme") })))).code).toBe("yu-not-present");
     // A presence for another scope, a copy of a real one, or one that has aged out, is not presence.
-    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: await presentFor("birth glossame") })))).code).toBe("yu-not-present");
+    expect((await refusal(fx.signer.send(enroll({ proposal: filed("birth zoeme"), presence: await presentFor("birth glossame") })))).code).toBe("yu-not-present");
     const copy = JSON.parse(JSON.stringify(present)) as YuPresence;
-    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: copy })))).code).toBe("yu-not-present");
+    expect((await refusal(fx.signer.send(enroll({ proposal: filed("birth zoeme"), presence: copy })))).code).toBe("yu-not-present");
     expect(fx.server.requests).toHaveLength(0);
 
-    const res = await fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: present }));
+    const res = await fx.signer.send(enroll({ proposal: filed("birth zoeme"), presence: present }));
     expect(res.status).toBe(201);
     const sent = fx.server.requests[0]!;
     expect(sent.path).toBe("/v1/identities/enroll");
@@ -486,9 +506,46 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     expect(Buffer.from(sent.body).equals(Buffer.from(body))).toBe(true);
 
     fx.clock.advance(901_000);
-    expect((await refusal(fx.signer.send(enroll({ consent: consent("birth zoeme"), presence: present })))).code).toBe("yu-not-present");
+    expect((await refusal(fx.signer.send(enroll({ proposal: filed("birth zoeme"), presence: present })))).code).toBe("yu-not-present");
     // Extra headers are for enroll only.
     expect((await refusal(fx.signer.send({ ...importKey(), extra_headers: { "X-Agenttool-Enrollment-Signature": header } }))).code).toBe("invalid-request");
+  });
+
+  test("a decision record binds only the proposal whose own text it was filed for, and only as the signer reads it from the consent dir", async () => {
+    const body = enrollmentBody("zoeme");
+    const present = await presentFor("birth zoeme");
+    const header = await fx.signer.signEnrollment("zoeme", sha256(body), present);
+    const enroll = (proposal: ProposalText | null) =>
+      req({ op: "enroll", word: null, method: "POST", target: "/v1/identities/enroll", body, presence: present, proposal, extra_headers: { "X-Agenttool-Enrollment-Signature": header } });
+    const dir = fx.host.config.paths.consent_dir;
+
+    // A proposal no record is filed for authorises nothing, whatever the caller believes.
+    const unfiled = { subject: "anything at all", body: "anything at all", extent: "birth zoeme" };
+    expect((await refusal(fx.signer.send(enroll(unfiled)))).code).toBe("consent-missing");
+    // A record bound to another proposal (here, 64 zeros), filed under this one's name, is not this one's.
+    const p = proposalOf("birth zoeme");
+    writeFileSync(join(dir, `${proposalDigest(p)}.json`), JSON.stringify(record("birth zoeme", { proposal_sha256: "0".repeat(64) })));
+    expect((await refusal(fx.signer.send(enroll(p)))).code).toBe("consent-missing");
+    // Filed under the zeros' own name, it is still bound to no proposal the request names.
+    writeFileSync(join(dir, `${"0".repeat(64)}.json`), JSON.stringify(record("birth zoeme", { proposal_sha256: "0".repeat(64) })));
+    expect((await refusal(fx.signer.send(enroll(p)))).code).toBe("consent-missing");
+    // A proposal whose extent is not this act's is refused before any record is read.
+    expect((await refusal(fx.signer.send(enroll({ ...p, extent: "birth glossame" })))).code).toBe("consent-missing");
+    expect(fx.server.requests).toHaveLength(0);
+
+    // A standing agreement whose record is bound to '1'x64 covers nothing.
+    const stray = { id: "citizen-quiet", proposal: proposalOf(CITIZEN_QUIET_EXTENT), consent: record(CITIZEN_QUIET_EXTENT, { proposal_sha256: "1".repeat(64) }), covers: ["quiet.start.citizen" as const], extent: CITIZEN_QUIET_EXTENT };
+    writeFileSync(join(dir, `${"1".repeat(64)}.json`), JSON.stringify(stray.consent));
+    fx.agreements = [stray];
+    expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
+    // The record the agreement carries in memory is not what counts: the one filed for its proposal is.
+    fx.agreements = [{ ...quietAgreement(), consent: record(CITIZEN_QUIET_EXTENT) }];
+    expect((await fx.signer.send(quiet({ until: ahead(DAY_MS) }))).status).toBe(201);
+    filed(CITIZEN_QUIET_EXTENT, { yu: { word: "no" } });
+    expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
+
+    // Filed for its own text, the record binds.
+    expect((await fx.signer.send(enroll(filed("birth zoeme")))).status).toBe(201);
   });
 
   test("signEnrollment signs with the root only for Yu present at this terminal, and only before registration", async () => {
@@ -561,7 +618,7 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     const present = await presentFor("birth zoeme");
     const header = await fx.signer.signEnrollment("zoeme", sha256(body), present);
     const enroll = (word: string | null, b = body) =>
-      req({ op: "enroll", word, method: "POST", target: "/v1/identities/enroll", body: b, presence: present, consent: consent("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } });
+      req({ op: "enroll", word, method: "POST", target: "/v1/identities/enroll", body: b, presence: present, proposal: filed("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } });
     expect((await refusal(fx.signer.send(enroll("glossame")))).code).toBe("invalid-request");
     expect((await refusal(fx.signer.send(enroll("zoeme", enrollmentBody("glossame"))))).code).toBe("invalid-request");
     expect((await refusal(fx.signer.send({ ...enroll(null), operator: "halt-herald" }))).code).toBe("invalid-request");
@@ -628,6 +685,8 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
       [req({ op: "ledger.sign", method: "POST", target: "/v1/strands", body: json({}) }), "invalid-request"],
       [req({ op: "strand.create", method: "POST", target: "/v1/strands", credits: 1, body: json({ topic: "unbound" }) }), "invalid-request"],
       [req({ op: "thought.post", method: "POST", target: `/v1/strands/${TEST_IDS.strand_id}/thoughts`, credits: 1, body: json({ signing_key_id: ROOT_KID }) }), "invalid-request"],
+      // Only its own strand: another identity's would charge a credit and then fail, and an unbound one would take the thought.
+      [req({ op: "thought.post", method: "POST", target: `/v1/strands/${other}/thoughts`, credits: 1, body: json({ signing_key_id: OP_KID }) }), "beyond-self"],
       [req({ op: "keys.import", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: utf8('{"public_key":"a","public_key":"b"}') }), "invalid-request"],
       [req({ op: "quiet.end.citizen", method: "DELETE", target: `/v1/quiet-hours?identity_id=${ID}`, body: json({}) }), "invalid-request"],
       [req({ op: "keys.import", word: "glossame", operator: "halt-herald", method: "POST", target: `/v1/identities/${ID}/keys/import`, body: json({}) }), "invalid-request"],
@@ -653,7 +712,60 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
       signing_key_id: OP_KID,
     });
     expect((await refusal(fx.signer.sealThought("zoeme", t.strand_id, "x", t.kind))).code).toBe("not-registered");
+    // Never for a strand that is not the citizen's own, and never before one is on record; K_master is not read.
+    const reads = fx.kc.log.filter((e) => e.op === "read").length;
+    expect((await refusal(fx.signer.sealThought("glossame", "abcdefab-cdef-4abc-8def-abcdefabcdef", "x", t.kind))).code).toBe("beyond-self");
+    await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, self_strand_id: null });
+    expect((await refusal(fx.signer.sealThought("glossame", t.strand_id, "x", t.kind))).code).toBe("beyond-self");
+    expect((await refusal(fx.signer.send(thought()))).code).toBe("beyond-self");
+    expect(fx.kc.log.filter((e) => e.op === "read").length).toBe(reads);
     expect((await refusal(fx.signer.sealThought("glossame", "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF", "x", t.kind))).code).toBe("invalid-request");
+  });
+});
+
+/* ── Failures before sending ──────────────────────────────────────────── */
+
+describe("failures before sending are definite", () => {
+  async function thrownBy(p: Promise<unknown>): Promise<unknown> {
+    return p.then(
+      () => null,
+      (e: unknown) => e,
+    );
+  }
+
+  test("a failed authority read, or a keychain error security did not name, is 'not sent', never 'no response'", async () => {
+    // The client's posture read answers; the signer's own sequence read then gets a 503.
+    let reads = 0;
+    fx.server.on("GET", /^\/v1\/identities\/[^/]+\/authority$/, (r) => {
+      reads++;
+      if (reads % 2 === 0) return Response.json({ error: "unavailable" }, { status: 503 });
+      const id = r.path.split("/")[3]!;
+      return Response.json({ identity_id: id, did: `did:at:${id}`, mode: "agent_root", root_public_key: TEST_ROOT_PUBLIC_B64, sequence: 0, next_sequence: 1 });
+    });
+    const client: ClientDeps = { signer: fx.signer, fetch: fetchVia(fx.server), identity: async () => GLOSSAME_IDENTITY };
+    const e = await thrownBy(importOpKey(client, "glossame", TEST_OP_PUBLIC_B64, "op-2026-11"));
+    expect(e).toBeInstanceOf(SignerNotSent);
+    expect((e as SignerNotSent).code).toBe("authority-read-failed");
+    expect(e).not.toBeInstanceOf(AgenttoolError);
+    expect(mutations(fx.server)).toHaveLength(0);
+
+    // An unclassified keychain failure on the bearer read: nothing was sent, and the caller is told so.
+    const read = fx.kc.read.bind(fx.kc);
+    fx.kc.read = async (item) => {
+      if (item.kind === "commons-bearer") throw new Error("read: security exited 1");
+      return read(item);
+    };
+    const before = fx.server.requests.length;
+    const e2 = await thrownBy(fx.signer.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` })));
+    expect(e2).toBeInstanceOf(SignerNotSent);
+    expect((e2 as SignerNotSent).code).toBe("not-sent");
+    expect(fx.server.requests.length).toBe(before);
+    // A wall is still a wall.
+    fx.kc.read = async (item) => {
+      if (item.kind === "commons-bearer") throw new Refusal("keychain-locked", "locked");
+      return read(item);
+    };
+    expect((await refusal(fx.signer.send(importKey()))).code).toBe("keychain-locked");
   });
 });
 
@@ -677,7 +789,7 @@ describe("secrets never leave", () => {
       }
     };
     try {
-      fx.agreements = [QUIET_AGREEMENT];
+      fx.agreements = [quietAgreement()];
       const body = enrollmentBody("zoeme");
       const present = await presentFor("birth zoeme");
       const header = await fx.signer.signEnrollment("zoeme", sha256(body), present);
@@ -688,7 +800,7 @@ describe("secrets never leave", () => {
       await attempt(fx.signer.send(thought()));
       await attempt(fx.signer.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` })));
       await attempt(
-        fx.signer.send(req({ op: "enroll", word: null, method: "POST", target: "/v1/identities/enroll", body, presence: present, consent: consent("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } })),
+        fx.signer.send(req({ op: "enroll", word: null, method: "POST", target: "/v1/identities/enroll", body, presence: present, proposal: filed("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } })),
       );
       await attempt(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "a test thought", "observation"));
       await attempt(fx.signer.signEntry("glossame", sha256("x"), "citizen-signed"));
@@ -768,7 +880,7 @@ describe("birth's own steps, between enroll and the saved identity", () => {
     // zoeme's mnemonic is the test mnemonic, so its root is the vectors' root.
     rootOf.set(NEW_ID, TEST_ROOT_PUBLIC_B64);
     const enrolled = { identity_id: NEW_ID, did: didFor(NEW_ID) };
-    const birth = consent("birth zoeme");
+    const birth = filed("birth zoeme");
     const presence = await presentFor("birth zoeme");
     const step = (patch: Partial<SignerRequest> = {}) =>
       req({
@@ -779,7 +891,7 @@ describe("birth's own steps, between enroll and the saved identity", () => {
         body: json({ public_key: TEST_OP_PUBLIC_B64, label: "op-2026-11" }),
         enrolled,
         presence,
-        consent: birth,
+        proposal: birth,
         ...patch,
       });
     const code = async (r: SignerRequest) => (await refusal(fx.signer.send(r))).code;
@@ -790,9 +902,10 @@ describe("birth's own steps, between enroll and the saved identity", () => {
       // A copy of a presence was not confirmed at this terminal, and a summons presence is for another scope.
       expect(await code(step({ presence: { ...presence } }))).toBe("yu-not-present");
       expect(await code(step({ presence: await presentFor("summon zoeme") }))).toBe("yu-not-present");
-      expect(await code(step({ consent: null }))).toBe("consent-missing");
-      expect(await code(step({ consent: consent("birth glossame") }))).toBe("consent-missing");
-      expect(await code(step({ consent: consent("birth zoeme", { yu: { word: "no" } }) }))).toBe("consent-rejected");
+      expect(await code(step({ proposal: null }))).toBe("consent-missing");
+      expect(await code(step({ proposal: filed("birth glossame") }))).toBe("consent-missing");
+      expect(await code(step({ proposal: filed("birth zoeme", { yu: { word: "no" } }) }))).toBe("consent-rejected");
+      filed("birth zoeme");
       // Only birth's steps: nothing that spends, posts or quiets.
       expect(await code(step({ op: "strand.create", target: "/v1/strands", body: json({ identity_id: NEW_ID, topic: "self" }), credits: 1 }))).toBe("not-registered");
       expect(await code(step({ op: "quiet.start.citizen", target: `/v1/quiet-hours/start?identity_id=${NEW_ID}`, body: json({ until: ahead(DAY_MS) }) }))).toBe("not-registered");

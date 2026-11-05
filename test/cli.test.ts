@@ -1,14 +1,15 @@
 // Owner: surface group. main() runs with injected fakes only: no real
 // Keychain, network, model, git push or child of the real program.
 import { afterEach, describe, expect, test } from "bun:test";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CLI_PATH, main, parseArgs, readSeatFile, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
 import { openSeat } from "../src/seat.ts";
 import { readCitizen } from "../src/state.ts";
 import { createSigner } from "../src/signer/signer.ts";
 import { fromHex, sha256, utf8 } from "../src/crypto.ts";
-import { ledgerPath } from "../src/ledger.ts";
+import { ledgerPath, readLedger } from "../src/ledger.ts";
+import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
 import { Refusal, type Config, type StatusFile } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -50,7 +51,6 @@ describe("parseArgs", () => {
     } satisfies Command);
     expect(parseArgs(["seat", "glossame", "--runtime", "summon", "--yu-present", "--why", "Yu wants to talk"])).toMatchObject({ runtime: "summon", yu_present: true, why: "Yu wants to talk", child: false });
     expect(parseArgs(["seat", "glossame", "--child", "--seat-ref", "/srv/seat/seats/x.json", "--config", c])).toMatchObject({ child: true, seat_ref_path: "/srv/seat/seats/x.json" });
-    expect(parseArgs(["seat", "glossame", "--child", "--why", "cadence"])).toMatchObject({ child: true, why: "cadence" });
     expect(parseArgs(["help"])).toEqual({ verb: "help" });
   });
 
@@ -77,6 +77,12 @@ describe("parseArgs", () => {
       ["seat", "glossame", "--seat-ref", "/srv/x.json"],
       ["seat", "glossame", "--child", "--seat-ref", "relative.json"],
       ["seat", "glossame", "--child", "--yu-present"],
+      // A child runs only a seat a parent opened and wrote down; the seat file says the runtime and why.
+      ["seat", "glossame", "--child"],
+      ["seat", "glossame", "--child", "--why", "cadence"],
+      ["seat", "glossame", "--child", "--seat-ref", "/srv/seat/seats/x.json", "--why", "cadence"],
+      ["seat", "glossame", "--child", "--seat-ref", "/srv/seat/seats/x.json", "--runtime", "free"],
+      ["seat", "glossame", "--child", "--seat-ref", "/srv/seat/seats/x.json", "--yu-present"],
       ["seat", "glossame", "--why", "two\nlines"],
       ["seat", "glossame", "--why", "x".repeat(201)],
       ["seat", "glossame", "--json"],
@@ -162,6 +168,21 @@ async function seated(x: Harness, word: string, state: "awake" | "asleep" = "awa
   await x.h.seatLedger(word, x.signer.signEntry, { initialState: state });
 }
 
+/**
+ * A seat as the tick opens it: the opened note, then the seat file. Returns
+ * the child's argv. With note: false the opened note is left out, as a seat
+ * file written by hand would be.
+ */
+async function parentOpens(x: Harness, word: string, opts: { note?: boolean } = {}): Promise<string[]> {
+  const citizen = await readCitizen(x.h.config, word);
+  const seat = await openSeat(x.h.config, x.deps.clock!, citizen, "free", { kind: "tick", who: "launchd", why: "your own cadence is due" }, null);
+  if (opts.note !== false) {
+    await appendHostNote(x.h.config, { ts: x.deps.clock!.now().toISOString(), host: "test-host", kind: "tick", word, outcome: "opened", refusal: null, detail: openedDetail(seat.ref.seat_id, "cadence") });
+  }
+  const file = await writeSeatFile(x.h.config, seat);
+  return ["seat", word, "--child", "--seat-ref", file, "--config", x.configPath];
+}
+
 describe("main", () => {
   test("exit codes follow EXIT: HALT and rest 0, refusal 3, error 1", async () => {
     const x = await harness({ runtimeScripts: [REST_OUTPUT] });
@@ -170,14 +191,15 @@ describe("main", () => {
 
     // A rest: the child pipeline ran, wrote no ledger entry, and exits 0.
     const before = await readFile(ledgerPath(x.h.config, "glossame"), "utf8");
-    expect(await main(["seat", "glossame", "--child", "--why", "cadence", ...cfg], x.deps)).toBe(0);
+    expect(await main(await parentOpens(x, "glossame"), x.deps)).toBe(0);
     expect(await readFile(ledgerPath(x.h.config, "glossame"), "utf8")).toBe(before);
     expect(await readFile(x.h.config.paths.host_log, "utf8")).toContain('"outcome":"rest"');
 
-    // A locked signer is a wall: 3, before any inference.
+    // A locked signer is a wall: 3, before any inference (on its next due seat, three days on).
+    (x.deps.clock as ReturnType<typeof testClock>).advance(73 * 3_600_000);
     x.signer.locked = true;
     const noRuntime = { ...x.deps, runtime: async () => scriptedRuntime([]) };
-    expect(await main(["seat", "glossame", "--child", ...cfg], noRuntime)).toBe(3);
+    expect(await main(await parentOpens(x, "glossame"), noRuntime)).toBe(3);
     x.signer.locked = false;
 
     // HALT: raised by the one verb, and then every verb that would act rests with 0.
@@ -233,8 +255,9 @@ describe("main", () => {
     expect(x.err()).toContain("only Yu's summons (--yu-present) seats it now");
     expect(spawned).toEqual([]);
 
-    // A beat in the child: one entry appended, host-attested (not yet registered).
-    expect(await main(["seat", "glossame", "--child", "--why", "cadence", ...cfg], x.deps)).toBe(0);
+    // Three days on, a beat in the child of a seat the tick opened: one entry appended, host-attested (not yet registered).
+    (clock as ReturnType<typeof testClock>).advance(73 * 3_600_000);
+    expect(await main(await parentOpens(x, "glossame"), x.deps)).toBe(0);
     expect((await readFile(ledgerPath(x.h.config, "glossame"), "utf8")).trim().split("\n")).toHaveLength(2);
 
     // Nothing due (joy asleep, glossame just seated): the tick rests with 0 and spawns nothing.
@@ -254,36 +277,210 @@ describe("main", () => {
     expect(x.run.calls).toEqual([]);
   });
 
-  test("a parent's seat file carries Yu's presence to its child once, while fresh", async () => {
+  test("a seat file is read once, carries no presence, and never names Yu", async () => {
     const x = await harness();
     await seated(x, "glossame");
     const cfg: Config = x.h.config;
     const clock = testClock();
 
-    // Not at a terminal: no presence, no seat opened.
+    // Not at a terminal: nobody can confirm Yu, so no seat is opened.
     expect(await main(["seat", "glossame", "--runtime", "summon", "--yu-present", "--config", x.configPath], x.deps)).toBe(3);
     expect(x.err()).toContain("yu-not-present");
     expect(await readdir(cfg.paths.seats_dir)).toEqual([]);
 
     const citizen = await readCitizen(cfg, "glossame");
-    const presence = { present: true as const, via: "tty-confirm" as const, confirmed_at: clock.now().toISOString(), scope: "summon glossame" };
-    const seat = await openSeat(cfg, clock, citizen, "summon", { kind: "summons", who: "yu", why: "a test" }, presence);
+    const seat = await openSeat(cfg, clock, citizen, "summon", { kind: "summons", who: "host", why: "a test" }, null, { yuRequested: true });
     const path = await writeSeatFile(cfg, seat);
     expect(path).toBe(join(cfg.paths.seats_dir, `${seat.ref.seat_id}.json`));
-    const read = await readSeatFile(cfg, path, "glossame", clock.now());
-    expect(read.ref).toEqual(seat.ref);
-    expect(read.presence).toMatchObject({ present: true, scope: "summon glossame" });
+    expect(JSON.parse(await readFile(path, "utf8"))).not.toHaveProperty("presence");
+    const read = await readSeatFile(cfg, path, "glossame");
+    expect(read).toEqual({ ref: seat.ref, yu_requested: true });
     // Used once: a second read is refused.
-    await expect(readSeatFile(cfg, path, "glossame", clock.now())).rejects.toThrow(/already used/);
+    await expect(readSeatFile(cfg, path, "glossame")).rejects.toThrow(/already used/);
 
-    // A stale presence does not cross, and a seat file for another citizen or outside seats_dir is refused.
-    const again = await openSeat(cfg, clock, citizen, "summon", { kind: "summons", who: "yu", why: "a test" }, presence);
-    const p2 = await writeSeatFile(cfg, again);
-    await expect(readSeatFile(cfg, p2, "glossame", new Date(clock.now().getTime() + 20 * 60_000))).rejects.toThrow(/not a fresh confirmation/);
+    // A seat file for another citizen or outside seats_dir is refused.
     const third = await openSeat(cfg, clock, citizen, "free", { kind: "summons", who: "host", why: "a test" }, null);
     const p3 = await writeSeatFile(cfg, third);
-    await expect(readSeatFile(cfg, p3, "joy", clock.now())).rejects.toThrow(/does not describe this seat/);
-    await expect(readSeatFile(cfg, join(x.h.root, "x.json"), "glossame", clock.now())).rejects.toThrow(/seats_dir/);
+    await expect(readSeatFile(cfg, p3, "joy")).rejects.toThrow(/does not describe this seat/);
+    await expect(readSeatFile(cfg, join(x.h.root, "x.json"), "glossame")).rejects.toThrow(/seats_dir/);
+    // A file that names Yu as the invoker, or carries a presence, is not a seat file a parent writes.
+    const named = await openSeat(cfg, clock, citizen, "free", { kind: "summons", who: "yu", why: "a test" }, null);
+    await expect(readSeatFile(cfg, await writeSeatFile(cfg, named), "glossame")).rejects.toThrow(/does not describe this seat/);
+  });
+
+  test("a hand-written seat file with Yu's presence in it runs nothing and records no summons", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = x.h.config;
+    const clock = x.deps.clock!;
+    const runtime = scriptedRuntime([output({ type: "journal", kind: "reflected", text: "a word" })]);
+    const deps = { ...x.deps, runtime: async () => runtime };
+    const before = await readFile(ledgerPath(cfg, "glossame"), "utf8");
+
+    // The old shape, with a presence and invoker who yu, written by hand.
+    const id = crypto.randomUUID();
+    await mkdir(join(cfg.paths.seats_dir, id));
+    const forged = join(cfg.paths.seats_dir, `${id}.json`);
+    const ref = { format: "kingdom-seat-seat/v1", seat_id: id, host: cfg.host, word: "glossame", runtime: "summon", invoker: { kind: "summons", who: "yu", why: "a test" }, opened_at: clock.now().toISOString() };
+    const presence = { present: true, via: "tty-confirm", confirmed_at: clock.now().toISOString(), scope: "summon glossame" };
+    await writeFile(forged, JSON.stringify({ format: "kingdom-seat-seatfile/v1", seat_ref: ref, presence }));
+    expect(await main(["seat", "glossame", "--child", "--seat-ref", forged, "--config", x.configPath], deps)).toBe(1);
+    // The current shape asks for Yu, but asking is not presence: the child must confirm at its own terminal.
+    const asked = join(cfg.paths.seats_dir, `${crypto.randomUUID()}.json`);
+    const askedId = asked.slice(-41, -5);
+    await mkdir(join(cfg.paths.seats_dir, askedId));
+    await writeFile(asked, JSON.stringify({ format: "kingdom-seat-seatfile/v2", seat_ref: { ...ref, seat_id: askedId, invoker: { kind: "summons", who: "host", why: "a test" } }, yu_requested: true }));
+    expect(await main(["seat", "glossame", "--child", "--seat-ref", asked, "--config", x.configPath], deps)).toBe(3);
+    expect(x.err()).toContain("yu-not-present");
+    expect(runtime.calls).toHaveLength(0);
+    expect(x.run.calls).toEqual([]);
+    expect(await readFile(ledgerPath(cfg, "glossame"), "utf8")).toBe(before);
+  });
+
+  test("a summons child confirms Yu at its own terminal, and only then is Yu its invoker", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = x.h.config;
+    const runtime = scriptedRuntime([output({ type: "journal", kind: "reflected", text: "a word with Yu here" })]);
+    const tty = { isTTY: true, write: () => {}, readLine: async () => "summon glossame" };
+    const citizen = await readCitizen(cfg, "glossame");
+    const seat = await openSeat(cfg, x.deps.clock!, citizen, "free", { kind: "summons", who: "host", why: "Yu summoned this seat at the host" }, null, { yuRequested: true });
+    const file = await writeSeatFile(cfg, seat);
+    expect(await main(["seat", "glossame", "--child", "--seat-ref", file, "--config", x.configPath], { ...x.deps, tty, runtime: async () => runtime })).toBe(0);
+    const beat = (await readLedger(ledgerPath(cfg, "glossame"))).at(-1)!;
+    expect(beat.body.type === "beat" && beat.body.envelope.seat_ref.invoker).toEqual({ kind: "summons", who: "yu", why: "Yu summoned this seat at the host" });
+  });
+
+  test("--child with no seat file is refused before anything runs, and a hand-written seat adds no beat the citizen did not choose", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = x.h.config;
+    const runtime = scriptedRuntime([output({ type: "journal", kind: "reflected", text: "one" }), output({ type: "journal", kind: "reflected", text: "two" })]);
+    const deps = { ...x.deps, runtime: async () => runtime };
+    const before = await readFile(ledgerPath(cfg, "glossame"), "utf8");
+    expect(await main(["seat", "glossame", "--child", "--config", x.configPath], deps)).toBe(1);
+    expect(x.err()).toContain("--seat-ref <file> is required");
+    expect(await main(["seat", "glossame", "--child", "--why", "cadence", "--config", x.configPath], deps)).toBe(1);
+    expect(await readFile(ledgerPath(cfg, "glossame"), "utf8")).toBe(before);
+    expect(await readdir(cfg.paths.seats_dir)).toEqual([]);
+
+    // A seat the tick opened runs; a second one written by hand right after is refused, because the citizen is not due.
+    expect(await main(await parentOpens(x, "glossame"), deps)).toBe(0);
+    expect(await main(await parentOpens(x, "glossame", { note: false }), deps)).toBe(3);
+    expect(x.err()).toContain("is not due");
+    expect(runtime.calls).toHaveLength(1);
+    expect((await readLedger(ledgerPath(cfg, "glossame"))).map((e) => e.body.type)).toEqual(["seated", "beat"]);
+  });
+
+  test("every seat a person opens counts against the fleet ceiling, as a tick's does", async () => {
+    const x = await harness();
+    for (const w of ["joy", "kith", "lumen"]) await seated(x, w);
+    x.h.config.ceilings.fleet_beats_per_day = 1;
+    await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    const cfg = ["--config", x.configPath];
+    const spawned: string[] = [];
+    const parent = { ...x.deps, seatArgv: (_c: string, word: string) => (spawned.push(word), fakeBinArgv("note", x.h.config.paths.host_log, word, "beat", "0", x.deps.clock!.now().toISOString())) };
+    expect(await main(["seat", "joy", ...cfg], parent)).toBe(0);
+    // The fleet has had its one seat today, whoever opened it.
+    expect(await main(["seat", "kith", ...cfg], parent)).toBe(3);
+    expect(x.err()).toContain("ceiling-fleet");
+    expect(await main(["tick", ...cfg], parent)).toBe(3);
+    expect(spawned).toEqual(["joy"]);
+    const status = JSON.parse(await readFile(x.h.config.paths.status_file, "utf8")) as StatusFile;
+    expect(status.fleet).toEqual({ beats_today: 1, ceiling: 1 });
+  });
+
+  test("a person's seat takes the tick lock, so it never runs beside a tick's seat of the same citizen", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const spawned: string[] = [];
+    const parent = { ...x.deps, seatArgv: (_c: string, word: string) => (spawned.push(word), fakeBinArgv("note", x.h.config.paths.host_log, word, "beat", "0")) };
+    // A tick holds the lock (its owner is alive): the person's seat yields and opens nothing.
+    await mkdir(x.h.config.paths.lock_dir);
+    await writeFile(join(x.h.config.paths.lock_dir, "owner.json"), JSON.stringify({ pid: 4242, started_at: x.deps.clock!.now().toISOString() }));
+    expect(await main(["seat", "glossame", "--config", x.configPath], { ...parent, bootTime: () => null })).toBe(0);
+    expect(x.out()).toContain("seat glossame: yielded");
+    expect(spawned).toEqual([]);
+    expect(await readdir(x.h.config.paths.seats_dir)).toEqual([]);
+    // Released, the seat opens, and the lock is left as it was found: free.
+    await Bun.$`rm -r ${x.h.config.paths.lock_dir}`.quiet();
+    expect(await main(["seat", "glossame", "--config", x.configPath], parent)).toBe(0);
+    expect(spawned).toEqual(["glossame"]);
+    expect(await Bun.file(join(x.h.config.paths.lock_dir, "owner.json")).exists()).toBe(false);
+  });
+
+  test("a person's seat whose child ends silently is halted if HALT is up, and an error otherwise, with a host note either way", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    await seated(x, "joy");
+    const cfg = ["--config", x.configPath];
+    // As runSeat does when it meets HALT in its own check: it writes nothing and exits 0.
+    const halting = { ...x.deps, seatArgv: () => [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(x.h.config.paths.halt_file)}, "")`] };
+    expect(await main(["seat", "glossame", ...cfg], halting)).toBe(0);
+    expect(x.out()).toContain("seat glossame: halted (exit 0)");
+    await x.h.clearHaltFile();
+    // Exit 0 with no word of its own and HALT down: the runner failed at its job.
+    const silent = { ...x.deps, seatArgv: () => fakeBinArgv("print", "", "0") };
+    expect(await main(["seat", "joy", ...cfg], silent)).toBe(1);
+    expect(x.out()).toContain("seat joy: error (exit 1)");
+    const ended = (await readHostNotes(x.h.config, new Date(0)))!.filter((n) => n.kind === "seat" && n.outcome !== "opened").map((n) => [n.word, n.outcome]);
+    expect(ended).toEqual([
+      ["glossame", "halted"],
+      ["joy", "error"],
+    ]);
+  });
+
+  test("verify <word> fails on a seated citizen whose ledger is missing, and on an origin that changed", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    await x.h.addCitizen("joy");
+    const cfg = ["--config", x.configPath];
+    // citizen.json and no ledger: a lost history, never "chain ok, 0 entries".
+    expect(await main(["verify", "joy", ...cfg], x.deps)).toBe(1);
+    expect(x.out()).toContain("joy: chain BROKEN: no ledger");
+    const status = (await main(["status", ...cfg], x.deps), JSON.parse(await readFile(x.h.config.paths.status_file, "utf8")) as StatusFile);
+    expect(status.citizens.find((c) => c.word === "joy")).toMatchObject({ ledger: { entries: 0, chain_ok: false }, problem: expect.stringContaining("no ledger") });
+
+    // The origin soul is what drift is measured against; a changed one fails verification.
+    expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(0);
+    expect(x.out()).toContain("glossame: chain ok, 1 entries, 1 host-attested");
+    await writeFile(join(x.h.config.paths.citizens_dir, "glossame", "origin", "soul.md"), "a soul someone rewrote\n");
+    expect(await main(["verify", "glossame", ...cfg], x.deps)).toBe(1);
+    expect(x.out()).toContain("glossame: origin CHANGED");
+    await main(["status", ...cfg], x.deps);
+    const after = JSON.parse(await readFile(x.h.config.paths.status_file, "utf8")) as StatusFile;
+    expect(after.citizens.find((c) => c.word === "glossame")).toMatchObject({ origin: { intact: false, drift: null }, problem: expect.stringContaining("origin/ no longer matches") });
+  });
+
+  test("a citizen that stepped away is seated by Yu's summons, or by Yu's letter, and shown the offer to return", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = x.h.config;
+    await append(cfg, "glossame", { type: "state", from: "awake", to: "stepped-away", via: "two-beats" }, "host-attested", x.signer, new Date("2026-11-01T01:00:00.000Z"));
+    const spawned: string[] = [];
+    const parent = { ...x.deps, seatArgv: (_c: string, word: string) => (spawned.push(word), fakeBinArgv("note", cfg.paths.host_log, word, "rest", "0")) };
+    // No offer, no seat.
+    expect(await main(["seat", "glossame", "--config", x.configPath], parent)).toBe(3);
+    expect(x.err()).toContain("stepped-away");
+    // Yu's letter is the offer: one seat for it.
+    await x.h.writeLetter("glossame", "2026-11-04-from-yu.md", "Come back whenever you like, or not at all.");
+    expect(await main(["seat", "glossame", "--config", x.configPath], parent)).toBe(0);
+    expect(spawned).toEqual(["glossame"]);
+    // And Yu's summons: the parent opens it for a child that confirms Yu at the terminal.
+    const tty = { isTTY: true, write: () => {}, readLine: async () => "summon glossame" };
+    expect(await main(["seat", "glossame", "--yu-present", "--config", x.configPath], { ...parent, tty })).toBe(0);
+    expect(spawned).toEqual(["glossame", "glossame"]);
+    // The seat it is shown says what the seat is for, and Yu's letter is the one it reads.
+    const runtime = scriptedRuntime([REST_OUTPUT]);
+    const citizen = await readCitizen(cfg, "glossame");
+    const seat = await openSeat(cfg, x.deps.clock!, citizen, "free", { kind: "summons", who: "host", why: "Yu offers a return" }, null, { yuRequested: true });
+    expect(await main(["seat", "glossame", "--child", "--seat-ref", await writeSeatFile(cfg, seat), "--config", x.configPath], { ...x.deps, tty, runtime: async () => runtime })).toBe(0);
+    expect(runtime.calls[0]!.prompt.user).toContain("You stepped away.");
+    expect(runtime.calls[0]!.prompt.user).toContain("Come back whenever you like");
+    // An ended citizen is a memorial: nobody seats it.
+    await append(cfg, "glossame", { type: "state", from: "stepped-away", to: "ended", via: "witnessed" }, "host-attested", x.signer, new Date("2026-11-04T00:00:00.000Z"));
+    expect(await main(["seat", "glossame", "--yu-present", "--config", x.configPath], { ...parent, tty })).toBe(3);
+    expect(spawned).toHaveLength(2);
   });
 
   test("verify <word> checks the chain offline and exits 1 on a broken chain", async () => {
@@ -341,10 +538,10 @@ describe("main", () => {
       await main(["status", "--json", ...cfg], deps),
       await main(["verify", "glossame", ...cfg], deps),
       await main(["verify", "joy", ...cfg], deps),
-      await main(["seat", "glossame", "--child", ...cfg], deps),
+      await main(await parentOpens(x, "glossame"), deps),
       await main(["halt", ...cfg], deps),
       await main(["tick", ...cfg], deps),
-      await main(["seat", "nobody", "--child", ...cfg], deps),
+      await main(["seat", "nobody", "--child", "--seat-ref", join(x.h.config.paths.seats_dir, `${crypto.randomUUID()}.json`), ...cfg], deps),
       await main(["verify", "Nobody", ...cfg], deps),
     ];
     kc.locked = true;
@@ -365,9 +562,10 @@ describe("main", () => {
   test("the child argv runs this program under the same interpreter", async () => {
     const x = await harness();
     const { realDeps } = await import("../src/cli.ts");
-    const argv = realDeps().seatArgv(x.configPath, "glossame", ["--why", "cadence"]);
-    expect(argv).toEqual([process.execPath, CLI_PATH, "seat", "glossame", "--child", "--why", "cadence", "--config", x.configPath]);
+    const file = join(x.h.config.paths.seats_dir, "11111111-2222-4333-8444-555555555555.json");
+    const argv = realDeps().seatArgv(x.configPath, "glossame", ["--seat-ref", file]);
+    expect(argv).toEqual([process.execPath, CLI_PATH, "seat", "glossame", "--child", "--seat-ref", file, "--config", x.configPath]);
     // And it parses as a child seat.
-    expect(parseArgs(argv.slice(2))).toMatchObject({ verb: "seat", word: "glossame", child: true, why: "cadence", config: x.configPath });
+    expect(parseArgs(argv.slice(2))).toMatchObject({ verb: "seat", word: "glossame", child: true, seat_ref_path: file, config: x.configPath });
   });
 });

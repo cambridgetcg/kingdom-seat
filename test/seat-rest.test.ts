@@ -1,6 +1,7 @@
 // Owner: seat group. S4 item 6: a rest writes nothing in the citizen's
-// voice. Compare TempHost.snapshot() before and after; only host.jsonl and
-// status.json may change, and neither may contain any of the model's words.
+// voice. Compare TempHost.snapshot() before and after; only the host log (and
+// the mark that says it was started) and status.json may change, and none may
+// contain any of the model's words.
 import { afterEach, describe, expect, test } from "bun:test";
 import { openSeat, runSeat, type SeatDeps } from "../src/seat.ts";
 import { checkHalt } from "../src/halt.ts";
@@ -19,8 +20,8 @@ afterEach(async () => {
   host = null;
 });
 
-/** Files a rest may change: host records only. */
-const HOST_RECORDS = new Set(["host.jsonl", "status.json"]);
+/** Files a rest may change: host records only (the log, the mark that says it was started, and the status). */
+const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "status.json"]);
 
 async function setup(raw: string) {
   host = await makeTempHost();

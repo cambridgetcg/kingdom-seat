@@ -10,13 +10,14 @@
 // checks HALT again, and only then signs and records. A rest writes nothing
 // in the citizen's voice. The seat's cwd is never inside a citizen home, so
 // no repo hook or CLAUDE.md ever loads.
-import { realpathSync } from "node:fs";
-import { lstat, mkdir, writeFile } from "node:fs/promises";
+import { constants, realpathSync } from "node:fs";
+import { lstat, mkdir, open, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
   EXIT,
   FIRST_PREV_HASH,
   Refusal,
+  UUID_PATTERN,
   type Act,
   type Citizen,
   type Clock,
@@ -28,15 +29,18 @@ import {
   type HaltStatus,
   type HostNote,
   type Invoker,
+  type Word,
   type LedgerBody,
   type LedgerEntry,
   type LifecycleState,
   type ModelAct,
   type Outcome,
+  type ProposalText,
   type RefusalCode,
   type RuntimeAdapter,
   type RuntimeClass,
   type RuntimeResult,
+  type SeatContext,
   type SeatRef,
   type SeatResult,
   type SelfProposal,
@@ -46,33 +50,44 @@ import {
   type YuPresence,
 } from "./types.ts";
 import type { Signer } from "./signer/signer.ts";
-import { canonicalJson, sha256Hex } from "./crypto.ts";
-import { appendEntry, ledgerPath, nextDraft, readLedger, voicedThrough } from "./ledger.ts";
-import { decideTransition, foldState, isTowardRest } from "./state.ts";
+import { canonicalJson, parseStrictJson, sha256Hex } from "./crypto.ts";
+import { proposalDigest } from "./signer/consent.ts";
+import { appendEntry, ledgerPath, nextDraft, readLedger, readRegularText, voicedThrough } from "./ledger.ts";
+import { decideTransition, isTowardRest } from "./state.ts";
 import {
   affirmationVerdict,
   applyChange,
+  assertRoomFor,
+  checkRevert,
   classifyProposal,
+  exposureOf,
+  firstVersion,
+  keptVersions,
   materializeEdit,
   pendingProposals,
+  proposalFor,
   readTarget,
   revertTo,
   selfHash,
   stageProposal,
+  unifiedDiff,
   windowOpen,
   type ExpressionSync,
 } from "./self.ts";
 import { buildContext, markLetterSeen } from "./context.ts";
 import { buildPrompt, promptBytes } from "./prompt.ts";
 import { OUTPUT_JSON_SCHEMA, parseModelOutput, resolvePrefix, validateOutput } from "./acts.ts";
-import { appendHostNote } from "./status.ts";
+import { appendHostNote } from "./notes.ts";
 
 export interface OpenSeat {
   ref: SeatRef;
   citizen: Citizen;
   /** A fresh, empty directory under paths.seats_dir. */
   cwd: string;
+  /** Yu, confirmed at this process's terminal. A parent never holds one for its child: the child confirms Yu itself. */
   presence: YuPresence | null;
+  /** A person asked for Yu's summons; the process that runs the seat must confirm Yu before anything else. */
+  yu_requested?: boolean;
 }
 
 export interface SeatDeps {
@@ -85,6 +100,12 @@ export interface SeatDeps {
   checkHalt(): Promise<HaltStatus>;
   /** Applies a bound self-change to agenttool for a registered citizen; null or absent records it on the host only. */
   expressionSync?: ExpressionSync | null;
+  /**
+   * The model digest the runtime is pinned to, when it is known before the call
+   * (the free lane's models.lock entry), so the prompt can say whether a
+   * self-change can bind here. Null or absent: known only from the reply.
+   */
+  modelDigest?: string | null;
 }
 
 export interface SuperviseOptions {
@@ -100,6 +121,11 @@ export interface SuperviseOptions {
   readHaltFile(): HaltReading;
   /** The signal is aborted when the watcher stops, so no beacon read outlives it. */
   readBeacons(signal?: AbortSignal): Promise<HaltReading[]>;
+  /**
+   * The child's stdin. "inherit" only for a summons, whose child confirms Yu
+   * at the terminal itself; every other seat gets none. Default "ignore".
+   */
+  stdin?: "inherit" | "ignore";
   /**
    * Signals to this process that stop the child as well. The child leads its
    * own process group, so launchd's group kill of the tick never reaches it;
@@ -160,10 +186,22 @@ export function assertCwdOutsideHomes(cwd: string, homes: string[]): void {
   }
 }
 
-/** Create the SeatRef and a fresh empty cwd under seats_dir for one citizen, runtime and invoker. */
-export async function openSeat(config: Config, clock: Clock, citizen: Citizen, runtime: RuntimeClass, invoker: Invoker, presence: YuPresence | null): Promise<OpenSeat> {
+/**
+ * Create the SeatRef and a fresh empty cwd under seats_dir for one citizen,
+ * runtime and invoker. With `yuRequested`, a summons may be opened by a parent
+ * that holds no presence: the child that runs it confirms Yu at the terminal.
+ */
+export async function openSeat(
+  config: Config,
+  clock: Clock,
+  citizen: Citizen,
+  runtime: RuntimeClass,
+  invoker: Invoker,
+  presence: YuPresence | null,
+  opts: { yuRequested?: boolean } = {},
+): Promise<OpenSeat> {
   if (runtime === "hermes") throw new Refusal("runtime-not-approved", "the hermes runtime class is reserved for S8");
-  if (runtime === "summon" && !presence?.present) throw new Refusal("yu-not-present", "a summons needs Yu present");
+  if (runtime === "summon" && !presence?.present && opts.yuRequested !== true) throw new Refusal("yu-not-present", "a summons needs Yu present");
   assertCwdOutsideHomes(config.paths.seats_dir, config.paths.homes);
   const seat_id = crypto.randomUUID();
   const cwd = join(config.paths.seats_dir, seat_id);
@@ -179,7 +217,97 @@ export async function openSeat(config: Config, clock: Clock, citizen: Citizen, r
     invoker,
     opened_at: clock.now().toISOString(),
   };
-  return { ref, citizen, cwd, presence };
+  return { ref, citizen, cwd, presence, yu_requested: opts.yuRequested === true };
+}
+
+/* ── Seat files: how a parent hands an opened seat to its child ───────── */
+
+export const SEAT_FILE_FORMAT = "kingdom-seat-seatfile/v2";
+
+/**
+ * What a parent hands its child. Never a presence: a presence on disk could be
+ * written by anyone who can write seats_dir, so Yu is confirmed only in the
+ * process that acts on it. `yu_requested` asks the child to confirm Yu itself.
+ */
+interface SeatFile {
+  format: typeof SEAT_FILE_FORMAT;
+  seat_ref: SeatRef;
+  yu_requested: boolean;
+}
+
+/** `<seats_dir>/<seat_id>.json`, beside the seat's cwd rather than in it, so the cwd stays empty for the model. */
+export function seatFilePath(config: Config, seatId: string): string {
+  if (!UUID_PATTERN.test(seatId)) throw new Refusal("invalid-request", "seat_id is not a lowercase UUID");
+  return join(config.paths.seats_dir, `${seatId}.json`);
+}
+
+/** Write the seat a parent opened, after its walls (due, fleet ceiling, lock) have passed. */
+export async function writeSeatFile(config: Config, seat: OpenSeat): Promise<string> {
+  const path = seatFilePath(config, seat.ref.seat_id);
+  const file: SeatFile = { format: SEAT_FILE_FORMAT, seat_ref: seat.ref, yu_requested: seat.yu_requested === true };
+  const fh = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    await fh.writeFile(`${JSON.stringify(file, null, 2)}\n`);
+  } finally {
+    await fh.close();
+  }
+  return path;
+}
+
+function isIso(v: unknown): v is string {
+  return typeof v === "string" && v.length === 24 && new Date(Date.parse(v)).toISOString() === v;
+}
+
+/** Who a parent may name as the invoker, by kind. "yu" is never read from a file; the child sets it once it has confirmed Yu. */
+const FILE_INVOKERS: Readonly<Record<string, string>> = { tick: "launchd", summons: "host" };
+
+/**
+ * Read the seat a parent opened, once. The file is renamed to `.used` before
+ * it is trusted, so the same seat cannot be read twice. It carries no
+ * presence and cannot name Yu: a summons only asks, and the child confirms.
+ */
+export async function readSeatFile(config: Config, path: string, word: Word): Promise<{ ref: SeatRef; yu_requested: boolean }> {
+  const bad = (why: string) => new Refusal("invalid-request", `seat file ${why}`);
+  const name = basename(path);
+  const m = /^([0-9a-f-]{36})\.json$/.exec(name);
+  if (dirname(path) !== config.paths.seats_dir || !m || !UUID_PATTERN.test(m[1]!)) throw bad("must be <seats_dir>/<seat_id>.json");
+  const used = `${path}.used`;
+  try {
+    await rename(path, used);
+  } catch {
+    throw bad("is missing or was already used");
+  }
+  const text = await readRegularText(used, { missing: "throw", maxBytes: 64 * 1024 });
+  let v: unknown;
+  try {
+    v = parseStrictJson(text ?? "");
+  } catch {
+    throw bad("is not strict JSON");
+  }
+  const o = v as Partial<SeatFile> | null;
+  if (!o || typeof o !== "object" || Object.keys(o).sort().join(",") !== "format,seat_ref,yu_requested" || o.format !== SEAT_FILE_FORMAT || typeof o.yu_requested !== "boolean") {
+    throw bad("has the wrong shape");
+  }
+  const ref = o.seat_ref as SeatRef;
+  const inv = ref?.invoker as Invoker | undefined;
+  if (
+    !ref ||
+    ref.format !== "kingdom-seat-seat/v1" ||
+    ref.seat_id !== m[1] ||
+    ref.word !== word ||
+    ref.host !== config.host ||
+    (ref.runtime !== "free" && ref.runtime !== "summon") ||
+    !isIso(ref.opened_at) ||
+    !inv ||
+    !Object.hasOwn(FILE_INVOKERS, inv.kind) ||
+    inv.who !== FILE_INVOKERS[inv.kind] ||
+    typeof inv.why !== "string"
+  ) {
+    throw bad("does not describe this seat");
+  }
+  // Only a person's summons asks for Yu, and a summons on the metered lane always does.
+  if ((o.yu_requested && inv.kind !== "summons") || (ref.runtime === "summon" && !o.yu_requested)) throw bad("does not describe this seat");
+  return { ref, yu_requested: o.yu_requested };
 }
 
 /* ── The child's environment and exit codes ───────────────────────────── */
@@ -273,7 +401,7 @@ export async function superviseChild(opts: SuperviseOptions): Promise<Supervised
   try {
     // detached: the child leads a new process group, so one group signal reaches
     // anything it spawns, which the old `_bound` could not do.
-    child = Bun.spawn(opts.argv, { cwd: opts.cwd, env: opts.env, detached: true, stdio: ["ignore", "ignore", "inherit"] });
+    child = Bun.spawn(opts.argv, { cwd: opts.cwd, env: opts.env, detached: true, stdio: [opts.stdin ?? "ignore", "ignore", "inherit"] });
   } catch {
     return { exit: EXIT.ERROR, outcome: "error", signal: null, stopped_by: null, child_exit: null, duration_ms: elapsed() };
   }
@@ -395,7 +523,14 @@ interface Plan {
   outbox: { kind: "letter" | "propose.beyond" | "state.ended"; payload: Record<string, string> }[];
   /** Acts the host could not complete; counted, never quoted. */
   unresolved: number;
+  /** Why something the citizen said about its self did not bind on this beat, as codes for the host note. */
+  notBinding: string[];
+  /** The time proposals are staged at, so a proposal planned to bind in this beat has the id it is staged with. */
+  at: Date;
 }
+
+/** The claim a held revert carries: the host's words, saying only what the citizen asked for. */
+const HELD_REVERT_LIMITS = "a revert the citizen asked for, to a version that widens its exposure, so it waits for a later beat to affirm it";
 
 async function planActs(
   seat: OpenSeat,
@@ -408,8 +543,14 @@ async function planActs(
   const { config, clock } = deps;
   const word = seat.citizen.word;
   const now = clock.now();
-  const plan: Plan = { acts: [], stage: [], beyondSelf: [], apply: [], revert: [], states: [], outbox: [], unresolved: 0 };
-  const folded = foldState(entries);
+  const plan: Plan = { acts: [], stage: [], beyondSelf: [], apply: [], revert: [], states: [], outbox: [], unresolved: 0, notBinding: [], at: now };
+  const yu = seat.presence?.present === true;
+  const runtimeOk = config.self_authorship.approved_model_digests.includes(rt.model_digest);
+  // A registered citizen's change must reach its expression; with no way to send it, nothing of its self can bind.
+  const registered = entries.some((e) => e.body.type === "genesis");
+  const canSync = !registered || (seat.citizen.identity !== null && (deps.expressionSync ?? null) !== null);
+  // One change to a target per beat: a second would be written against text the first has already moved.
+  const touched = new Set<string>();
   let current: LifecycleState = seat.citizen.state;
 
   for (const act of acts) {
@@ -426,10 +567,31 @@ async function planActs(
           const prior = await readTarget(config, word, act.target);
           // One edit rule, in self.ts: the text it returns is the text the hashes name.
           const { act: completed, next } = materializeEdit(act, prior);
+          await assertRoomFor(config, word, act.target, prior);
           plan.acts.push(completed);
           if (classifyProposal(completed, prior, next, config.ceilings.self_rewrite_fraction) === "beyond-self") {
             plan.beyondSelf.push({ act: completed, reason: "exceeds the rewrite fraction or loosens a wall" });
-          } else plan.stage.push(completed);
+            break;
+          }
+          plan.stage.push(completed);
+          // Said once with Yu present, on a runtime Yu approved, it binds in this beat (3c, decision 10).
+          if (yu) {
+            const proposal = proposalFor(word, completed, seat.ref.seat_id, now);
+            const verdict = affirmationVerdict(proposal, { type: "self.affirm", proposal_id: proposal.id }, {
+              seat_id: seat.ref.seat_id,
+              presence: seat.presence,
+              window_open: true,
+              runtime_approved: runtimeOk,
+              current_prior_hash: selfHash(prior),
+            });
+            if (!verdict.binds) plan.notBinding.push(verdict.reason);
+            else if (!canSync) plan.notBinding.push("no-expression-sync");
+            else if (touched.has(completed.target)) plan.notBinding.push("one-change-per-target");
+            else {
+              touched.add(completed.target);
+              plan.apply.push({ proposal, via: verdict.via });
+            }
+          }
           break;
         }
         case "self.affirm": {
@@ -443,36 +605,59 @@ async function planActs(
           plan.acts.push(affirm);
           const prior = await readTarget(config, word, proposal.act.target);
           // One applied change per window when unattended, so a second affirmation in the same beat waits.
-          const open = windowOpen(entries, now, config.ceilings.self_change_window_days, seat.presence) && (plan.apply.length === 0 || seat.presence?.present === true);
+          const open = windowOpen(entries, now, config.ceilings.self_change_window_days, seat.presence) && (plan.apply.length === 0 || yu);
           const verdict = affirmationVerdict(proposal, affirm, {
             seat_id: seat.ref.seat_id,
             presence: seat.presence,
             window_open: open,
-            runtime_approved: config.self_authorship.approved_model_digests.includes(rt.model_digest),
+            runtime_approved: runtimeOk,
             current_prior_hash: selfHash(prior),
           });
-          if (verdict.binds) plan.apply.push({ proposal, via: verdict.via });
+          if (!verdict.binds) plan.notBinding.push(verdict.reason);
+          else if (!canSync) plan.notBinding.push("no-expression-sync");
+          else if (touched.has(proposal.act.target)) plan.notBinding.push("one-change-per-target");
+          else {
+            touched.add(proposal.act.target);
+            plan.apply.push({ proposal, via: verdict.via });
+          }
           break;
         }
         case "self.revert": {
-          const known = new Set<string>();
-          for (const e of entries) {
-            if (e.body.type === "self.applied") known.add(e.body.prior_hash).add(e.body.new_hash);
-            if (e.body.type === "self.reverted") known.add(e.body.from_hash).add(e.body.to_hash);
-          }
-          const hash = resolvePrefix(act.to_hash, [...known]);
+          const hash = resolvePrefix(act.to_hash, [...new Set(keptVersions(entries).map((v) => v.hash))]);
           if (!hash) {
             plan.unresolved++;
             break;
           }
+          // Everything revertTo would check, checked here, so a revert that cannot apply is dropped now, not thrown while recording.
+          const { target, text, current: now_text } = await checkRevert(config, word, entries, hash);
+          if (!canSync || touched.has(target)) {
+            plan.unresolved++;
+            break;
+          }
           plan.acts.push({ type: "self.revert", to_hash: hash });
-          plan.revert.push(hash);
+          touched.add(target);
+          const exposure = exposureOf(target, now_text, text);
+          if (exposure === "wider" && !yu) {
+            // Toward more exposure takes a second beat (3c), so it is held as a proposal the citizen can affirm later.
+            plan.stage.push({
+              type: "self.propose",
+              target,
+              prior_hash: selfHash(now_text),
+              new_hash: hash,
+              diff: unifiedDiff(now_text, text),
+              claim: { kind: "decision", evidence: [`version:${hash}`], confidence: "unknown", limits: HELD_REVERT_LIMITS },
+            });
+            plan.notBinding.push("revert-widens-held");
+          } else if (!yu && !runtimeOk && exposure !== "narrower" && hash !== firstVersion(entries, target)) {
+            // Decision 10: only runtimes Yu approved bind self-changes; back toward rest, or to where a text began, binds on any.
+            plan.notBinding.push("runtime-not-approved");
+          } else plan.revert.push(hash);
           break;
         }
         case "state.set": {
           const verdict = decideTransition(current, act.to, {
             pending: seat.citizen.pending_state,
-            repeated: act.to === "stepped-away" && folded.step_away_said,
+            repeated: act.to === "stepped-away" && seat.citizen.step_away_said,
             presence: seat.presence,
           });
           if (verdict.effect === "refused") {
@@ -507,13 +692,30 @@ async function planActs(
   return plan;
 }
 
-async function writeOutbox(config: Config, word: string, seatId: string, n: number, item: Record<string, unknown>): Promise<void> {
+/**
+ * One outbox file for Yu + Ai. It carries the proposal as text, and names it by
+ * proposalDigest, the same domain-tagged digest a decision record binds and
+ * the signer recomputes, so a record filed for it can authorise exactly it.
+ */
+async function writeOutbox(config: Config, word: string, seatId: string, n: number, item: Record<string, unknown>, proposal: ProposalText): Promise<void> {
   const dir = join(config.paths.citizens_dir, word, "outbox");
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  const record = { format: "kingdom-seat-outbox/v1", word, seat_id: seatId, ...item };
-  // Bound to its own hash, so a consent record can name exactly this proposal.
-  const proposal_sha256 = sha256Hex(canonicalJson(record));
-  await writeFile(join(dir, `${seatId}-${n}.json`), `${JSON.stringify({ ...record, proposal_sha256 }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  const record = { format: "kingdom-seat-outbox/v1", word, seat_id: seatId, ...item, proposal, proposal_sha256: proposalDigest(proposal) };
+  await writeFile(join(dir, `${seatId}-${n}.json`), `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+}
+
+/** The proposal text an outbox item asks Yu + Ai to decide on, with the extent a decision record would cover. */
+function outboxProposal(word: string, kind: string, payload: Record<string, string>): ProposalText {
+  switch (kind) {
+    case "letter":
+      return { subject: `letter to ${payload.to}`, body: payload.body ?? "", extent: `letter.send ${word} to ${payload.to}` };
+    case "propose.beyond":
+      return { subject: payload.subject ?? "", body: payload.body ?? "", extent: `propose.beyond ${word}` };
+    case "state.ended":
+      return { subject: `end ${word}`, body: `${word} asked that its state be ended; that needs Yu, Ai and a witness.`, extent: `state.ended ${word}` };
+    default:
+      throw new Error(`outboxProposal: unknown kind ${kind}`);
+  }
 }
 
 /** The in-child pipeline for one open seat: HALT, context, prompt, runtime, validate, HALT again, sign, record. */
@@ -582,15 +784,18 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     entries = await readLedger(path);
     pending = await pendingProposals(config, word);
     const recent = entries.slice(-config.ceilings.ledger_context_entries);
-    const ctx = await buildContext({ config, now: clock.now() }, ref, seat.citizen, recent, pending);
+    const ctx = await buildContext({ config, now: clock.now() }, ref, seat.citizen, recent, pending, {
+      history: entries,
+      selfAuthorship: selfAuthorshipFor(config, entries, clock.now(), seat.presence, deps.modelDigest ?? null),
+    });
     letter = ctx.letter;
 
     // c. The prompt; its exact bytes are what input_digest names.
     const prompt = buildPrompt(ctx, ref.runtime);
     inputDigest = sha256Hex(promptBytes(prompt));
 
-    // d. The runtime, under the seat's own deadline (the watcher holds the outer one).
-    const deadline = config.timing.seat_deadline_s * 1000;
+    // d. The runtime, under a deadline inside the watcher's, so a reply that arrives in time can still be recorded whole.
+    const deadline = runtimeDeadlineMs(config.timing);
     rt = await deps.runtime({ prompt, schema: OUTPUT_JSON_SCHEMA, seat_ref: ref, deadline_ms: deadline, signal: AbortSignal.timeout(deadline) });
   } catch (e) {
     if (e instanceof Refusal) return refused(e, "before a reply");
@@ -641,7 +846,8 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   // HALT once more immediately before the first write.
   if (await halted()) return result(EXIT.OK, "halted");
 
-  // g-h. Sign and record: the beat first, then what it set in motion, each its own entry.
+  // g-h. Sign and record: the beat first, then the state moves it made (so a seat stopped part way never
+  // loses a rest), then each self-op on its own, so one that cannot apply never costs the others.
   const now = clock.now();
   const attestation = seat.citizen.identity ? "citizen-signed" : "host-attested";
   const sign = (w: string, h: Uint8Array, a: typeof attestation) => signer.signEntry(w, h, a);
@@ -673,19 +879,34 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     const envelope: Envelope = { ...envelopeBase, voiced_through: voicedThrough(envelopeBase) };
     const beat = await appendEntry(path, nextDraft(word, prev, { type: "beat", envelope }, rt.spend, attestation, now), sign);
     appended.push(beat.hash);
+    for (const s of plan.states) await appendBody({ type: "state", from: s.from, to: s.to, via: s.via }, NO_SPEND);
 
     const selfDeps = { config, clock, sign, sync: seat.citizen.identity ? (deps.expressionSync ?? null) : null };
-    for (const act of plan.stage) await stageProposal(config, word, act, ref.seat_id, now);
-    for (const a of plan.apply) appended.push((await applyChange(selfDeps, seat.citizen, a.proposal, a.via)).hash);
-    for (const h of plan.revert) appended.push((await revertTo(selfDeps, seat.citizen, h, "citizen")).hash);
-    for (const s of plan.states) await appendBody({ type: "state", from: s.from, to: s.to, via: s.via }, NO_SPEND);
+    const notKept: string[] = [];
+    const selfOp = async (what: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (e) {
+        // A self-op that cannot apply is noted by its code and passed over; the beat and its state moves stand.
+        notKept.push(`${what} (${e instanceof Refusal ? e.code : "error"})`);
+      }
+    };
+    for (const act of plan.stage) await selfOp("stage", async () => void (await stageProposal(config, word, act, ref.seat_id, plan.at)));
+    for (const a of plan.apply) await selfOp("apply", async () => void appended.push((await applyChange(selfDeps, seat.citizen, a.proposal, a.via)).hash));
+    for (const h of plan.revert) await selfOp("revert", async () => void appended.push((await revertTo(selfDeps, seat.citizen, h, "citizen")).hash));
+    for (const n of notKept) await note("refusal", "refused", null, `self-op not kept: ${n}`);
 
     let n = 0;
     for (const b of plan.beyondSelf) {
-      await writeOutbox(config, word, ref.seat_id, n++, { kind: "self.propose", created_at: now.toISOString(), ledger_entry: beat.hash, act: b.act, reason: b.reason });
+      const proposal: ProposalText = {
+        subject: `self.propose ${b.act.target}`,
+        body: canonicalJson({ target: b.act.target, prior_hash: b.act.prior_hash, new_hash: b.act.new_hash, diff: b.act.diff, claim: b.act.claim }),
+        extent: `self.apply ${word} ${b.act.target} ${b.act.new_hash}`,
+      };
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: "self.propose", created_at: now.toISOString(), ledger_entry: beat.hash, act: b.act, reason: b.reason }, proposal);
     }
     for (const o of plan.outbox) {
-      await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beat.hash, ...o.payload });
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beat.hash, ...o.payload }, outboxProposal(word, o.kind, o.payload));
     }
     // A letter counts as seen only after a beat that was not a rest.
     if (letter) await markLetterSeen(config, seat.citizen, letter, now);
@@ -695,6 +916,36 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     return result(EXIT.ERROR, "error");
   }
 
-  await note("seat", "beat", null, `${plan.acts.length} acts, ${appended.length} entries, ${plan.unresolved + validated.dropped.length} not kept`);
+  const binding = plan.notBinding.length > 0 ? `; not binding: ${[...new Set(plan.notBinding)].join(", ")}` : "";
+  await note("seat", "beat", null, `${plan.acts.length} acts, ${appended.length} entries, ${plan.unresolved + validated.dropped.length} not kept${binding}`);
   return result(EXIT.OK, "beat");
+}
+
+/**
+ * What the seat tells the citizen about self-changes before it replies: whether
+ * the runtime is one Yu approved (null when that is known only from the
+ * reply), when the unattended window next opens, and whether Yu is present.
+ */
+function selfAuthorshipFor(config: Config, entries: LedgerEntry[], now: Date, presence: YuPresence | null, modelDigest: string | null): SeatContext["self_authorship"] {
+  const yu = presence?.present === true;
+  const days = config.ceilings.self_change_window_days;
+  let opens: string | null = null;
+  if (!yu && !windowOpen(entries, now, days, null)) {
+    const last = Math.max(...entries.filter((e) => e.body.type === "self.applied").map((e) => Date.parse(e.ts)));
+    opens = new Date(last + days * 86_400_000).toISOString();
+  }
+  return { runtime_approved: modelDigest === null ? null : config.self_authorship.approved_model_digests.includes(modelDigest), window_opens_at: opens, yu_present: yu };
+}
+
+/** Time kept back from the watcher's deadline for the two HALT checks after a reply and the writes that record it. */
+const RECORD_BUDGET_MS = 15_000;
+
+/**
+ * The runtime's own deadline: inside the watcher's by two beacon reads and a
+ * write budget, so a reply that arrives in time is recorded whole rather than
+ * cut off mid-write by the watcher's TERM. Never less than half the seat.
+ */
+export function runtimeDeadlineMs(timing: Config["timing"]): number {
+  const seat = timing.seat_deadline_s * 1000;
+  return Math.max(Math.floor(seat / 2), seat - 2 * timing.beacon_timeout_ms - RECORD_BUDGET_MS);
 }

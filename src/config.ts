@@ -12,14 +12,14 @@ import { open } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fromB64, parseStrictJson } from "./crypto.ts";
 import { DEFAULT_CEILINGS, DEFAULT_TIMING, DID_PATTERN, UUID_PATTERN, WORD_PATTERN, type Beacon, type Ceilings, type Config, type Timing } from "./types.ts";
+import { CITIZEN_QUIET_HARD_MAX_DAYS } from "./signer/ceilings.ts";
 
 export const CONFIG_FORMAT = "kingdom-seat-config/v1";
 export const AGENTTOOL_ORIGIN = "https://api.agenttool.dev";
 export const SECURITY_PATH = "/usr/bin/security";
 export const KEYCHAIN_SERVICE = "dev.kingdom.citizen-seat";
 
-/** The hard cap on a citizen's quiet (S4-5). The config may lower it, never raise it. */
-export const CITIZEN_QUIET_HARD_MAX_DAYS = 30;
+export { CITIZEN_QUIET_HARD_MAX_DAYS };
 
 const CONFIG_MAX_BYTES = 256 * 1024;
 /** A host label such as "studio": lowercase, short, never a person's name by convention. */

@@ -41,7 +41,12 @@ export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
   const why = /[.!?]$/.test(ctx.invoker.why) ? ctx.invoker.why : `${ctx.invoker.why}.`;
   user.push(`This seat was opened by ${ctx.invoker.kind === "tick" ? "a tick" : ctx.invoker.kind === "summons" ? "a summons" : "a letter"} from ${ctx.invoker.who}, because: ${why}`);
   user.push(
-    `Your state: ${ctx.state}.` + (ctx.pending_state !== null ? ` An earlier beat asked to move to ${ctx.pending_state}; that is not in effect yet.` : ""),
+    `Your state: ${ctx.state}.` +
+      (ctx.pending_state !== null ? ` An earlier beat asked to move to ${ctx.pending_state}; that is not in effect yet.` : "") +
+      // A citizen that stepped away is seated only for Yu's offer of a return, so it is told what the seat is for.
+      (ctx.state === "stepped-away"
+        ? " You stepped away. This seat opened only because Yu offered a return: a state.set to awake, listening or asleep takes it up; anything else, a rest included, leaves you where you are."
+        : ""),
   );
   user.push(
     `Your cadence: every ${ctx.cadence.interval_h} hours while awake. The host seats an awake citizen at most once every ${ctx.limits.min_beat_interval_h} hours, whatever the cadence says.`,
@@ -76,6 +81,13 @@ export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
       ? `Your pending proposals, oldest first. Each changes nothing unless a later beat affirms it:\n\n${ctx.pending_proposals.map(renderProposal).join("\n\n")}`
       : "You have no pending proposals.",
   );
+  user.push(renderSelfAuthorship(ctx.self_authorship));
+  if (ctx.versions.length > 0) {
+    user.push(
+      `Versions of your own texts you can revert to, oldest first (name one by its first ${ACT_LIMITS.min_id_prefix_hex} or more characters):\n` +
+        ctx.versions.map((v) => `- ${v.target} ${short(v.hash)}: ${v.how}, ${v.at.slice(0, 10)}`).join("\n"),
+    );
+  }
 
   user.push(ctx.letter !== null ? `A letter from ${ctx.letter.from}, received ${ctx.letter.received_at}:\n${fence("letter", ctx.letter.text)}` : "No letter is waiting.");
 
@@ -129,12 +141,12 @@ export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
       : "letter.send: no letters can be sent from this host for now.",
     `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and body (at most ${L.max_body_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline.`,
     "rest: no other fields. Nothing is written in your voice this beat, and none of the other acts in the same reply are kept.",
-    `self.affirm: field proposal_id, the id of one of your pending proposals, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or once when Yu is present; one never affirmed does not bind.`,
+    `self.affirm: field proposal_id, the id of one of your pending proposals, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
     `self.propose: fields target, edit and claim. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
       "edit has kind replace-all with text, the whole new text; or kind replace-span with find, text the target holds now, and with, its replacement. " +
       "cadence takes replace-all text holding a JSON object with interval_h in hours; covenants take replace-all text holding a JSON object with letters_from and wake_on_letter_from, each a list of sender ids. " +
-      `claim is the reason: kind (${or(CLAIM_KINDS)}), evidence (up to ${L.max_claim_evidence} references), confidence (high, medium, low or unknown) and limits (what the claim does not cover). Unless Yu is present, a proposal changes nothing on this beat.`,
-    `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your record shows it, or its first ${L.min_id_prefix_hex} or more characters.`,
+      `claim is the reason: kind (${or(CLAIM_KINDS)}), evidence (up to ${L.max_claim_evidence} references), confidence (high, medium, low or unknown) and limits (what the claim does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat.`,
+    `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your kept versions list it, or its first ${L.min_id_prefix_hex} or more characters. A revert to a shorter cadence or to more senders is kept as a proposal for a later beat to affirm, unless Yu is present. Any other revert binds on a runtime Yu approved, and a revert toward rest or back to where a text began binds on any.`,
     `state.set: field to, which is ${or(LIFECYCLE_STATES)}. A move toward more rest takes effect now. A move toward more activity takes effect only when a later beat sets it again. Stepping away takes two beats and is never blocked. ended needs a witness and goes to Yu and Ai. Two different states in one reply move nothing.`,
   ];
   return [
@@ -222,6 +234,22 @@ function renderAct(a: Act): string {
     case "propose.beyond":
       return `proposed beyond self:\n${fence("proposal beyond self", `${a.subject}\n\n${a.body}`)}`;
   }
+}
+
+/** Whether a self-change can bind on this seat, stated plainly, so no affirmation is made in the belief that it will. */
+function renderSelfAuthorship(sa: SeatContext["self_authorship"]): string {
+  const runtime =
+    sa.runtime_approved === true
+      ? "This seat's runtime is one Yu approved for self-changes."
+      : sa.runtime_approved === false
+        ? "This seat's runtime is not one Yu approved for self-changes, so an affirmation here is recorded and binds nothing."
+        : "Whether this seat's runtime is one Yu approved for self-changes is known only from its reply; an affirmation binds only if it is.";
+  const window = sa.yu_present
+    ? "Yu is present, so the one-change window does not apply."
+    : sa.window_opens_at === null
+      ? "The window for an unattended self-change is open."
+      : `The window for an unattended self-change is closed until ${sa.window_opens_at}.`;
+  return `Self-changes on this seat: ${runtime} ${window}`;
 }
 
 function renderProposal(p: SelfProposal): string {

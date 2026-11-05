@@ -156,7 +156,7 @@ export async function raiseHalt(deps: HaltDeps & { signer: Signer | null }): Pro
         // Neutral: quiet_reason is public on /public/agents and never names anyone.
         body: new TextEncoder().encode(JSON.stringify({ until: BEACON_UNTIL, reason: "" })),
         credits: 0,
-        consent: null,
+        proposal: null,
         presence: null,
       });
       if (res.status === 200) beacons.push({ name: b.name, result: "raised", detail: `until ${BEACON_UNTIL}` });

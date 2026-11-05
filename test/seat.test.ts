@@ -1,6 +1,6 @@
 // Owner: seat group. Seat opening and the pipeline's happy path.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readdir, readFile, stat, symlink } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { assertCwdOutsideHomes, openSeat, runSeat, SEAT_ENV_ALLOWLIST, seatEnv, superviseChild, type OpenSeat, type SeatDeps } from "../src/seat.ts";
 import { checkHalt } from "../src/halt.ts";
@@ -9,7 +9,8 @@ import { pendingProposals } from "../src/self.ts";
 import { ledgerPath, readLedger } from "../src/ledger.ts";
 import { promptBytes } from "../src/prompt.ts";
 import { fromHex, sha256, sha256Hex, utf8 } from "../src/crypto.ts";
-import { EXIT, Refusal, UUID_PATTERN, type CitizenIdentity, type LedgerEntry } from "../src/types.ts";
+import { EXIT, Refusal, UUID_PATTERN, type CitizenIdentity, type ConsentRecord, type LedgerEntry } from "../src/types.ts";
+import { proposalDigest, readConsentFor, verifyConsent } from "../src/signer/consent.ts";
 import { assertNoSecretIn, fakeKeychain } from "./helpers/fake-keychain.ts";
 import { FAKE_MODEL_DIGEST, fakeBinArgv, output, scriptedRuntime, type Script } from "./helpers/fake-runtime.ts";
 import { noFetch } from "./helpers/fake-server.ts";
@@ -213,7 +214,7 @@ describe("pipeline", () => {
     expect(r).toMatchObject({ exit: EXIT.REFUSED, outcome: "refused", refusal: "keychain-locked", appended: [] });
     expect(s.runtime.calls).toHaveLength(0);
     const after = await s.host.snapshot();
-    for (const k of new Set([...before.keys(), ...after.keys()])) if (k !== "host.jsonl") expect(after.get(k)).toBe(before.get(k)!);
+    for (const k of new Set([...before.keys(), ...after.keys()])) if (k !== "host.jsonl" && k !== "host.jsonl.started") expect(after.get(k)).toBe(before.get(k)!);
   });
 
   test("a propose.beyond act becomes an inert outbox proposal and executes nothing", async () => {
@@ -226,7 +227,22 @@ describe("pipeline", () => {
     expect(files).toHaveLength(1);
     const item = JSON.parse(await readFile(join(outbox, files[0]!), "utf8"));
     expect(item).toMatchObject({ format: "kingdom-seat-outbox/v1", kind: "propose.beyond", word: "glossame", seat_id: s.seat.ref.seat_id, subject: "a public name", ledger_entry: r.appended[0] });
-    expect(item.proposal_sha256).toMatch(/^[0-9a-f]{64}$/);
+    // Named by the same digest a decision record binds and the signer recomputes, so a record filed for it can authorise exactly it.
+    expect(item.proposal).toEqual({ subject: "a public name", body: "I would like my name shown on my porch.", extent: "propose.beyond glossame" });
+    expect(item.proposal_sha256).toBe(proposalDigest(item.proposal));
+    const consent_dir = s.host.config.paths.consent_dir;
+    const decided: ConsentRecord = {
+      format: "kingdom-seat-consent/v1",
+      proposal_sha256: item.proposal_sha256,
+      subject: item.proposal.subject,
+      extent: item.proposal.extent,
+      yu: { word: "yes", recorded_at: "2026-11-05T01:00:00.000Z", via: "decision-record" },
+      ai: { word: "agree", basis: "lazy-consensus", supports: ["report:another-controller"], open_challenges: 0, deadline: "2026-11-05T01:30:00.000Z" },
+      expires_at: null,
+    };
+    await writeFile(join(consent_dir, `${item.proposal_sha256}.json`), JSON.stringify(decided));
+    const found = await readConsentFor(consent_dir, item.proposal);
+    expect(found && verifyConsent(found, proposalDigest(item.proposal), s.clock.now())).toEqual({ ok: true, via: "decision-record" });
     // Nothing about the citizen changed except the record of what it said.
     const c = await readCitizen(s.host.config, "glossame");
     expect(c.state).toBe(s.citizen.state);

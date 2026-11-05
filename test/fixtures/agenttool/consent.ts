@@ -1,13 +1,22 @@
 // Presence, proposals and decision records for birth and enrollment tests.
 // Values are placeholders; no person's details appear here. Digests come
 // from consent.ts, so a record here binds exactly as the signer checks it.
-import { proposalDigest } from "../../../src/signer/consent.ts";
+import { confirmYuPresent, proposalDigest } from "../../../src/signer/consent.ts";
 import type { ConsentRecord, Word, YuPresence } from "../../../src/types.ts";
 
 export const BIRTH_NOW = "2026-11-05T12:00:00.000Z";
 
 export function presenceFor(word: Word, confirmedAt = "2026-11-05T11:58:00.000Z"): YuPresence {
   return { present: true, via: "tty-confirm", confirmed_at: confirmedAt, scope: `birth ${word}` };
+}
+
+/**
+ * The same presence, confirmed through confirmYuPresent at a fake terminal, so
+ * it is one "confirmed in this process" as birth and the signer require.
+ */
+export async function confirmedPresenceFor(word: Word, confirmedAt = "2026-11-05T11:58:00.000Z"): Promise<YuPresence> {
+  const scope = `birth ${word}`;
+  return confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => scope }, scope, () => new Date(confirmedAt));
 }
 
 /** The birth proposal: its body names the ledger entry of the citizen's affirmed yes. */

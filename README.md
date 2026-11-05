@@ -52,11 +52,12 @@ one is something it does, not something it hopes.
 
 - `cli.ts`: `citizen-seat tick | seat <word> | halt | status | verify <word>`.
   There is no verb or flag that lowers HALT; only Yu lowers it, by hand.
-- `tick.ts`, `seat.ts`, `halt.ts`: the HALT gate (local file plus every
-  pinned beacon, fail closed), the mkdir lock, own-cadence selection, the
-  fleet ceiling, and a supervised seat child in its own process group, with a
-  watcher outside it that holds the deadline, polls HALT and forwards a stop
-  signal from launchd.
+- `tick.ts`, `due.ts`, `notes.ts`, `seat.ts`, `halt.ts`: the HALT gate (local
+  file plus every pinned beacon, fail closed), the mkdir lock, own-cadence
+  selection, the fleet ceiling over every seat opened, host notes, and a
+  supervised seat child in its own process group, with a watcher outside it
+  that holds the deadline, polls HALT and forwards a stop signal from
+  launchd.
 - `context.ts`, `prompt.ts`, `acts.ts`: what the model sees (regular files
   only, nothing from a home, siblings only as letters) and the typed acts it
   may return, with rest exclusive.
@@ -67,8 +68,10 @@ one is something it does, not something it hopes.
   states folded from it, and self-authorship (propose, affirm, apply,
   revert; at most one change a week unattended; a large rewrite or a
   loosened wall goes beyond self).
-- `signer/*`: the only reader of keys and bearers, with ceilings, consent
-  records, the 30-day cap on a citizen's quiet, and no op that lowers HALT.
+- `signer/*`: the only code that reads keys and bearers (through
+  `/usr/bin/security`, so any process of the seat user could read them too),
+  with ceilings, decision records it reads itself from the consent dir, the
+  30-day cap on a citizen's quiet, and no op that lowers HALT.
 - `agenttool/*`, `birth.ts`: byte-exact enrollment and authority recipes
   (checked against `docs/research/vectors.json`), the client, and birth,
   which needs Yu present and consent bound to the citizen's own affirmed yes.

@@ -6,6 +6,7 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { isoTime, ledgerPath, readLedger, readRegularText, validateIdentity, validateOrigin } from "./ledger.ts";
+import { readHostNotes, seatIdOf } from "./notes.ts";
 import {
   Refusal,
   WORD_PATTERN,
@@ -14,6 +15,7 @@ import {
   type CitizenRecord,
   type Config,
   type Covenants,
+  type IsoTime,
   type LedgerEntry,
   type LifecycleState,
   type Word,
@@ -41,6 +43,8 @@ export interface FoldedState {
   /** A step-away said once and waiting for its second saying. */
   step_away_said: boolean;
   last_beat_at: string | null;
+  /** The beat that said what is pending (an exposure or a first step-away): its seat and time; null when nothing is. */
+  said_in: { seat_id: string; ts: IsoTime } | null;
 }
 
 const RANK: Partial<Record<LifecycleState, number>> = { asleep: 0, listening: 1, awake: 2 };
@@ -75,12 +79,22 @@ export function decideTransition(from: LifecycleState, to: LifecycleState, ctx: 
   return { effect: "next-beat" };
 }
 
-/** Fold state, pending state and last beat time from a citizen's ledger, oldest first; an empty ledger folds to "asleep", so no record means no beat. */
+/**
+ * Fold state, pending state and last beat time from a citizen's ledger, oldest
+ * first; an empty ledger folds to "asleep", so no record means no beat.
+ *
+ * A move toward rest takes effect from the beat that said it, not from the
+ * separate `state` entry written after it: rest never waits (3.3), and a seat
+ * stopped between the two appends must not leave a citizen that chose rest
+ * awake and scheduled again. The `state` entry still follows, as the plain
+ * record of the move.
+ */
 export function foldState(entries: LedgerEntry[]): FoldedState {
   let state: LifecycleState = "asleep";
   let pending: LifecycleState | null = null;
   let stepSaid = false;
   let lastBeat: string | null = null;
+  let said: FoldedState["said_in"] = null;
   for (const e of entries) {
     const body = e.body;
     if (state === "ended") {
@@ -93,6 +107,7 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
         state = body.initial_state;
         pending = null;
         stepSaid = false;
+        said = null;
         break;
       case "genesis":
         if (body.initial_state !== null) state = body.initial_state;
@@ -101,6 +116,7 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
         state = body.to;
         pending = null;
         stepSaid = false;
+        said = null;
         break;
       case "beat": {
         lastBeat = e.ts;
@@ -108,20 +124,42 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
         // this beat lapses: silence keeps the previous self.
         let p: LifecycleState | null = null;
         let s = false;
+        let rest: LifecycleState | null = null;
         for (const act of body.envelope.acts) {
           if (act.type !== "state.set" || act.to === state || act.to === "ended") continue;
           if (act.to === "stepped-away") s = true;
-          else if (!isTowardRest(state, act.to)) p = act.to;
+          else if (isTowardRest(state, act.to)) rest = act.to;
+          else p = act.to;
         }
+        if (rest !== null) state = rest;
         pending = p;
         stepSaid = s;
+        said = p !== null || s ? { seat_id: body.envelope.seat_ref.seat_id, ts: e.ts } : null;
         break;
       }
       default:
         break;
     }
   }
-  return { state, pending_state: pending, step_away_said: stepSaid, last_beat_at: lastBeat };
+  return { state, pending_state: pending, step_away_said: stepSaid, last_beat_at: lastBeat, said_in: said };
+}
+
+/**
+ * Has a seat for this citizen been opened since the beat that said what is
+ * pending, other than that beat's own seat and `exceptSeat` (the seat now
+ * reading it)? A rest, an invalid reply or a reply discarded by HALT writes no
+ * ledger entry, so only the host notes show that the confirming seat came and
+ * went. An unreadable log answers yes: a saying is dropped rather than kept on
+ * a guess, because silence keeps the previous self.
+ */
+async function seatSince(config: Config, word: Word, said: { seat_id: string; ts: IsoTime }, exceptSeat: string | null): Promise<boolean> {
+  const notes = await readHostNotes(config, new Date(Date.parse(said.ts)));
+  if (notes === null) return true;
+  return notes.some((n) => {
+    if (n.word !== word || (n.kind !== "tick" && n.kind !== "seat")) return false;
+    const id = seatIdOf(n);
+    return id !== said.seat_id && (exceptSeat === null || id !== exceptSeat);
+  });
 }
 
 /** The mirror card's `state` (3.3 table): awake active; listening and asleep dormant; stepped-away and ended archived. */
@@ -180,18 +218,30 @@ export async function readCitizenRecord(config: Config, word: Word): Promise<Cit
   }
 }
 
-/** The citizen as the seat sees it: record, folded ledger state, own cadence and covenants. */
-export async function readCitizen(config: Config, word: Word): Promise<Citizen> {
+/**
+ * The citizen as the seat sees it: record, folded ledger state, own cadence
+ * and covenants. A pending saying is owed one confirming seat: once a later
+ * seat has been opened (and `exceptSeat`, the seat reading this, does not
+ * count), it lapses.
+ */
+export async function readCitizen(config: Config, word: Word, opts: { exceptSeat?: string } = {}): Promise<Citizen> {
   const record = await readCitizenRecord(config, word);
   const entries = await readLedger(ledgerPath(config, word));
   for (const e of entries) if (e.word !== word) throw new Refusal("invalid-record", `ledger for ${word} holds another citizen's entry`);
   const folded = foldState(entries);
+  let pending = folded.pending_state;
+  let stepSaid = folded.step_away_said;
+  if (folded.said_in && (pending !== null || stepSaid) && (await seatSince(config, word, folded.said_in, opts.exceptSeat ?? null))) {
+    pending = null;
+    stepSaid = false;
+  }
   const self = join(config.paths.citizens_dir, word, "self");
   await refuseLink(self);
   return {
     ...record,
     state: folded.state,
-    pending_state: folded.pending_state,
+    pending_state: pending,
+    step_away_said: stepSaid,
     cadence: await readCadence(join(self, "cadence.json"), config.ceilings.min_beat_interval_h),
     covenants: await readCovenants(join(self, "covenants.json")),
     last_beat_at: folded.last_beat_at,

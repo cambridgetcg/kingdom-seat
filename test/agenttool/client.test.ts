@@ -27,7 +27,13 @@ import { FAKE_STRAND_ID_UPPER, fakeAgenttool, type FakeAgenttool } from "../fixt
 
 const WORD: Word = "glossame";
 const ID = TEST_IDS.identity_id;
-const IDENTITY: ClientIdentity = { identity_id: ID, did: TEST_IDS.did, root_kid: TEST_IDS.root_signing_key_id, root_public_key_b64: TEST_ROOT_PUBLIC_B64 };
+const IDENTITY: ClientIdentity = {
+  identity_id: ID,
+  did: TEST_IDS.did,
+  root_kid: TEST_IDS.root_signing_key_id,
+  root_public_key_b64: TEST_ROOT_PUBLIC_B64,
+  self_strand_id: FAKE_STRAND_ID_UPPER.toLowerCase(),
+};
 const ROOT_OPS = new Set<SignerOp>(["keys.import", "keys.revoke", "box-keys.register", "expression.put.private", "quiet.start.citizen", "quiet.end.citizen"]);
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
 const vector = (label: string) => vectors.authority.find((a) => a.label === label)!;
@@ -127,7 +133,7 @@ describe("requests through the signer", () => {
   test("importOpKey, registerBoxKey, putExpression and quiet routes use the right SignerOp, method, target and exact body", async () => {
     const h = harness();
     const presence = { present: true as const, via: "tty-confirm" as const, confirmed_at: "2026-11-05T12:00:00.000Z", scope: `birth ${WORD}` };
-    const auth = { presence, consent: null };
+    const auth = { presence, proposal: null };
     expect(await importOpKey(h.deps, WORD, TEST_OP_PUBLIC_B64, "op-2026-11", auth)).toEqual({ kid: FAKE_OP_KID });
     expect(await registerBoxKey(h.deps, WORD, vectors.derivation.box_pub_b64, auth)).toEqual({ id: "77777777-7777-4777-8777-777777777777" });
     await putExpression(h.deps, WORD, { register: "Plain.", wake_text: "A test wake text." }, auth);
@@ -228,6 +234,16 @@ describe("requests through the signer", () => {
     h.at.override((r) => r.op === "strand.create", { status: 201, json: { id: FAKE_STRAND_ID_UPPER, identity_id: null } });
     expect((await agenttoolErrorOf(createStrand(h.deps, WORD, "self"))).code).toBe("malformed_response");
 
+    // A thought to any strand but the citizen's own is refused before it is sealed or sent: the credit is charged
+    // before agenttool checks the strand, and an unbound strand takes any key in the project.
+    const sealedBefore = sealed.length;
+    const sentBefore = h.signer.sent.length;
+    expect((await refusalOf(postThought(h.deps, WORD, "66666666-6666-4666-8666-666666666666", "x", "drift"))).code).toBe("beyond-self");
+    expect([sealed.length, h.signer.sent.length]).toEqual([sealedBefore, sentBefore]);
+    const unstranded = { ...h.deps, identity: async () => ({ ...IDENTITY, self_strand_id: null }) };
+    expect((await refusalOf(postThought(unstranded, WORD, strand_id, "x", "drift"))).code).toBe("beyond-self");
+    expect([sealed.length, h.signer.sent.length]).toEqual([sealedBefore, sentBefore]);
+
     // A thought sealed by the root kid is a root act; refused before sending, since the credit is charged before verification.
     h.signer.sealThought = async (_w, _s, _p, kind) => ({ ciphertext: "AAAA", nonce: "AAAAAAAAAAAAAAAA", kind, signature: "A".repeat(88), signing_key_id: IDENTITY.root_kid });
     const before = h.signer.sent.length;
@@ -258,7 +274,7 @@ describe("requests through the signer", () => {
     expect(h3.acts()).toHaveLength(1);
 
     // Concurrency: many root acts at once for one identity, through a signer that answers slowly.
-    const second: ClientIdentity = { identity_id: "99999999-9999-4999-8999-999999999999", did: "did:at:99999999-9999-4999-8999-999999999999", root_kid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", root_public_key_b64: TEST_ROOT_PUBLIC_B64 };
+    const second: ClientIdentity = { identity_id: "99999999-9999-4999-8999-999999999999", did: "did:at:99999999-9999-4999-8999-999999999999", root_kid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", root_public_key_b64: TEST_ROOT_PUBLIC_B64, self_strand_id: null };
     const h4 = harness([second]);
     const inFlight = new Map<string, number>();
     let maxPerIdentity = 0;

@@ -93,6 +93,7 @@ async function mirrorCitizen(h: TempHost, worktree: string, remote: string): Pro
     mirror: { remote, worktree, chosen_at: "2026-11-05T00:00:00.000Z" },
     state: "awake",
     pending_state: null,
+    step_away_said: false,
     cadence: { interval_h: 72 },
     covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },
     last_beat_at: null,
@@ -360,9 +361,9 @@ describe("[S4-3] divergence and push", () => {
     expect(g.pushes.calls).toEqual([]);
     expect(g.log.some((a) => a[1] === "fetch")).toBe(false);
 
-    // A push that fails is reported, not retried, and never forced.
-    git(worktree, "rm", "-q", "--", "run.sh");
-    git(worktree, "commit", "-q", "-m", "runner removed");
+    // A push that fails is reported, not retried, and never forced. (The runner commit is dropped here
+    // by the fixture: a later commit that only removes it would still publish it in the history.)
+    git(worktree, "reset", "-q", "--hard", "HEAD~1");
     const failing = gitButNoPush();
     const failRun: CommandRunner = async (argv, opts) => {
       const r = await failing.run(argv, opts);
@@ -377,6 +378,40 @@ describe("[S4-3] divergence and push", () => {
     ]);
     // Host notes name codes and counts, never a file name the citizen chose.
     for (const n of notes) expect(n.detail).not.toContain("run.sh");
+  });
+
+  test("pushMirror seals every commit it would publish, not only HEAD's tree", async () => {
+    host = await makeTempHost();
+    const { remote, worktree } = await repos(host);
+    const citizen = await mirrorCitizen(host, worktree, remote);
+
+    // A workflow and an executable runner added, then removed: HEAD's tree is clean, the history is not.
+    await mkdir(join(worktree, ".github", "workflows"), { recursive: true });
+    await writeFile(join(worktree, ".github", "workflows", "x.yml"), "on: push\n");
+    await writeFile(join(worktree, "run.sh"), "#!/bin/sh\nexec claude\n");
+    await chmod(join(worktree, "run.sh"), 0o755);
+    git(worktree, "add", "--", ".github/workflows/x.yml", "run.sh");
+    git(worktree, "commit", "-q", "-m", "an old home's runner");
+    git(worktree, "rm", "-q", "-r", "--", ".github", "run.sh");
+    git(worktree, "commit", "-q", "-m", "runner removed");
+    await commitFile(worktree, "WILL.md", "a clean head\n");
+
+    const g = gitButNoPush();
+    const r = await pushMirror(host.config, citizen, g.run);
+    expect(r).toMatchObject({ pushed: false, divergence: "ahead", refusal: "host-owned-path" });
+    expect(g.pushes.calls).toEqual([]);
+    const notes = await pushNotes(host);
+    expect(notes.map((n) => [n.outcome, n.refusal])).toEqual([["refused", "host-owned-path"]]);
+    for (const n of notes) expect(n.detail).not.toMatch(/run\.sh|workflows/);
+
+    // History the seal admits goes out: a fresh clone with only clean commits ahead.
+    const clean = join(host.root, "mirrors", "clean");
+    git(host.root, "clone", "-q", remote, clean);
+    await commitFile(clean, "WILL.md", "one\n");
+    await commitFile(clean, "NAME.md", "two\n");
+    const g2 = gitButNoPush();
+    expect(await pushMirror(host.config, { ...citizen, mirror: { ...citizen.mirror!, worktree: clean } }, g2.run)).toEqual({ pushed: true, divergence: "ahead", refusal: null });
+    expect(g2.pushes.calls).toHaveLength(1);
   });
 
   test("pushMirror refuses a worktree inside a citizen home or the seat's own state", async () => {

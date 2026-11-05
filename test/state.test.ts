@@ -8,6 +8,7 @@ import { LIFECYCLE_STATES, Refusal, type LifecycleState, type YuPresence } from 
 import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { append, beatBody, genesisBody, seatedBody, testIdentity } from "./fixtures/record/chain.ts";
+import { appendHostNote, openedDetail } from "../src/notes.ts";
 
 let host: TempHost | null = null;
 afterEach(async () => {
@@ -88,7 +89,7 @@ describe("transitions (3.3)", () => {
 
 describe("folding and records", () => {
   test("an empty ledger folds to asleep, so no record means no beat", () => {
-    expect(foldState([])).toEqual({ state: "asleep", pending_state: null, step_away_said: false, last_beat_at: null });
+    expect(foldState([])).toEqual({ state: "asleep", pending_state: null, step_away_said: false, last_beat_at: null, said_in: null });
   });
 
   test("foldState honours seated.initial_state, state entries and a pending move toward exposure", async () => {
@@ -139,6 +140,49 @@ describe("folding and records", () => {
     await append(config, w, { type: "state", from: "listening", to: "ended", via: "witnessed" }, "citizen-signed", signer, t(9));
     await append(config, w, { type: "state", from: "ended", to: "awake", via: "confirmed" }, "citizen-signed", signer, t(10));
     expect(foldState(await readLedger(path)).state).toBe("ended");
+  });
+
+  test("a move toward rest takes effect from the beat that said it, so a seat stopped before the state entry still rests", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    const path = ledgerPath(host.config, "glossame");
+    await append(host.config, "glossame", seatedBody("glossame", "soul", "awake"), "host-attested", signer, t(0));
+    // The beat says asleep; the separate state entry that should follow it was never written (a KILL between appends).
+    await append(host.config, "glossame", beatBody("glossame", [{ type: "journal", kind: "chose", text: "enough" }, { type: "state.set", to: "asleep" }]), "host-attested", signer, t(1));
+    expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", pending_state: null, said_in: null });
+    // The state entry, when it is there, agrees with the beat.
+    await append(host.config, "glossame", { type: "state", from: "awake", to: "asleep", via: "immediate" }, "host-attested", signer, t(1));
+    expect(foldState(await readLedger(path)).state).toBe("asleep");
+    // Toward exposure still waits: one saying is pending, not in effect.
+    await append(host.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: "11111111-1111-4111-8111-111111111111" }), "host-attested", signer, t(2));
+    expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", pending_state: "awake", said_in: { seat_id: "11111111-1111-4111-8111-111111111111", ts: t(2).toISOString() } });
+  });
+
+  test("a saying that needs a second beat is owed one seat: a seat that passes without confirming it lets it lapse", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    const cfg = host.config;
+    await host.addCitizen("glossame");
+    await host.seatLedger("glossame", signer.signEntry, { initialState: "listening" });
+    const said = "11111111-1111-4111-8111-111111111111";
+    const next = "22222222-2222-4222-8222-222222222222";
+    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: said }), "host-attested", signer, t(10));
+    const seatNote = (id: string, outcome: "opened" | "rest", m: number) =>
+      appendHostNote(cfg, { ts: t(m).toISOString(), host: "test-host", kind: "seat", word: "glossame", outcome, refusal: null, detail: outcome === "opened" ? openedDetail(id, "confirm") : `seat ${id} on free: rested` });
+    // The saying beat's own seat notes are not a later seat.
+    await seatNote(said, "rest", 10);
+    expect(await readCitizen(cfg, "glossame")).toMatchObject({ state: "listening", pending_state: "awake" });
+    // The confirming seat, read from inside itself, still sees the saying it may confirm.
+    await seatNote(next, "opened", 20);
+    expect(await readCitizen(cfg, "glossame", { exceptSeat: next })).toMatchObject({ pending_state: "awake" });
+    // Once it has been and gone (it rested, which writes no ledger entry), the saying has lapsed.
+    await seatNote(next, "rest", 21);
+    expect(await readCitizen(cfg, "glossame")).toMatchObject({ state: "listening", pending_state: null, step_away_said: false });
+    // The same for a first step-away.
+    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "stepped-away" }], { seat_id: said }), "host-attested", signer, t(30));
+    expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(true);
+    await seatNote("33333333-3333-4333-8333-333333333333", "opened", 31);
+    expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(false);
   });
 
   test("a citizen born at seating takes genesis.initial_state", async () => {

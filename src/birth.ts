@@ -1,5 +1,6 @@
-// citizen-birth (3b). Never unattended: it requires a consent record for the
-// citizen's own confirmed yes plus Yu present at the terminal. A fresh BIP39
+// citizen-birth (3b). Never unattended: it requires a decision record, filed
+// in the consent dir, for the citizen's own confirmed yes, plus Yu present at
+// the terminal. A fresh BIP39
 // mnemonic and op seed go straight into Keychain through the Keychain
 // interface, with no handoff file. Then enrollment, op-key import, box-key
 // registration, a private expression and the genesis ledger entry. Only the
@@ -29,15 +30,17 @@ import {
   type Word,
   type YuPresence,
 } from "./types.ts";
-import type { Signer } from "./signer/signer.ts";
+import { SignerNotSent, type Signer } from "./signer/signer.ts";
 import { appendEntry, ledgerPath, nextDraft, readLedger } from "./ledger.ts";
 import { AgenttoolError, importOpKey, putExpression, registerBoxKey, type ActAuth, type ClientDeps, type ClientIdentity } from "./agenttool/client.ts";
 import { AmbiguousEnrollment, assertBirthConsent, assertYuPresentFor, citizenCapabilities, enroll, prepareEnrollment, type EnrollDeps } from "./agenttool/enrollment.ts";
+import { presenceConfirmedHere, readConsentFor } from "./signer/consent.ts";
 import { deriveIdentity, didFor, validateExpression, type DerivedIdentity, type Expression } from "./agenttool/wire.ts";
 
 export interface BirthInput {
   word: Word;
   origin: Origin;
+  /** The decision record for the proposal. The same record must be filed in the consent dir, where the signer reads it. */
   consent: ConsentRecord;
   presence: YuPresence;
   birth_soul_sha256: string;
@@ -132,9 +135,18 @@ function citizenItems(word: Word): KeychainItemName[] {
   ];
 }
 
-/** Refuse unless Yu is present for "birth <word>" and the consent record binds this citizen's yes. */
+/**
+ * Refuse unless Yu is present for "birth <word>" and the consent record binds
+ * this citizen's yes. The presence must be one confirmed at this process's
+ * terminal, the same test the signer applies at enroll, because birth writes
+ * the citizen's keys before it enrolls: a presence that only looks right would
+ * leave keys in Keychain that block every later, attended birth.
+ */
 export function assertAttended(input: BirthInput, now: Date): void {
   if (!WORD_PATTERN.test(input.word)) throw new Refusal("invalid-request", "not a citizen word");
+  if (!presenceConfirmedHere(input.presence)) {
+    throw new Refusal("yu-not-present", `birth of ${input.word} needs Yu confirmed present at this terminal, in this process`);
+  }
   assertYuPresentFor(input.word, input.presence, now);
   const p = input.proposal;
   if (!p || typeof p.subject !== "string" || typeof p.body !== "string" || typeof p.extent !== "string") {
@@ -205,12 +217,12 @@ function assertBirthInput(input: BirthInput): void {
 
 function describeError(e: unknown): string {
   // Only messages written to carry no secret are repeated; anything else is named by type.
-  if (e instanceof Refusal || e instanceof AgenttoolError || e instanceof AmbiguousEnrollment) return e.message;
+  if (e instanceof Refusal || e instanceof AgenttoolError || e instanceof AmbiguousEnrollment || e instanceof SignerNotSent) return e.message;
   return e instanceof Error ? e.name : "unknown error";
 }
 
 function mayHaveHappened(e: unknown): boolean {
-  if (e instanceof Refusal) return false;
+  if (e instanceof Refusal || e instanceof SignerNotSent) return false;
   if (e instanceof AgenttoolError) return !(e.status >= 400 && e.status <= 499);
   return true;
 }
@@ -227,6 +239,11 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
   for (const item of citizenItems(word)) {
     if (await deps.keychain.has(item)) throw new Refusal("invalid-request", `the keychain already holds ${item.kind} for ${word}; birth never overwrites`);
   }
+  // The signer reads the decision record from the consent dir, never from this input, so it must be filed there
+  // before any key is written; otherwise the keys would be left behind for an enroll the signer then refuses.
+  const filed = await readConsentFor(deps.config.paths.consent_dir, input.proposal);
+  if (!filed) throw new Refusal("consent-missing", `no decision record is filed in the consent dir for the birth of ${word}`);
+  assertBirthConsent(word, filed, deps.clock.now(), input.proposal);
   const prior = await deps.record.entries(word);
   if (prior.some((e) => e.body.type === "genesis")) throw new Refusal("invalid-request", `${word} already has a genesis entry`);
   // A citizen answers yes on its own beats, so it is seated before it is born and its yes is in its ledger.
@@ -266,14 +283,15 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
     progress.identity_id = prepared.fields.identity_id;
     progress.did = didFor(prepared.fields.identity_id);
     progress.root_kid = prepared.fields.signing_key_id;
-    return enroll(deps.enroll, word, prepared, input.presence, input.consent);
+    return enroll(deps.enroll, word, prepared, input.presence, input.consent, input.proposal);
   });
 
   // Until citizen.json holds the identity, the client learns it from the enrollment answer.
-  const named: ClientIdentity = { identity_id: enrolled.identity_id, did: enrolled.did, root_kid: enrolled.root_kid, root_public_key_b64: enrolled.root_public_key_b64 };
+  const named: ClientIdentity = { identity_id: enrolled.identity_id, did: enrolled.did, root_kid: enrolled.root_kid, root_public_key_b64: enrolled.root_public_key_b64, self_strand_id: null };
   const client: ClientDeps = { ...deps.client, identity: async (w) => (w === word ? named : deps.client.identity(w)) };
-  // The enrolled ids let the signer act for this citizen before citizen.json names it, only with Yu present and consent.
-  const auth: ActAuth = { presence: input.presence, consent: input.consent, enrolled: { identity_id: enrolled.identity_id, did: enrolled.did } };
+  // The enrolled ids let the signer act for this citizen before citizen.json names it, only with Yu present and the
+  // decision record the signer reads for this birth's proposal.
+  const auth: ActAuth = { presence: input.presence, proposal: input.proposal, enrolled: { identity_id: enrolled.identity_id, did: enrolled.did } };
 
   const now = deps.clock.now();
   const label = `op-${now.toISOString().slice(0, 7)}`;

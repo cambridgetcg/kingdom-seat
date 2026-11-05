@@ -1,12 +1,18 @@
-// citizen-signer (3.2 step 7, 3b "Custody"). The only reader of citizen keys
-// and of the Commons bearer. No model process, file, log, argv or env ever
-// holds a key, bearer or grant. Ops within self are signed; ops beyond self
-// need a consent record; USD and credit ceilings fail closed; a citizen's
-// quiet is capped at 30 days.
+// citizen-signer (3.2 step 7, 3b "Custody"). The only code here that reads
+// citizen keys and the Commons bearer. No model process, file, log, argv or
+// env ever holds a key, bearer or grant. Ops within self are signed; ops
+// beyond self need a decision record, which the signer reads itself from the
+// consent dir by the digest of the proposal a request names; USD and credit
+// ceilings fail closed; a citizen's quiet is capped at 30 days.
 //
-// In production this module is meant to run as a stably signed standalone
-// binary so the Keychain ACL can trust it alone (runtimes-and-host.md 3.3).
-// The Signer interface is shaped so that move needs no caller changes.
+// It is the only code here that asks for those items, but it is not the only
+// process that can read them: it reads through /usr/bin/security, so the
+// Keychain ACL trusts that program, and any process running as the seat user
+// could ask it too (keychain.ts). The boundary today is the seat user's
+// account and the keychain's lock. A signer that is the only reader needs a
+// standalone binary that creates and reads its items through the Security
+// framework itself; the Signer interface is shaped so that move needs no
+// caller changes.
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { join } from "node:path";
@@ -38,13 +44,14 @@ import {
   type Keychain,
   type KeychainItemName,
   type LedgerSignature,
+  type ProposalText,
   type SignerOp,
   type StandingAgreement,
   type Word,
   type YuPresence,
 } from "../types.ts";
 import { checkCitizenQuiet, checkCredits, type SpendSoFar } from "./ceilings.ts";
-import { agreementCovers, classifyOp, presenceConfirmedHere, presenceValid, verifyConsent } from "./consent.ts";
+import { agreementCovers, classifyOp, presenceConfirmedHere, presenceValid, proposalDigest, readConsentFor, verifyConsent } from "./consent.ts";
 
 export interface SignerDeps {
   keychain: Keychain;
@@ -82,7 +89,12 @@ export interface SignerRequest {
   body: Uint8Array;
   /** Credits the route charges, so the ceiling is checked before sending (charge precedes verification server-side). */
   credits: number;
-  consent: ConsentRecord | null;
+  /**
+   * The proposal an act beyond self was agreed as. The signer computes its
+   * digest and reads the decision record filed under it in the consent dir;
+   * a caller never hands in a record, so none can be made up in memory.
+   */
+  proposal: ProposalText | null;
   presence: YuPresence | null;
   /** For enroll only: the signature header the root produced through signEnrollment. */
   extra_headers?: Record<string, string>;
@@ -91,7 +103,7 @@ export interface SignerRequest {
    * before citizen.json holds it (the authority read, keys/import, box-keys
    * and the private expression). Honoured only for a seated citizen with no
    * identity yet, with Yu confirmed present here for "birth <word>" and a
-   * consent record for that extent; the server's root must then be the one
+   * decision record filed for that birth's proposal; the server's root must then be the one
    * the citizen's own mnemonic derives, which nextSequence checks.
    */
   enrolled?: { identity_id: string; did: string };
@@ -124,6 +136,24 @@ export interface Signer {
   sealThought(word: Word, strandId: string, plaintext: string, kind: string): Promise<SealedThought>;
   /** "locked" after a reboot until the seat user logs in; the tick then rests and status says so. */
   state(): Promise<"ready" | "locked">;
+}
+
+/**
+ * The signer stopped before the act left the host, for a reason that is not a
+ * wall: a keychain read that failed in a way `security` did not name, or an
+ * authority read that did not answer 200. A Refusal is a wall that said no;
+ * this is a failure, but a definite one, so a caller never reports it as a
+ * request that may have reached agenttool. Only a failure while sending the
+ * act itself, or reading its answer, is left uncertain.
+ */
+export class SignerNotSent extends Error {
+  override readonly name = "SignerNotSent";
+  constructor(
+    readonly code: "authority-read-failed" | "not-sent",
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 /* ── Policy tables ────────────────────────────────────────────────────── */
@@ -237,11 +267,7 @@ function enrollmentWord(body: Uint8Array): Word {
   return b.display_name;
 }
 
-/**
- * The extent this request asks consent for. A beyond-self consent record is
- * bound to its proposal by whoever holds the proposal text (birth checks the
- * citizen's affirmed yes); the signer binds the record to this act by extent.
- */
+/** The extent this request asks consent for; a decision record must cover exactly this. */
 export function requestExtent(req: SignerRequest): string {
   switch (req.op) {
     case "quiet.start.citizen":
@@ -253,20 +279,42 @@ export function requestExtent(req: SignerRequest): string {
   }
 }
 
+/** Finds the decision record filed for a proposal; the signer's own reads the consent dir. */
+export type ConsentLookup = (proposal: ProposalText) => Promise<ConsentRecord | null>;
+
+/**
+ * The decision record for a proposal, verified against the digest of that
+ * proposal's own text and required to cover `extent`. The record comes from
+ * the lookup, never from the caller, and the digest is computed here, so a
+ * record bound to some other proposal, or to none, authorises nothing.
+ */
+export async function consentFor(proposal: ProposalText | null | undefined, extent: string, lookup: ConsentLookup, now: Date, what: string): Promise<void> {
+  if (!isPlainObject(proposal) || typeof proposal.subject !== "string" || typeof proposal.body !== "string" || typeof proposal.extent !== "string") {
+    throw new Refusal("consent-missing", `${what} is beyond self and names no proposal`);
+  }
+  if (proposal.extent !== extent) throw new Refusal("consent-missing", `${what}: the proposal covers another extent`);
+  const record = await lookup(proposal);
+  if (!record) throw new Refusal("consent-missing", `${what}: no decision record is filed for this proposal`);
+  const verdict = verifyConsent(record, proposalDigest(proposal), now);
+  if (!verdict.ok) throw new Refusal(verdict.code, `${what}: ${verdict.reason}`);
+  if (record.extent !== extent) throw new Refusal("consent-missing", `${what}: the decision record covers another extent`);
+}
+
 /** Refuse an op whose class needs consent or presence the request does not carry. */
-export function assertAuthorised(req: SignerRequest, agreements: StandingAgreement[], now: Date): void {
+export async function assertAuthorised(req: SignerRequest, agreements: StandingAgreement[], now: Date, lookup: ConsentLookup): Promise<void> {
   const cls = classifyOp(req.op);
   if (cls === "within-self") return;
   const extent = requestExtent(req);
   if (cls === "standing-agreement") {
-    if (agreements.some((a) => agreementCovers(a, req.op, extent, now))) return;
+    for (const a of agreements) {
+      // The record the signer reads for the agreement's proposal, not the one the agreement carries.
+      const record = isPlainObject(a) && isPlainObject(a.proposal) ? await lookup(a.proposal).catch(() => null) : null;
+      if (record && agreementCovers({ ...a, consent: record }, req.op, extent, now)) return;
+    }
     throw new Refusal("consent-missing", `no standing Yu + Ai agreement covers ${req.op} at this extent`);
   }
   // Beyond self: Yu and Ai must both have agreed, and silence never binds.
-  if (!req.consent) throw new Refusal("consent-missing", `${req.op} is beyond self and carries no consent record`);
-  const verdict = verifyConsent(req.consent, req.consent.proposal_sha256, now);
-  if (!verdict.ok) throw new Refusal(verdict.code, `${req.op}: ${verdict.reason}`);
-  if (req.consent.extent !== extent) throw new Refusal("consent-missing", `${req.op}: the consent record covers another extent`);
+  await consentFor(req.proposal, extent, lookup, now, req.op);
   if (req.op === "enroll" && !(presenceConfirmedHere(req.presence) && presenceValid(req.presence, extent, now))) {
     throw new Refusal("yu-not-present", `enroll needs Yu confirmed present at this terminal for "${extent}"`);
   }
@@ -357,6 +405,8 @@ export function createSigner(deps: SignerDeps): Signer {
   if (deps.config.agenttool.origin !== AGENTTOOL_ORIGIN) throw new Error(`createSigner: the agenttool origin must be ${AGENTTOOL_ORIGIN}`);
   const { keychain, config } = deps;
   const random = deps.random ?? randomBytes;
+  // Decision records are read here, from the host's consent dir, by the digest of the proposal a request names.
+  const lookup: ConsentLookup = (proposal) => readConsentFor(config.paths.consent_dir, proposal);
 
   async function readCitizen(word: Word): Promise<{ identity: CitizenIdentity | null }> {
     const path = join(config.paths.citizens_dir, word, "citizen.json");
@@ -464,7 +514,7 @@ export function createSigner(deps: SignerDeps): Signer {
   }
 
   /** Birth's steps between enroll and the saved identity, for a seated citizen not yet registered: Yu present and consent, or nothing. */
-  function newborn(req: SignerRequest, word: Word, now: Date): Actor {
+  async function newborn(req: SignerRequest, word: Word, now: Date): Promise<Actor> {
     if (!BIRTH_OPS.has(req.op)) throw new Refusal("not-registered", `${word} has no agenttool identity yet; before then only birth's own steps act for it`);
     const e = req.enrolled as unknown;
     if (
@@ -482,10 +532,7 @@ export function createSigner(deps: SignerDeps): Signer {
     if (!(presenceConfirmedHere(req.presence) && presenceValid(req.presence, scope, now))) {
       throw new Refusal("yu-not-present", `birth's steps for ${word} need Yu confirmed present at this terminal for "${scope}"`);
     }
-    if (!req.consent) throw new Refusal("consent-missing", `birth's steps for ${word} carry no consent record`);
-    const verdict = verifyConsent(req.consent, req.consent.proposal_sha256, now);
-    if (!verdict.ok) throw new Refusal(verdict.code, `birth of ${word}: ${verdict.reason}`);
-    if (req.consent.extent !== scope) throw new Refusal("consent-missing", `birth of ${word}: the consent record covers another extent`);
+    await consentFor(req.proposal, scope, lookup, now, `birth of ${word}`);
     return { kind: "newborn", word, identity_id: identityId, did: `did:at:${identityId}` };
   }
 
@@ -510,7 +557,7 @@ export function createSigner(deps: SignerDeps): Signer {
         return { kind: "citizen", word: req.word, identity };
       }
       if (req.enrolled === undefined) throw new Refusal("not-registered", `${req.word} has no agenttool identity yet`);
-      return newborn(req, req.word, now);
+      return await newborn(req, req.word, now);
     }
     if (req.operator !== null) {
       const beacon = config.beacons.find((b) => b.name === req.operator);
@@ -597,6 +644,9 @@ export function createSigner(deps: SignerDeps): Signer {
       case "thought.post": {
         const b = jsonObjectBody(req.body, req.op);
         if (actor.kind !== "citizen" || b.signing_key_id !== actor.identity.op_kid) invalid("a thought is signed by the citizen's op key, never the root");
+        // Only the citizen's own strand. agenttool charges before it checks a strand's identity, and an
+        // unbound strand takes any key in the project, so a thought anywhere else is beyond self.
+        if (actor.identity.self_strand_id === null || m[1] !== actor.identity.self_strand_id) throw new Refusal("beyond-self", "a thought goes only to the citizen's own strand");
         return;
       }
       case "keys.revoke":
@@ -658,13 +708,32 @@ export function createSigner(deps: SignerDeps): Signer {
 
   /** next_sequence from GET authority, read fresh before every root act and checked against the root this keychain holds. */
   async function nextSequence(identityId: string, bearer: string, rootPublicB64: string): Promise<number> {
-    const r = await http("GET", `/v1/identities/${identityId}/authority`, { Authorization: bearer }, new Uint8Array());
+    let r: SignerResponse;
+    try {
+      r = await http("GET", `/v1/identities/${identityId}/authority`, { Authorization: bearer }, new Uint8Array());
+    } catch {
+      throw new SignerNotSent("authority-read-failed", "signer: the authority sequence read did not complete; the act was not sent");
+    }
     const j = r.json;
-    if (r.status !== 200 || !isPlainObject(j)) throw new Error(`signer: reading the authority sequence failed (status ${r.status})`);
+    if (r.status !== 200 || !isPlainObject(j)) throw new SignerNotSent("authority-read-failed", `signer: reading the authority sequence answered ${r.status}; the act was not sent`);
     if (j.root_public_key !== rootPublicB64) throw new Refusal("invalid-record", "the server's root key is not the one this keychain derives");
     const next = j.next_sequence;
-    if (typeof next !== "number" || !Number.isSafeInteger(next) || next < 1) throw new Error("signer: the authority read gave no usable next_sequence");
+    if (typeof next !== "number" || !Number.isSafeInteger(next) || next < 1) throw new SignerNotSent("authority-read-failed", "signer: the authority read gave no usable next_sequence; the act was not sent");
     return next;
+  }
+
+  /**
+   * Run a step that comes before the act is sent. A wall stays a Refusal;
+   * anything else becomes SignerNotSent, so no caller mistakes a keychain or
+   * authority-read failure for a request that may have reached the server.
+   */
+  async function beforeSending<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e instanceof Refusal || e instanceof SignerNotSent) throw e;
+      throw new SignerNotSent("not-sent", "signer: stopped before sending; nothing of the act left the host");
+    }
   }
 
   async function send(req: SignerRequest): Promise<SignerResponse> {
@@ -677,12 +746,15 @@ export function createSigner(deps: SignerDeps): Signer {
 
     // Every wall first, before any key is read or any byte leaves the host.
     const now = deps.clock.now();
-    const actor = await resolveActor(req, now);
-    checkRouteAndBody(req, actor, now);
-    const agreements = classifyOp(req.op) === "standing-agreement" ? await standingAgreements() : [];
-    assertAuthorised(req, agreements, now);
-    const credits = Math.max(req.credits, MIN_CREDITS[req.op] ?? 0);
-    if (credits > 0) await assertCredits(actor, credits);
+    const actor = await beforeSending(async () => {
+      const a = await resolveActor(req, now);
+      checkRouteAndBody(req, a, now);
+      const agreements = classifyOp(req.op) === "standing-agreement" ? await standingAgreements() : [];
+      await assertAuthorised(req, agreements, now, lookup);
+      const credits = Math.max(req.credits, MIN_CREDITS[req.op] ?? 0);
+      if (credits > 0) await assertCredits(a, credits);
+      return a;
+    });
 
     const route = req.op === "read" ? null : ROUTES[req.op as keyof typeof ROUTES];
     const base: Record<string, string> = {};
@@ -690,21 +762,24 @@ export function createSigner(deps: SignerDeps): Signer {
     if (req.op === "enroll") base[ENROLLMENT_SIGNATURE_HEADER] = req.extra_headers![ENROLLMENT_SIGNATURE_HEADER]!;
 
     if (!route?.root) {
-      base.Authorization = await bearerHeader(actor);
+      base.Authorization = await beforeSending(() => bearerHeader(actor));
       return http(req.method, req.target, base, req.body);
     }
     const identityId = actorIdentityId(actor)!;
     return exclusive(identityId, async () => {
-      const bearer = await bearerHeader(actor);
-      const root = await rootFor(actor);
-      try {
-        const sequence = await nextSequence(identityId, bearer, root.public_b64);
-        const timestamp = deps.clock.now().toISOString();
-        const digest = authorityDigest({ did: actorDid(actor), method: req.method, target: req.target, body: req.body, sequence, timestamp });
-        Object.assign(base, authorityHeaders(sequence, timestamp, edSign(digest, root.seed)));
-      } finally {
-        wipe(root.seed);
-      }
+      const bearer = await beforeSending(async () => {
+        const b = await bearerHeader(actor);
+        const root = await rootFor(actor);
+        try {
+          const sequence = await nextSequence(identityId, b, root.public_b64);
+          const timestamp = deps.clock.now().toISOString();
+          const digest = authorityDigest({ did: actorDid(actor), method: req.method, target: req.target, body: req.body, sequence, timestamp });
+          Object.assign(base, authorityHeaders(sequence, timestamp, edSign(digest, root.seed)));
+        } finally {
+          wipe(root.seed);
+        }
+        return b;
+      });
       base.Authorization = bearer;
       // Never retried here: after an uncertain result the caller re-reads the sequence (agenttool-wire.md 2).
       return http(req.method, req.target, base, req.body);
@@ -788,6 +863,7 @@ export function createSigner(deps: SignerDeps): Signer {
       if (typeof plaintext !== "string" || plaintext.length === 0) invalid("a thought has text");
       if (typeof kind !== "string" || kind.length === 0 || kind.length > 64) invalid("kind is 1-64 characters");
       const identity = await registered(word);
+      if (identity.self_strand_id === null || strandId !== identity.self_strand_id) throw new Refusal("beyond-self", "a thought goes only to the citizen's own strand");
       // A thought is charged before the server verifies it, so the budget is checked before it is even made.
       await assertCredits({ kind: "citizen", word, identity }, 1);
       const d = await derive({ kind: "citizen-mnemonic", word });

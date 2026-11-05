@@ -17,20 +17,22 @@ import {
   UUID_PATTERN,
   WORD_PATTERN,
   type CitizenIdentity,
-  type ConsentRecord,
   type FetchLike,
+  type ProposalText,
   type SignerOp,
   type Word,
   type YuPresence,
 } from "../types.ts";
-import type { Signer, SignerRequest, SignerResponse } from "../signer/signer.ts";
+import { SignerNotSent, type Signer, type SignerRequest, type SignerResponse } from "../signer/signer.ts";
 import { AGENTTOOL_ORIGIN, isCanonicalIso, jsonBody, validateBoxPublicKey, validateExpression, type Expression } from "./wire.ts";
 
 /**
  * What the client needs to name a citizen. Birth supplies it from the
  * enrollment answer, before the rest of the identity (op kid, box key) exists.
+ * self_strand_id is the one strand its thoughts may go to; null until a
+ * strand is created and its id saved in the record.
  */
-export type ClientIdentity = Pick<CitizenIdentity, "identity_id" | "did" | "root_kid" | "root_public_key_b64">;
+export type ClientIdentity = Pick<CitizenIdentity, "identity_id" | "did" | "root_kid" | "root_public_key_b64" | "self_strand_id">;
 
 export interface ClientDeps {
   signer: Signer;
@@ -39,10 +41,14 @@ export interface ClientDeps {
   identity(word: Word): Promise<ClientIdentity>;
 }
 
-/** Presence and consent the caller holds for this act (birth holds both); the signer decides whether the op needs them. */
+/**
+ * Presence and the agreed proposal the caller holds for this act (birth holds
+ * both); the signer decides whether the op needs them, and reads the decision
+ * record for the proposal itself.
+ */
 export interface ActAuth {
   presence: YuPresence | null;
-  consent: ConsentRecord | null;
+  proposal: ProposalText | null;
   /** Birth only, between enroll and the saved identity: the enrolled ids, which the signer honours only with both of the above. */
   enrolled?: { identity_id: string; did: string };
 }
@@ -120,7 +126,8 @@ async function citizen(deps: Pick<ClientDeps, "identity">, word: Word): Promise<
   } catch {
     rootOk = false;
   }
-  if (!UUID_PATTERN.test(id.identity_id) || id.did !== `did:at:${id.identity_id}` || !UUID_PATTERN.test(id.root_kid) || !rootOk) {
+  const strandOk = id.self_strand_id === null || (typeof id.self_strand_id === "string" && UUID_PATTERN.test(id.self_strand_id));
+  if (!UUID_PATTERN.test(id.identity_id) || id.did !== `did:at:${id.identity_id}` || !UUID_PATTERN.test(id.root_kid) || !rootOk || !strandOk) {
     throw new Refusal("invalid-record", `${word}: the identity record is not well formed`);
   }
   return id;
@@ -151,15 +158,15 @@ async function send(deps: ClientDeps, word: Word, call: Call, auth: ActAuth | un
     target: call.target,
     body: call.body,
     credits: call.credits,
-    consent: auth?.consent ?? null,
+    proposal: auth?.proposal ?? null,
     presence: auth?.presence ?? null,
     ...(auth?.enrolled ? { enrolled: { identity_id: auth.enrolled.identity_id, did: auth.enrolled.did } } : {}),
   };
   try {
     return await deps.signer.send(req);
   } catch (e) {
-    // A wall refused before anything was sent: that answer is definite.
-    if (e instanceof Refusal) throw e;
+    // A wall refused, or the signer stopped before sending: either answer is definite.
+    if (e instanceof Refusal || e instanceof SignerNotSent) throw e;
     throw new AgenttoolError(NO_RESPONSE, "no_response", `agenttool ${call.op}: no response; read the authority sequence before signing again`);
   }
 }
@@ -199,7 +206,7 @@ interface AuthorityState {
 
 async function authorityState(deps: ClientDeps, word: Word, id: ClientIdentity, auth?: ActAuth): Promise<AuthorityState> {
   const what = "authority read";
-  // The act's own auth rides along, so a read during birth is held to the same presence and consent as the act.
+  // The act's own auth rides along, so a read during birth is held to the same presence and proposal as the act.
   const res = await send(deps, word, { op: "read", method: "GET", target: identityRoute(id.identity_id, "/authority"), body: EMPTY, credits: 0 }, auth);
   if (res.status !== 200) throw refused(what, res);
   const j = res.json;
@@ -409,6 +416,9 @@ export async function postThought(deps: ClientDeps, word: Word, strandId: string
   // The canonical bytes use the URL's strand id as given, so sign and send one spelling.
   const sid = strandId.toLowerCase();
   const id = await citizen(deps, word);
+  // Only the citizen's own strand. agenttool charges the credit before it checks the strand's
+  // identity, and an unbound strand takes any key in the project, so a foreign one is refused here.
+  if (id.self_strand_id === null || sid !== id.self_strand_id) throw new Refusal("beyond-self", "a thought goes only to the citizen's own strand");
   const sealed = await deps.signer.sealThought(word, sid, plaintext, kind);
   // Every refusal below happens before sending, because the server charges the credit before it verifies.
   if (sealed.kind !== kind) throw new Refusal("invalid-request", "the sealed thought carries another kind");

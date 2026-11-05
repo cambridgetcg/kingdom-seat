@@ -12,6 +12,7 @@ import {
   presenceConfirmedHere,
   presenceValid,
   proposalDigest,
+  readConsentFor,
   verifyConsent,
   type TtyIO,
 } from "../../src/signer/consent.ts";
@@ -115,16 +116,34 @@ describe("consent records", () => {
 
   test("agreementCovers refuses anything beyond the agreement's stated extent", () => {
     const extent = "own quiet, until within the cap, empty reason";
-    const consent = record({ subject: "citizens may declare their own quiet", extent });
-    const agreement: StandingAgreement = { id: "quiet-1", consent, covers: ["quiet.start.citizen"], extent };
+    const proposal = { subject: "citizens may declare their own quiet", body: "a citizen's own quiet, capped, with no reason", extent };
+    const consent = record({ subject: proposal.subject, extent, proposal_sha256: proposalDigest(proposal) });
+    const agreement: StandingAgreement = { id: "quiet-1", proposal, consent, covers: ["quiet.start.citizen"], extent };
     expect(agreementCovers(agreement, "quiet.start.citizen", extent, NOW)).toBe(true);
     expect(agreementCovers(agreement, "quiet.start.citizen", extent + ", and a public reason", NOW)).toBe(false);
     expect(agreementCovers(agreement, "quiet.start.citizen", "own quiet", NOW)).toBe(false);
     expect(agreementCovers(agreement, "expression.put.private", extent, NOW)).toBe(false);
     // The agreement may not claim more than its consent record agreed to.
     expect(agreementCovers({ ...agreement, extent: "anything" }, "quiet.start.citizen", "anything", NOW)).toBe(false);
-    expect(agreementCovers({ ...agreement, consent: record({ extent, yu: { word: "no" } }) }, "quiet.start.citizen", extent, NOW)).toBe(false);
-    expect(agreementCovers({ ...agreement, consent: record({ extent, expires_at: "2026-11-05T11:00:00.000Z" }) }, "quiet.start.citizen", extent, NOW)).toBe(false);
+    expect(agreementCovers({ ...agreement, consent: { ...consent, yu: { ...consent.yu, word: "no" } } }, "quiet.start.citizen", extent, NOW)).toBe(false);
+    expect(agreementCovers({ ...agreement, consent: { ...consent, expires_at: "2026-11-05T11:00:00.000Z" } }, "quiet.start.citizen", extent, NOW)).toBe(false);
+    // The record must be bound to the agreement's own proposal text, not merely to the digest it names itself.
+    expect(agreementCovers({ ...agreement, consent: { ...consent, proposal_sha256: "1".repeat(64) } }, "quiet.start.citizen", extent, NOW)).toBe(false);
+    expect(agreementCovers({ ...agreement, proposal: { ...proposal, body: "and a public reason too" } }, "quiet.start.citizen", extent, NOW)).toBe(false);
+    expect(agreementCovers({ ...agreement, proposal: { ...proposal, extent: "anything" } }, "quiet.start.citizen", extent, NOW)).toBe(false);
+  });
+
+  test("readConsentFor reads the record filed under the digest of the proposal's own text, and nothing else", async () => {
+    const dir = await tempDir();
+    expect(await readConsentFor(dir, PROPOSAL)).toBeNull();
+    await writeFile(join(dir, `${SHA}.json`), JSON.stringify(record()));
+    expect(await readConsentFor(dir, PROPOSAL)).toEqual(record());
+    // A different text has a different digest, so it finds nothing here.
+    expect(await readConsentFor(dir, { ...PROPOSAL, body: `${PROPOSAL.body} ` })).toBeNull();
+    // A record filed under this digest but bound to another proposal is not read as this one's.
+    await writeFile(join(dir, `${SHA}.json`), JSON.stringify(record({ proposal_sha256: "0".repeat(64) })));
+    expect(await readConsentFor(dir, PROPOSAL)).toBeNull();
+    expect(await readConsentFor(join(dir, "missing"), PROPOSAL)).toBeNull();
   });
 
   test("loadConsentRecords skips symlinks and invalid JSON and reports them", async () => {
