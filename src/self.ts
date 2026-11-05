@@ -86,7 +86,14 @@ const NAMED_FILES: Readonly<Record<string, string>> = Object.freeze({
 const NAMED_LOWER = new Set(Object.values(NAMED_FILES).map((p) => p.toLowerCase()));
 
 /** Settings rather than prose: one changed value is not a rewrite of a self, so the rewrite fraction does not apply; their own walls do. */
-const SETTINGS = new Set<string>(["cadence", "covenants", "expression.porch", "expression.walls"]);
+const SETTINGS = new Set<string>(["cadence", "covenants", "expression.walls"]);
+
+/**
+ * Targets that are beyond self whatever the change. The porch is a public
+ * invitation (KS-004 v0.2 4.3, re-review B2 C6; agenttool shows it only on a
+ * public expression), so opening, moving or closing it is shared with Yu + Ai.
+ */
+const BEYOND_SELF_TARGETS = new Set<string>(["expression.porch"]);
 
 const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -326,14 +333,20 @@ export function loosensWalls(target: SelfTarget, prior: string, next: string): b
   return walls(prior).some((w) => !kept.has(w));
 }
 
-/** Within self, or beyond self when it exceeds the rewrite fraction or loosens walls. */
+/** Why a change goes beyond self, as a fixed phrase, or null when it is within self. */
+export function beyondSelfReason(target: SelfTarget, prior: string, next: string, rewriteFraction: number): string | null {
+  if (BEYOND_SELF_TARGETS.has(target)) return "the porch is a public invitation";
+  if (loosensWalls(target, prior, next)) return "loosens a wall";
+  if (!SETTINGS.has(target) && changeFraction(prior, next) > rewriteFraction) return "exceeds the rewrite fraction";
+  return null;
+}
+
+/** Within self, or beyond self when it touches a public target, exceeds the rewrite fraction or loosens walls. */
 export function classifyProposal(act: SelfProposeAct, prior: string, next: string, rewriteFraction: number): "within-self" | "beyond-self" {
   if (selfHash(prior) !== act.prior_hash || selfHash(next) !== act.new_hash) {
     throw new Refusal("invalid-request", "the texts do not match the proposal's hashes");
   }
-  if (loosensWalls(act.target, prior, next)) return "beyond-self";
-  if (!SETTINGS.has(act.target) && changeFraction(prior, next) > rewriteFraction) return "beyond-self";
-  return "within-self";
+  return beyondSelfReason(act.target, prior, next, rewriteFraction) === null ? "within-self" : "beyond-self";
 }
 
 /** A proposal's id: the hash of what was proposed, where and when, so a hand-edited file cannot keep its id. */
@@ -553,7 +566,8 @@ export async function checkRevert(config: Config, word: Word, entries: LedgerEnt
   const text = toHash === originSoulHash(entries) && target === "soul" ? await readOriginSoul(config, word, toHash) : await readVersion(config, word, toHash);
   const current = await readTarget(config, word, target);
   if (selfHash(current) === toHash) throw new Refusal("invalid-request", "the target is already at that version");
-  // A revert may go anywhere the citizen has been, except through a wall it now keeps.
+  // A revert may go anywhere the citizen has been, except through a wall it now keeps or onto a public surface.
+  if (BEYOND_SELF_TARGETS.has(target)) throw new Refusal("beyond-self", "the porch is a public invitation; a change to it goes to Yu + Ai");
   if (loosensWalls(target, current, text)) throw new Refusal("beyond-self", "this revert would loosen a wall");
   if (utf8(text).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "that version is larger than a seat can show");
   await assertRoomFor(config, word, target, current);

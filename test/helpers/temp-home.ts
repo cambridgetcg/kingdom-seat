@@ -78,6 +78,8 @@ export function longSoul(word: Word): string {
 }
 
 export const TEST_HALT_FILE = "HALT";
+/** The operator's directory beside the state dir: the HALT file lives here, never under state_dir (KS-004 B2 R5). */
+export const TEST_OPERATOR_DIR = "operator";
 
 /** The two beacons the redesign pins (3.6): the gardener desk on the lease host and a halt herald on the Air. */
 export function testBeacons(opts: { canRaiseHere?: ("gardener-desk" | "halt-herald")[] } = {}): Beacon[] {
@@ -112,7 +114,7 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
       ledger_dir: join(state, "ledger"),
       consent_dir: join(state, "consent"),
       seats_dir: join(state, "seats"),
-      halt_file: join(state, TEST_HALT_FILE),
+      halt_file: join(root, TEST_OPERATOR_DIR, TEST_HALT_FILE),
       lock_dir: join(state, "tick.lock"),
       status_file: join(state, "status.json"),
       host_log: join(state, "host.jsonl"),
@@ -125,7 +127,8 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
     agenttool: { origin: "https://api.agenttool.dev", project_id: null },
     keychain: { path: join(root, "fake.keychain-db"), service: "dev.kingdom.citizen-seat.test", security_path: "/usr/bin/security", trusted_app: null },
     beacons: opts.beacons ?? [],
-    halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined) },
+    halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined), raise_beacons_argv: null },
+    schedule: { wake_confirm_seat: true },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
     self_authorship: { approved_model_digests: [] },
@@ -154,7 +157,7 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
   const homesRoot = join(root, "homes");
   const config = testConfig(root, homesRoot, opts);
   const p = config.paths;
-  for (const d of [p.state_dir, p.citizens_dir, p.ledger_dir, p.consent_dir, p.seats_dir, homesRoot]) await mkdir(d, { recursive: true });
+  for (const d of [p.state_dir, p.citizens_dir, p.ledger_dir, p.consent_dir, p.seats_dir, homesRoot, join(root, TEST_OPERATOR_DIR)]) await mkdir(d, { recursive: true });
   await writeFile(p.models_lock, JSON.stringify(UNPINNED_LOCK, null, 2));
 
   const fixtures = new Map<Word, CitizenFixture>();

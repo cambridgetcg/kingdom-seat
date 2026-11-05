@@ -9,7 +9,8 @@ import { pendingProposals } from "../src/self.ts";
 import { ledgerPath, readLedger } from "../src/ledger.ts";
 import { promptBytes } from "../src/prompt.ts";
 import { fromHex, sha256, sha256Hex, utf8 } from "../src/crypto.ts";
-import { EXIT, Refusal, UUID_PATTERN, type CitizenIdentity, type ConsentRecord, type LedgerEntry } from "../src/types.ts";
+import { EXIT, Refusal, UUID_PATTERN, exitForRefusal, type CitizenIdentity, type ConsentRecord, type LedgerEntry } from "../src/types.ts";
+import { freeRuntime } from "../src/runtime/free.ts";
 import { proposalDigest, readConsentFor, verifyConsent } from "../src/signer/consent.ts";
 import { assertNoSecretIn, fakeKeychain } from "./helpers/fake-keychain.ts";
 import { FAKE_MODEL_DIGEST, fakeBinArgv, output, scriptedRuntime, type Script } from "./helpers/fake-runtime.ts";
@@ -206,12 +207,12 @@ describe("pipeline", () => {
     expect(b.body.envelope.citizen).toEqual({ word: "glossame", did: TEST_IDS.did, kid: FAKE_OP_KID });
   });
 
-  test("a locked signer: exit 3, outcome refused, refusal keychain-locked, nothing written", async () => {
+  test("a locked signer rests the citizen: exit 0, outcome refused, refusal keychain-locked, nothing written", async () => {
     const s = await setup([JOURNAL]);
     s.signer.locked = true;
     const before = await s.host.snapshot();
     const r = await runSeat(s.seat, s.deps);
-    expect(r).toMatchObject({ exit: EXIT.REFUSED, outcome: "refused", refusal: "keychain-locked", appended: [] });
+    expect(r).toMatchObject({ exit: EXIT.OK, outcome: "refused", refusal: "keychain-locked", appended: [] });
     expect(s.runtime.calls).toHaveLength(0);
     const after = await s.host.snapshot();
     for (const k of new Set([...before.keys(), ...after.keys()])) if (k !== "host.jsonl" && k !== "host.jsonl.started") expect(after.get(k)).toBe(before.get(k)!);
@@ -310,18 +311,41 @@ describe("pipeline", () => {
     expect(seen).not.toContain("HOOK-CANARY");
   });
 
+  test("a whole context that does not fit the locked window: exit 1, refused context-too-large, nothing sent and nothing written", async () => {
+    const s = await setup([]);
+    const lock = { format: "kingdom-seat-models-lock/v1" as const, models: [{ name: "qwen2.5:7b", digest: "e2".repeat(32), runner: null, store: "legacy" as const, num_ctx: 8192, num_predict: 600, temperature: 0.7, seed: null }] };
+    // noFetch throws for any request, so a seat that got past the fit check would fail differently.
+    const runtime = freeRuntime({ config: s.host.config, fetch: noFetch, lock, model: "qwen2.5:7b", env: {} });
+    const before = await s.host.snapshot();
+    const r = await runSeat(s.seat, { ...s.deps, runtime });
+    // 1: the seat cannot open. Not 3, which would close the free lane for the day, and not a cut self.
+    expect(r).toMatchObject({ exit: EXIT.ERROR, outcome: "refused", refusal: "context-too-large", appended: [] });
+    const after = await s.host.snapshot();
+    const changed = [...new Set([...before.keys(), ...after.keys()])].filter((k) => before.get(k) !== after.get(k));
+    expect(changed.filter((k) => !["host.jsonl", "host.jsonl.started"].includes(k))).toEqual([]);
+    expect(s.signer.signed).toEqual([]);
+  });
+
+  test("exit 3 is only the USD ceiling; a locked signer or HALT rests (0); every other wall cannot seat (1)", () => {
+    expect(exitForRefusal("ceiling-usd")).toBe(EXIT.USD_CEILING);
+    for (const code of ["keychain-locked", "halted"] as const) expect(exitForRefusal(code)).toBe(EXIT.OK);
+    for (const code of ["symlink", "model-mismatch", "model-unpinned", "consent-missing", "ceiling-credits", "ceiling-fleet", "ceiling-interval", "yu-not-present", "window-closed", "context-too-large", "invalid-record"] as const) {
+      expect(exitForRefusal(code)).toBe(EXIT.ERROR);
+    }
+  });
+
   test("hermes runtime class is refused until S8", async () => {
     const s = await setup([JOURNAL]);
     const hermes: OpenSeat = { ...s.seat, ref: { ...s.seat.ref, runtime: "hermes" } };
     const r = await runSeat(hermes, s.deps);
-    expect(r).toMatchObject({ exit: EXIT.REFUSED, outcome: "refused", refusal: "runtime-not-approved", appended: [] });
+    expect(r).toMatchObject({ exit: EXIT.ERROR, outcome: "refused", refusal: "runtime-not-approved", appended: [] });
     expect(s.runtime.calls).toHaveLength(0);
   });
 
   test("a seat whose cwd is inside a home is refused before inference", async () => {
     const s = await setup([JOURNAL]);
     const r = await runSeat({ ...s.seat, cwd: join(s.host.homesRoot, "citizen-glossame") }, s.deps);
-    expect(r).toMatchObject({ exit: EXIT.REFUSED, outcome: "refused", refusal: "cwd-in-home" });
+    expect(r).toMatchObject({ exit: EXIT.ERROR, outcome: "refused", refusal: "cwd-in-home" });
     expect(s.runtime.calls).toHaveLength(0);
   });
 

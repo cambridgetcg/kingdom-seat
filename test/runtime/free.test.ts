@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256Hex } from "../../src/crypto.ts";
 import {
+  CHAT_TEMPLATE_OVERHEAD_TOKENS,
   assertLoopback,
   assertNoProxy,
   chatBody,
   checkChatReply,
   checkTags,
+  contextFit,
   freeRuntime,
   loadModelsLock,
   lockedEntry,
@@ -230,6 +232,23 @@ describe("before the call", () => {
     }
     expect(server.requests).toHaveLength(0);
     expect(() => assertNoProxy({ HTTP_PROXY: "", PATH: "/usr/bin" })).not.toThrow();
+  });
+
+  test("a context that does not fit num_ctx by the byte rule is refused before any request; one that fits exactly is sent", async () => {
+    serveOllama(server, [localRow], () => ollamaChatJson(REPLY));
+    // UTF-8 bytes, not characters: "àṣẹ" is 3 characters and 8 bytes.
+    const prompt = { system: "àṣẹ", user: "x".repeat(92) };
+    expect(contextFit(prompt, entry({ num_ctx: 8192, num_predict: 600 }))).toEqual({ fits: true, needed: 8 + 92 + CHAT_TEMPLATE_OVERHEAD_TOKENS + 600, num_ctx: 8192 });
+    const exact = 8 + 92 + CHAT_TEMPLATE_OVERHEAD_TOKENS + 600;
+    expect(contextFit(prompt, entry({ num_ctx: exact })).fits).toBe(true);
+    expect(contextFit(prompt, entry({ num_ctx: exact - 1 })).fits).toBe(false);
+
+    const refusal = await expectRefusal(() => adapter(lockOf(entry({ num_ctx: exact - 1 })))(request({ prompt })), "context-too-large");
+    expect(refusal.message).toContain(`num_ctx is ${exact - 1}`);
+    // Nothing reached Ollama: not the tags check, and no chat call that could drop part of the self.
+    expect(server.requests).toHaveLength(0);
+    expect((await adapter(lockOf(entry({ num_ctx: exact })))(request({ prompt }))).raw_output).toBe(REPLY);
+    expect(chatRequests()).toHaveLength(1);
   });
 
   test("checkTags refuses a missing row, a different digest, a different runner, and any row with remote_host or remote_model", async () => {

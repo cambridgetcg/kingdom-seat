@@ -10,7 +10,7 @@
 import { lstat, mkdir, readdir, readFile, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { uptime } from "node:os";
 import { join } from "node:path";
-import { EXIT, type Citizen, type Clock, type Config, type ExitCode, type FetchLike, type HaltStatus, type IsoTime, type Outcome, type RefusalCode, type TickResult, type Word } from "./types.ts";
+import { EXIT, exitForRefusal, type Citizen, type Clock, type Config, type ExitCode, type FetchLike, type HaltStatus, type IsoTime, type Outcome, type RefusalCode, type TickResult, type Word } from "./types.ts";
 import { readBeacons, readHaltFile } from "./halt.ts";
 import { assertCwdOutsideHomes, openSeat, seatEnv, superviseChild, writeSeatFile } from "./seat.ts";
 import { listSeated, readCitizen } from "./state.ts";
@@ -277,15 +277,15 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
   const window = Math.max(minH, ...citizens.map((c) => (Number.isFinite(c.cadence.interval_h) ? c.cadence.interval_h : 0)));
   const notes = await readHostNotes(config, new Date(now.getTime() - window * HOUR_MS)).catch(() => null);
   if (notes === null) {
-    // Without the log there is no knowing who was seated when: fail closed.
+    // Without the log there is no knowing who was seated when: fail closed, and exit 1 so someone looks.
     await note("fleet-ceiling", null, "ceiling-fleet", "host log unreadable").catch(() => {});
-    return done({ exit: EXIT.REFUSED, outcome: "fleet-ceiling", word: null, seat: null });
+    return done({ exit: EXIT.ERROR, outcome: "fleet-ceiling", word: null, seat: null });
   }
   const candidates: { word: Word; verdict: DueVerdict }[] = [];
   for (const c of citizens) {
     // Letters are read only for citizens they could seat.
     const letter = await wakingLetter(config, c).catch(() => false);
-    candidates.push({ word: c.word, verdict: isDue(c, letter, now, minH, lastSeatOf(notes, c.word)) });
+    candidates.push({ word: c.word, verdict: isDue(c, letter, now, minH, lastSeatOf(notes, c.word), config.schedule) });
   }
   const word = selectDue(candidates);
   if (word === null) {
@@ -295,15 +295,19 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
   const verdict = candidates.find((c) => c.word === word)!.verdict as Extract<DueVerdict, { due: true }>;
   const citizen = citizens.find((c) => c.word === word)!;
 
-  // 4. The fleet ceiling, and a locked signer, each rest the tick before a seat opens.
-  const fleet = checkFleet(await fleetBeatsToday(config, now), config.ceilings);
+  // 4. The fleet ceiling, and a locked signer, each rest the tick before a seat opens. Both exit 0: a full
+  // day bounds the fleet like nothing due, and a locked signer rests the citizens; the note and status say why.
+  // Neither is the USD ceiling, the only wall that may exit 3 (KS-004 B2 C9).
+  const beatsToday = await fleetBeatsToday(config, now);
+  const fleet = checkFleet(beatsToday, config.ceilings);
   if (!fleet.ok) {
     await note("fleet-ceiling", null, fleet.code, fleet.reason);
-    return done({ exit: EXIT.REFUSED, outcome: "fleet-ceiling", word: null, seat: null });
+    // A count nobody can read is the runner unable to do its job, so that one exits 1.
+    return done({ exit: beatsToday === null ? EXIT.ERROR : EXIT.OK, outcome: "fleet-ceiling", word: null, seat: null });
   }
   if (deps.signerState && (await deps.signerState().catch(() => "locked" as const)) === "locked") {
     await note("refused", null, "keychain-locked", "signer locked; the tick rests");
-    return done({ exit: EXIT.REFUSED, outcome: "refused", word: null, seat: null });
+    return done({ exit: exitForRefusal("keychain-locked"), outcome: "refused", word: null, seat: null });
   }
 
   // 5. The tick opens the seat, records that it did (so the fleet count and the due check see it from now

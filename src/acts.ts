@@ -16,6 +16,7 @@ import {
   type ActType,
   type Ceilings,
   type DroppedAct,
+  type LifecycleState,
   type ModelAct,
   type SelfTarget,
   type ValidatedOutput,
@@ -231,14 +232,19 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
 
   // Rest is honoured from any item whose type is "rest", even a malformed one or
   // one past the act limit: writing nothing is the safe reading of a reply that
-  // tried to rest, and it must never let the rest of the reply through.
+  // tried to rest, and it must never let the rest of the reply through, except
+  // one well-formed state.set, which the seat keeps only toward less activity.
   if (items.some((item) => isPlainObject(item) && item.type === "rest")) {
-    const dropped: DroppedAct[] = [];
-    if (!topOk) dropped.push({ index: -1, type: null, reason: "output has fields other than acts" });
+    const others: RestOther[] = [];
     items.forEach((item, index) => {
-      if (!(isPlainObject(item) && item.type === "rest")) dropped.push({ index, type: knownType(item), reason: "rest is exclusive" });
+      if (isPlainObject(item) && item.type === "rest") return;
+      const type = knownType(item);
+      const r = type === "state.set" && index < ACT_LIMITS.max_acts ? validateAct(item, ctx) : null;
+      others.push({ index, type, to: r !== null && "act" in r && r.act.type === "state.set" ? r.act.to : null });
     });
-    return { rest: true, acts: [], dropped };
+    const out = restWith(others);
+    if (!topOk) out.dropped.unshift({ index: -1, type: null, reason: "output has fields other than acts" });
+    return out;
   }
 
   if (!topOk) {
@@ -263,7 +269,7 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
     else dropped.push({ index, ...r.dropped });
   });
   const n = normalizeIndexed(kept, ctx.ceilings);
-  return { rest: n.rest, acts: n.acts, dropped: [...dropped, ...n.dropped].sort((a, b) => a.index - b.index) };
+  return { ...n, dropped: [...dropped, ...n.dropped].sort((a, b) => a.index - b.index) };
 }
 
 /** Validate one act by its type; null with a reason when it does not conform. */
@@ -348,7 +354,7 @@ export function validateAct(value: unknown, ctx: ValidationContext): { act: Mode
 }
 
 /** Apply rest exclusivity and per-beat caps (at most one letter.send), in output order. */
-export function normalizeActs(acts: ModelAct[], ceilings: Ceilings): { rest: boolean; acts: ModelAct[]; dropped: DroppedAct[] } {
+export function normalizeActs(acts: ModelAct[], ceilings: Ceilings): ValidatedOutput {
   return normalizeIndexed(
     acts.map((act, index) => ({ index, act })),
     ceilings,
@@ -380,13 +386,36 @@ interface Indexed {
   act: ModelAct;
 }
 
-function normalizeIndexed(items: Indexed[], ceilings: Ceilings): { rest: boolean; acts: ModelAct[]; dropped: DroppedAct[] } {
+/** A non-rest item of a reply that rests: its known type, and the state it names when it is a well-formed state.set. */
+interface RestOther {
+  index: number;
+  type: ActType | null;
+  to: LifecycleState | null;
+}
+
+/**
+ * A rest, and what it may carry: one state.set, when the reply names exactly
+ * one state (KS-004 v0.2 5.7, re-review B2 C7). Every other act is dropped,
+ * and two different states move nothing, as on any beat. Whether the state is
+ * toward less activity depends on the citizen's state, so the seat decides.
+ */
+function restWith(others: RestOther[]): ValidatedOutput {
+  const named = new Set(others.flatMap((o) => (o.to !== null ? [o.to] : [])));
+  const restState = named.size === 1 ? [...named][0]! : undefined;
+  let kept = false;
+  const dropped: DroppedAct[] = [];
+  for (const o of others) {
+    if (o.to === null) dropped.push({ index: o.index, type: o.type, reason: "rest is exclusive" });
+    else if (restState === undefined) dropped.push({ index: o.index, type: o.type, reason: "contradictory state.set" });
+    else if (kept) dropped.push({ index: o.index, type: o.type, reason: "repeated state.set" });
+    else kept = true;
+  }
+  return restState === undefined ? { rest: true, acts: [], dropped } : { rest: true, acts: [], dropped, rest_state: restState };
+}
+
+function normalizeIndexed(items: Indexed[], ceilings: Ceilings): ValidatedOutput {
   if (items.some((i) => i.act.type === "rest")) {
-    return {
-      rest: true,
-      acts: [],
-      dropped: items.filter((i) => i.act.type !== "rest").map((i) => ({ index: i.index, type: i.act.type, reason: "rest is exclusive" })),
-    };
+    return restWith(items.filter((i) => i.act.type !== "rest").map((i) => ({ index: i.index, type: i.act.type, to: i.act.type === "state.set" ? i.act.to : null })));
   }
   const kept: ModelAct[] = [];
   const dropped: DroppedAct[] = [];

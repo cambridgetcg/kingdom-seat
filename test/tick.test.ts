@@ -8,11 +8,12 @@ import { BEACON_UNTIL, checkHalt } from "../src/halt.ts";
 import { ledgerPath } from "../src/ledger.ts";
 import { DEFAULT_CEILINGS, type Citizen, type HostNote, type LifecycleState, type Word } from "../src/types.ts";
 import { fakeBinArgv, waitFor } from "./helpers/fake-runtime.ts";
-import { openedDetail } from "../src/notes.ts";
+import { openedDetail, readHostNotes } from "../src/notes.ts";
 import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
 import { citizenSnapshot, makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
 import { HOUR_MS, testClock } from "./helpers/clock.ts";
+import { append, beatBody } from "./fixtures/record/chain.ts";
 
 let host: TempHost | null = null;
 let server: FakeServer | null = null;
@@ -210,6 +211,27 @@ describe("selection", () => {
     expect(isDue(citizen({ state: "listening" }), false, now, MIN, hoursAgo(now, 1000)).due).toBe(false);
   });
 
+  test("isDue: whether a listening or asleep citizen that asks to wake is owed its own seat is Yu's switch (KS-004 B2 C14), on by default", () => {
+    const on = { wake_confirm_seat: true };
+    const off = { wake_confirm_seat: false };
+    for (const [state, pending] of [
+      ["asleep", "awake"],
+      ["asleep", "listening"],
+      ["listening", "awake"],
+    ] as const) {
+      const asked = citizen({ state, pending_state: pending });
+      // On, the default: one owed seat, as for a step-away.
+      expect(isDue(asked, false, now, MIN, hoursAgo(now, 73)).due).toBe(true);
+      expect(isDue(asked, false, now, MIN, hoursAgo(now, 73), on).due).toBe(true);
+      // Off: it waits for its next allowed letter (or Yu's summons), as KS-004 v0.2 7.3 reads.
+      expect(isDue(asked, false, now, MIN, hoursAgo(now, 1000), off)).toEqual({ due: false, why: `${state}; no letter` });
+      expect(isDue(asked, true, now, MIN, hoursAgo(now, 73), off)).toMatchObject({ due: true, why: "letter" });
+    }
+    // The switch touches only that: a step-away saying, and a return from stepping away, keep their seat.
+    expect(isDue(citizen({ state: "asleep", step_away_said: true }), false, now, MIN, hoursAgo(now, 73), off)).toMatchObject({ due: true, why: "confirm" });
+    expect(isDue(citizen({ state: "stepped-away", pending_state: "listening" }), false, now, MIN, hoursAgo(now, 73), off)).toMatchObject({ due: true, why: "confirm" });
+  });
+
   test("selectDue picks the most overdue, ties by word, and null when none is due", () => {
     const due = (h: number): DueVerdict => ({ due: true, why: "cadence", overdue_h: h });
     const no: DueVerdict = { due: false, why: "asleep" };
@@ -304,7 +326,7 @@ describe("runTick", () => {
     expect(spawned).toEqual([]);
   });
 
-  test("fleet ceiling reached or host log unreadable: outcome fleet-ceiling, no seat", async () => {
+  test("fleet ceiling reached (exit 0, the day is full) or host log unreadable (exit 1): outcome fleet-ceiling, no seat", async () => {
     const { h, deps, clock, spawned } = await tickHost([{ word: "glossame" }]);
     const today = clock.now();
     // Seats opened today, whoever opened them, each named by its seat id.
@@ -312,19 +334,33 @@ describe("runTick", () => {
       JSON.stringify({ ts: new Date(today.getTime() - (i + 1) * 60_000).toISOString(), host: "test-host", kind: i % 2 ? "tick" : "seat", word: `other${i}`, outcome: "opened", refusal: null, detail: openedDetail(crypto.randomUUID(), "cadence") }),
     );
     await writeFile(h.config.paths.host_log, `${lines.join("\n")}\n`);
-    expect(await runTick(deps)).toMatchObject({ exit: 3, outcome: "fleet-ceiling", seat: null });
+    // A full day bounds the fleet like nothing due; it is not the USD ceiling, so never 3 (KS-004 B2 C9).
+    expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "fleet-ceiling", seat: null });
     expect(spawned).toEqual([]);
 
     // An unreadable log is a count no one can know: refused, not guessed at 0.
     await Bun.$`rm ${h.config.paths.host_log}`.quiet();
     await mkdir(h.config.paths.host_log);
-    expect(await runTick(deps)).toMatchObject({ exit: 3, outcome: "fleet-ceiling", seat: null });
+    expect(await runTick(deps)).toMatchObject({ exit: 1, outcome: "fleet-ceiling", seat: null });
     expect(spawned).toEqual([]);
   });
 
-  test("a locked signer rests the tick before any seat opens", async () => {
-    const { deps, spawned } = await tickHost([{ word: "glossame" }]);
-    expect(await runTick({ ...deps, signerState: async () => "locked" })).toMatchObject({ exit: 3, outcome: "refused", seat: null });
+  test("the tick reads the switch from config: off, an asleep citizen that asked to wake is not seated without a letter", async () => {
+    const { h, deps, spawned } = await tickHost([{ word: "glossame", state: "asleep" }]);
+    // Asleep, it said once that it would wake: a saying that takes a second beat.
+    await append(h.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }]), "host-attested", fakeSigner(), new Date("2026-11-01T01:00:00.000Z"));
+    h.config.schedule = { wake_confirm_seat: false };
+    expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "nothing-due" });
+    expect(spawned).toEqual([]);
+    h.config.schedule = { wake_confirm_seat: true };
+    expect(await runTick(deps)).toMatchObject({ word: "glossame" });
+    expect(spawned.map((x) => x.word)).toEqual(["glossame"]);
+  });
+
+  test("a locked signer rests the tick before any seat opens: exit 0, the host note says why", async () => {
+    const { h, deps, spawned } = await tickHost([{ word: "glossame" }]);
+    expect(await runTick({ ...deps, signerState: async () => "locked" })).toMatchObject({ exit: 0, outcome: "refused", seat: null });
+    expect((await readHostNotes(h.config, new Date(0)))!.at(-1)).toMatchObject({ outcome: "refused", refusal: "keychain-locked" });
     expect(spawned).toEqual([]);
   });
 

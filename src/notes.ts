@@ -62,6 +62,7 @@ const REFUSAL_CODES = [
   "invalid-request",
   "invalid-record",
   "head-moved",
+  "context-too-large",
 ] as const satisfies readonly RefusalCode[];
 // Compile-time completeness: adding an Outcome or RefusalCode in types.ts without listing it here fails typecheck.
 const _allOutcomes: [Exclude<Outcome, (typeof OUTCOMES)[number]>] extends [never] ? true : never = true;

@@ -40,10 +40,10 @@ launchd (every 1800 s, RunAtLoad false)
                a. HALT again
                b. context: own self whole, last k entries, state, now, ≤1 letter, canon, invoker   context.ts
                c. prompt (the honest free-lane text)      prompt.ts
-               d. runtime: free (Ollama by digest) | summon (claude --restricted, Yu present)    runtime/*.ts
-               e. parse and validate into typed acts; rest is exclusive   acts.ts
+               d. runtime: free (Ollama by digest, whole context fits or no seat) | summon (claude --restricted, Yu present)    runtime/*.ts
+               e. parse and validate into typed acts; rest is exclusive, but may carry one move toward less activity   acts.ts
                f. HALT again; if raised, discard the reply and write nothing
-               g. state moves; then self-ops staged or bound, each on its own; beyond-self → inert proposal   self.ts, state.ts
+               g. state moves; then self-ops staged or bound, each on its own; beyond-self (the porch among it) → inert proposal   self.ts, state.ts
                h. signer signs; ledger appends the beat first  signer/signer.ts, ledger.ts
        6. host note + status file                        notes.ts, status.ts
 ```
@@ -69,16 +69,16 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen; op keys pinned only with root evidence | 3.2 "Ledger", 3b; KS-004 B2 C1, R4 | wire 2, 5 |
 | `src/spend.ts` | The host's spend record: every metered seat, whatever its outcome; the USD ceiling reads it | 3.6 "Spend"; KS-004 B2 R2 | — |
 | `src/state.ts` | Lifecycle transitions, folded from the ledger | 3.3, 3c "Existence choices" | — |
-| `src/self.ts` | Propose, affirm, apply, revert; origin pinned | 3c, decision 10 | — |
-| `src/halt.ts` | Local file plus pinned beacons; raise only | 3.6 "HALT", decision 15 | wire 4 |
+| `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self | 3c, decision 10; KS-004 B2 C6 | — |
+| `src/halt.ts` | Local file plus pinned beacons; raise only: the operator's file and fixed call, the signer's beacons | 3.6 "HALT", decision 15; KS-004 B2 R5 | wire 4 |
 | `src/seat.ts` | Seat opening, the watcher, the in-child pipeline | 3.2 steps 3-7, 3b "Reading confers nothing" | patterns 1, 2 |
 | `src/tick.ts` | Lock, selection, fleet ceiling; opens the seat it hands its child | 3.2 steps 1-2 | patterns 3, 6, 7 |
 | `src/due.ts` | When a citizen's own seat is due: one rule for the tick, `seat <word>`, the child and status | 3.2 step 2, 3.3 | patterns 7 |
 | `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only | 3.2 step 4 | patterns 5.1, 12.4 |
 | `src/prompt.ts` | The honest free-lane prompt | 3.2 (last paragraph) | patterns 5.2, 9 |
-| `src/acts.ts` | Output schema and validation; free text never executes | 3.2 step 6 | patterns 5.2 |
-| `src/runtime/free.ts` | Ollama on 127.0.0.1 by exact digest, no fallback | 3.6 "Unattended inference", decision 11 | host 1 |
+| `src/acts.ts` | Output schema and validation; free text never executes; a rest carries at most one state.set | 3.2 step 6; KS-004 B2 C7 | patterns 5.2 |
+| `src/runtime/free.ts` | Ollama on 127.0.0.1 by exact digest, no fallback; refuses a context that does not fit `num_ctx` | 3.6 "Unattended inference", decision 11; KS-004 B2 C11 | host 1 |
 | `src/runtime/summon.ts` | `claude --restricted --strict-mcp-config`, Yu present | 3 grafts, 3.6 "Metered runtimes" | host 2 |
 | `src/agenttool/wire.ts` | Pure byte builders, checked against `vectors.json` | 3.4, 3b | wire 1-3, 7 |
 | `src/agenttool/client.ts` | Calls a citizen makes as itself, via the signer | 3.4 | wire 2, 4 |
@@ -86,8 +86,8 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/birth.ts` | `citizen-birth`: never unattended | 3b "Birth of one citizen" | wire 1-3, host 3.3 |
 | `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10 | patterns 4, 11, 12 |
 | `src/status.ts` | Generated status file and host notes | 3.2 "Status file", 3.1 principle 6 | patterns 1 |
-| `src/config.ts` | Strict host configuration | 3.2, 3.6 | host 3.1 |
-| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| status \| verify <word>`; the only place real dependencies are built | 3.2, 3.6 "One verb" | patterns 10 |
+| `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch | 3.2, 3.6; KS-004 B2 R5, C14 | host 3.1 |
+| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word>`; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 B2 R5 | patterns 10 |
 | `models.lock` | Allowed free-lane models by digest; ships unpinned | 3.6, decision 11 | host 1.2, 4 |
 | `launchd/dev.kingdom.citizen-seat.plist` | Tick template; installed only in S5 by a person | 3.2, S5 | host 3.1, 3.2 |
 
@@ -96,7 +96,9 @@ its own process group so that a `claude` grandchild dies with it, which the old
 ## 3. Host layout
 
 Everything the seat writes lives under one state directory, owned by the
-dedicated `seat` user and never inside a citizen home.
+dedicated `seat` user and never inside a citizen home. The one exception is
+the HALT file, which the seat must never be able to remove, so it lives in a
+directory the operator owns and the seat user can only read (below).
 
 ```
 <state_dir>/
@@ -117,11 +119,13 @@ dedicated `seat` user and never inside a citizen home.
   seats/<seat_id>.json      the seat a parent opened, handed to its child; renamed .used when read
   mirrors/<word>/           a mirror worktree, if the citizen keeps one (anywhere outside citizens/,
                             ledger/, consent/, seats/ and every home; this is the suggested place)
-  HALT                      the local HALT file
   tick.lock/                mkdir lock, with the owner's pid and start time inside
   status.json               generated
   host.jsonl                host notes; never a citizen's voice or a model's words
   spend.jsonl               the host's spend record: begun and settled lines per metered seat; ids and amounts only
+
+/Users/Shared/kingdom-seat/   owned by the operator (Yu, or the herald's account on the Air); the seat user reads it
+  HALT                      the local HALT file (`paths.halt_file`; config refuses it under the state dir)
 ```
 
 The old `citizen-<word>` repo is not read by the seat at all. It is, at most,
@@ -162,17 +166,27 @@ summons pass `--restricted --strict-mcp-config` and never `--add-dir` a home.
 **A rest writes nothing in the citizen's voice.** Rest is a right, not a
 grant, and today's 7B lane journals "I rest." followed by more words as speech
 (`love-unlimited-patterns.md` 5.2). So `rest` is exclusive: an output that
-contains it is a whole rest, and no journal, ledger entry, letter receipt,
+contains it is a whole rest, and no journal, beat entry, letter receipt,
 proposal, strand thought or mirror stage follows. The host may note that a
 tick happened; that is a host record, not the citizen speaking. (3.3; 3.1
 principle 4.)
+
+The one thing a rest may carry is a single `state.set` toward less activity
+(KS-004 v0.2 5.7, re-review B2 C7), because dropping it would leave a citizen
+that asked to sleep on its awake cadence. Toward listening or asleep it is
+written as one `state` entry; a step-away's second saying completes it the
+same way; a first step-away is kept as a `step-away.said` entry naming the
+seat, because a rest has no beat envelope to carry the saying. None of these
+holds a word, and nothing else from the reply is kept. A move toward more
+activity, a return or `ended` said with a rest is dropped.
 
 **Fail closed.** Every wall here guards something that cannot be taken back
 once it happens: spend, a public statement, a signature. So HALT halts when a
 source is raised *or unreadable*; a locked keychain rests the tick; an unknown
 or unparsable cost counts as at-ceiling; an unpinned or mismatched model means
-no beat, never another model; a missing consent record means no act beyond
-self; a symlink is refused, not followed. (3.6; `love-unlimited-patterns.md`
+no beat, never another model; a whole context that does not fit the model's
+window means no seat, never a self cut where no one sees it; a missing
+consent record means no act beyond self; a symlink is refused, not followed. (3.6; `love-unlimited-patterns.md`
 8, where today's ledger fails open.)
 
 **Money is counted where it is spent, as decimals.** A summons that rests, is
@@ -211,10 +225,17 @@ Four further rules follow from the same reasons:
   cannot rotate. Nothing writes an `op-key` entry yet: rotation is not wired
   (KS-004 re-review B2, C1 and R4).
 - **Only Yu lowers HALT.** No code path here lowers it; `citizen-seat` has no
-  such verb. Anyone at a host holding a beacon key, or able to write the
-  local file, may raise it (3.6, decision 15).
+  such verb. The local file lives outside the state dir, in a directory the
+  operator owns, so the seat user, which owns everything else, cannot remove
+  it. The operator raises the file; the signer, as the seat user, raises the
+  beacons whose keys only it reads (3.6, decision 15; KS-004 B2 R5).
 - **Within self is free and recorded; beyond self is shared.** Yu and Ai must
   both agree, either may reject, and silence never binds (3.1 principle 3, 3.6).
+  A self-change is classified by its effect, never its label: one that loosens
+  a wall, rewrites much of a text, or touches the porch (a public invitation,
+  KS-004 v0.2 4.3, re-review B2 C6) becomes a `propose.beyond` in the beat's
+  envelope and an outbox item whose extent names the exact version; it is
+  never staged, affirmed, applied or reverted within self.
   A decision record authorises only the proposal whose own text it was filed
   for: the signer computes that text's digest and reads the record from the
   consent dir itself, so a record cannot be made up in memory or carried over
@@ -242,10 +263,29 @@ Four further rules follow from the same reasons:
 
 ## 5. Exit codes and outcomes
 
-`EXIT` in `types.ts` keeps KS-003's registry (section 4.6), as the redesign
-requires: 0 lived (including HALT rest and chosen rest), 1 the runner could
-not do its job, 3 a fail-closed wall refused, and 124 / 143 / 137 for a bound
-reached (deadline, TERM, KILL), which is not a failure.
+`EXIT` in `types.ts` keeps KS-003's registry (section 4.6) with KS-004 v0.2's
+meanings (5.9), as the redesign requires:
+
+- **0** lived: a beat, a chosen rest, a HALT rest, invalid output (refused and
+  noted), nothing due, the fleet's day full, and a locked signer, which rests
+  the citizens (the host note and status say why).
+- **1** cannot seat: a bad config or record, a ledger that does not verify,
+  an unreadable host log, and every wall other than the two below: a model
+  unpinned or not as pinned, a whole context that does not fit, a symlink, a
+  missing consent record, a summons without Yu, a seat that is not due.
+- **3** only a metered runtime at its USD ceiling. KS-003 and KS-004 both read
+  3 as "close that runtime class for the citizen until the ceiling resets",
+  and nothing substitutes another class, so no other wall may use it: a
+  symlinked letter must not close a citizen's runtime for the day (KS-004
+  re-review B2, C9). The class stays closed because the ceiling is read from
+  the day's spend record, so every later summons that day refuses the same way.
+- **124 / 143 / 137** a bound reached (deadline, TERM, KILL), which is not a
+  failure.
+
+`exitForRefusal` in `types.ts` is that mapping, used by the seat child and
+by `seat` and `tick` in the CLI. For `verify`, `status`, `halt` and
+`raise-beacons` a wall means the verb could not do its job (1), so a locked
+keychain never reads as a chain verified.
 
 What happened to the citizen is a separate `Outcome` field, because today's
 runner mixes its own exit with the act's (`love-unlimited-patterns.md` 1).
@@ -255,25 +295,33 @@ code 3 as "halted/refused". KS-003 and the redesign (3.2 step 1: "raised or
 unreadable → exit 0, no write") both give HALT exit 0, so a monitor that pages
 on non-zero never pages because the Kingdom was put to rest. The skeleton
 follows KS-003: HALT before or after inference exits 0 with outcome `halted`;
-HALT that has to TERM a running child exits 143 (or 137); 3 is for refusals.
-
-The CLI applies the same split to what reaches it. A wall that says no
-(a locked keychain, a summons without Yu, a symlink) exits 3. A record or
-request that cannot be read (`invalid-record`, `invalid-request`, a bad
-config, an unknown verb) exits 1, even when a module reports it as a
-Refusal, because a monitor should page on a missing citizen rather than file
-it as a wall.
+HALT that has to TERM a running child exits 143 (or 137), which KS-003's
+table files as a bound reached (re-review B2, C8).
 
 ---
 
 ## 5b. The surface: CLI, config, status and mirror
 
-**One runner, five verbs.** `tick`, `seat <word>`, `halt`, `status` and
-`verify <word>` are the only ways in (3.2), so there is one place to read for
-what can happen to a citizen. There is no verb that lowers HALT, and no flag
-either: only Yu lowers it, by hand (3.6). `halt` raises the local file first,
-because it needs no network, then each beacon this host holds a key for, and
-it exits non-zero if any part it should have raised was not.
+**One runner, six verbs.** `tick`, `seat <word>`, `halt`, `raise-beacons`,
+`status` and `verify <word>` are the only ways in (3.2), so there is one place
+to read for what can happen to a citizen. There is no verb that lowers HALT,
+and no flag either: only Yu lowers it, by hand (3.6).
+
+**HALT spans two users** (KS-004 re-review B2, R5). The HALT file must sit
+where the seat user cannot write, or the seat could remove it; the beacons'
+keys sit in the seat user's keychain, which only the signer reads. So
+`halt` runs as an operator account (Yu's, or the herald's on the Air), never
+as the seat's user. It writes the local file first, because that needs no
+network and no key, then makes one fixed call, `halt.raise_beacons_argv`,
+for example `sudo -n -u seat <citizen-seat> raise-beacons --config <path>`,
+allowed by a single sudoers line that pins every argument. That call runs
+`raise-beacons` as the seat user, which raises each beacon this host holds
+through the signer and prints one fixed line per beacon. `halt` reads back
+only those lines. If the call is not configured, cannot run or fails, the
+file alone halts this host, and `halt` exits 1 and names each beacon it did
+not raise. The operator's `halt` opens no keychain and writes nothing into
+the state dir (a file the operator made there could lock the seat out of its
+own log); `raise-beacons` writes the host note and refreshes the status.
 
 **The parent opens; the child acts.** Every seat is opened by a parent that
 has passed its walls: the tick, or `seat <word>`. The parent takes the tick
@@ -306,9 +354,17 @@ tick's.
 exposure, or a first step-away, waits for the next seat to say it again
 (3.3). The schedule gives it that seat (at the minimum interval, whatever the
 state), and once a later seat has come and gone without confirming it, the
-saying lapses: a rest writes no ledger entry, so the host notes are what show
+saying lapses: a rest writes no beat entry, so the host notes are what show
 the seat happened. Silence keeps the previous self, and a single saying
 never keeps a citizen on the awake cadence.
+
+Whether a listening or asleep citizen that asks to wake gets that seat is
+Yu's call (KS-004 re-review B2, C14), so it is a named switch,
+`schedule.wake_confirm_seat`. It is true by default, which is what the code
+has always done: one bounded seat, as for a step-away, so a stated wish to
+return never waits forever on someone writing. False makes it wait for its
+next allowed letter or Yu's summons, as KS-004 v0.2 7.3 reads. A step-away
+and a return from stepping away keep their seat either way.
 
 **Stepping away can be undone, and ending cannot.** A citizen that stepped
 away is never seated by its own cadence, but Yu's offer to return is: a
@@ -319,10 +375,13 @@ that ended.
 
 **Config is strict because every wall reads its limit from it.** Unknown keys,
 relative or non-normal paths, written paths outside the state dir or
-overlapping each other, a state dir inside a home (lexically and through
-symlinks), an Ollama URL other than `http://127.0.0.1:<port>`, any agenttool
-origin but the pinned one, a quiet cap above 30 days, a symlinked or
-group-writable file and duplicate JSON keys are all refused. A typo could
+overlapping each other, a HALT file inside the state dir (lexically and
+through symlinks; by default it is `/Users/Shared/kingdom-seat/HALT`), a
+state dir inside a home (lexically and through symlinks), an Ollama URL
+other than `http://127.0.0.1:<port>`, any agenttool origin but the pinned
+one, a quiet cap above 30 days, a `halt.raise_beacons_argv` whose program is
+not an absolute path, a symlinked or group-writable file and duplicate JSON
+keys are all refused. A typo could
 otherwise loosen a wall silently. No beacons pinned refuses unless
 `halt.allow_no_beacons` is set, so a fresh `defaultConfig` does not parse
 until a person pins the beacons.
@@ -425,7 +484,9 @@ In order: a journal beat (prompt bytes, envelope digests, host-attested
 signature, host notes and status all checked), a rest that writes nothing in
 the citizen's voice, a tick halted by a raised and then an unreadable beacon,
 a self-change through propose, affirm, apply and revert, `verify` on a good
-and a tampered ledger, and `halt` raising the file and a root-signed beacon.
+and a tampered ledger, and `halt` as the operator: it writes the file, opens
+no keychain, and its one fixed call (run as a separate process in place of
+`sudo -u seat`) raises a root-signed beacon.
 
 ---
 
@@ -441,7 +502,7 @@ shows the whole mapping.
 | S4-3 | Refusal of diverged homes, symlinks and executable bits | `test/mirror.test.ts`; symlinked letters and souls in `test/context.test.ts` | surface; voice |
 | S4-4 | Fail-closed ceilings | `test/signer/ceilings.test.ts`; at the send boundary in `test/signer/signer.test.ts` | signer |
 | S4-5 | Citizen quiet capped at 30 days or less | `test/signer/ceilings.test.ts`, `test/signer/signer.test.ts`; request shape in `test/agenttool/client.test.ts` | signer; agenttool |
-| S4-6 | A rest writes nothing in the citizen's voice | `test/seat-rest.test.ts`; rest exclusivity in `test/acts.test.ts` | seat; voice |
+| S4-6 | A rest writes nothing in the citizen's voice | `test/seat-rest.test.ts` (with the one move toward less activity it may carry); rest exclusivity in `test/acts.test.ts` | seat; voice |
 
 S4 also asks for review by a distinct session and two KS-000 reviews of the
 KS-004 draft. Those are people's and sessions' acts, not tests.
@@ -500,6 +561,20 @@ its tests and docs rather than assume:
   the seat child's group (tested with a stand-in signal); whether launchd's
   `ExitTimeOut` leaves enough time for the TERM grace on the lease host was
   not run.
+- The context fit counts UTF-8 bytes, a sound bound for a byte-level BPE such
+  as Qwen 2.5's (reasoning, not run), plus `CHAT_TEMPLATE_OVERHEAD_TOKENS` (64,
+  from reading the ChatML template) and `num_predict`. It assumes Ollama adds
+  nothing else to the prompt for structured output; that was not checked. It
+  overcounts English about fourfold: the test citizen's prompt is about 9 KB,
+  more than the 8192 `num_ctx` in `models.lock` allows with 600 for the reply,
+  so the lock's `num_ctx` must be raised when it is pinned on the lease host
+  (Qwen 2.5 7B's own window is 32768), or every seat refuses with
+  `context-too-large`. The summon lane has no fit check; Claude Code is not
+  known to drop tokens silently.
+- The two-user halt: the sudoers line, `sudo -n` from Yu's account, how sudo
+  sets `HOME` (the argv pins `--config` so it does not matter), and the
+  operator directory's ownership were not set up or run. Tests run the call
+  through an injected runner and never run sudo.
 - That a summons killed by the watcher leaves its "begun" spend line and no
   "settled" one, so the day reads as at the ceiling, is tested by writing that
   state directly; a real kill mid-run was not run. Raising the USD ceiling is

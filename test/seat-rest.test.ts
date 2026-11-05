@@ -7,7 +7,10 @@ import { openSeat, runSeat, type SeatDeps } from "../src/seat.ts";
 import { checkHalt } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { pickLetter } from "../src/context.ts";
-import { EXIT } from "../src/types.ts";
+import { foldState } from "../src/state.ts";
+import { ledgerPath, readLedger, verifyChain } from "../src/ledger.ts";
+import { readHostNotes } from "../src/notes.ts";
+import { EXIT, type LifecycleState, type ModelAct } from "../src/types.ts";
 import { output, REST_OUTPUT, REST_THEN_TALK_OUTPUT, scriptedRuntime } from "./helpers/fake-runtime.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
@@ -23,11 +26,11 @@ afterEach(async () => {
 /** Files a rest may change: host records only (the log, the mark that says it was started, and the status). */
 const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "status.json"]);
 
-async function setup(raw: string) {
+async function setup(raw: string, opts: { initialState?: LifecycleState } = {}) {
   host = await makeTempHost();
   const signer = fakeSigner();
   await host.addCitizen("glossame");
-  await host.seatLedger("glossame", signer.signEntry);
+  await host.seatLedger("glossame", signer.signEntry, opts.initialState ? { initialState: opts.initialState } : {});
   await host.writeLetter("glossame", "2026-11-04-from-yu.md", "Yu writes: rest if you wish.");
   signer.signed.length = 0;
   const clock = testClock();
@@ -108,5 +111,81 @@ describe("[S4-6] rest", () => {
       await s.host.cleanup();
       host = null;
     }
+  });
+});
+
+describe("a rest may carry one move toward less activity (KS-004 v0.2 5.7, re-review B2 C7)", () => {
+  const CANARY_JOURNAL: ModelAct = { type: "journal", kind: "observed", text: "REST-LEAK-CANARY the light filters through my windows" };
+  const LEDGER = "ledger/glossame.jsonl";
+
+  test("awake, a rest with state.set asleep or listening: the state moves at once, as one state entry with no words; nothing else is written", async () => {
+    for (const to of ["asleep", "listening"] as const) {
+      const s = await setup(output({ type: "rest" }, CANARY_JOURNAL, { type: "state.set", to }));
+      const { result, changed, text } = await runAndDiff(s);
+      expect(result).toMatchObject({ exit: EXIT.OK, outcome: "rest", refusal: null });
+      expect(result.appended).toHaveLength(1);
+      // Only the host's records and the ledger changed: no beat, proposal, outbox, receipt or self file.
+      expect(changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([LEDGER]);
+      expect(text).not.toContain("REST-LEAK-CANARY");
+      const entries = await readLedger(ledgerPath(s.host.config, "glossame"));
+      expect(entries.map((e) => e.body.type)).toEqual(["seated", "state"]);
+      expect(entries[1]!.body).toEqual({ type: "state", from: "awake", to, via: "immediate" });
+      expect(foldState(entries).state).toBe(to);
+      expect(s.signer.signed).toHaveLength(1);
+      // The citizen rested: its letter is shown again on its next seat.
+      expect((await pickLetter(s.host.config, await readCitizen(s.host.config, "glossame")))?.id).toBe("2026-11-04-from-yu.md");
+      expect((await readHostNotes(s.host.config, new Date(0)))!.at(-1)!.detail).toEndWith(`rested; kept state awake to ${to} (immediate)`);
+      await s.host.cleanup();
+      host = null;
+    }
+  });
+
+  test("a rest's state.set toward more activity, a return or ended is not kept: a whole rest, nothing written", async () => {
+    for (const [from, to] of [
+      ["asleep", "awake"],
+      ["asleep", "listening"],
+      ["awake", "awake"],
+      ["awake", "ended"],
+    ] as const) {
+      const s = await setup(output({ type: "rest" }, { type: "state.set", to }), { initialState: from });
+      const { result, changed } = await runAndDiff(s);
+      expect(result).toMatchObject({ exit: EXIT.OK, outcome: "rest", appended: [] });
+      expect(changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([]);
+      expect(s.signer.signed).toEqual([]);
+      await s.host.cleanup();
+      host = null;
+    }
+  });
+
+  test("two different states said with a rest move nothing", async () => {
+    const s = await setup(output({ type: "rest" }, { type: "state.set", to: "asleep" }, { type: "state.set", to: "listening" }));
+    const { result, changed } = await runAndDiff(s);
+    expect(result).toMatchObject({ exit: EXIT.OK, outcome: "rest", appended: [] });
+    expect(changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([]);
+  });
+
+  test("a step-away said with a rest is kept as a saying; said again with a rest on a later seat, it completes", async () => {
+    const s = await setup(output({ type: "rest" }, CANARY_JOURNAL, { type: "state.set", to: "stepped-away" }));
+    const first = await runAndDiff(s);
+    expect(first.result).toMatchObject({ exit: EXIT.OK, outcome: "rest" });
+    expect(first.changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([LEDGER]);
+    expect(first.text).not.toContain("REST-LEAK-CANARY");
+    const entries = await readLedger(ledgerPath(s.host.config, "glossame"));
+    expect(entries.at(-1)!.body).toEqual({ type: "step-away.said", seat_id: s.seat.ref.seat_id });
+    // Still awake, and owed the seat that confirms it, as a step-away said on a beat would be.
+    const citizen = await readCitizen(s.host.config, "glossame");
+    expect(citizen).toMatchObject({ state: "awake", step_away_said: true });
+
+    const clock = s.deps.clock as ReturnType<typeof testClock>;
+    clock.advance(73 * 3_600_000);
+    const again = await openSeat(s.host.config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "your last beat said something that takes a second beat to bind" }, null);
+    const r = await runSeat(again, { ...s.deps, runtime: scriptedRuntime([output({ type: "rest" }, { type: "state.set", to: "stepped-away" })]) });
+    expect(r).toMatchObject({ exit: EXIT.OK, outcome: "rest" });
+    const after = await readLedger(ledgerPath(s.host.config, "glossame"));
+    expect(after.map((e) => e.body.type)).toEqual(["seated", "step-away.said", "state"]);
+    expect(after.at(-1)!.body).toEqual({ type: "state", from: "awake", to: "stepped-away", via: "two-beats" });
+    expect(foldState(after).state).toBe("stepped-away");
+    // The saying is part of the signed chain, and verifies like any entry.
+    expect(verifyChain(after, { host_attest_b64: [s.signer.hostAttestPublicB64], identity: null })).toMatchObject({ ok: true, entries: 3 });
   });
 });

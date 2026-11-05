@@ -86,7 +86,9 @@ describe("validation", () => {
     );
     expect(restLast.rest).toBe(true);
     expect(restLast.acts).toEqual([]);
-    expect(restLast.dropped.map((d) => d.type)).toEqual(["letter.send", "state.set", "propose.beyond"]);
+    // A rest may carry the one state it names; the seat keeps it only toward less activity (KS-004 B2 C7).
+    expect(restLast.dropped.map((d) => d.type)).toEqual(["letter.send", "propose.beyond"]);
+    expect(restLast.rest_state).toBe("awake");
     expect(JSON.stringify(restLast)).not.toContain(CANARY);
 
     // A malformed rest, a rest past the act limit, and a rest in an output with stray fields are all still rests.
@@ -111,6 +113,36 @@ describe("validation", () => {
     // normalizeActs applies the same exclusivity to already-validated acts.
     const n = normalizeActs([{ type: "journal", kind: "observed", text: CANARY }, { type: "rest" }], DEFAULT_CEILINGS);
     expect(n).toEqual({ rest: true, acts: [], dropped: [{ index: 0, type: "journal", reason: "rest is exclusive" }] });
+  });
+
+  test("a rest carries the one state its reply names, whatever else it said; a malformed or contradictory state.set carries none", () => {
+    // Kept from wherever it sits, with every other act dropped without its text; even beside stray fields.
+    const r = run(JSON.stringify({ voice: CANARY, acts: [{ type: "journal", kind: "chose", text: CANARY }, { type: "state.set", to: "asleep" }, { type: "rest" }] }));
+    expect(r).toEqual({
+      rest: true,
+      acts: [],
+      rest_state: "asleep",
+      dropped: [
+        { index: -1, type: null, reason: "output has fields other than acts" },
+        { index: 0, type: "journal", reason: "rest is exclusive" },
+      ],
+    });
+    expect(JSON.stringify(r)).not.toContain(CANARY);
+    // The same state twice is one saying; two different states move nothing, as on any beat.
+    expect(run(output({ type: "rest" }, { type: "state.set", to: "listening" }, { type: "state.set", to: "listening" }))).toEqual({
+      rest: true,
+      acts: [],
+      rest_state: "listening",
+      dropped: [{ index: 2, type: "state.set", reason: "repeated state.set" }],
+    });
+    const contra = run(output({ type: "rest" }, { type: "state.set", to: "asleep" }, { type: "state.set", to: "awake" }));
+    expect(contra.rest_state).toBeUndefined();
+    expect(contra.dropped.map((d) => d.reason)).toEqual(["contradictory state.set", "contradictory state.set"]);
+    // A state.set that does not validate is just dropped.
+    const bad = run(JSON.stringify({ acts: [{ type: "rest" }, { type: "state.set", to: "dormant" }] }));
+    expect(bad).toEqual({ rest: true, acts: [], dropped: [{ index: 1, type: "state.set", reason: "rest is exclusive" }] });
+    // normalizeActs pairs already-validated acts the same way.
+    expect(normalizeActs([{ type: "state.set", to: "asleep" }, { type: "rest" }], DEFAULT_CEILINGS)).toEqual({ rest: true, acts: [], dropped: [], rest_state: "asleep" });
   });
 
   test("each act type validates its fields; unknown types, extra keys and wrong kinds are dropped with a reason", () => {

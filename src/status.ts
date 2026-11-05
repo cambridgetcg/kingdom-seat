@@ -179,11 +179,11 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
   if (citizen) {
     const letter = await wakingLetter(config, citizen).catch(() => false);
     const since = lastSeat ?? (citizen.last_beat_at === null ? citizen.seated_at : null);
-    const verdict = isDue(citizen, letter, now, config.ceilings.min_beat_interval_h, since);
+    const verdict = isDue(citizen, letter, now, config.ceilings.min_beat_interval_h, since, config.schedule);
     const graceH = config.timing.tick_interval_s / 3600;
     isOverdue = !halted && verdict.due && verdict.overdue_h > graceH;
     // A citizen whose seat would be due on the free lane, but whose runtime runs only with Yu, waits for Yu.
-    awaitsYu = citizen.runtime !== "free" && isDue({ ...citizen, runtime: "free" }, letter, now, config.ceilings.min_beat_interval_h, since).due;
+    awaitsYu = citizen.runtime !== "free" && isDue({ ...citizen, runtime: "free" }, letter, now, config.ceilings.min_beat_interval_h, since, config.schedule).due;
   }
 
   // Without a record there is no identity to check the chain against, so it is not reported as verified.

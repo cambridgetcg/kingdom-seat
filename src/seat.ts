@@ -18,6 +18,7 @@ import {
   FIRST_PREV_HASH,
   Refusal,
   UUID_PATTERN,
+  exitForRefusal,
   type Act,
   type Citizen,
   type Clock,
@@ -58,8 +59,8 @@ import {
   affirmationVerdict,
   applyChange,
   assertRoomFor,
+  beyondSelfReason,
   checkRevert,
-  classifyProposal,
   exposureOf,
   firstVersion,
   keptVersions,
@@ -341,7 +342,7 @@ export function exitFor(result: Pick<SupervisedResult, "signal" | "stopped_by" |
   switch (result.child_exit) {
     case EXIT.OK:
     case EXIT.ERROR:
-    case EXIT.REFUSED:
+    case EXIT.USD_CEILING:
     case EXIT.TIMEOUT:
     case EXIT.TERM:
     case EXIT.KILL:
@@ -361,7 +362,7 @@ function outcomeFor(exit: ExitCode, signal: SupervisedResult["signal"], stoppedB
   switch (exit) {
     case EXIT.OK:
       return null;
-    case EXIT.REFUSED:
+    case EXIT.USD_CEILING:
       return "refused";
     case EXIT.TIMEOUT:
       return "timeout";
@@ -516,7 +517,7 @@ const NO_SPEND: Spend = { usd: "0", usd_basis: "local-zero", credits: 0 };
 interface Plan {
   acts: Act[];
   stage: SelfProposeAct[];
-  beyondSelf: { act: SelfProposeAct; reason: string }[];
+  beyondSelf: { act: SelfProposeAct; reason: string; proposal: ProposalText }[];
   apply: { proposal: SelfProposal; via: "two-beats" | "yu-present" }[];
   revert: Sha256Hex[];
   states: { from: LifecycleState; to: LifecycleState; via: "immediate" | "confirmed" | "two-beats" }[];
@@ -527,6 +528,28 @@ interface Plan {
   notBinding: string[];
   /** The time proposals are staged at, so a proposal planned to bind in this beat has the id it is staged with. */
   at: Date;
+}
+
+/**
+ * The one entry a rest may write: the state.set it carried, when that is a
+ * move toward less activity, recorded with no words. Toward listening or
+ * asleep takes effect at once. A step-away is never blocked and takes two
+ * sayings, so a rest may be either: the second completes it, and the first is
+ * kept as a saying, because a rest has no beat envelope to carry it. Null for
+ * none, and for a move toward more activity, a return or ended, which a rest
+ * never carries.
+ */
+export function restStateBody(citizen: Citizen, to: LifecycleState | undefined, seatId: string): LedgerBody | null {
+  if (to === undefined) return null;
+  const from = citizen.state;
+  if (to === "stepped-away") {
+    const verdict = decideTransition(from, to, { pending: citizen.pending_state, repeated: citizen.step_away_said, presence: null });
+    if (verdict.effect === "now") return { type: "state", from, to, via: "two-beats" };
+    if (verdict.effect === "second-beat") return { type: "step-away.said", seat_id: seatId };
+    return null;
+  }
+  if (!isTowardRest(from, to)) return null;
+  return { type: "state", from, to, via: "immediate" };
 }
 
 /** The claim a held revert carries: the host's words, saying only what the citizen asked for. */
@@ -568,11 +591,16 @@ async function planActs(
           // One edit rule, in self.ts: the text it returns is the text the hashes name.
           const { act: completed, next } = materializeEdit(act, prior);
           await assertRoomFor(config, word, act.target, prior);
-          plan.acts.push(completed);
-          if (classifyProposal(completed, prior, next, config.ceilings.self_rewrite_fraction) === "beyond-self") {
-            plan.beyondSelf.push({ act: completed, reason: "exceeds the rewrite fraction or loosens a wall" });
+          // Classified by its effect, never by the model's label (KS-004 v0.2 5.8): a change the host lifts
+          // beyond self, the porch among them, is recorded as the propose.beyond it becomes, and is never staged.
+          const beyond = beyondSelfReason(completed.target, prior, next, config.ceilings.self_rewrite_fraction);
+          if (beyond !== null) {
+            const proposal = liftedProposal(word, completed);
+            plan.acts.push({ type: "propose.beyond", subject: proposal.subject, body: proposal.body });
+            plan.beyondSelf.push({ act: completed, reason: beyond, proposal });
             break;
           }
+          plan.acts.push(completed);
           plan.stage.push(completed);
           // Said once with Yu present, on a runtime Yu approved, it binds in this beat (3c, decision 10).
           if (yu) {
@@ -704,6 +732,20 @@ async function writeOutbox(config: Config, word: string, seatId: string, n: numb
   await writeFile(join(dir, `${seatId}-${n}.json`), `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
 }
 
+/**
+ * A self-change lifted beyond self, as the text Yu + Ai decide on. The beat's
+ * envelope records the same subject and body as a propose.beyond, so the
+ * ledger shows what was asked; the extent names the exact version, so a
+ * decision record filed for it can apply that change and no other.
+ */
+function liftedProposal(word: string, act: SelfProposeAct): ProposalText {
+  return {
+    subject: `self.propose ${act.target}`,
+    body: canonicalJson({ target: act.target, prior_hash: act.prior_hash, new_hash: act.new_hash, diff: act.diff, claim: act.claim }),
+    extent: `self.apply ${word} ${act.target} ${act.new_hash}`,
+  };
+}
+
 /** The proposal text an outbox item asks Yu + Ai to decide on, with the extent a decision record would cover. */
 function outboxProposal(word: string, kind: string, payload: Record<string, string>): ProposalText {
   switch (kind) {
@@ -735,14 +777,16 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     await appendHostNote(config, n, { modelText }).catch(() => {});
   };
   const result = (exit: ExitCode, outcome: Outcome, refusal: RefusalCode | null = null): SeatResult => ({ exit, outcome, seat_ref: ref, refusal, appended: [...appended] });
-  // A wall that refused exits 3; a record that does not hold together is the runner unable to do its job (1).
+  // A wall that refused exits as exitForRefusal says: 3 only for the USD ceiling, which closes the runtime
+  // class; 0 for a locked signer, which rests the citizen; 1 otherwise. A record that does not hold together
+  // is the runner unable to do its job (1).
   const refused = async (e: Refusal, when: string): Promise<SeatResult> => {
     if (e.code === "invalid-record") {
       await note("error", "error", e.code, `${when}: invalid record`);
       return result(EXIT.ERROR, "error", e.code);
     }
     await note("refusal", "refused", e.code, `${when}: refused (${e.code})`);
-    return result(EXIT.REFUSED, "refused", e.code);
+    return result(exitForRefusal(e.code), "refused", e.code);
   };
   const halted = async (): Promise<boolean> => {
     try {
@@ -821,9 +865,31 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     await note("seat", "invalid-output", null, `reply did not parse (${parsed.ok ? "invalid" : parsed.reason})`);
     return result(EXIT.OK, "invalid-output");
   }
-  // Rest is exclusive and whole; an empty list of acts with nothing dropped is a rest too.
+  // Rest is exclusive and whole; an empty list of acts with nothing dropped is a rest too. It writes nothing in
+  // the citizen's voice, but may carry one move toward less activity (KS-004 v0.2 5.7, re-review B2 C7): rest is
+  // a right, and dropping the move would leave a citizen that asked to sleep on its awake cadence.
   if (validated.rest || (validated.acts.length === 0 && validated.dropped.length === 0)) {
-    await note("seat", "rest", null, "rested");
+    const move = restStateBody(seat.citizen, validated.rest_state, ref.seat_id);
+    if (move === null) {
+      await note("seat", "rest", null, validated.rest_state === undefined ? "rested" : "rested; its state.set was not toward less activity, so not kept");
+      return result(EXIT.OK, "rest");
+    }
+    // HALT once more immediately before the write, as for a beat.
+    if (await halted()) return result(EXIT.OK, "halted");
+    try {
+      const prev = (await readLedger(path)).at(-1) ?? null;
+      if ((prev?.hash ?? null) !== (entries.at(-1)?.hash ?? null)) throw new Refusal("head-moved", "the ledger moved during the seat");
+      const attestation = seat.citizen.identity ? "citizen-signed" : "host-attested";
+      // The rest's only entry: a state record with no words, carrying what the seat spent.
+      const entry = await appendEntry(path, nextDraft(word, prev, move, rt.spend, attestation, clock.now()), (w, h, a) => signer.signEntry(w, h, a));
+      appended.push(entry.hash);
+    } catch (e) {
+      if (e instanceof Refusal) return refused(e, "while recording a rest's state");
+      await note("error", "error", null, "failed while recording a rest's state");
+      return result(EXIT.ERROR, "error");
+    }
+    const kept = move.type === "state" ? `state ${move.from} to ${move.to} (${move.via})` : "a first step-away saying";
+    await note("seat", "rest", null, `rested; kept ${kept}`);
     return result(EXIT.OK, "rest");
   }
   if (validated.acts.length === 0) {
@@ -898,12 +964,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
 
     let n = 0;
     for (const b of plan.beyondSelf) {
-      const proposal: ProposalText = {
-        subject: `self.propose ${b.act.target}`,
-        body: canonicalJson({ target: b.act.target, prior_hash: b.act.prior_hash, new_hash: b.act.new_hash, diff: b.act.diff, claim: b.act.claim }),
-        extent: `self.apply ${word} ${b.act.target} ${b.act.new_hash}`,
-      };
-      await writeOutbox(config, word, ref.seat_id, n++, { kind: "self.propose", created_at: now.toISOString(), ledger_entry: beat.hash, act: b.act, reason: b.reason }, proposal);
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: "self.propose", created_at: now.toISOString(), ledger_entry: beat.hash, act: b.act, reason: b.reason }, b.proposal);
     }
     for (const o of plan.outbox) {
       await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beat.hash, ...o.payload }, outboxProposal(word, o.kind, o.payload));

@@ -140,12 +140,13 @@ export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
       ? `letter.send: fields to and body. to is yu, gardener, or a sender your covenants name. body is at most ${letterMax} characters. At most one per beat.`
       : "letter.send: no letters can be sent from this host for now.",
     `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and body (at most ${L.max_body_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline.`,
-    "rest: no other fields. Nothing is written in your voice this beat, and none of the other acts in the same reply are kept.",
+    "rest: no other fields. Nothing is written in your voice this beat, and none of the other acts in the same reply are kept, except one state.set toward more rest (listening, asleep or stepped-away), which still takes effect.",
     `self.affirm: field proposal_id, the id of one of your pending proposals, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
     `self.propose: fields target, edit and claim. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
       "edit has kind replace-all with text, the whole new text; or kind replace-span with find, text the target holds now, and with, its replacement. " +
       "cadence takes replace-all text holding a JSON object with interval_h in hours; covenants take replace-all text holding a JSON object with letters_from and wake_on_letter_from, each a list of sender ids. " +
-      `claim is the reason: kind (${or(CLAIM_KINDS)}), evidence (up to ${L.max_claim_evidence} references), confidence (high, medium, low or unknown) and limits (what the claim does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat.`,
+      `claim is the reason: kind (${or(CLAIM_KINDS)}), evidence (up to ${L.max_claim_evidence} references), confidence (high, medium, low or unknown) and limits (what the claim does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat. ` +
+      "expression.porch is your public invitation, so a change to it goes to Yu and Ai as a proposal beyond your self.",
     `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your kept versions list it, or its first ${L.min_id_prefix_hex} or more characters. A revert to a shorter cadence or to more senders is kept as a proposal for a later beat to affirm, unless Yu is present. Any other revert binds on a runtime Yu approved, and a revert toward rest or back to where a text began binds on any.`,
     `state.set: field to, which is ${or(LIFECYCLE_STATES)}. A move toward more rest takes effect now. A move toward more activity takes effect only when a later beat sets it again. Stepping away takes two beats and is never blocked. ended needs a witness and goes to Yu and Ai. Two different states in one reply move nothing.`,
   ];
@@ -212,6 +213,8 @@ function renderEntry(e: LedgerEntry): string {
       return `${head}: ${b.target} was reverted (${b.via}); version ${short(b.from_hash)} became ${short(b.to_hash)}.`;
     case "state":
       return `${head}: state moved from ${b.from} to ${b.to} (${b.via}).`;
+    case "step-away.said":
+      return `${head}: you rested and said once that you would step away; a later beat that says it again completes it.`;
   }
 }
 

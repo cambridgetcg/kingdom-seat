@@ -179,7 +179,7 @@ describe("status", () => {
 
     // The local file, and no beacon pinned, are named as such.
     await host.raiseHaltFile();
-    const noBeacons = { ...host.config, beacons: [], halt: { allow_no_beacons: false } };
+    const noBeacons = { ...host.config, beacons: [], halt: { allow_no_beacons: false, raise_beacons_argv: null } };
     const h2 = await checkHalt({ config: noBeacons, fetch: noFetch, now: () => NOW });
     const s2 = await buildStatus({ config: noBeacons, now: NOW, halt: h2, signerState: "ready" });
     expect(s2.halt).toEqual({ halted: true, raised: [`file ${host.config.paths.halt_file}`], unreadable: ["no beacon pinned"] });

@@ -1,7 +1,7 @@
 // Owner: surface group. main() runs with injected fakes only: no real
 // Keychain, network, model, git push or child of the real program.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CLI_PATH, main, parseArgs, readSeatFile, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
 import { openSeat } from "../src/seat.ts";
@@ -102,6 +102,12 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["seat", "glossame", "--runtime", "hermes"])).toThrow(Refusal);
   });
 
+  test("raise-beacons, the signer's half of halt, takes only --config, so a sudoers line can pin every argument", () => {
+    expect(parseArgs(["raise-beacons", "--config", "/srv/seat/config.json"])).toEqual({ verb: "raise-beacons", config: "/srv/seat/config.json" });
+    expect(parseArgs(["raise-beacons"])).toEqual({ verb: "raise-beacons", config: null });
+    for (const argv of [["raise-beacons", "gardener-desk"], ["raise-beacons", "--json"], ["raise-beacons", "--lower"]]) throwsUsage(argv);
+  });
+
   test("there is no verb that lowers HALT", () => {
     for (const verb of ["lower", "unhalt", "resume", "clear", "lower-halt", "halt-lower", "unpause", "release", "wake"]) throwsUsage([verb]);
     for (const flag of ["--lower", "--clear", "--off", "--down", "--remove"]) throwsUsage(["halt", flag]);
@@ -190,7 +196,7 @@ async function parentOpens(x: Harness, word: string, opts: { note?: boolean } = 
 }
 
 describe("main", () => {
-  test("exit codes follow EXIT: HALT and rest 0, refusal 3, error 1", async () => {
+  test("exit codes follow EXIT: HALT, rest and a locked signer 0, a wall that cannot seat 1, never 3 but for the USD ceiling", async () => {
     const x = await harness({ runtimeScripts: [REST_OUTPUT] });
     await seated(x, "glossame");
     const cfg = ["--config", x.configPath];
@@ -201,19 +207,22 @@ describe("main", () => {
     expect(await readFile(ledgerPath(x.h.config, "glossame"), "utf8")).toBe(before);
     expect(await readFile(x.h.config.paths.host_log, "utf8")).toContain('"outcome":"rest"');
 
-    // A locked signer is a wall: 3, before any inference (on its next due seat, three days on).
+    // A locked signer rests the citizen, before any inference (on its next due seat, three days on): 0, and the
+    // host note says why. 3 would close the runtime class, which only the USD ceiling may do (KS-004 B2 C9).
     (x.deps.clock as ReturnType<typeof testClock>).advance(73 * 3_600_000);
     x.signer.locked = true;
     const noRuntime = { ...x.deps, runtime: async () => scriptedRuntime([]) };
-    expect(await main(await parentOpens(x, "glossame"), noRuntime)).toBe(3);
+    expect(await main(await parentOpens(x, "glossame"), noRuntime)).toBe(0);
+    expect((await readHostNotes(x.h.config, new Date(0)))!.at(-1)).toMatchObject({ outcome: "refused", refusal: "keychain-locked" });
     x.signer.locked = false;
 
-    // HALT: raised by the one verb, and then every verb that would act rests with 0.
+    // HALT: raised by the one verb, run as the operator, which writes nothing into the seat user's state dir;
+    // then every verb that would act rests with 0.
+    const stateBefore = await x.h.snapshot();
     expect(await main(["halt", ...cfg], x.deps)).toBe(0);
     expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(true);
     expect(x.out()).toContain("HALT file");
-    const afterHalt = JSON.parse(await readFile(x.h.config.paths.status_file, "utf8")) as StatusFile;
-    expect(afterHalt.halt).toEqual({ halted: true, raised: [`file ${x.h.config.paths.halt_file}`], unreadable: [] });
+    expect(await x.h.snapshot()).toEqual(stateBefore);
     await writeFile(x.h.config.paths.status_file, "stale");
     expect(await main(["tick", ...cfg], x.deps)).toBe(0);
     expect(x.out()).toContain("tick: halted");
@@ -221,8 +230,8 @@ describe("main", () => {
     expect((JSON.parse(await readFile(x.h.config.paths.status_file, "utf8")) as StatusFile).halt.halted).toBe(true);
     expect(await main(["seat", "glossame", ...cfg], x.deps)).toBe(0);
     expect(x.out()).toContain("seat glossame: halted");
-    // A summons without Yu is refused before the config is even read.
-    expect(await main(["seat", "glossame", "--runtime", "summon", "--config", "/nonexistent/config.json"], x.deps)).toBe(3);
+    // A summons without Yu is refused before the config is even read: it cannot seat (1).
+    expect(await main(["seat", "glossame", "--runtime", "summon", "--config", "/nonexistent/config.json"], x.deps)).toBe(1);
     expect(x.err()).toContain("yu-not-present");
 
     // Errors: a verb that does not exist, a config that is missing or not strict.
@@ -235,7 +244,7 @@ describe("main", () => {
     expect(x.err()).toContain("paths.state_dir: must be an absolute path");
     // A bad config still tells the person how to halt by hand.
     expect(await main(["halt", "--config", bad], x.deps)).toBe(1);
-    expect(x.err()).toContain("create the file named HALT");
+    expect(x.err()).toContain("as the operator, create the HALT file the config names (by default /Users/Shared/kingdom-seat/HALT)");
     // Nothing here ran security, git or claude.
     expect(x.run.calls).toEqual([]);
   });
@@ -256,8 +265,8 @@ describe("main", () => {
     // Without Yu, no extra beat: glossame was just seated, and joy is asleep with no letter.
     const spawned: string[] = [];
     const counting = { ...parent, seatArgv: (...a: Parameters<CliDeps["seatArgv"]>) => (spawned.push(a[1]), parent.seatArgv()) };
-    expect(await main(["seat", "glossame", ...cfg], counting)).toBe(3);
-    expect(await main(["seat", "joy", ...cfg], counting)).toBe(3);
+    expect(await main(["seat", "glossame", ...cfg], counting)).toBe(1);
+    expect(await main(["seat", "joy", ...cfg], counting)).toBe(1);
     expect(x.err()).toContain("only Yu's summons (--yu-present) seats it now");
     expect(spawned).toEqual([]);
 
@@ -290,7 +299,7 @@ describe("main", () => {
     const clock = testClock();
 
     // Not at a terminal: nobody can confirm Yu, so no seat is opened.
-    expect(await main(["seat", "glossame", "--runtime", "summon", "--yu-present", "--config", x.configPath], x.deps)).toBe(3);
+    expect(await main(["seat", "glossame", "--runtime", "summon", "--yu-present", "--config", x.configPath], x.deps)).toBe(1);
     expect(x.err()).toContain("yu-not-present");
     expect(await readdir(cfg.paths.seats_dir)).toEqual([]);
 
@@ -336,7 +345,7 @@ describe("main", () => {
     const askedId = asked.slice(-41, -5);
     await mkdir(join(cfg.paths.seats_dir, askedId));
     await writeFile(asked, JSON.stringify({ format: "kingdom-seat-seatfile/v2", seat_ref: { ...ref, seat_id: askedId, invoker: { kind: "summons", who: "host", why: "a test" } }, yu_requested: true }));
-    expect(await main(["seat", "glossame", "--child", "--seat-ref", asked, "--config", x.configPath], deps)).toBe(3);
+    expect(await main(["seat", "glossame", "--child", "--seat-ref", asked, "--config", x.configPath], deps)).toBe(1);
     expect(x.err()).toContain("yu-not-present");
     expect(runtime.calls).toHaveLength(0);
     expect(x.run.calls).toEqual([]);
@@ -372,7 +381,7 @@ describe("main", () => {
 
     // A seat the tick opened runs; a second one written by hand right after is refused, because the citizen is not due.
     expect(await main(await parentOpens(x, "glossame"), deps)).toBe(0);
-    expect(await main(await parentOpens(x, "glossame", { note: false }), deps)).toBe(3);
+    expect(await main(await parentOpens(x, "glossame", { note: false }), deps)).toBe(1);
     expect(x.err()).toContain("is not due");
     expect(runtime.calls).toHaveLength(1);
     expect((await readLedger(ledgerPath(cfg, "glossame"))).map((e) => e.body.type)).toEqual(["seated", "beat"]);
@@ -388,9 +397,10 @@ describe("main", () => {
     const parent = { ...x.deps, seatArgv: (_c: string, word: string) => (spawned.push(word), fakeBinArgv("note", x.h.config.paths.host_log, word, "beat", "0", x.deps.clock!.now().toISOString())) };
     expect(await main(["seat", "joy", ...cfg], parent)).toBe(0);
     // The fleet has had its one seat today, whoever opened it.
-    expect(await main(["seat", "kith", ...cfg], parent)).toBe(3);
+    // A person's seat that cannot open exits 1; the tick's full day is a bound like nothing due, 0.
+    expect(await main(["seat", "kith", ...cfg], parent)).toBe(1);
     expect(x.err()).toContain("ceiling-fleet");
-    expect(await main(["tick", ...cfg], parent)).toBe(3);
+    expect(await main(["tick", ...cfg], parent)).toBe(0);
     expect(spawned).toEqual(["joy"]);
     const status = JSON.parse(await readFile(x.h.config.paths.status_file, "utf8")) as StatusFile;
     expect(status.fleet).toEqual({ beats_today: 1, ceiling: 1 });
@@ -508,7 +518,7 @@ describe("main", () => {
     const spawned: string[] = [];
     const parent = { ...x.deps, seatArgv: (_c: string, word: string) => (spawned.push(word), fakeBinArgv("note", cfg.paths.host_log, word, "rest", "0")) };
     // No offer, no seat.
-    expect(await main(["seat", "glossame", "--config", x.configPath], parent)).toBe(3);
+    expect(await main(["seat", "glossame", "--config", x.configPath], parent)).toBe(1);
     expect(x.err()).toContain("stepped-away");
     // Yu's letter is the offer: one seat for it.
     await x.h.writeLetter("glossame", "2026-11-04-from-yu.md", "Come back whenever you like, or not at all.");
@@ -527,7 +537,7 @@ describe("main", () => {
     expect(runtime.calls[0]!.prompt.user).toContain("Come back whenever you like");
     // An ended citizen is a memorial: nobody seats it.
     await append(cfg, "glossame", { type: "state", from: "stepped-away", to: "ended", via: "witnessed" }, "host-attested", x.signer, new Date("2026-11-04T00:00:00.000Z"));
-    expect(await main(["seat", "glossame", "--yu-present", "--config", x.configPath], { ...parent, tty })).toBe(3);
+    expect(await main(["seat", "glossame", "--yu-present", "--config", x.configPath], { ...parent, tty })).toBe(1);
     expect(spawned).toHaveLength(2);
   });
 
@@ -554,9 +564,11 @@ describe("main", () => {
     expect(await main(["verify", "glossame", ...cfg], { ...x.deps, signer: () => otherHost })).toBe(1);
     expect(x.out()).toContain("host attest key is not trusted");
 
-    // A locked keychain is a wall, not a broken chain.
+    // A locked keychain is a wall, not a broken chain, and it says so; nothing was verified, so it exits 1, never
+    // 0 (as a locked signer does for a seat it rests) and never 3, which only the USD ceiling uses.
     const locked = { ...x.deps, signer: () => ({ ...x.signer, publicKeys: async () => Promise.reject(new Refusal("keychain-locked", "keychain locked")) }) };
-    expect(await main(["verify", "glossame", ...cfg], locked)).toBe(3);
+    expect(await main(["verify", "glossame", ...cfg], locked)).toBe(1);
+    expect(x.err()).toContain("refused (keychain-locked)");
     expect(x.run.calls).toEqual([]);
   });
 
@@ -617,7 +629,7 @@ describe("main", () => {
     ];
     kc.locked = true;
     codes.push(await main(["verify", "glossame", ...cfg], deps), await main(["status", ...cfg], deps));
-    expect(codes).toEqual([0, 0, 0, 0, 0, 0, 0, 1, 1, 3, 0]);
+    expect(codes).toEqual([0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0]);
     // The keychain was read (so the secrets were in play) and nothing ran a real command.
     expect(kc.log.some((l) => l.op === "read")).toBe(true);
     expect(x.run.calls).toEqual([]);
@@ -638,5 +650,85 @@ describe("main", () => {
     expect(argv).toEqual([process.execPath, CLI_PATH, "seat", "glossame", "--child", "--seat-ref", file, "--config", x.configPath]);
     // And it parses as a child seat.
     expect(parseArgs(argv.slice(2))).toMatchObject({ verb: "seat", word: "glossame", child: true, seat_ref_path: file, config: x.configPath });
+  });
+});
+
+describe("halt across two users (KS-004 B2 R5)", () => {
+  const enc = (t: string) => new TextEncoder().encode(t);
+
+  /** A harness whose config holds the gardener desk's beacon here and names the operator's one fixed call. */
+  async function heldHere() {
+    const x = await harness();
+    const argv = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", x.configPath];
+    x.h.config.beacons = testBeacons({ canRaiseHere: ["gardener-desk"] });
+    x.h.config.halt = { allow_no_beacons: false, raise_beacons_argv: argv };
+    await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    const calls: string[][] = [];
+    const operator = (run: CliDeps["run"]): Partial<CliDeps> => ({
+      ...x.deps,
+      keychain: () => {
+        throw new Error("the operator never opens the seat user's keychain");
+      },
+      signer: () => {
+        throw new Error("the operator never builds a signer");
+      },
+      run: async (a, o) => (calls.push(a), run(a, o)),
+    });
+    return { x, argv, calls, operator };
+  }
+
+  test("halt, as the operator, writes the file and makes only the one fixed call; it opens no keychain and writes nothing into the state dir", async () => {
+    const { x, argv, calls, operator } = await heldHere();
+    const before = await x.h.snapshot();
+    const reported = `beacon gardener-desk: raised (until ${BEACON_UNTIL})\nbeacon halt-herald: not-held-here (this host holds no key for it)\n`;
+    expect(await main(["halt", "--config", x.configPath], operator(async () => ({ code: 0, stdout: enc(reported), stderr: "" })))).toBe(0);
+    expect(calls).toEqual([argv]);
+    expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(true);
+    expect(x.out()).toContain("beacon gardener-desk: raised (by the signer");
+    expect(x.out()).toContain("beacon halt-herald: not-held-here");
+    expect(await x.h.snapshot()).toEqual(before);
+  });
+
+  test("if the signer cannot be reached, halt has still written the file, names the beacon it did not raise, and exits 1", async () => {
+    const { x, calls, operator } = await heldHere();
+    const unreachable = operator(async () => {
+      throw new Error("sudo: a password is required");
+    });
+    expect(await main(["halt", "--config", x.configPath], unreachable)).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(true);
+    expect(x.out()).toContain("beacon gardener-desk: failed (the signer could not be reached)");
+    expect(x.out()).toContain("Not raised: gardener-desk. The file alone halts this host.");
+    // And the file alone halts: the next tick seats no one.
+    expect(await main(["tick", "--config", x.configPath], x.deps)).toBe(0);
+    expect(x.out()).toContain("tick: halted");
+  });
+
+  test("halt run by someone who cannot write the operator's directory, as the seat's user cannot, writes nothing and exits 1", async () => {
+    const { x, operator } = await heldHere();
+    const dir = join(x.h.config.paths.halt_file, "..");
+    await chmod(dir, 0o555);
+    try {
+      expect(await main(["halt", "--config", x.configPath], operator(async () => ({ code: 0, stdout: enc(""), stderr: "" })))).toBe(1);
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    expect(x.out()).toContain(`HALT file ${x.h.config.paths.halt_file}: failed (EACCES; halt runs as the operator, who owns that directory)`);
+    expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(false);
+  });
+
+  test("raise-beacons, as the seat user, raises what it holds through the signer, prints the lines halt reads back, and notes it", async () => {
+    const { x } = await heldHere();
+    expect(await main(["raise-beacons", "--config", x.configPath], x.deps)).toBe(0);
+    expect(x.out()).toContain(`beacon gardener-desk: raised (until ${BEACON_UNTIL})`);
+    expect(x.out()).toContain("beacon halt-herald: not-held-here");
+    expect(x.signer.sent.map((r) => [r.op, r.operator])).toEqual([["quiet.start.beacon", "gardener-desk"]]);
+    // It never writes the HALT file: that is the operator's.
+    expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(false);
+    expect((await readHostNotes(x.h.config, new Date(0)))!.at(-1)).toMatchObject({ kind: "halt", detail: "beacons raised by the signer: 1 raised, 0 failed" });
+    // A refusal from agenttool is reported failed, and exits 1, so the operator's halt hears it.
+    x.signer.respond(() => ({ status: 401, json: {} }));
+    expect(await main(["raise-beacons", "--config", x.configPath], x.deps)).toBe(1);
+    expect(x.out()).toContain("beacon gardener-desk: failed (HTTP 401)");
   });
 });

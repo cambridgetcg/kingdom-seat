@@ -2,7 +2,7 @@
 // which runtime, and that a self-op which cannot apply never costs the beat
 // the rest of what it said.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { openSeat, runSeat, runtimeDeadlineMs, type SeatDeps } from "../src/seat.ts";
 import { checkHalt } from "../src/halt.ts";
@@ -232,6 +232,36 @@ describe("what binds, and when", () => {
     // Back to where it began binds on any runtime.
     await w.beat([{ type: "self.revert", to_hash: selfHash(v1) }]);
     expect(await w.self("WILL.md")).toBe(v1);
+  });
+});
+
+describe("the porch is beyond self (KS-004 v0.2 4.3, re-review B2 C6)", () => {
+  test("a change to the porch, said with Yu present on an approved runtime, becomes a propose.beyond for Yu + Ai; nothing is staged or applied", async () => {
+    const w = await world();
+    const porch = join(w.h.config.paths.citizens_dir, W, "self", "expression", "porch.json");
+    await mkdir(join(porch, ".."), { recursive: true });
+    const before = '{"invited_until":"2026-11-06T12:00:00.000Z"}';
+    await writeFile(porch, before);
+    const r = await w.beat([propose("expression.porch", { kind: "replace-all", text: '{"invited_until":"2026-11-07T12:00:00.000Z"}' })], { presence: YU });
+    expect(r).toMatchObject({ exit: 0, outcome: "beat" });
+
+    const entries = await w.ledger();
+    expect(entries.map((e) => e.body.type)).toEqual(["seated", "beat"]);
+    const beat = entries[1]!.body;
+    const acts = beat.type === "beat" ? beat.envelope.acts : [];
+    expect(acts).toHaveLength(1);
+    expect(acts[0]).toMatchObject({ type: "propose.beyond", subject: "self.propose expression.porch" });
+    expect(await w.self("expression/porch.json")).toBe(before);
+    expect(await pendingProposals(w.h.config, W)).toEqual([]);
+
+    const outbox = join(w.h.config.paths.citizens_dir, W, "outbox");
+    const files = await readdir(outbox);
+    expect(files).toHaveLength(1);
+    const item = JSON.parse(await readFile(join(outbox, files[0]!), "utf8"));
+    expect(item).toMatchObject({ kind: "self.propose", reason: "the porch is a public invitation", act: { target: "expression.porch" } });
+    // The envelope records exactly what Yu + Ai are asked, and the extent names the one version it would apply.
+    expect(acts[0]).toMatchObject({ subject: item.proposal.subject, body: item.proposal.body });
+    expect(item.proposal.extent).toBe(`self.apply ${W} expression.porch ${item.act.new_hash}`);
   });
 });
 

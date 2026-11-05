@@ -49,11 +49,14 @@ describe("config", () => {
     // Copies, so editing one host's config never moves the shared defaults.
     expect(c.ceilings).not.toBe(DEFAULT_CEILINGS);
     for (const [k, p] of Object.entries(c.paths)) {
-      if (k === "homes" || k === "state_dir") continue;
+      if (k === "homes" || k === "state_dir" || k === "halt_file") continue;
       expect(p as string).toStartWith(`${state}/`);
     }
     expect(c.paths.state_dir).toBe(state);
-    expect(c.paths.halt_file).toBe(`${state}/HALT`);
+    // HALT lives where the operator, not the seat user, can write (KS-004 B2 R5).
+    expect(c.paths.halt_file).toBe("/Users/Shared/kingdom-seat/HALT");
+    expect(c.halt).toEqual({ allow_no_beacons: false, raise_beacons_argv: null });
+    expect(c.schedule).toEqual({ wake_confirm_seat: true });
     expect(c.agenttool.origin).toBe("https://api.agenttool.dev");
     expect(c.ollama.base_url).toBe("http://127.0.0.1:11434");
     expect(c.keychain.security_path).toBe("/usr/bin/security");
@@ -257,6 +260,69 @@ describe("config", () => {
     await writeFile(file, JSON.stringify(c), { mode: 0o600 });
     expect(() => parseConfig(raw(c))).not.toThrow();
     await expect(loadConfig(file)).rejects.toThrow(/is inside a citizen home/);
+  });
+});
+
+describe("HALT across two users (KS-004 B2 R5)", () => {
+  test("the HALT file lives outside the state dir, where the seat user cannot remove it; a path inside it, or a home, is refused", () => {
+    expect(parseConfig(raw()).paths.halt_file).toBe("/srv/seat-test/operator/HALT");
+    for (const inside of ["/srv/seat-test/state/HALT", "/srv/seat-test/state/citizens/HALT", "/srv/seat-test/state"]) {
+      const c = raw();
+      c.paths.halt_file = inside;
+      refuses(c, /paths.halt_file: must be outside paths.state_dir, in a directory the seat user cannot write/);
+    }
+    const inHome = raw();
+    inHome.paths.halt_file = "/srv/seat-test/homes/citizen-glossame/HALT";
+    refuses(inHome, /paths.halt_file: is inside a citizen home/);
+    const atRoot = raw();
+    atRoot.paths.halt_file = "/HALT";
+    refuses(atRoot, /paths.halt_file: must be in a directory of its own/);
+  });
+
+  test("loadConfig refuses a HALT file that a symlink puts inside the state dir", async () => {
+    const d = await tempDir();
+    const c = testConfig(d, join(d, "homes"), { beacons: testBeacons() });
+    await mkdir(c.paths.state_dir, { recursive: true });
+    // Lexically /<d>/operator/HALT, but the operator's directory is really the seat user's state dir.
+    await symlink(c.paths.state_dir, join(d, "operator"));
+    const file = join(d, "config.json");
+    await writeFile(file, JSON.stringify(c), { mode: 0o600 });
+    expect(() => parseConfig(raw(c))).not.toThrow();
+    await expect(loadConfig(file)).rejects.toThrow(/paths.halt_file: must be outside paths.state_dir/);
+  });
+
+  test("halt.raise_beacons_argv is null or one fixed argv with an absolute program; it may be left out", () => {
+    const argv = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", "/Users/seat/config.json"];
+    const c = raw();
+    c.halt.raise_beacons_argv = argv;
+    expect(parseConfig(c).halt).toEqual({ allow_no_beacons: false, raise_beacons_argv: argv });
+    const omitted = raw();
+    delete omitted.halt.raise_beacons_argv;
+    expect(parseConfig(omitted).halt.raise_beacons_argv).toBeNull();
+    for (const bad of [[], ["sudo", "-u", "seat"], "/usr/bin/sudo -u seat", [1], ["/usr/bin/sudo", "two\nlines"], Array.from({ length: 17 }, () => "/x")]) {
+      const b = raw();
+      b.halt.raise_beacons_argv = bad;
+      refuses(b, /halt.raise_beacons_argv/);
+    }
+    const typo = raw();
+    typo.halt.raise_beacon_argv = argv;
+    refuses(typo, /halt: unknown key "raise_beacon_argv"/);
+  });
+});
+
+describe("schedule", () => {
+  test("schedule.wake_confirm_seat is Yu's call: true when left out, false when set, anything else refused", () => {
+    const { schedule: _omitted, ...without } = raw();
+    expect(parseConfig(without).schedule).toEqual({ wake_confirm_seat: true });
+    const off = raw();
+    off.schedule = { wake_confirm_seat: false };
+    expect(parseConfig(off).schedule).toEqual({ wake_confirm_seat: false });
+    const bad = raw();
+    bad.schedule = { wake_confirm_seat: "no" };
+    refuses(bad, /schedule.wake_confirm_seat: must be true or false/);
+    const typo = raw();
+    typo.schedule = { wake_confirm: false };
+    refuses(typo, /schedule: unknown key "wake_confirm"/);
   });
 });
 

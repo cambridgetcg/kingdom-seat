@@ -3,9 +3,14 @@
 // and it fails closed: a raised or unreadable source halts. A beacon is a
 // `quiet_until` on a pinned operator identity, read from
 // `GET /public/agents/:did` (agenttool-wire.md section 4).
+//
+// The verb spans two users (KS-004 B2 R5): the operator writes the file, in a
+// directory the seat user cannot write, and the signer, as the seat user,
+// raises the beacons whose keys only it reads. raiseHalt is the operator's
+// half and raiseBeacons the signer's.
 import { lstatSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { DID_PATTERN, UUID_PATTERN, type Beacon, type Config, type FetchLike, type HaltReading, type HaltStatus } from "./types.ts";
+import { DID_PATTERN, UUID_PATTERN, type Beacon, type CommandRunner, type Config, type FetchLike, type HaltReading, type HaltStatus } from "./types.ts";
 import type { Signer } from "./signer/signer.ts";
 
 /** An explicit far-future `until` so a raised beacon never lapses on its own; the API does not cap it. */
@@ -19,6 +24,8 @@ export interface HaltDeps {
 
 export interface RaiseResult {
   file: "written" | "already-present" | "failed";
+  /** The errno when the file could not be written, e.g. EACCES when the verb was not run as the operator. */
+  file_detail?: string;
   beacons: { name: string; result: "raised" | "not-held-here" | "failed"; detail: string }[];
 }
 
@@ -121,21 +128,70 @@ export async function checkHalt(deps: HaltDeps): Promise<HaltStatus> {
   return { halted: readings.some((r) => r.state !== "lowered"), readings };
 }
 
-/** Raise HALT: write the local file first (no network needed), then every beacon this host can sign, with BEACON_UNTIL and no reason. */
-export async function raiseHalt(deps: HaltDeps & { signer: Signer | null }): Promise<RaiseResult> {
-  const path = deps.config.paths.halt_file;
-  let file: RaiseResult["file"];
-  const before = readHaltFile(path, deps.now());
-  if (before.state === "raised") file = "already-present";
-  else {
+/**
+ * Raise HALT as `citizen-seat halt` does, run by the operator, never by the
+ * seat's user (KS-004 B2 R5). The local file first, because it needs no
+ * network and no key, in a directory only the operator can write; then the
+ * one fixed call (`halt.raise_beacons_argv`, a sudo line) that has the signer
+ * raise this host's beacons as the seat user, whose keychain holds their keys.
+ * The operator never reads that keychain. A beacon the signer did not report
+ * raised, because the call is not configured, could not run or failed, is
+ * "failed": the file alone still halts this host.
+ */
+export async function raiseHalt(deps: { config: Config; now: () => Date; run: CommandRunner }): Promise<RaiseResult> {
+  const { file, detail } = await raiseHaltFile(deps.config, deps.now());
+  const held = deps.config.beacons.filter((b) => b.can_raise_here);
+  const argv = deps.config.halt.raise_beacons_argv;
+  let raised = new Set<string>();
+  let why = "";
+  if (held.length > 0 && argv === null) why = "no signer call is configured (halt.raise_beacons_argv)";
+  else if (held.length > 0 && argv !== null) {
     try {
-      await writeFile(path, `raised ${deps.now().toISOString()} on ${deps.config.host}\n`, { flag: "wx", mode: 0o644 });
-      file = "written";
-    } catch (e) {
-      file = errCode(e) === "EEXIST" ? "already-present" : "failed";
+      const timeoutMs = Math.max(30_000, 3 * held.length * deps.config.timing.beacon_timeout_ms);
+      const r = await deps.run(argv, { timeoutMs });
+      raised = raisedIn(new TextDecoder().decode(r.stdout));
+      if (r.code !== 0) why = `the signer call exited ${r.code}`;
+    } catch {
+      why = "the signer could not be reached";
     }
   }
+  const beacons: RaiseResult["beacons"] = deps.config.beacons.map((b) => {
+    if (!b.can_raise_here) return { name: b.name, result: "not-held-here", detail: "this host holds no key for it" };
+    if (raised.has(b.name)) return { name: b.name, result: "raised", detail: `by the signer, until ${BEACON_UNTIL}` };
+    return { name: b.name, result: "failed", detail: why || "the signer did not report it raised" };
+  });
+  return { file, ...(file === "failed" ? { file_detail: detail } : {}), beacons };
+}
 
+/** The beacon names a `raise-beacons` run reported raised, read only from lines in its own fixed form. */
+function raisedIn(stdout: string): Set<string> {
+  const names = new Set<string>();
+  for (const line of stdout.split("\n")) {
+    const m = /^beacon ([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?): raised \(/.exec(line);
+    if (m) names.add(m[1]!);
+  }
+  return names;
+}
+
+/** Write the local HALT file if nothing is at the path yet; "failed" carries the errno, so a person sees EACCES or ENOENT. */
+export async function raiseHaltFile(config: Config, now: Date): Promise<{ file: RaiseResult["file"]; detail: string }> {
+  const path = config.paths.halt_file;
+  if (readHaltFile(path, now).state === "raised") return { file: "already-present", detail: "" };
+  try {
+    await writeFile(path, `raised ${now.toISOString()} on ${config.host}\n`, { flag: "wx", mode: 0o644 });
+    return { file: "written", detail: "" };
+  } catch (e) {
+    const code = errCode(e);
+    return code === "EEXIST" ? { file: "already-present", detail: "" } : { file: "failed", detail: code };
+  }
+}
+
+/**
+ * Raise every beacon this host can sign, with BEACON_UNTIL and no reason:
+ * `citizen-seat raise-beacons`, which runs as the seat user through the
+ * operator's one fixed call, because only the signer reads the beacon keys.
+ */
+export async function raiseBeacons(deps: { config: Config; signer: Signer | null }): Promise<RaiseResult["beacons"]> {
   const beacons: RaiseResult["beacons"] = [];
   for (const b of deps.config.beacons) {
     if (!b.can_raise_here) {
@@ -165,7 +221,7 @@ export async function raiseHalt(deps: HaltDeps & { signer: Signer | null }): Pro
       beacons.push({ name: b.name, result: "failed", detail: e instanceof Error ? e.name : "error" });
     }
   }
-  return { file, beacons };
+  return beacons;
 }
 
 /** One line for status and logs, e.g. "halted by beacon gardener-desk", never just "down". */

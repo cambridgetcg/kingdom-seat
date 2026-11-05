@@ -1,10 +1,10 @@
 // Owner: seat group. Beacon readings against test/helpers/fake-server.ts.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import * as halt from "../src/halt.ts";
-import { BEACON_UNTIL, checkHalt, describeHalt, raiseHalt, readBeacon, readHaltFile, type HaltDeps } from "../src/halt.ts";
-import { Refusal, type Config, type HaltStatus } from "../src/types.ts";
+import { BEACON_UNTIL, checkHalt, describeHalt, raiseBeacons, raiseHalt, readBeacon, readHaltFile, type HaltDeps } from "../src/halt.ts";
+import { Refusal, type CommandRunner, type Config, type HaltStatus } from "../src/types.ts";
 import { fetchVia, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
@@ -152,31 +152,77 @@ describe("HALT readings fail closed", () => {
 });
 
 describe("raising", () => {
-  test("raiseHalt writes the local file first, even when every beacon raise fails", async () => {
+  /** The operator's one fixed call, as a sudoers line would allow it: the program and every argument pinned. */
+  const ARGV = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", "/Users/seat/Library/Application Support/kingdom-seat/config.json"];
+  const enc = (t: string) => new TextEncoder().encode(t);
+
+  test("raiseHalt, as the operator, writes the local file first and then makes the one fixed call; if the signer cannot be reached, the file stands and each held beacon is failed", async () => {
     const { deps, config } = await setup({ beacons: testBeacons({ canRaiseHere: ["gardener-desk", "halt-herald"] }) });
-    const signer = fakeSigner();
-    const fileAtSend: boolean[] = [];
-    signer.respond(() => {
-      fileAtSend.push(readHaltFile(config.paths.halt_file, clock.now()).state === "raised");
-      throw new Refusal("keychain-locked", "locked");
-    });
-    const r = await raiseHalt({ ...deps, signer });
+    config.halt.raise_beacons_argv = ARGV;
+    const calls: string[][] = [];
+    const fileAtCall: boolean[] = [];
+    const unreachable: CommandRunner = async (argv) => {
+      calls.push(argv);
+      fileAtCall.push(readHaltFile(config.paths.halt_file, clock.now()).state === "raised");
+      throw new Error("sudo: a password is required");
+    };
+    const r = await raiseHalt({ config, now: deps.now, run: unreachable });
     expect(r.file).toBe("written");
-    expect(fileAtSend).toEqual([true, true]);
-    expect(r.beacons.map((b) => b.result)).toEqual(["failed", "failed"]);
+    expect(calls).toEqual([ARGV]);
+    expect(fileAtCall).toEqual([true]);
+    expect(r.beacons).toEqual([
+      { name: "gardener-desk", result: "failed", detail: "the signer could not be reached" },
+      { name: "halt-herald", result: "failed", detail: "the signer could not be reached" },
+    ]);
     expect(await readFile(config.paths.halt_file, "utf8")).toContain("raised");
 
-    // A second raise leaves the file as it is, and with no signer at all the file is still raised.
-    const again = await raiseHalt({ ...deps, signer: null });
+    // A second raise leaves the file as it is; with no call configured nothing runs, and the held beacons are failed.
+    config.halt.raise_beacons_argv = null;
+    const again = await raiseHalt({ config, now: deps.now, run: unreachable });
     expect(again.file).toBe("already-present");
-    expect(again.beacons.every((b) => b.result === "failed")).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(again.beacons.map((b) => [b.result, b.detail])).toEqual([
+      ["failed", "no signer call is configured (halt.raise_beacons_argv)"],
+      ["failed", "no signer call is configured (halt.raise_beacons_argv)"],
+    ]);
   });
 
-  test("raiseHalt raises only beacons this host can sign, via signer op quiet.start.beacon with BEACON_UNTIL and an empty reason", async () => {
-    const { deps } = await setup({ beacons: testBeacons({ canRaiseHere: ["halt-herald"] }) });
-    const signer = fakeSigner();
-    const r = await raiseHalt({ ...deps, signer });
+  test("raiseHalt reads back only what the signer reported raised, in its own fixed lines; a non-zero exit fails the rest", async () => {
+    const { deps, config } = await setup({ beacons: testBeacons({ canRaiseHere: ["gardener-desk", "halt-herald"] }) });
+    config.halt.raise_beacons_argv = ARGV;
+    const stdout = [`beacon gardener-desk: raised (until ${BEACON_UNTIL})`, "beacon halt-herald: failed (HTTP 401)", "note: beacon halt-herald: raised (forged)", "beacon halt-herald: raised"].join("\n");
+    const r = await raiseHalt({ config, now: deps.now, run: async () => ({ code: 1, stdout: enc(stdout), stderr: "" }) });
     expect(r.beacons).toEqual([
+      { name: "gardener-desk", result: "raised", detail: `by the signer, until ${BEACON_UNTIL}` },
+      { name: "halt-herald", result: "failed", detail: "the signer call exited 1" },
+    ]);
+
+    // No beacon held here: no call at all, and nothing failed.
+    config.beacons = testBeacons();
+    let ran = 0;
+    const r2 = await raiseHalt({ config, now: deps.now, run: async () => (ran++, { code: 0, stdout: enc(""), stderr: "" }) });
+    expect(ran).toBe(0);
+    expect(r2.beacons.map((b) => b.result)).toEqual(["not-held-here", "not-held-here"]);
+  });
+
+  test("raiseHalt reports why the file could not be written, as the seat user would find: the operator's directory is not theirs", async () => {
+    const { deps, config } = await setup({ beacons: testBeacons() });
+    const dir = dirname(config.paths.halt_file);
+    await chmod(dir, 0o555);
+    try {
+      const r = await raiseHalt({ config, now: deps.now, run: async () => ({ code: 0, stdout: enc(""), stderr: "" }) });
+      expect(r).toMatchObject({ file: "failed", file_detail: "EACCES" });
+      expect(readHaltFile(config.paths.halt_file, clock.now()).state).toBe("lowered");
+    } finally {
+      await chmod(dir, 0o755);
+    }
+  });
+
+  test("raiseBeacons, the signer's half as the seat user, raises only beacons this host can sign, via quiet.start.beacon with BEACON_UNTIL and an empty reason", async () => {
+    const { config } = await setup({ beacons: testBeacons({ canRaiseHere: ["halt-herald"] }) });
+    const signer = fakeSigner();
+    const beacons = await raiseBeacons({ config, signer });
+    expect(beacons).toEqual([
       { name: "gardener-desk", result: "not-held-here", detail: expect.any(String) },
       { name: "halt-herald", result: "raised", detail: expect.any(String) },
     ]);
@@ -186,14 +232,20 @@ describe("raising", () => {
     expect(req.target).toBe(`/v1/quiet-hours/start?identity_id=${HERALD!.identity_id}`);
     expect(JSON.parse(new TextDecoder().decode(req.body))).toEqual({ until: BEACON_UNTIL, reason: "" });
     expect(BEACON_UNTIL).toBe("2999-12-31T00:00:00.000Z");
+    // It writes no HALT file: that is the operator's, in a directory the seat user cannot write.
+    expect(readHaltFile(config.paths.halt_file, clock.now()).state).toBe("lowered");
   });
 
-  test("a beacon raise the server refuses is reported failed, not raised", async () => {
-    const { deps } = await setup({ beacons: testBeacons({ canRaiseHere: ["gardener-desk"] }) });
+  test("a beacon raise the server refuses, or a locked keychain, is reported failed, not raised", async () => {
+    const { config } = await setup({ beacons: testBeacons({ canRaiseHere: ["gardener-desk"] }) });
     const signer = fakeSigner();
     signer.respond(() => ({ status: 401, json: { error: "unauthorized" } }));
-    const r = await raiseHalt({ ...deps, signer });
-    expect(r.beacons[0]).toMatchObject({ name: "gardener-desk", result: "failed", detail: "HTTP 401" });
+    expect((await raiseBeacons({ config, signer }))[0]).toMatchObject({ name: "gardener-desk", result: "failed", detail: "HTTP 401" });
+    signer.respond(() => {
+      throw new Refusal("keychain-locked", "locked");
+    });
+    expect((await raiseBeacons({ config, signer }))[0]).toMatchObject({ name: "gardener-desk", result: "failed" });
+    expect((await raiseBeacons({ config, signer: null }))[0]).toMatchObject({ name: "gardener-desk", result: "failed", detail: "no signer available" });
   });
 
   test("there is no exported function that lowers HALT", () => {

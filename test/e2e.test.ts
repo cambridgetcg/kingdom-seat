@@ -36,6 +36,8 @@ const JOURNAL = "I read my soul through to SHADOW today, all of it, for the firs
 const WILL = `# WILL of ${WORD}\n\nReceive one word that will not cross over.\n`;
 const WILL_NEXT = `# WILL of ${WORD}\n\nReceive one quiet word that will not cross over.\n`;
 const STEP_MS = 30_000;
+/** `sudo -n -u seat <citizen-seat>`: what the operator's halt would run; never run here. */
+const RAISE_PREFIX = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat"];
 
 interface World {
   h: TempHost;
@@ -59,14 +61,17 @@ beforeAll(async () => {
   const server = await startFakeServer();
   const beacons = testBeacons({ canRaiseHere: ["gardener-desk"] });
   const h = await makeTempHost({ beacons, ollamaBaseUrl: server.url });
+  // A window the whole context fits by the byte rule (free.contextFit): about 9 KB of prompt, and room for the reply.
   await h.writeModelsLock({
     format: "kingdom-seat-models-lock/v1",
-    models: [{ name: MODEL, digest: DIGEST, runner: null, store: "legacy", num_ctx: 8192, num_predict: 600, temperature: 0.7, seed: null }],
+    models: [{ name: MODEL, digest: DIGEST, runner: null, store: "legacy", num_ctx: 32768, num_predict: 600, temperature: 0.7, seed: null }],
   });
   const hostPin = toB64(edPublicKey(E2E_HOST_SEED));
   h.config.self_authorship.approved_model_digests = [`sha256:${DIGEST}`];
   h.config.trust.host_attest_public_keys_b64 = [hostPin];
   const configPath = join(h.root, "config.json");
+  // The operator's one fixed call to the signer, as a sudoers line would pin it; the test runs the e2e child in its place.
+  h.config.halt.raise_beacons_argv = [...RAISE_PREFIX, "raise-beacons", "--config", configPath];
   await writeFile(configPath, JSON.stringify(h.config, null, 2), { mode: 0o600 });
 
   for (const b of beacons) serveBeacon(server, b.did, { kind: "lowered" });
@@ -368,7 +373,7 @@ describe("end to end: one citizen on one host", () => {
   );
 
   test(
-    "halt raises the local file and the beacon this host holds, root-signed; then the next tick rests",
+    "halt, as the operator, raises the local file and has the signer raise the beacon this host holds, root-signed; then the next tick rests",
     async () => {
       const gardener = testBeacons()[0]!;
       w.server.on("GET", `/v1/identities/${gardener.identity_id}/authority`, () =>
@@ -378,9 +383,27 @@ describe("end to end: one citizen on one host", () => {
       w.server.requests.length = 0;
 
       w.clock.set(at(300));
-      expect(await main(["halt", "--config", w.configPath], w.deps)).toBe(0);
+      await writeFile(scenarioPath(w.configPath), JSON.stringify({ server_url: w.server.url, now: at(300) }));
+      // The operator holds no key: its halt never opens the keychain. The one fixed call stands in for
+      // `sudo -u seat ... raise-beacons`, run here as the e2e child: another process, with the seat's keychain.
+      const calls: string[][] = [];
+      const operator: Partial<CliDeps> = {
+        ...w.deps,
+        keychain: () => {
+          throw new Error("e2e: the operator's halt must never open the seat user's keychain");
+        },
+        run: async (argv) => {
+          calls.push(argv);
+          if (JSON.stringify(argv) !== JSON.stringify(w.h.config.halt.raise_beacons_argv)) throw new Error("e2e: only the configured call may run");
+          const child = Bun.spawn([process.execPath, E2E_CHILD, ...argv.slice(RAISE_PREFIX.length)], { stdout: "pipe", stderr: "inherit", env: { PATH: "/usr/bin:/bin", HOME: w.h.root } });
+          const [stdout, code] = await Promise.all([new Response(child.stdout).arrayBuffer(), child.exited]);
+          return { code, stdout: new Uint8Array(stdout), stderr: "" };
+        },
+      };
+      expect(await main(["halt", "--config", w.configPath], operator)).toBe(0);
+      expect(calls).toHaveLength(1);
       expect(await Bun.file(w.h.config.paths.halt_file).exists()).toBe(true);
-      expect(w.out).toContain("beacon gardener-desk: raised");
+      expect(w.out).toContain("beacon gardener-desk: raised (by the signer");
       expect(w.out).toContain("beacon halt-herald: not-held-here");
       expect(w.out).toContain("Only Yu lowers HALT, by hand");
 

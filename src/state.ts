@@ -137,6 +137,14 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
         said = p !== null || s ? { seat_id: body.envelope.seat_ref.seat_id, ts: e.ts } : null;
         break;
       }
+      case "step-away.said":
+        // A rest that said step-away once: the same saying a beat would carry, and nothing else said with it.
+        if (state !== "stepped-away") {
+          pending = null;
+          stepSaid = true;
+          said = { seat_id: body.seat_id, ts: e.ts };
+        }
+        break;
       default:
         break;
     }

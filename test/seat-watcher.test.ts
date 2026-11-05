@@ -204,7 +204,7 @@ describe("[S4-2] the watcher", () => {
     const d = await tmp();
     for (const [code, exit, outcome] of [
       ["0", EXIT.OK, null],
-      ["3", EXIT.REFUSED, "refused"],
+      ["3", EXIT.USD_CEILING, "refused"],
       ["1", EXIT.ERROR, "error"],
       ["7", EXIT.ERROR, "error"],
     ] as const) {

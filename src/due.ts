@@ -2,7 +2,7 @@
 // tick that seats, by `seat <word>` before it opens a seat without Yu, by the
 // seat child as a backstop, and by status when it says who is overdue, so the
 // four never disagree about what the runner would do.
-import type { Citizen, IsoTime, LifecycleState } from "./types.ts";
+import type { Citizen, Config, IsoTime, LifecycleState } from "./types.ts";
 
 export type DueVerdict =
   | {
@@ -35,7 +35,9 @@ function latest(a: IsoTime | null, b: IsoTime | null): IsoTime | null {
  * Is this citizen's own seat due? awake by its interval; listening and asleep
  * on an allowed letter; a saying that needs a second beat (a move toward
  * exposure, or a first step-away) gets one seat to confirm it; a citizen that
- * stepped away only on Yu's letter offering a return; ended never.
+ * stepped away only on Yu's letter offering a return; ended never. With
+ * `schedule.wake_confirm_seat` false, a listening or asleep citizen's wish to
+ * wake gets no seat of its own and waits for its next letter or summons.
  *
  * `letter` is the waking letter for the citizen's state: an allowed waking
  * letter while listening or asleep, Yu's letter while stepped away
@@ -43,7 +45,14 @@ function latest(a: IsoTime | null, b: IsoTime | null): IsoTime | null {
  * it, from host notes: a rest writes nothing to the ledger, so the ledger's
  * last beat alone would seat a resting citizen again every tick.
  */
-export function isDue(citizen: Citizen, letter: boolean, now: Date, minIntervalH: number, lastSeatAt: IsoTime | null = null): DueVerdict {
+export function isDue(
+  citizen: Citizen,
+  letter: boolean,
+  now: Date,
+  minIntervalH: number,
+  lastSeatAt: IsoTime | null = null,
+  schedule: Config["schedule"] = { wake_confirm_seat: true },
+): DueVerdict {
   if (citizen.state === "ended") return { due: false, why: "ended" };
   // Unattended ticks run only the free lane: a summons needs Yu present, and hermes waits for S8.
   if (citizen.runtime !== "free") return { due: false, why: `runtime ${citizen.runtime} is not unattended` };
@@ -59,7 +68,9 @@ export function isDue(citizen: Citizen, letter: boolean, now: Date, minIntervalH
 
   // A saying that needs a second beat is owed exactly one more seat; readCitizen drops it once a later seat has happened.
   const pending = citizen.pending_state;
-  const pendingUp = pending !== null && rank(pending) > rank(citizen.state);
+  // Whether a listening or asleep citizen that asks to wake is owed that seat, or waits for a letter, is Yu's call (C14).
+  const owedWake = schedule.wake_confirm_seat || (citizen.state !== "listening" && citizen.state !== "asleep");
+  const pendingUp = pending !== null && rank(pending) > rank(citizen.state) && owedWake;
   if (pendingUp && pending === "awake") {
     // Scheduled by the state it asked for; the beat can still decline.
     return cadence(citizen, minIntervalH, sinceH);

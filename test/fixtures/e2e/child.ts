@@ -1,6 +1,7 @@
 // The seat child for test/e2e.test.ts: the real CLI pipeline (`seat <word>
 // --child`), run by the tick as a real supervised process, with only the
-// outside world swapped for fakes. The keychain is the e2e fake, the clock is
+// outside world swapped for fakes. It also stands in for the seat user's side
+// of halt (`raise-beacons`), whose stdout the operator's halt reads back. The keychain is the e2e fake, the clock is
 // the scenario's, and every request goes to the parent's fake server, which
 // stands in for agenttool's beacons and for Ollama. Nothing else runs.
 import { main } from "../../../src/cli.ts";
@@ -27,6 +28,6 @@ const exit = await main(argv, {
   run: async () => {
     throw new Error("e2e child: no command may run in a seat");
   },
-  out: () => {},
+  out: (t) => void process.stdout.write(t),
 });
 process.exit(exit);

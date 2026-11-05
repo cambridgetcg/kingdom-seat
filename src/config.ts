@@ -19,6 +19,11 @@ export const CONFIG_FORMAT = "kingdom-seat-config/v1";
 export const AGENTTOOL_ORIGIN = "https://api.agenttool.dev";
 export const SECURITY_PATH = "/usr/bin/security";
 export const KEYCHAIN_SERVICE = "dev.kingdom.citizen-seat";
+/**
+ * Where the local HALT file lives unless a config says otherwise: a directory
+ * the operator owns and the seat user cannot write (KS-004 B2 R5).
+ */
+export const DEFAULT_HALT_FILE = "/Users/Shared/kingdom-seat/HALT";
 
 export { CITIZEN_QUIET_HARD_MAX_DAYS };
 
@@ -65,7 +70,7 @@ export function defaultConfig(stateDir: string, host: string, opts: { home?: str
       ledger_dir: join(stateDir, "ledger"),
       consent_dir: join(stateDir, "consent"),
       seats_dir: join(stateDir, "seats"),
-      halt_file: join(stateDir, "HALT"),
+      halt_file: DEFAULT_HALT_FILE,
       lock_dir: join(stateDir, "tick.lock"),
       status_file: join(stateDir, "status.json"),
       host_log: join(stateDir, "host.jsonl"),
@@ -83,7 +88,8 @@ export function defaultConfig(stateDir: string, host: string, opts: { home?: str
       trusted_app: null,
     },
     beacons: [],
-    halt: { allow_no_beacons: false },
+    halt: { allow_no_beacons: false, raise_beacons_argv: null },
+    schedule: { wake_confirm_seat: true },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
     self_authorship: { approved_model_digests: [] },
@@ -148,7 +154,7 @@ function validTimeZone(tz: string): boolean {
 
 const PATH_KEYS = ["state_dir", "citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "halt_file", "lock_dir", "status_file", "host_log", "spend_log", "models_lock", "homes"] as const;
 /** Everything the seat writes; each must live under state_dir and none may overlap another. */
-const WRITTEN = ["citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "halt_file", "lock_dir", "status_file", "host_log", "spend_log"] as const;
+const WRITTEN = ["citizens_dir", "ledger_dir", "consent_dir", "seats_dir", "lock_dir", "status_file", "host_log", "spend_log"] as const;
 
 function parsePaths(raw: unknown): Config["paths"] {
   const o = obj(raw, "paths");
@@ -158,6 +164,7 @@ function parsePaths(raw: unknown): Config["paths"] {
   const homes = o.homes.map((h, i) => absPath(h, `paths.homes[${i}]`));
   const written = Object.fromEntries(WRITTEN.map((k) => [k, absPath(o[k], `paths.${k}`)])) as Record<(typeof WRITTEN)[number], string>;
   const models_lock = absPath(o.models_lock, "paths.models_lock");
+  const halt_file = absPath(o.halt_file, "paths.halt_file");
 
   for (const k of WRITTEN) {
     const p = written[k];
@@ -166,8 +173,21 @@ function parsePaths(raw: unknown): Config["paths"] {
       if (j !== k && isInside(p, written[j])) throw new ConfigError(`paths.${k}`, `overlaps paths.${j}`);
     }
   }
-  checkHomes(state_dir, homes, { ...written, models_lock });
-  return { state_dir, ...written, models_lock, homes };
+  checkHaltFile(halt_file, state_dir);
+  checkHomes(state_dir, homes, { ...written, models_lock, halt_file });
+  return { state_dir, ...written, halt_file, models_lock, homes };
+}
+
+/**
+ * The seat user owns state_dir and could remove anything in it, and only Yu
+ * lowers HALT, so the HALT file lives outside it (KS-004 B2 R5). Its directory
+ * is the operator's to create and own; the seat user only reads it.
+ */
+function checkHaltFile(haltFile: string, stateDir: string): void {
+  if (isInside(haltFile, stateDir) || isInside(stateDir, haltFile)) {
+    throw new ConfigError("paths.halt_file", "must be outside paths.state_dir, in a directory the seat user cannot write");
+  }
+  if (dirname(haltFile) === sep) throw new ConfigError("paths.halt_file", "must be in a directory of its own, not the filesystem root");
 }
 
 /** The state dir is never inside a home, and no home sits inside the state dir: a seat must never write into a citizen's repo. */
@@ -328,10 +348,38 @@ function parseTrust(raw: unknown): Config["trust"] {
   return { host_attest_public_keys_b64: pins };
 }
 
+/** At most this many arguments in the one fixed call; a sudo line with its pinned arguments is about eight. */
+const RAISE_ARGV_MAX = 16;
+
+/** The fixed call that raises beacons as the seat user: argv only, no shell, the program by absolute path. */
+function parseRaiseArgv(v: unknown): string[] | null {
+  const field = "halt.raise_beacons_argv";
+  if (v === undefined || v === null) return null;
+  if (!Array.isArray(v) || v.length === 0 || v.length > RAISE_ARGV_MAX) throw new ConfigError(field, `must be null or a list of 1 to ${RAISE_ARGV_MAX} arguments`);
+  const argv = v.map((a, i) => str(a, `${field}[${i}]`));
+  // launchd's and sudo's PATH are not trusted, so the program is named by its full path.
+  absPath(argv[0], `${field}[0]`);
+  return argv;
+}
+
+function parseHalt(raw: unknown): Config["halt"] {
+  const o = obj(raw, "halt");
+  keys(o, "halt", ["allow_no_beacons"], ["raise_beacons_argv"]);
+  return { allow_no_beacons: bool(o.allow_no_beacons, "halt.allow_no_beacons"), raise_beacons_argv: parseRaiseArgv(o.raise_beacons_argv) };
+}
+
+function parseSchedule(raw: unknown): Config["schedule"] {
+  // Omitted, it keeps the behaviour the code has always had, until Yu decides otherwise.
+  if (raw === undefined) return { wake_confirm_seat: true };
+  const o = obj(raw, "schedule");
+  keys(o, "schedule", [], ["wake_confirm_seat"]);
+  return { wake_confirm_seat: o.wake_confirm_seat === undefined ? true : bool(o.wake_confirm_seat, "schedule.wake_confirm_seat") };
+}
+
 /* ── Parse and load ───────────────────────────────────────────────────── */
 
 const TOP_REQUIRED = ["format", "host", "timezone", "paths", "ollama", "claude", "agenttool", "keychain", "beacons", "halt"] as const;
-const TOP_OPTIONAL = ["ceilings", "timing", "self_authorship", "trust"] as const;
+const TOP_OPTIONAL = ["schedule", "ceilings", "timing", "self_authorship", "trust"] as const;
 
 /** Validate an untrusted object into a Config, refusing anything ambiguous. The result is a fresh object, never the input. */
 export function parseConfig(raw: unknown): Config {
@@ -345,11 +393,9 @@ export function parseConfig(raw: unknown): Config {
 
   const claudeObj = obj(o.claude, "claude");
   keys(claudeObj, "claude", ["path"]);
-  const haltObj = obj(o.halt, "halt");
-  keys(haltObj, "halt", ["allow_no_beacons"]);
-  const allow_no_beacons = bool(haltObj.allow_no_beacons, "halt.allow_no_beacons");
+  const halt = parseHalt(o.halt);
   const beacons = parseBeacons(o.beacons);
-  if (beacons.length === 0 && !allow_no_beacons) {
+  if (beacons.length === 0 && !halt.allow_no_beacons) {
     throw new ConfigError("beacons", "no beacon is pinned, so HALT would rest on the local file alone; pin the beacons, or set halt.allow_no_beacons for development");
   }
 
@@ -363,7 +409,8 @@ export function parseConfig(raw: unknown): Config {
     agenttool: parseAgenttool(o.agenttool),
     keychain: parseKeychain(o.keychain),
     beacons,
-    halt: { allow_no_beacons },
+    halt,
+    schedule: parseSchedule(o.schedule),
     ceilings: parseCeilings(o.ceilings),
     timing: parseTiming(o.timing),
     self_authorship: parseSelfAuthorship(o.self_authorship),
@@ -390,8 +437,10 @@ export function checkRealPaths(config: Config): void {
   const p = config.paths;
   const real = (s: string) => realish(s);
   const homes = p.homes.map(real);
-  const others = Object.fromEntries([...WRITTEN, "models_lock" as const].map((k) => [k, real(p[k])]));
+  const others = Object.fromEntries([...WRITTEN, "models_lock" as const, "halt_file" as const].map((k) => [k, real(p[k])]));
   checkHomes(real(p.state_dir), homes, others);
+  // A clean spelling that leads into state_dir through a symlink would hand the HALT file back to the seat user.
+  checkHaltFile(real(p.halt_file), real(p.state_dir));
 }
 
 /** Read a config file as a regular file (no symlink) and parse it strictly. */

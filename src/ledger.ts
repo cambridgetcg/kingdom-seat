@@ -530,6 +530,10 @@ function parseBody(value: unknown): void {
       if (!["immediate", "confirmed", "two-beats", "witnessed"].includes(b.via as string)) throw new Error("body.via");
       if (b.to === "ended" && b.via !== "witnessed") throw new Error("ended needs a witness");
       return;
+    case "step-away.said":
+      exactly(b, ["seat_id", "type"], "body");
+      str(b.seat_id, "body.seat_id");
+      return;
     default:
       throw new Error("body.type");
   }

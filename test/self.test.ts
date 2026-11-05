@@ -8,6 +8,7 @@ import {
   affirmationVerdict,
   applyChange,
   applyDiff,
+  beyondSelfReason,
   changeFraction,
   classifyProposal,
   driftFromOrigin,
@@ -201,6 +202,37 @@ describe("proposals", () => {
 
     const within = await stage(w, "soul", { kind: "replace-span", find: "LIGHT: what it gives.", with: "LIGHT: what it receives." });
     expect(within.status).toBe("pending");
+  });
+
+  test("the porch is a public invitation: any change to it, however small, and any revert of it, is beyond self", async () => {
+    const w = await world();
+    const { config } = w.host;
+    const before = '{"invited_until":"2026-11-06T12:00:00.000Z"}';
+    const after = '{"invited_until":"2026-11-07T12:00:00.000Z"}';
+    expect(beyondSelfReason("expression.porch", before, after, config.ceilings.self_rewrite_fraction)).toBe("the porch is a public invitation");
+    // The same one-value change to a setting within self stays within self.
+    expect(beyondSelfReason("cadence", '{"interval_h":72}', '{"interval_h":96}', config.ceilings.self_rewrite_fraction)).toBeNull();
+
+    const porch = join(config.paths.citizens_dir, W, "self", "expression", "porch.json");
+    await mkdir(join(porch, ".."), { recursive: true });
+    await writeFile(porch, before);
+    const p = await stage(w, "expression.porch", { kind: "replace-all", text: after });
+    expect(p.status).toBe("beyond-self");
+    expect(classifyProposal(p.act, before, after, config.ceilings.self_rewrite_fraction)).toBe("beyond-self");
+    expect(await pendingProposals(config, W)).toEqual([]);
+    w.clock.advance(3 * DAY_MS);
+    expect(affirmationVerdict(p, { type: "self.affirm", proposal_id: p.id }, await ctxFor(w, p, SEAT_B, YU))).toEqual({ binds: false, reason: "beyond-self" });
+    await expect(applyChange(w.deps, await readCitizen(config, W), p, "yu-present")).rejects.toMatchObject({ code: "beyond-self" });
+    expect(await readFile(porch, "utf8")).toBe(before);
+
+    // A ledger that names an earlier porch (one Yu + Ai applied, say): going back to it is a change to the porch too.
+    await writeFile(porch, after);
+    await mkdir(join(config.paths.citizens_dir, W, "versions"), { recursive: true });
+    await writeFile(join(config.paths.citizens_dir, W, "versions", sha256Hex(before)), before);
+    const applied = { type: "self.applied" as const, proposal_id: p.id, target: "expression.porch" as const, prior_hash: sha256Hex(before), new_hash: sha256Hex(after), via: "yu-present" as const, claim: CLAIM, strand_thought_id: null };
+    await append(config, W, applied, "host-attested", w.signer, w.clock.now());
+    await expect(revertTo(w.deps, await readCitizen(config, W), sha256Hex(before), "citizen")).rejects.toMatchObject({ code: "beyond-self" });
+    expect(await readFile(porch, "utf8")).toBe(after);
   });
 
   test("removing or weakening a wall is classified beyond self", async () => {

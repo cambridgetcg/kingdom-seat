@@ -211,7 +211,7 @@ describe("[R2] a metered seat's spend is recorded whatever its outcome", () => {
 
     // Now past the ceiling: the next summons is refused before claude runs, and records nothing.
     const over = await summonSeat(host, { acts: [{ type: "rest" }] });
-    expect(over.result).toMatchObject({ exit: EXIT.REFUSED, outcome: "refused", refusal: "ceiling-usd" });
+    expect(over.result).toMatchObject({ exit: EXIT.USD_CEILING, outcome: "refused", refusal: "ceiling-usd" });
     expect(over.run.calls).toHaveLength(0);
   });
 
@@ -264,7 +264,7 @@ describe("[R2] a metered seat's spend is recorded whatever its outcome", () => {
       opened_at: "2026-11-05T02:00:00.000Z",
     });
     const next = await summonSeat(host, { acts: [{ type: "rest" }] });
-    expect(next.result).toMatchObject({ exit: EXIT.REFUSED, outcome: "refused", refusal: "ceiling-usd" });
+    expect(next.result).toMatchObject({ exit: EXIT.USD_CEILING, outcome: "refused", refusal: "ceiling-usd" });
     expect(next.run.calls).toHaveLength(0);
     // A settled line arriving later for that seat gives the day back its known spend.
     await appendFile(

@@ -34,12 +34,16 @@ export type IsoTime = string;
  * pages on non-zero never pages because the Kingdom was put to rest.
  */
 export const EXIT = {
-  /** Lived: a beat, a rest, a HALT rest, nothing due, or a tick that yielded to another. */
+  /** Lived: a beat, a rest, a HALT rest, nothing due, the fleet's day full, a locked signer resting the citizens, or a tick that yielded. */
   OK: 0,
-  /** The runner could not do its job: bad config, invalid citizen record, runtime unreachable, crash. */
+  /** Cannot seat: bad config, invalid record, a wall such as a symlink or an unpinned model, a context that does not fit, a crash. */
   ERROR: 1,
-  /** A fail-closed wall refused: ceiling, models.lock mismatch, locked signer, missing consent. Not a failure; never retried at once. */
-  REFUSED: 3,
+  /**
+   * Only a metered runtime at its USD ceiling. KS-003 and KS-004 both read 3
+   * as "close that runtime class for the citizen until the ceiling resets", so
+   * no other wall may use it (KS-004 re-review B2, C9).
+   */
+  USD_CEILING: 3,
   /** The seat's own deadline ended the act. Bound reached; not a failure. */
   TIMEOUT: 124,
   /** The act ended by SIGTERM (HALT raised mid-seat, or launchd stopping the job). Bound reached; not a failure. */
@@ -100,7 +104,9 @@ export type RefusalCode =
   | "invalid-request"
   | "invalid-record"
   /** The ledger's head moved between reading it and appending: another writer got there first. */
-  | "head-moved";
+  | "head-moved"
+  /** The whole context would not fit the runtime's window, so the seat does not open rather than lose part of the self. */
+  | "context-too-large";
 
 /** A fail-closed refusal. Messages name the wall, never a secret or a model's words. */
 export class Refusal extends Error {
@@ -111,6 +117,19 @@ export class Refusal extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The exit for a wall that said no (KS-004 v0.2 section 5.9, re-review B2 C9).
+ * 3 closes a runtime class for the day, so only the USD ceiling uses it: a
+ * symlinked letter must not close a citizen's runtime. HALT and a locked
+ * signer rest the citizens (0; the host note and status say why). Every other
+ * wall means the seat could not open as asked (1), which a monitor should see.
+ */
+export function exitForRefusal(code: RefusalCode): ExitCode {
+  if (code === "ceiling-usd") return EXIT.USD_CEILING;
+  if (code === "halted" || code === "keychain-locked") return EXIT.OK;
+  return EXIT.ERROR;
 }
 
 /* ── Citizens (3.1, 3.3, 3b) ──────────────────────────────────────────── */
@@ -368,6 +387,12 @@ export interface ValidatedOutput {
   rest: boolean;
   acts: ModelAct[];
   dropped: DroppedAct[];
+  /**
+   * The one state a rest's reply named in a state.set, when it named exactly
+   * one. A rest may carry a move toward less activity (KS-004 B2 C7); the seat
+   * keeps it only when it is one, from the citizen's state. Absent otherwise.
+   */
+  rest_state?: LifecycleState;
 }
 
 /** A self.propose kept by the host between beats, until affirmed, applied or left to lapse. */
@@ -522,7 +547,14 @@ export type LedgerBody =
       from: LifecycleState;
       to: LifecycleState;
       via: "immediate" | "confirmed" | "two-beats" | "witnessed";
-    };
+    }
+  /**
+   * A first step-away said on a rest. A rest writes no beat, and a first
+   * saying is otherwise carried only by a beat's envelope, so this keeps the
+   * saying, with no words, for the seat that confirms it. `seat_id` is the
+   * seat that said it, which never counts as its own confirmation.
+   */
+  | { type: "step-away.said"; seat_id: string };
 
 /** One line of `ledger/<word>.jsonl`. Hash-chained and signed; never rewritten or deleted. */
 export interface LedgerEntry {
@@ -891,7 +923,7 @@ export interface SeatResult {
   outcome: Outcome;
   seat_ref: SeatRef | null;
   refusal: RefusalCode | null;
-  /** Ledger entries this seat appended; empty for a rest, a HALT or a refusal. */
+  /** Ledger entries this seat appended; empty for a HALT or a refusal, and for a rest unless it carried a move toward less activity (one entry). */
   appended: Sha256Hex[];
 }
 
@@ -977,6 +1009,11 @@ export interface Config {
     consent_dir: string;
     /** Each seat gets a fresh empty cwd under here. */
     seats_dir: string;
+    /**
+     * The local HALT file, outside state_dir, in a directory the operator owns
+     * and the seat user cannot write, so the seat can never remove it (KS-004
+     * B2 R5). Default /Users/Shared/kingdom-seat/HALT.
+     */
     halt_file: string;
     lock_dir: string;
     status_file: string;
@@ -1013,6 +1050,26 @@ export interface Config {
   halt: {
     /** Only for development and tests: run with the local file as the sole HALT source. */
     allow_no_beacons: boolean;
+    /**
+     * The one fixed call `citizen-seat halt`, run by the operator, makes to have
+     * the signer raise this host's beacons as the seat user, e.g.
+     * ["/usr/bin/sudo", "-n", "-u", "seat", "<citizen-seat>", "raise-beacons",
+     * "--config", "<config>"], allowed by one sudoers line with exactly these
+     * arguments. The operator cannot read the seat user's keychain, and the
+     * seat user cannot write the HALT file, so one verb needs both (R5). Null:
+     * no call, and a beacon held here is reported not raised.
+     */
+    raise_beacons_argv: string[] | null;
+  };
+  /** When a citizen's own seat is due, where the spec leaves it to Yu. */
+  schedule: {
+    /**
+     * Yu's call (KS-004 B2 C14). True, the default: a listening or asleep
+     * citizen that asks to wake is owed one seat at the minimum interval to
+     * say it again, as a step-away is. False: it waits for its next allowed
+     * letter or Yu's summons, as KS-004 v0.2 section 7.3 reads.
+     */
+    wake_confirm_seat: boolean;
   };
   ceilings: Ceilings;
   timing: Timing;

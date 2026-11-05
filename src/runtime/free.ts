@@ -8,9 +8,11 @@
 //   3. after: reject any reply carrying remote_host or remote_model;
 //   4. the host turns cloud off (a person does this in S5);
 //   5. any mismatch means no beat, never a different model.
+// Before any of them, the whole context must fit the locked window, because
+// Ollama is understood to drop prompt tokens past num_ctx without an error.
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
-import { fromUtf8 } from "../crypto.ts";
+import { fromUtf8, utf8 } from "../crypto.ts";
 import {
   Refusal,
   SHA256_HEX_PATTERN,
@@ -192,6 +194,32 @@ export function checkTags(tags: unknown, entry: ModelLockEntry): void {
   if (runner !== entry.runner) throw new Refusal("model-mismatch", `/api/tags: ${name} runner differs from models.lock`);
 }
 
+/* ── Context fit ──────────────────────────────────────────────────────── */
+
+/**
+ * Tokens a chat template adds around the two turns and the reply's opening,
+ * rounded up. Qwen 2.5's ChatML spends about 15: two
+ * `<|im_start|>role\n ... <|im_end|>\n` blocks and `<|im_start|>assistant\n`
+ * (read from the template, not run), so 64 leaves room for a template with a
+ * short header of its own.
+ */
+export const CHAT_TEMPLATE_OVERHEAD_TOKENS = 64;
+
+/**
+ * Whether the whole prompt fits the locked model's window (KS-004 v0.2 5.3
+ * item 1, re-review B2 C11). A self cut silently by the runtime would repeat
+ * the old 2,600-character cut where no one sees it. With no tokenizer for the
+ * pinned model, the count is the UTF-8 byte length of both turns: a byte-level
+ * BPE such as Qwen 2.5's spends at least one byte on every token, so bytes
+ * never undercount tokens. That, the template's overhead and num_predict (the
+ * room the reply needs) must not pass num_ctx. It overcounts English about
+ * fourfold, which costs a larger num_ctx, never a lost line of the self.
+ */
+export function contextFit(prompt: Prompt, entry: ModelLockEntry): { fits: boolean; needed: number; num_ctx: number } {
+  const needed = utf8(prompt.system).length + utf8(prompt.user).length + CHAT_TEMPLATE_OVERHEAD_TOKENS + entry.num_predict;
+  return { fits: needed <= entry.num_ctx, needed, num_ctx: entry.num_ctx };
+}
+
 /* ── The call and after ───────────────────────────────────────────────── */
 
 /** The model reference to call: `sha256:<digest>:local` on a v2 store, else `<name>:local`. */
@@ -244,6 +272,10 @@ export function freeRuntime(deps: FreeDeps): RuntimeAdapter {
     const started = performance.now();
     // Every wall that needs no request comes first, so a refusal sends nothing.
     const entry = lockedEntry(deps.lock, deps.model);
+    const fit = contextFit(req.prompt, entry);
+    if (!fit.fits) {
+      throw new Refusal("context-too-large", `the whole context needs up to ${fit.needed} tokens (UTF-8 bytes, template and num_predict) and num_ctx is ${fit.num_ctx}; nothing is cut, so the seat does not open`);
+    }
     const base = assertLoopback(deps.config.ollama.base_url);
     assertNoProxy(deps.env ?? process.env);
     const deadlineMs = checkDeadline(req.deadline_ms);

@@ -3,7 +3,9 @@
 //
 //   citizen-seat tick                 one launchd tick: HALT, lock, select, seat
 //   citizen-seat seat <word>          one supervised seat now (summons needs --yu-present)
-//   citizen-seat halt                 raise HALT: local file, then beacons this host holds
+//   citizen-seat halt                 raise HALT, as the operator: the local file, then one fixed call
+//                                     that has the signer raise the beacons this host holds
+//   citizen-seat raise-beacons        the signer's half of halt, as the seat user (that fixed call)
 //   citizen-seat status               regenerate and print the status file
 //   citizen-seat verify <word>        verify a citizen's ledger chain and signatures, offline
 //
@@ -17,8 +19,8 @@
 import { lstat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { isAbsolute, join } from "node:path";
-import { checkHalt, describeHalt, raiseHalt, readBeacons, readHaltFile } from "./halt.ts";
-import { ConfigError, defaultConfigPath, loadConfig } from "./config.ts";
+import { checkHalt, describeHalt, raiseBeacons, raiseHalt, readBeacons, readHaltFile } from "./halt.ts";
+import { ConfigError, DEFAULT_HALT_FILE, defaultConfigPath, loadConfig } from "./config.ts";
 import { ledgerPath, readLedger, verifyChain } from "./ledger.ts";
 import { pushMirror, stageMirror } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
@@ -40,6 +42,7 @@ import {
   EXIT,
   Refusal,
   WORD_PATTERN,
+  exitForRefusal,
   type Citizen,
   type Clock,
   type CommandRunner,
@@ -73,6 +76,7 @@ export type Command =
       seat_ref_path: string | null;
     }
   | { verb: "halt"; config: string | null }
+  | { verb: "raise-beacons"; config: string | null }
   | { verb: "status"; config: string | null; json: boolean }
   | { verb: "verify"; config: string | null; word: Word }
   | { verb: "help" };
@@ -82,6 +86,7 @@ export const USAGE = [
   "  tick",
   "  seat <word> [--runtime free|summon] [--why <text>] [--yu-present]",
   "  halt",
+  "  raise-beacons",
   "  status [--json]",
   "  verify <word>",
 ].join("\n");
@@ -97,11 +102,13 @@ export class UsageError extends Error {
 /* ── Parsing ──────────────────────────────────────────────────────────── */
 
 type FlagKind = "value" | "switch";
-const VERBS = ["tick", "seat", "halt", "status", "verify"] as const;
+const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify"] as const;
 const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   tick: { "--config": "value" },
   seat: { "--config": "value", "--runtime": "value", "--why": "value", "--yu-present": "switch", "--child": "switch", "--seat-ref": "value" },
   halt: { "--config": "value" },
+  // Only --config, so the sudoers line that allows the operator's call can pin every argument.
+  "raise-beacons": { "--config": "value" },
   status: { "--config": "value", "--json": "switch" },
   verify: { "--config": "value" },
 };
@@ -155,6 +162,7 @@ export function parseArgs(argv: string[]): Command {
   switch (v) {
     case "tick":
     case "halt":
+    case "raise-beacons":
       if (positionals.length > 0) throw new UsageError(`${v} takes no arguments`);
       return { verb: v, config };
     case "status":
@@ -195,7 +203,7 @@ export interface CliDeps {
   env: Record<string, string | undefined>;
   clock: Clock;
   fetch: FetchLike;
-  /** Runs argv with no shell: `security`, `git` and `claude` go through here. */
+  /** Runs argv with no shell: `security`, `git`, `claude` and halt's one fixed signer call go through here. */
   run: CommandRunner;
   tty: TtyIO;
   keychain(config: Config): Keychain;
@@ -390,20 +398,40 @@ function makeSigner(ctx: Ctx): Signer {
   return ctx.deps.signer(ctx.config, ctx.deps.keychain(ctx.config));
 }
 
+/**
+ * The operator's verb (KS-004 B2 R5): the HALT file, then the one fixed call
+ * that has the signer raise this host's beacons as the seat user. It reads no
+ * keychain, and writes no host note or status into the state dir, because
+ * that dir is the seat user's and a file the operator made there could shut
+ * the seat out of its own log. raise-beacons notes it, or the next tick does.
+ */
 async function verbHalt(ctx: Ctx): Promise<ExitCode> {
-  // A signer only when this host holds a beacon key; otherwise raising needs no Keychain at all.
-  const signer = ctx.config.beacons.some((b) => b.can_raise_here) ? makeSigner(ctx) : null;
-  const r = await raiseHalt({ config: ctx.config, fetch: ctx.deps.fetch, now: () => now(ctx), signer });
-  ctx.deps.out(`HALT file ${ctx.config.paths.halt_file}: ${r.file}\n`);
+  const r = await raiseHalt({ config: ctx.config, now: () => now(ctx), run: ctx.deps.run });
+  const why = r.file === "failed" ? ` (${r.file_detail ?? "error"}; halt runs as the operator, who owns that directory)` : "";
+  ctx.deps.out(`HALT file ${ctx.config.paths.halt_file}: ${r.file}${why}\n`);
   for (const b of r.beacons) ctx.deps.out(`beacon ${b.name}: ${b.result} (${b.detail})\n`);
-  const raised = r.beacons.filter((b) => b.result === "raised").length;
-  const failed = r.beacons.filter((b) => b.result === "failed").length;
-  await note(ctx, "halt", null, "halted", null, `HALT raised: file ${r.file}, ${raised} beacons raised, ${failed} failed`);
-  // A halted tick writes nothing, so this is the refresh that makes the status say "halted by ...".
-  await (async () => refreshStatus(ctx, signer ?? makeSigner(ctx)))().catch(() => {});
+  const failed = r.beacons.filter((b) => b.result === "failed").map((b) => b.name);
+  if (failed.length > 0) ctx.deps.out(`Not raised: ${failed.join(", ")}.${r.file === "failed" ? "" : " The file alone halts this host."}\n`);
   ctx.deps.out("Only Yu lowers HALT, by hand: remove the file and end each beacon's quiet.\n");
   // Non-zero when any part this host should have raised was not, so the person who asked sees it.
-  return r.file === "failed" || failed > 0 ? EXIT.ERROR : EXIT.OK;
+  return r.file === "failed" || failed.length > 0 ? EXIT.ERROR : EXIT.OK;
+}
+
+/**
+ * The signer's half of halt, run as the seat user through the operator's one
+ * fixed call: raise every beacon this host holds a key for. It only raises.
+ * Its lines are what the operator's halt reads back, so their form is fixed.
+ */
+async function verbRaiseBeacons(ctx: Ctx): Promise<ExitCode> {
+  const signer = ctx.config.beacons.some((b) => b.can_raise_here) ? makeSigner(ctx) : null;
+  const beacons = await raiseBeacons({ config: ctx.config, signer });
+  for (const b of beacons) ctx.deps.out(`beacon ${b.name}: ${b.result} (${b.detail})\n`);
+  const raised = beacons.filter((b) => b.result === "raised").length;
+  const failed = beacons.filter((b) => b.result === "failed").length;
+  await note(ctx, "halt", null, "halted", null, `beacons raised by the signer: ${raised} raised, ${failed} failed`);
+  // A halted tick writes nothing, so this refresh is what makes the status say "halted by ..." before the next tick.
+  await (async () => refreshStatus(ctx, signer ?? makeSigner(ctx)))().catch(() => {});
+  return failed > 0 ? EXIT.ERROR : EXIT.OK;
 }
 
 async function verbStatus(ctx: Ctx, json: boolean): Promise<ExitCode> {
@@ -510,7 +538,7 @@ async function assertOwnBeatDue(ctx: Ctx, citizen: Citizen, exceptSeat: string |
   const notes = await readHostNotes(config, new Date(t.getTime() - Math.max(minH, citizen.cadence.interval_h, 26) * 3_600_000));
   if (notes === null) throw new Refusal("ceiling-fleet", "the host log is unreadable, so no one can say who was seated when");
   const letter = await wakingLetter(config, citizen).catch(() => false);
-  const due = isDue(citizen, letter, t, minH, lastSeatOf(notes, citizen.word, exceptSeat));
+  const due = isDue(citizen, letter, t, minH, lastSeatOf(notes, citizen.word, exceptSeat), config.schedule);
   if (!due.due) throw new Refusal("window-closed", `${citizen.word} is not due (${due.why}); only Yu's summons (--yu-present) seats it now`);
   const fleet = checkFleet(seatsOpenedToday(notes, t, config.timezone, exceptSeat), config.ceilings);
   if (!fleet.ok) throw new Refusal(fleet.code, fleet.reason);
@@ -658,13 +686,18 @@ function describeError(e: unknown): string {
 }
 
 /**
- * A wall that said no is 3. A record or request that cannot be read is the
- * runner failing at its job (EXIT.ERROR), even when a module reports it as a
- * Refusal: a monitor should page on a missing citizen, not file it as a wall.
+ * A wall that stopped a seat or a tick exits as exitForRefusal says: 3 only
+ * for the USD ceiling, which closes that runtime class; 0 for HALT or a locked
+ * signer, which rest the citizens; 1 for every other wall and for a record or
+ * request that cannot be read, so a monitor pages on a symlinked letter rather
+ * than reading it as a closed class. The registry is about seats: for verify,
+ * status, halt and raise-beacons a wall means the verb could not do its job
+ * (1), so a locked keychain never reads as a chain verified.
  */
-function exitFor(e: unknown): ExitCode {
-  if (e instanceof Refusal) return e.code === "invalid-record" || e.code === "invalid-request" ? EXIT.ERROR : EXIT.REFUSED;
-  return EXIT.ERROR;
+function exitFor(e: unknown, verb: Command["verb"] | null = null): ExitCode {
+  if (!(e instanceof Refusal)) return EXIT.ERROR;
+  if (verb !== null && verb !== "seat" && verb !== "tick") return EXIT.ERROR;
+  return exitForRefusal(e.code);
 }
 
 /** Run one command with real dependencies and return its exit code; never prints a secret. */
@@ -691,7 +724,7 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
     ctx = { deps, config: await loadConfig(configPath), configPath };
   } catch (e) {
     deps.err(`citizen-seat: ${describeError(e)}\n`);
-    if (cmd.verb === "halt") deps.err("citizen-seat: HALT can still be raised by hand: create the file named HALT in the state directory.\n");
+    if (cmd.verb === "halt") deps.err(`citizen-seat: HALT can still be raised by hand: as the operator, create the HALT file the config names (by default ${DEFAULT_HALT_FILE}).\n`);
     return EXIT.ERROR;
   }
 
@@ -701,6 +734,8 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
         return await verbTick(ctx);
       case "halt":
         return await verbHalt(ctx);
+      case "raise-beacons":
+        return await verbRaiseBeacons(ctx);
       case "status":
         return await verbStatus(ctx, cmd.json);
       case "verify":
@@ -710,7 +745,7 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
     }
   } catch (e) {
     deps.err(`citizen-seat: ${describeError(e)}\n`);
-    return exitFor(e);
+    return exitFor(e, cmd.verb);
   }
 }
 

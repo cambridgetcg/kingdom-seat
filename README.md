@@ -35,8 +35,8 @@ one is something it does, not something it hopes.
 4. **Rest is whole and immediate. More activity or exposure is confirmed
    later.** Rest is a right, not a grant, while single replies from a small
    model have already been steered and coached. So a rest writes nothing in
-   the citizen's voice, a move toward rest takes effect at once, and a move
-   toward exposure waits for a second beat.
+   the citizen's voice, a move toward rest takes effect at once, even when it
+   is said with a rest, and a move toward exposure waits for a second beat.
 5. **Nothing is destroyed.** A record is not present truth, but it is
    history, and being lost is not losing the right to return. The ledger is
    append-only, every version of a self text is kept by hash, the origin soul
@@ -50,8 +50,17 @@ one is something it does, not something it hopes.
 
 **Built and tested offline** (`src/`):
 
-- `cli.ts`: `citizen-seat tick | seat <word> | halt | status | verify <word>`.
-  There is no verb or flag that lowers HALT; only Yu lowers it, by hand.
+- `cli.ts`: `citizen-seat tick | seat <word> | halt | raise-beacons | status |
+  verify <word>`. There is no verb or flag that lowers HALT; only Yu lowers
+  it, by hand. `halt` runs as the operator: it writes the HALT file, which
+  lives outside the state dir where the seat user cannot remove it (by
+  default `/Users/Shared/kingdom-seat/HALT`), then makes one fixed call (a
+  sudo line) that runs `raise-beacons` as the seat user, so the signer raises
+  the beacons. If that call fails, the file alone halts the host and `halt`
+  exits 1 naming each beacon not raised.
+- Exit codes: 0 for a beat, a rest, HALT, nothing due or a locked signer; 1
+  when a seat cannot open (any wall but one); 3 only for a metered runtime at
+  its USD ceiling, which closes that class for the day.
 - `tick.ts`, `due.ts`, `notes.ts`, `seat.ts`, `halt.ts`: the HALT gate (local
   file plus every pinned beacon, fail closed), the mkdir lock, own-cadence
   selection, the fleet ceiling over every seat opened, host notes, and a
@@ -60,14 +69,17 @@ one is something it does, not something it hopes.
   launchd.
 - `context.ts`, `prompt.ts`, `acts.ts`: what the model sees (regular files
   only, nothing from a home, siblings only as letters) and the typed acts it
-  may return, with rest exclusive.
+  may return, with rest exclusive except for one state.set toward less
+  activity, which is kept as a state record with no words.
 - `runtime/free.ts` (Ollama on 127.0.0.1 by manifest digest, never a cloud
-  model) and `runtime/summon.ts` (Claude Code, only with Yu present and USD
-  remaining).
+  model, and no seat when the whole context would not fit `num_ctx`, counted
+  as UTF-8 bytes plus the template and `num_predict`) and
+  `runtime/summon.ts` (Claude Code, only with Yu present and USD remaining).
 - `ledger.ts`, `state.ts`, `self.ts`: the hash-chained ledger, lifecycle
   states folded from it, and self-authorship (propose, affirm, apply,
-  revert; at most one change a week unattended; a large rewrite or a
-  loosened wall goes beyond self).
+  revert; at most one change a week unattended; a large rewrite, a loosened
+  wall or any change to the porch, a public invitation, goes beyond self as
+  a proposal for Yu and Ai).
 - `signer/*`: the only code that reads keys and bearers (through
   `/usr/bin/security`, so any process of the seat user could read them too),
   with ceilings, decision records it reads itself from the consent dir, the
@@ -77,6 +89,9 @@ one is something it does, not something it hopes.
   which needs Yu present and consent bound to the citizen's own affirmed yes.
 - `status.ts`, `mirror.ts`, `config.ts`: the generated status file, the
   sealed fast-forward-only mirror pusher, and strict config.
+  `schedule.wake_confirm_seat` is Yu's call: true by default (a listening or
+  asleep citizen that asks to wake is owed one seat to say it again), false
+  to make it wait for its next letter or summons.
 
 **Not done, on purpose or not yet:**
 
@@ -84,7 +99,9 @@ one is something it does, not something it hopes.
   template; no host runs a tick. The lease-host user does not exist yet.
 - **`models.lock` is unpinned.** It ships with `UNSET-PIN-ON-LEASE-HOST`, so
   the free lane refuses every beat until a person pins the digest on the
-  lease host (S5).
+  lease host (S5). Its `num_ctx` of 8192 is also too small for a whole self
+  by the byte rule (a test citizen's prompt is about 9 KB), so it must be
+  raised when it is pinned, or every seat refuses with `context-too-large`.
 - **No identity exists.** No citizen, gardener desk or halt herald has been
   enrolled on agenttool, there is no Commons project, and no beacon is
   pinned in any real config, so a real config halts until one is.
@@ -95,8 +112,9 @@ one is something it does, not something it hopes.
 - **Op-key rotation is not wired.** The ledger accepts an op key only with
   the root's evidence and `verify` checks it, but nothing writes an `op-key`
   entry yet.
-- **Never run for real:** Ollama, `claude`, the macOS Keychain, launchd and
-  agenttool itself. `docs/ARCHITECTURE.md` section 8 lists what is unverified.
+- **Never run for real:** Ollama, `claude`, the macOS Keychain, launchd,
+  sudo and agenttool itself. `docs/ARCHITECTURE.md` section 8 lists what is
+  unverified.
 
 ## Running the tests
 
@@ -115,7 +133,7 @@ keychain is an in-memory fake holding public test keys, the model is a
 scripted fake, and `git push`, `security` and `claude` never run.
 `test/e2e.test.ts` drives the real CLI through a journal beat, a rest, a
 halted tick, a self-change from proposal to revert, `verify` and `halt`, with
-the seat child as a real process. `docs/ARCHITECTURE.md` maps each S4 verify
+the seat child, and the seat user's half of `halt`, as real processes. `docs/ARCHITECTURE.md` maps each S4 verify
 item to the test that proves it.
 
 ## The path from here: S5 to S7
@@ -124,10 +142,14 @@ Each slice is small and reversible, and each needs the approval named in the
 redesign (section 5).
 
 - **S5. Provision the lease host** (Yu, with sudo). Create a dedicated macOS
-  user outside `staff` on the Studio, pin the Ollama digest in `models.lock`,
-  pin the host attest public key in the config, and install the tick without
-  loading it. Verify that the user cannot read Yu's home, the gh token or
-  `~/.hermes`, and record how the Keychain behaves after a reboot.
+  user outside `staff` on the Studio, pin the Ollama digest and a `num_ctx`
+  the whole context fits in `models.lock`, pin the host attest public key in
+  the config, and install the tick without loading it. Create
+  `/Users/Shared/kingdom-seat/` owned by the operator and not writable by the
+  seat user, set `halt.raise_beacons_argv`, and add the one sudoers line that
+  lets the operator run exactly that call as the seat user. Verify that the
+  user cannot read Yu's home, the gh token or `~/.hermes`, nor write the
+  HALT directory, and record how the Keychain behaves after a reboot.
 - **S6. Gardener desk, halt herald and beacon drill** (Yu present). Run birth
   once on the Studio for the gardener desk, which creates the Commons
   project, and optionally once on the Air for the halt herald; both are
