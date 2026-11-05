@@ -84,11 +84,12 @@ function haltLabel(r: HaltStatus["readings"][number]): string {
   return `beacon ${r.id}`;
 }
 
-function haltSection(halt: HaltStatus | null): StatusFile["halt"] {
+function haltSection(halt: HaltStatus | null, file: string): StatusFile["halt"] {
   // A HALT check that did not run is unreadable, and unreadable halts.
-  if (halt === null) return { halted: true, raised: [], unreadable: ["halt check"] };
+  if (halt === null) return { halted: true, file, raised: [], unreadable: ["halt check"] };
   return {
     halted: halt.halted,
+    file,
     raised: halt.readings.filter((r) => r.state === "raised").map(haltLabel),
     unreadable: halt.readings.filter((r) => r.state === "unreadable").map(haltLabel),
   };
@@ -275,7 +276,8 @@ async function tickLockView(config: Config): Promise<StatusFile["tick_lock"]> {
 export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
   const { config, now } = deps;
   const notes = await readHostNotes(config, new Date(0));
-  const halt = haltSection(deps.halt);
+  // The file is named even while lowered: the path is configurable and outside the state dir, so a reader must be told which one stops the seat.
+  const halt = haltSection(deps.halt, config.paths.halt_file);
   // An unreadable log is a count no one can know: null, which the tick treats as at-ceiling.
   const beatsToday = notes === null ? null : seatsOpenedToday(notes, now, config.timezone);
 
@@ -323,11 +325,12 @@ export async function writeStatus(path: string, status: StatusFile): Promise<voi
 /* ── Rendering ────────────────────────────────────────────────────────── */
 
 function haltLine(h: StatusFile["halt"]): string {
-  if (!h.halted) return "HALT: not halted";
+  const watching = ` (HALT file ${h.file})`;
+  if (!h.halted) return `HALT: not halted${watching}`;
   const parts: string[] = [];
   if (h.raised.length > 0) parts.push(`halted by ${h.raised.join(", ")}`);
   if (h.unreadable.length > 0) parts.push(`halted: ${h.unreadable.join(", ")} unreadable, which counts as raised`);
-  return `HALT: ${parts.length > 0 ? parts.join("; ") : "halted"}`;
+  return `HALT: ${parts.length > 0 ? parts.join("; ") : "halted"}${watching}`;
 }
 
 function money(usd: string | null): string {

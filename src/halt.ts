@@ -26,6 +26,8 @@ export interface RaiseResult {
   file: "written" | "already-present" | "failed";
   /** The errno when the file could not be written, e.g. EACCES when the verb was not run as the operator. */
   file_detail?: string;
+  /** `halt.also_files`, each written the same way; detail is the errno when it failed. */
+  also_files: { path: string; file: RaiseResult["file"]; detail: string }[];
   beacons: { name: string; result: "raised" | "not-held-here" | "failed"; detail: string }[];
 }
 
@@ -140,6 +142,9 @@ export async function checkHalt(deps: HaltDeps): Promise<HaltStatus> {
  */
 export async function raiseHalt(deps: { config: Config; now: () => Date; run: CommandRunner }): Promise<RaiseResult> {
   const { file, detail } = await raiseHaltFile(deps.config, deps.now());
+  // Another runner's HALT, such as the KS-003 fleet's, so one verb still stops everything on this host.
+  const also_files: RaiseResult["also_files"] = [];
+  for (const path of deps.config.halt.also_files) also_files.push({ path, ...(await raiseHaltFileAt(path, haltText(deps.config.host, deps.now()), deps.now())) });
   const held = deps.config.beacons.filter((b) => b.can_raise_here);
   const argv = deps.config.halt.raise_beacons_argv;
   let raised = new Set<string>();
@@ -160,7 +165,7 @@ export async function raiseHalt(deps: { config: Config; now: () => Date; run: Co
     if (raised.has(b.name)) return { name: b.name, result: "raised", detail: `by the signer, until ${BEACON_UNTIL}` };
     return { name: b.name, result: "failed", detail: why || "the signer did not report it raised" };
   });
-  return { file, ...(file === "failed" ? { file_detail: detail } : {}), beacons };
+  return { file, ...(file === "failed" ? { file_detail: detail } : {}), also_files, beacons };
 }
 
 /** The beacon names a `raise-beacons` run reported raised, read only from lines in its own fixed form. */
@@ -173,12 +178,20 @@ function raisedIn(stdout: string): Set<string> {
   return names;
 }
 
+function haltText(host: string, now: Date): string {
+  return `raised ${now.toISOString()} on ${host}\n`;
+}
+
 /** Write the local HALT file if nothing is at the path yet; "failed" carries the errno, so a person sees EACCES or ENOENT. */
 export async function raiseHaltFile(config: Config, now: Date): Promise<{ file: RaiseResult["file"]; detail: string }> {
-  const path = config.paths.halt_file;
+  return raiseHaltFileAt(config.paths.halt_file, haltText(config.host, now), now);
+}
+
+/** Write a HALT file at `path` if nothing is there yet, with `text` saying who raised it and when. */
+export async function raiseHaltFileAt(path: string, text: string, now: Date): Promise<{ file: RaiseResult["file"]; detail: string }> {
   if (readHaltFile(path, now).state === "raised") return { file: "already-present", detail: "" };
   try {
-    await writeFile(path, `raised ${now.toISOString()} on ${config.host}\n`, { flag: "wx", mode: 0o644 });
+    await writeFile(path, text, { flag: "wx", mode: 0o644 });
     return { file: "written", detail: "" };
   } catch (e) {
     const code = errCode(e);

@@ -176,9 +176,14 @@ The one thing a rest may carry is a single `state.set` toward less activity
 that asked to sleep on its awake cadence. Toward listening or asleep it is
 written as one `state` entry; a step-away's second saying completes it the
 same way; a first step-away is kept as a `step-away.said` entry naming the
-seat, because a rest has no beat envelope to carry the saying. None of these
-holds a word, and nothing else from the reply is kept. A move toward more
-activity, a return or `ended` said with a rest is dropped.
+seat, because a rest has no beat envelope to carry the saying, followed for
+an awake or listening citizen by the `state` entry that puts it asleep at
+once (KS-004 v0.3 7.3). None of these holds a word, and nothing else from the
+reply is kept. A move toward more activity, a return or `ended` said with a
+rest is dropped, and so is everything when the reply has fields besides
+`acts`: an output that fails validation applies nothing (KS-004 5.8), so its
+rest is a whole rest. A rest that moved what the mirror card shows (active,
+dormant, archived) has the mirror staged after it, as a beat does.
 
 **Fail closed.** Every wall here guards something that cannot be taken back
 once it happens: spend, a public statement, a signature. So HALT halts when a
@@ -215,6 +220,10 @@ Four further rules follow from the same reasons:
 - **An op key is pinned only with the root's evidence.** The signer keeps the
   root-signed request exactly as it sent it (method, path and query, body
   bytes, and the three authority headers), because agenttool keeps no copy.
+  It keeps it when the answer is lost too (`SignerSentUncertain`), and the
+  client carries it on the error for no answer, a 5xx, or a 2xx that does not
+  read, so a birth stopped at keys/import still holds the proof in its
+  progress if the key turns out to be installed.
   Genesis carries the keys/import of the first op key, and an `op-key` entry
   the imports and revokes that change them. `verify` rebuilds the
   identity-authority/v1 digest from each and checks it against the root in
@@ -322,6 +331,24 @@ file alone halts this host, and `halt` exits 1 and names each beacon it did
 not raise. The operator's `halt` opens no keychain and writes nothing into
 the state dir (a file the operator made there could lock the seat out of its
 own log); `raise-beacons` writes the host note and refreshes the status.
+`halt` raises the file before, and without, a config it can read: if the
+config does not load, it still raises the default HALT file and exits 1,
+saying no beacon was raised. It also creates each of `halt.also_files`, such
+as the KS-003 fleet's `$LOVE/HALT` while that fleet runs on the host, so one
+verb still stops everything (KS-004 section 10); it names each, and exits 1
+if one could not be written.
+
+**The config is the operator's.** It names the HALT file and the beacons, so
+a config the seat user could rewrite would let the seat lower HALT. By
+default it is `/Users/Shared/kingdom-seat/config.json`, beside HALT, owned by
+the operator, mode 0644, so both users read it and only the operator writes
+it. Every verb but `halt` runs as the seat user and refuses a config owned by
+that user, or under a directory that user owns, or under one that group or
+others can write without the sticky bit. `halt` asks none of this: owning
+the config is the operator's place, and HALT must not wait on it. The seat
+user still controls its own processes, the code in its home and its launchd
+job, so this keeps a running seat from lowering HALT through the file it
+reads, not a seat account that is already compromised.
 
 **The parent opens; the child acts.** Every seat is opened by a parent that
 has passed its walls: the tick, or `seat <word>`. The parent takes the tick
@@ -352,7 +379,10 @@ tick's.
 
 **A saying that takes two beats is owed exactly one more.** A move toward
 exposure, or a first step-away, waits for the next seat to say it again
-(3.3). The schedule gives it that seat (at the minimum interval, whatever the
+(3.3). A first step-away is also a move toward rest: it puts an awake or
+listening citizen asleep at once, on a beat or a rest, and silence then
+leaves it asleep (KS-004 v0.3 7.3). The `state` entry that records that move
+leaves the saying owed its second beat. The schedule gives it that seat (at the minimum interval, whatever the
 state), and once a later seat has come and gone without confirming it, the
 saying lapses: a rest writes no beat entry, so the host notes are what show
 the seat happened. Silence keeps the previous self, and a single saying
@@ -380,8 +410,9 @@ through symlinks; by default it is `/Users/Shared/kingdom-seat/HALT`), a
 state dir inside a home (lexically and through symlinks), an Ollama URL
 other than `http://127.0.0.1:<port>`, any agenttool origin but the pinned
 one, a quiet cap above 30 days, a `halt.raise_beacons_argv` whose program is
-not an absolute path, a symlinked or group-writable file and duplicate JSON
-keys are all refused. A typo could
+not an absolute path, a `halt.also_files` entry inside the state dir, a
+symlinked or group-writable file, a file the seat user could have written
+(for its verbs) and duplicate JSON keys are all refused. A typo could
 otherwise loosen a wall silently. No beacons pinned refuses unless
 `halt.allow_no_beacons` is set, so a fresh `defaultConfig` does not parse
 until a person pins the beacons.
@@ -418,6 +449,8 @@ way the tick does, so the file shows what the runner would act on.
 - `signer.since` is carried from the previous status while the state holds.
 - HALT reads "halted by beacon gardener-desk" or "halted by file ...", never
   "down". A halted tick still regenerates the file, so it never goes stale.
+  `halt.file` names the HALT file this host watches, raised or not, since the
+  path is configurable and lives outside the state dir.
 - The file is written to a temp name, fsynced and renamed, mode 0644.
 
 **Host notes are the host's words.** A note holds codes, counts and ids: one
@@ -454,8 +487,10 @@ because a citizen chooses its file names.
   never forced, and only when HEAD is equal or ahead. Remotes that read as
   options or name a transport helper are refused. Git runs with no hooks, no
   user or system config and no prompt.
-- *After a beat only.* The CLI stages and pushes after a beat, checking HALT
-  again first, because a push is public.
+- *After a beat, or a rest that moved the card.* The CLI stages and pushes
+  after a beat, and after a rest whose kept move changed the card's state,
+  checking HALT again first, because a push is public. Any other rest stages
+  nothing, so it commits and pushes nothing.
 
 **A stopped job stops its seat.** The seat child leads its own process group,
 so launchd's group kill of the tick does not reach it. The watcher therefore

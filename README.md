@@ -57,7 +57,12 @@ one is something it does, not something it hopes.
   default `/Users/Shared/kingdom-seat/HALT`), then makes one fixed call (a
   sudo line) that runs `raise-beacons` as the seat user, so the signer raises
   the beacons. If that call fails, the file alone halts the host and `halt`
-  exits 1 naming each beacon not raised.
+  exits 1 naming each beacon not raised. If the config cannot be read, `halt`
+  still raises the default HALT file and exits 1. `halt.also_files` names
+  other HALT files it creates too, such as the KS-003 fleet's `$LOVE/HALT`.
+  The config lives beside HALT (`/Users/Shared/kingdom-seat/config.json` by
+  default), owned by the operator; every verb but `halt` refuses a config the
+  seat user owns or could replace.
 - Exit codes: 0 for a beat, a rest, HALT, nothing due or a locked signer; 1
   when a seat cannot open (any wall but one); 3 only for a metered runtime at
   its USD ceiling, which closes that class for the day.
@@ -145,11 +150,14 @@ redesign (section 5).
   user outside `staff` on the Studio, pin the Ollama digest and a `num_ctx`
   the whole context fits in `models.lock`, pin the host attest public key in
   the config, and install the tick without loading it. Create
-  `/Users/Shared/kingdom-seat/` owned by the operator and not writable by the
-  seat user, set `halt.raise_beacons_argv`, and add the one sudoers line that
-  lets the operator run exactly that call as the seat user. Verify that the
-  user cannot read Yu's home, the gh token or `~/.hermes`, nor write the
-  HALT directory, and record how the Keychain behaves after a reboot.
+  `/Users/Shared/kingdom-seat/` owned by the operator, mode 0755, and put the
+  config there as `config.json`, owned by the operator, mode 0644: the seat
+  user reads it and cannot change it, and the operator's `halt` can read it.
+  Set `halt.raise_beacons_argv` (and `halt.also_files` while the KS-003 fleet
+  runs there), and add the one sudoers line that lets the operator run
+  exactly that call as the seat user. Verify that the user cannot read Yu's
+  home, the gh token or `~/.hermes`, nor write the HALT directory or the
+  config, and record how the Keychain behaves after a reboot.
 - **S6. Gardener desk, halt herald and beacon drill** (Yu present). Run birth
   once on the Studio for the gardener desk, which creates the Commons
   project, and optionally once on the Air for the halt herald; both are

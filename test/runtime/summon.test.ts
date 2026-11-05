@@ -321,6 +321,9 @@ describe("summon", () => {
     // Summed as decimals: in floats 0.1 + 0.2 would be recorded as 0.30000000000000004.
     const exact = parseSummonResult(utf8(JSON.stringify(withUsage({ a: { ...entry, costUSD: 0.1 }, b: { ...entry, costUSD: 0.2 } }, { total_cost_usd: 0.3 }))));
     expect(exact.spend).toEqual({ usd: "0.3", usd_basis: "reported", credits: 0 });
+    // A small model's cost that claude summed in floats is still a measured cost: rounded up at 18 places, not unknown.
+    const noisy = parseSummonResult(utf8(JSON.stringify(withUsage({ main: { ...entry, costUSD: 0.05 }, aux: { ...entry, costUSD: 0.0034000000000000002 } }, { total_cost_usd: 0.0534 }))));
+    expect(noisy.spend).toEqual({ usd: "0.053400000000000001", usd_basis: "reported", credits: 0 });
 
     expect(() => parseSummonResult(utf8("Error: not json"))).toThrow(/not one JSON result/);
     expect(() => parseSummonResult(utf8(JSON.stringify({ type: "assistant" })))).toThrow(/not a result/);

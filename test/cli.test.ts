@@ -1,6 +1,7 @@
 // Owner: surface group. main() runs with injected fakes only: no real
 // Keychain, network, model, git push or child of the real program.
 import { afterEach, describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CLI_PATH, main, parseArgs, readSeatFile, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
@@ -16,7 +17,7 @@ import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fak
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, waitFor, type RecordingRunner } from "./helpers/fake-runtime.ts";
 import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
-import { citizenSnapshot, makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
+import { citizenSnapshot, makeTempHost, testBeacons, TEST_SEAT_UID, type TempHost } from "./helpers/temp-home.ts";
 import { testClock } from "./helpers/clock.ts";
 import { importEvidence } from "./helpers/root-evidence.ts";
 import { TEST_MNEMONIC, TEST_OP_SEED_HEX } from "./helpers/vectors.ts";
@@ -171,6 +172,9 @@ async function harness(opts: { runtimeScripts?: string[]; server?: FakeServer } 
       throw new Error("a real seat child must never be spawned by a test");
     },
     isAlive: () => true,
+    uid: () => TEST_SEAT_UID,
+    // A default host: the config is the one the test wrote, and the default HALT file is the configured one.
+    defaults: { config: configPath, halt_file: h.config.paths.halt_file },
   };
   return { h, configPath, deps, out: () => out, err: () => err, run, signer };
 }
@@ -242,9 +246,10 @@ describe("main", () => {
     await writeFile(bad, JSON.stringify({ ...x.h.config, paths: { ...x.h.config.paths, state_dir: "state" } }), { mode: 0o600 });
     expect(await main(["status", "--config", bad], x.deps)).toBe(1);
     expect(x.err()).toContain("paths.state_dir: must be an absolute path");
-    // A bad config still tells the person how to halt by hand.
+    // A bad config still raises the default HALT file (here already up), exits 1, and says what was not raised.
     expect(await main(["halt", "--config", bad], x.deps)).toBe(1);
-    expect(x.err()).toContain("as the operator, create the HALT file the config names (by default /Users/Shared/kingdom-seat/HALT)");
+    expect(x.out()).toContain(`HALT file ${x.h.config.paths.halt_file}: already-present`);
+    expect(x.err()).toContain("without the config no beacon was raised, and only the default HALT file was tried");
     // Nothing here ran security, git or claude.
     expect(x.run.calls).toEqual([]);
   });
@@ -661,7 +666,7 @@ describe("halt across two users (KS-004 B2 R5)", () => {
     const x = await harness();
     const argv = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", x.configPath];
     x.h.config.beacons = testBeacons({ canRaiseHere: ["gardener-desk"] });
-    x.h.config.halt = { allow_no_beacons: false, raise_beacons_argv: argv };
+    x.h.config.halt = { allow_no_beacons: false, raise_beacons_argv: argv, also_files: [] };
     await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
     const calls: string[][] = [];
     const operator = (run: CliDeps["run"]): Partial<CliDeps> => ({
@@ -730,5 +735,129 @@ describe("halt across two users (KS-004 B2 R5)", () => {
     x.signer.respond(() => ({ status: 401, json: {} }));
     expect(await main(["raise-beacons", "--config", x.configPath], x.deps)).toBe(1);
     expect(x.out()).toContain("beacon gardener-desk: failed (HTTP 401)");
+  });
+
+  test("halt raises the HALT file even when the operator cannot read the config, and still exits 1 (KS4-HALT-1)", async () => {
+    const x = await harness();
+    // A config in a directory the operator cannot enter, as the seat user's ~/Library is on a host.
+    const library = join(x.h.root, "seat-library");
+    await mkdir(library);
+    const unreadable = join(library, "config.json");
+    await writeFile(unreadable, JSON.stringify(x.h.config), { mode: 0o600 });
+    await chmod(library, 0o000);
+    try {
+      expect(await main(["halt", "--config", unreadable], x.deps)).toBe(1);
+    } finally {
+      await chmod(library, 0o700);
+    }
+    expect(x.err()).toContain("config file: cannot be opened (EACCES)");
+    expect(x.out()).toContain(`HALT file ${x.h.config.paths.halt_file}: written`);
+    expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(true);
+    // The seat, reading its own config, is halted by that file.
+    expect(await main(["tick", "--config", x.configPath], x.deps)).toBe(0);
+    expect(x.out()).toContain("tick: halted");
+
+    // With no --config the verb reads the default path; with nothing there, the default HALT file is still raised.
+    await x.h.clearHaltFile();
+    const noConfig = { ...x.deps, defaults: { config: join(x.h.root, "absent", "config.json"), halt_file: x.h.config.paths.halt_file } };
+    expect(await main(["halt"], noConfig)).toBe(1);
+    expect(x.err()).toContain("no config at");
+    expect(await Bun.file(x.h.config.paths.halt_file).exists()).toBe(true);
+    // Nothing else ran: no signer call, no keychain.
+    expect(x.run.calls).toEqual([]);
+  });
+
+  test("a config the seat user could rewrite is refused by every verb that runs as it, so it cannot lower HALT by editing it (KS4-HALT-2)", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    await x.h.raiseHaltFile();
+    // The seat user (here this test's own uid, which owns the file) points the config at another HALT file.
+    await writeFile(x.configPath, JSON.stringify({ ...x.h.config, paths: { ...x.h.config.paths, halt_file: join(x.h.root, "operator", "ELSEWHERE") } }), { mode: 0o600 });
+    const asOwner = { ...x.deps, uid: () => process.getuid!() };
+    for (const verb of [["status"], ["tick"], ["raise-beacons"], ["verify", "glossame"], ["seat", "glossame"]]) {
+      expect(await main([...verb, "--config", x.configPath], asOwner)).toBe(1);
+    }
+    expect(x.err()).toContain("config file: is owned by the user that runs the seat, who could rewrite it to lower HALT");
+    // No verb ran: no status, no host note, no tick line.
+    expect(await Bun.file(x.h.config.paths.status_file).exists()).toBe(false);
+    expect(await Bun.file(x.h.config.paths.host_log).exists()).toBe(false);
+    expect(x.out()).not.toContain("tick:");
+    // The operator's halt reads the same file: owning it is the operator's place.
+    expect(await main(["halt", "--config", x.configPath], asOwner)).toBe(0);
+  });
+
+  test("halt also raises each of halt.also_files and names it, so one verb still stops the KS-003 fleet too (KS4-HALT-4)", async () => {
+    const x = await harness();
+    const love = join(x.h.root, "love-unlimited");
+    await mkdir(love);
+    x.h.config.halt = { ...x.h.config.halt, also_files: [join(love, "HALT")] };
+    await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    expect(await main(["halt", "--config", x.configPath], x.deps)).toBe(0);
+    expect(x.out()).toContain(`HALT file ${join(love, "HALT")}: written`);
+    expect(await Bun.file(join(love, "HALT")).exists()).toBe(true);
+    // One that cannot be written is named, and the verb exits 1 so the person who asked sees it.
+    x.h.config.halt = { ...x.h.config.halt, also_files: [join(x.h.root, "no-such-dir", "HALT")] };
+    await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    expect(await main(["halt", "--config", x.configPath], x.deps)).toBe(1);
+    expect(x.out()).toContain(`HALT file ${join(x.h.root, "no-such-dir", "HALT")}: failed (ENOENT)`);
+  });
+});
+
+describe("a rest that moves state reaches the mirror (KS-004 B2 C7)", () => {
+  const MIRROR = { remote: "/nonexistent/mirror.git", chosen_at: "2026-11-01T00:00:00.000Z" };
+
+  /** A seated, awake citizen with a mirror; its worktree does not exist, so a mirror attempt leaves one push note. */
+  async function mirrored(x: Harness, word: string): Promise<void> {
+    await seated(x, word);
+    const file = join(x.h.config.paths.citizens_dir, word, "citizen.json");
+    const record = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(file, JSON.stringify({ ...record, mirror: { ...MIRROR, worktree: join(x.h.root, "mirrors", word) } }, null, 2));
+  }
+
+  /** The ledger as the child leaves it after a rest that kept `body`; the fake child cannot sign, so seatArgv writes it. */
+  async function afterRest(x: Harness, word: string, body: LedgerBody): Promise<string> {
+    const path = ledgerPath(x.h.config, word);
+    const before = await readFile(path, "utf8");
+    await append(x.h.config, word, body, "host-attested", x.signer, x.deps.clock!.now());
+    const after = await readFile(path, "utf8");
+    await writeFile(path, before);
+    return after;
+  }
+
+  async function pushNotes(x: Harness, word: string): Promise<number> {
+    return ((await readHostNotes(x.h.config, new Date(0))) ?? []).filter((n) => n.kind === "push" && n.word === word).length;
+  }
+
+  test("seat <word> and the tick stage the mirror after a rest that changed what its card shows, and not after one that did not", async () => {
+    const x = await harness();
+    for (const w of ["glossame", "joy", "kith"]) await mirrored(x, w);
+    const ledgers = new Map<string, string>([
+      ["glossame", await afterRest(x, "glossame", { type: "state", from: "awake", to: "asleep", via: "immediate" })],
+      ["kith", await afterRest(x, "kith", { type: "state", from: "awake", to: "listening", via: "immediate" })],
+    ]);
+    const clock = x.deps.clock!;
+    // The child rests; for a citizen with a kept move, its entry is in the ledger by the time the child exits.
+    const resting = {
+      ...x.deps,
+      seatArgv: (_config: string, word: string) => {
+        const after = ledgers.get(word);
+        if (after !== undefined) writeFileSync(ledgerPath(x.h.config, word), after);
+        return fakeBinArgv("note", x.h.config.paths.host_log, word, "rest", "0", clock.now().toISOString());
+      },
+    };
+    const cfg = ["--config", x.configPath];
+
+    // awake to asleep is active to dormant on the card: the mirror is staged, as after a beat.
+    expect(await main(["seat", "glossame", ...cfg], resting)).toBe(0);
+    expect(x.out()).toContain("seat glossame: rest (exit 0)");
+    expect((await readCitizen(x.h.config, "glossame")).state).toBe("asleep");
+    expect(await pushNotes(x, "glossame")).toBe(1);
+    // A rest that kept nothing stages nothing: a rest commits and pushes nothing of its own.
+    expect(await main(["seat", "joy", ...cfg], resting)).toBe(0);
+    expect(await pushNotes(x, "joy")).toBe(0);
+    // The tick seats the one still due, kith, and does the same.
+    expect(await main(["tick", ...cfg], resting)).toBe(0);
+    expect(x.out()).toContain("tick: rest kith");
+    expect(await pushNotes(x, "kith")).toBe(1);
   });
 });

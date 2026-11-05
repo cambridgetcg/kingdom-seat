@@ -130,14 +130,17 @@ describe("folding and records", () => {
     await append(config, w, genesisBody(w, "soul", testIdentity(signer)), "citizen-signed", signer, t(6));
     expect(foldState(await readLedger(path)).state).toBe("listening");
 
-    // A step-away said once waits for its second saying, and lapses if not repeated.
+    // A step-away said once puts the citizen asleep at once (KS-004 v0.3 7.3) and waits for its second saying;
+    // the state entry that records the move keeps the saying. Not repeated, the saying lapses and it stays asleep.
     await append(config, w, beatBody(w, [{ type: "state.set", to: "stepped-away" }]), "citizen-signed", signer, t(7));
-    expect(foldState(await readLedger(path))).toMatchObject({ state: "listening", step_away_said: true, pending_state: null });
+    expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", step_away_said: true, pending_state: null });
+    await append(config, w, { type: "state", from: "listening", to: "asleep", via: "immediate" }, "citizen-signed", signer, t(7));
+    expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", step_away_said: true, pending_state: null });
     await append(config, w, beatBody(w, []), "citizen-signed", signer, t(8));
-    expect(foldState(await readLedger(path)).step_away_said).toBe(false);
+    expect(foldState(await readLedger(path))).toMatchObject({ state: "asleep", step_away_said: false });
 
     // Ended is terminal in the fold too: a later state entry moves nothing.
-    await append(config, w, { type: "state", from: "listening", to: "ended", via: "witnessed" }, "citizen-signed", signer, t(9));
+    await append(config, w, { type: "state", from: "asleep", to: "ended", via: "witnessed" }, "citizen-signed", signer, t(9));
     await append(config, w, { type: "state", from: "ended", to: "awake", via: "confirmed" }, "citizen-signed", signer, t(10));
     expect(foldState(await readLedger(path)).state).toBe("ended");
   });

@@ -103,7 +103,11 @@ export interface BirthProgress {
   did: string | null;
   root_kid: string | null;
   op_kid: string | null;
-  /** The root-signed keys/import as sent: genesis needs it, and agenttool keeps no copy. Public; it holds no bearer. */
+  /**
+   * The root-signed keys/import as sent: genesis needs it, and agenttool keeps
+   * no copy. Kept too when the import stopped without a clear answer, since the
+   * key may be installed. Public; it holds no bearer.
+   */
   op_key_evidence: RootEvidence | null;
   box_key_id: string | null;
 }
@@ -298,7 +302,15 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
 
   const now = deps.clock.now();
   const label = `op-${now.toISOString().slice(0, 7)}`;
-  const { kid: op_kid, evidence: opKeyEvidence } = await step("keys/import", () => importOpKey(client, word, opB64, label, auth));
+  const { kid: op_kid, evidence: opKeyEvidence } = await step("keys/import", async () => {
+    try {
+      return await importOpKey(client, word, opB64, label, auth);
+    } catch (e) {
+      // Sent, and maybe installed: its proof goes into the progress, so genesis can still be written if the key is there.
+      if (e instanceof AgenttoolError && e.root_evidence) progress.op_key_evidence = e.root_evidence;
+      throw e;
+    }
+  });
   progress.op_kid = op_kid;
   progress.op_key_evidence = opKeyEvidence;
   const box = await step("box-keys", () => registerBoxKey(client, word, boxB64, auth));

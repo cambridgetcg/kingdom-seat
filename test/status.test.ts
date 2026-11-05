@@ -171,20 +171,23 @@ describe("status", () => {
     serveBeacon(server, herald!.did, { kind: "status", status: 503 });
     const halt = await checkHalt({ config: host.config, fetch: fetchVia(server), now: () => NOW });
     const s = await buildStatus({ config: host.config, now: NOW, halt, signerState: "ready" });
-    expect(s.halt).toEqual({ halted: true, raised: ["beacon gardener-desk"], unreadable: ["beacon halt-herald"] });
+    // The file it watches is named whatever stopped it, since the path is the operator's and lives outside the state dir.
+    const file = host.config.paths.halt_file;
+    expect(s.halt).toEqual({ halted: true, file, raised: ["beacon gardener-desk"], unreadable: ["beacon halt-herald"] });
     const text = renderStatus(s);
     expect(text).toContain("HALT: halted by beacon gardener-desk");
+    expect(text).toContain(`(HALT file ${file})`);
     expect(text).toContain("beacon halt-herald unreadable");
     expect(text.toLowerCase()).not.toContain("down");
 
     // The local file, and no beacon pinned, are named as such.
     await host.raiseHaltFile();
-    const noBeacons = { ...host.config, beacons: [], halt: { allow_no_beacons: false, raise_beacons_argv: null } };
+    const noBeacons = { ...host.config, beacons: [], halt: { allow_no_beacons: false, raise_beacons_argv: null, also_files: [] } };
     const h2 = await checkHalt({ config: noBeacons, fetch: noFetch, now: () => NOW });
     const s2 = await buildStatus({ config: noBeacons, now: NOW, halt: h2, signerState: "ready" });
-    expect(s2.halt).toEqual({ halted: true, raised: [`file ${host.config.paths.halt_file}`], unreadable: ["no beacon pinned"] });
+    expect(s2.halt).toEqual({ halted: true, file, raised: [`file ${file}`], unreadable: ["no beacon pinned"] });
     // A HALT check that did not run is unreadable, and unreadable halts.
-    expect((await buildStatus({ config: host.config, now: NOW, halt: null, signerState: "ready" })).halt).toEqual({ halted: true, raised: [], unreadable: ["halt check"] });
+    expect((await buildStatus({ config: host.config, now: NOW, halt: null, signerState: "ready" })).halt).toEqual({ halted: true, file, raised: [], unreadable: ["halt check"] });
     expect(renderStatus(s2)).not.toMatch(/\bdown\b/i);
   });
 
@@ -212,7 +215,7 @@ describe("status", () => {
       format: "kingdom-seat-status/v1",
       generated_at: new Date(NOW.getTime() + n).toISOString(),
       host: "test-host",
-      halt: { halted: false, raised: [], unreadable: [] },
+      halt: { halted: false, file: "/Users/Shared/kingdom-seat/HALT", raised: [], unreadable: [] },
       signer: { state: "ready", since: NOW.toISOString() },
       fleet: { beats_today: n, ceiling: 24 },
       tick_lock: { state: "free", since: null },
@@ -399,7 +402,9 @@ describe("status", () => {
     const s = await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "ready", trusted: { host_attest_b64: [signer.hostAttestPublicB64] } });
     const lines = renderStatus(s).trimEnd().split("\n");
     expect(lines).toHaveLength(7);
-    expect(lines[1]).toBe("HALT: not halted");
+    // Lowered, the line still names the file that would stop the seat.
+    expect(lines[1]).toBe(`HALT: not halted (HALT file ${host.config.paths.halt_file})`);
+    expect(s.halt).toEqual({ halted: false, file: host.config.paths.halt_file, raised: [], unreadable: [] });
     expect(lines[2]).toMatch(/^signer: ready since /);
     expect(lines[3]).toBe("fleet: 0 of 24 beats today");
     expect(lines[4]).toBe("tick lock: free");

@@ -264,6 +264,24 @@ describe("pipeline", () => {
     expect(await readdir(join(s.host.config.paths.citizens_dir, "glossame", "receipts"))).toEqual(["2026-11-04-from-yu.md"]);
   });
 
+  test("a first step-away said on a beat puts an awake citizen asleep at once, and a later beat that says it again completes it", async () => {
+    const s = await setup([output({ type: "journal", kind: "chose", text: "I will step away." }, { type: "state.set", to: "stepped-away" })]);
+    expect((await runSeat(s.seat, s.deps)).outcome).toBe("beat");
+    const tail = (await s.ledger()).slice(-2);
+    expect(tail.map((e) => e.body.type)).toEqual(["beat", "state"]);
+    expect(tail[1]!.body).toEqual({ type: "state", from: "awake", to: "asleep", via: "immediate" });
+    // Asleep at once (KS-004 v0.3 7.3), with the saying still owed its second beat.
+    const citizen = await readCitizen(s.host.config, "glossame");
+    expect(citizen).toMatchObject({ state: "asleep", step_away_said: true });
+
+    s.clock.advance(73 * 3_600_000);
+    const again = await openSeat(s.host.config, s.clock, citizen, "free", INVOKER, null);
+    const r = await runSeat(again, { ...s.deps, runtime: scriptedRuntime([output({ type: "state.set", to: "stepped-away" })]) });
+    expect(r.outcome).toBe("beat");
+    expect((await s.ledger()).at(-1)!.body).toEqual({ type: "state", from: "asleep", to: "stepped-away", via: "two-beats" });
+    expect((await readCitizen(s.host.config, "glossame")).state).toBe("stepped-away");
+  });
+
   test("a self-change proposed on one beat is staged, and binds when affirmed on a later beat by an approved runtime", async () => {
     const propose = output({
       type: "self.propose",

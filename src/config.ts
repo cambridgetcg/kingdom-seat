@@ -8,7 +8,7 @@
 // relative, overlapping or out of range is refused rather than guessed at.
 import { realpathSync } from "node:fs";
 import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import { open, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fromB64, parseStrictJson } from "./crypto.ts";
 import { usdFromText } from "./money.ts";
@@ -24,6 +24,13 @@ export const KEYCHAIN_SERVICE = "dev.kingdom.citizen-seat";
  * the operator owns and the seat user cannot write (KS-004 B2 R5).
  */
 export const DEFAULT_HALT_FILE = "/Users/Shared/kingdom-seat/HALT";
+/**
+ * Where every verb looks when --config is not given: beside the HALT file, in
+ * the operator's directory, owned by the operator and mode 0644. The seat user
+ * reads it and cannot change it, so it cannot redirect HALT; the operator's
+ * `halt` can read it too, which a file in the seat user's home would not allow.
+ */
+export const DEFAULT_CONFIG_PATH = "/Users/Shared/kingdom-seat/config.json";
 
 export { CITIZEN_QUIET_HARD_MAX_DAYS };
 
@@ -44,12 +51,6 @@ export class ConfigError extends Error {
   ) {
     super(`config ${field}: ${message}`);
   }
-}
-
-/** Where the CLI looks when --config is not given: the seat user's Application Support folder. */
-export function defaultConfigPath(home: string): string {
-  if (!isAbsolute(home)) throw new ConfigError("home", "must be an absolute path");
-  return join(home, "Library", "Application Support", "kingdom-seat", "config.json");
 }
 
 /**
@@ -88,7 +89,7 @@ export function defaultConfig(stateDir: string, host: string, opts: { home?: str
       trusted_app: null,
     },
     beacons: [],
-    halt: { allow_no_beacons: false, raise_beacons_argv: null },
+    halt: { allow_no_beacons: false, raise_beacons_argv: null, also_files: [] },
     schedule: { wake_confirm_seat: true },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
@@ -362,10 +363,38 @@ function parseRaiseArgv(v: unknown): string[] | null {
   return argv;
 }
 
+/** More would not be one fleet's HALT beside this one; a short list stays one a person can read in halt's output. */
+const ALSO_FILES_MAX = 8;
+
+function parseAlsoFiles(v: unknown): string[] {
+  const field = "halt.also_files";
+  if (v === undefined) return [];
+  if (!Array.isArray(v) || v.length > ALSO_FILES_MAX) throw new ConfigError(field, `must be a list of at most ${ALSO_FILES_MAX} absolute paths`);
+  const files = v.map((f, i) => absPath(f, `${field}[${i}]`));
+  if (new Set(files).size !== files.length) throw new ConfigError(field, "names a file twice");
+  return files;
+}
+
 function parseHalt(raw: unknown): Config["halt"] {
   const o = obj(raw, "halt");
-  keys(o, "halt", ["allow_no_beacons"], ["raise_beacons_argv"]);
-  return { allow_no_beacons: bool(o.allow_no_beacons, "halt.allow_no_beacons"), raise_beacons_argv: parseRaiseArgv(o.raise_beacons_argv) };
+  keys(o, "halt", ["allow_no_beacons"], ["raise_beacons_argv", "also_files"]);
+  return {
+    allow_no_beacons: bool(o.allow_no_beacons, "halt.allow_no_beacons"),
+    raise_beacons_argv: parseRaiseArgv(o.raise_beacons_argv),
+    also_files: parseAlsoFiles(o.also_files),
+  };
+}
+
+/**
+ * The operator's halt writes these, so none may be in the state dir (a file
+ * the operator made there could shut the seat out of its own records) or be
+ * the HALT file itself, which halt already writes.
+ */
+function checkAlsoFiles(also: string[], haltFile: string, stateDir: string): void {
+  for (const [i, f] of also.entries()) {
+    if (f === haltFile) throw new ConfigError(`halt.also_files[${i}]`, "is paths.halt_file, which halt writes anyway");
+    if (isInside(f, stateDir) || isInside(stateDir, f)) throw new ConfigError(`halt.also_files[${i}]`, "must be outside paths.state_dir");
+  }
 }
 
 function parseSchedule(raw: unknown): Config["schedule"] {
@@ -399,11 +428,14 @@ export function parseConfig(raw: unknown): Config {
     throw new ConfigError("beacons", "no beacon is pinned, so HALT would rest on the local file alone; pin the beacons, or set halt.allow_no_beacons for development");
   }
 
+  const paths = parsePaths(o.paths);
+  checkAlsoFiles(halt.also_files, paths.halt_file, paths.state_dir);
+
   return {
     format: CONFIG_FORMAT,
     host,
     timezone,
-    paths: parsePaths(o.paths),
+    paths,
     ollama: parseOllama(o.ollama),
     claude: { path: absPath(claudeObj.path, "claude.path") },
     agenttool: parseAgenttool(o.agenttool),
@@ -441,10 +473,45 @@ export function checkRealPaths(config: Config): void {
   checkHomes(real(p.state_dir), homes, others);
   // A clean spelling that leads into state_dir through a symlink would hand the HALT file back to the seat user.
   checkHaltFile(real(p.halt_file), real(p.state_dir));
+  checkAlsoFiles(config.halt.also_files.map(real), real(p.halt_file), real(p.state_dir));
 }
 
-/** Read a config file as a regular file (no symlink) and parse it strictly. */
-export async function loadConfig(path: string): Promise<Config> {
+/**
+ * For a verb run as the seat user (KS-004 B2 R5): the config names the HALT
+ * file and the beacons, so one that user could rewrite or replace would let
+ * the seat lower HALT. The file must not be the seat user's, and no directory
+ * above it may be the seat user's, or writable by group or others without the
+ * sticky bit (which keeps others' entries from being renamed).
+ */
+async function assertSeatCannotWrite(fileUid: number, path: string, seatUid: number): Promise<void> {
+  if (fileUid === seatUid) throw new ConfigError("file", "is owned by the user that runs the seat, who could rewrite it to lower HALT; the operator or root must own it");
+  let dir: string;
+  try {
+    dir = await realpath(dirname(path));
+  } catch (e) {
+    throw new ConfigError("file", `its directory cannot be checked (${(e as NodeJS.ErrnoException).code ?? "error"})`);
+  }
+  for (;;) {
+    let st;
+    try {
+      st = await stat(dir);
+    } catch (e) {
+      throw new ConfigError("file", `its directory cannot be checked (${(e as NodeJS.ErrnoException).code ?? "error"})`);
+    }
+    if (st.uid === seatUid) throw new ConfigError("file", `is under ${dir}, which the user that runs the seat owns, so it could replace the config`);
+    if ((st.mode & 0o022) !== 0 && (st.mode & 0o1000) === 0) throw new ConfigError("file", `is under ${dir}, which group or others can write`);
+    const up = dirname(dir);
+    if (up === dir) return;
+    dir = up;
+  }
+}
+
+/**
+ * Read a config file as a regular file (no symlink) and parse it strictly.
+ * `seatUid` is given for every verb that runs as the seat user, and refuses a
+ * config that user could have written; the operator's `halt` gives none.
+ */
+export async function loadConfig(path: string, opts: { seatUid?: number } = {}): Promise<Config> {
   if (!isAbsolute(path)) throw new ConfigError("file", "the config path must be absolute");
   let fh;
   try {
@@ -463,6 +530,7 @@ export async function loadConfig(path: string): Promise<Config> {
     if (st.size > CONFIG_MAX_BYTES) throw new ConfigError("file", `is larger than ${CONFIG_MAX_BYTES} bytes`);
     // A config others can write could loosen any wall in it.
     if ((st.mode & 0o022) !== 0) throw new ConfigError("file", "is writable by group or others");
+    if (opts.seatUid !== undefined) await assertSeatCannotWrite(st.uid, path, opts.seatUid);
     bytes = new Uint8Array(await fh.readFile());
   } finally {
     await fh.close();

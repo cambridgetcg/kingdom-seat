@@ -87,7 +87,9 @@ export function decideTransition(from: LifecycleState, to: LifecycleState, ctx: 
  * separate `state` entry written after it: rest never waits (3.3), and a seat
  * stopped between the two appends must not leave a citizen that chose rest
  * awake and scheduled again. The `state` entry still follows, as the plain
- * record of the move.
+ * record of the move. A first step-away is such a move too: its saying puts
+ * an awake or listening citizen asleep at once, and the saying stays owed its
+ * second beat (KS-004 v0.3 7.3).
  */
 export function foldState(entries: LedgerEntry[]): FoldedState {
   let state: LifecycleState = "asleep";
@@ -113,6 +115,9 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
         if (body.initial_state !== null) state = body.initial_state;
         break;
       case "state":
+        // The plain record of a move the saying before it already made changes nothing more, so a first
+        // step-away recorded as awake to asleep keeps the saying it still owes a second beat.
+        if (body.to === state) break;
         state = body.to;
         pending = null;
         stepSaid = false;
@@ -132,6 +137,7 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
           else p = act.to;
         }
         if (rest !== null) state = rest;
+        else if (s && isTowardRest(state, "asleep")) state = "asleep";
         pending = p;
         stepSaid = s;
         said = p !== null || s ? { seat_id: body.envelope.seat_ref.seat_id, ts: e.ts } : null;
@@ -140,6 +146,7 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
       case "step-away.said":
         // A rest that said step-away once: the same saying a beat would carry, and nothing else said with it.
         if (state !== "stepped-away") {
+          if (isTowardRest(state, "asleep")) state = "asleep";
           pending = null;
           stepSaid = true;
           said = { seat_id: body.seat_id, ts: e.ts };

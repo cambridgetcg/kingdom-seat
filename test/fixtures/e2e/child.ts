@@ -6,7 +6,7 @@
 // stands in for agenttool's beacons and for Ollama. Nothing else runs.
 import { main } from "../../../src/cli.ts";
 import { fetchViaUrl } from "../../helpers/fake-server.ts";
-import { e2eKeychain, readScenario } from "./host.ts";
+import { E2E_SEAT_UID, e2eKeychain, readScenario } from "./host.ts";
 
 const argv = Bun.argv.slice(2);
 const at = argv.indexOf("--config");
@@ -29,5 +29,7 @@ const exit = await main(argv, {
     throw new Error("e2e child: no command may run in a seat");
   },
   out: (t) => void process.stdout.write(t),
+  uid: () => E2E_SEAT_UID,
+  defaults: { config: configPath, halt_file: "/nonexistent/e2e-child-must-not-fall-back/HALT" },
 });
 process.exit(exit);

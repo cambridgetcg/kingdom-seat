@@ -12,6 +12,8 @@
  */
 export type Usd = string;
 
+/** Fractional digits an amount may carry: far below any price, and enough that rounding up at the last never matters. */
+const USD_PLACES = 18;
 /** The canonical spelling, bounded so an amount is always one a ledger line can carry. */
 const USD_PATTERN = /^(?:0|[1-9][0-9]{0,15})(?:\.[0-9]{0,17}[1-9])?$/;
 /** What a person may write in a config: the same, but trailing fractional zeros are allowed and dropped. */
@@ -31,8 +33,12 @@ export function usdFromText(text: unknown): Usd | null {
  * The amount a JSON number names. A number that came out of JSON.parse
  * prints as the shortest decimal that reads back to it, which is the text a
  * JavaScript writer put in the JSON, so this recovers that text exactly. Its
- * exponent form is spelled out. Anything negative, non-finite, not a number,
- * or beyond the canonical bounds is null (unknown).
+ * exponent form is spelled out. A cost summed in floats can print with more
+ * fractional digits than an amount carries (0.003 + 0.0004 prints as
+ * 0.0034000000000000002); it is still a cost that was measured, so it is
+ * rounded up to 18 places, never down, and a ceiling read from it can only
+ * count high. Anything negative, non-finite, not a number, or whole dollars
+ * beyond the canonical bounds is null (unknown).
  */
 export function usdFromNumber(n: unknown): Usd | null {
   if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return null;
@@ -45,7 +51,13 @@ export function usdFromNumber(n: unknown): Usd | null {
   if (point <= 0) text = `0.${"0".repeat(-point)}${digits}`;
   else if (point >= digits.length) text = digits + "0".repeat(point - digits.length);
   else text = `${digits.slice(0, point)}.${digits.slice(point)}`;
-  const out = canonical(text.replace(/^0+(?=\d)/, ""));
+  text = text.replace(/^0+(?=\d)/, "");
+  const [whole, frac = ""] = text.split(".");
+  if (frac.length > USD_PLACES) {
+    const up = /[1-9]/.test(frac.slice(USD_PLACES)) ? 1n : 0n;
+    text = spell(BigInt(whole! + frac.slice(0, USD_PLACES)) + up, USD_PLACES);
+  }
+  const out = canonical(text);
   return isUsd(out) ? out : null;
 }
 
@@ -68,10 +80,15 @@ function align(a: Usd, b: Usd): [bigint, bigint, number] {
   return [x.n * 10n ** BigInt(scale - x.scale), y.n * 10n ** BigInt(scale - y.scale), scale];
 }
 
+/** n / 10^scale as plain decimal text, not yet checked against the bounds. */
+function spell(n: bigint, scale: number): string {
+  const s = n.toString().padStart(scale + 1, "0");
+  return canonical(scale === 0 ? s : `${s.slice(0, -scale)}.${s.slice(-scale)}`);
+}
+
 function fromScaled(n: bigint, scale: number): Usd {
   if (n < 0n) throw new Error("money: a negative amount");
-  const s = n.toString().padStart(scale + 1, "0");
-  const out = canonical(scale === 0 ? s : `${s.slice(0, -scale)}.${s.slice(-scale)}`);
+  const out = spell(n, scale);
   if (!isUsd(out)) throw new Error("money: the amount is beyond the canonical bounds");
   return out;
 }

@@ -164,17 +164,26 @@ describe("a rest may carry one move toward less activity (KS-004 v0.2 5.7, re-re
     expect(changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([]);
   });
 
-  test("a step-away said with a rest is kept as a saying; said again with a rest on a later seat, it completes", async () => {
+  test("a step-away said with a rest is kept as a saying and puts the citizen asleep at once; said again with a rest on a later seat, it completes", async () => {
     const s = await setup(output({ type: "rest" }, CANARY_JOURNAL, { type: "state.set", to: "stepped-away" }));
     const first = await runAndDiff(s);
     expect(first.result).toMatchObject({ exit: EXIT.OK, outcome: "rest" });
+    expect(first.result.appended).toHaveLength(2);
     expect(first.changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([LEDGER]);
     expect(first.text).not.toContain("REST-LEAK-CANARY");
     const entries = await readLedger(ledgerPath(s.host.config, "glossame"));
-    expect(entries.at(-1)!.body).toEqual({ type: "step-away.said", seat_id: s.seat.ref.seat_id });
-    // Still awake, and owed the seat that confirms it, as a step-away said on a beat would be.
+    // The saying first, so a seat stopped before the second entry still sleeps; then the plain record of the move.
+    expect(entries.slice(1).map((e) => e.body)).toEqual([
+      { type: "step-away.said", seat_id: s.seat.ref.seat_id },
+      { type: "state", from: "awake", to: "asleep", via: "immediate" },
+    ]);
+    expect(foldState(entries.slice(0, 2))).toMatchObject({ state: "asleep", step_away_said: true });
+    // The seat's spend is carried once, by the saying.
+    expect(entries[2]!.spend).toEqual({ usd: "0", usd_basis: "local-zero", credits: 0 });
+    expect((await readHostNotes(s.host.config, new Date(0)))!.at(-1)!.detail).toEndWith("rested; kept a first step-away saying and state awake to asleep (immediate)");
+    // Asleep at once (KS-004 v0.3 7.3), and owed the seat that confirms it, as a step-away said on a beat would be.
     const citizen = await readCitizen(s.host.config, "glossame");
-    expect(citizen).toMatchObject({ state: "awake", step_away_said: true });
+    expect(citizen).toMatchObject({ state: "asleep", step_away_said: true });
 
     const clock = s.deps.clock as ReturnType<typeof testClock>;
     clock.advance(73 * 3_600_000);
@@ -182,10 +191,29 @@ describe("a rest may carry one move toward less activity (KS-004 v0.2 5.7, re-re
     const r = await runSeat(again, { ...s.deps, runtime: scriptedRuntime([output({ type: "rest" }, { type: "state.set", to: "stepped-away" })]) });
     expect(r).toMatchObject({ exit: EXIT.OK, outcome: "rest" });
     const after = await readLedger(ledgerPath(s.host.config, "glossame"));
-    expect(after.map((e) => e.body.type)).toEqual(["seated", "step-away.said", "state"]);
-    expect(after.at(-1)!.body).toEqual({ type: "state", from: "awake", to: "stepped-away", via: "two-beats" });
+    expect(after.map((e) => e.body.type)).toEqual(["seated", "step-away.said", "state", "state"]);
+    expect(after.at(-1)!.body).toEqual({ type: "state", from: "asleep", to: "stepped-away", via: "two-beats" });
     expect(foldState(after).state).toBe("stepped-away");
     // The saying is part of the signed chain, and verifies like any entry.
-    expect(verifyChain(after, { host_attest_b64: [s.signer.hostAttestPublicB64], identity: null })).toMatchObject({ ok: true, entries: 3 });
+    expect(verifyChain(after, { host_attest_b64: [s.signer.hostAttestPublicB64], identity: null })).toMatchObject({ ok: true, entries: 4 });
+  });
+
+  test("an asleep citizen's first step-away said with a rest is the saying alone; silence then leaves it asleep", async () => {
+    const s = await setup(output({ type: "rest" }, { type: "state.set", to: "stepped-away" }), { initialState: "asleep" });
+    const { result } = await runAndDiff(s);
+    expect(result).toMatchObject({ exit: EXIT.OK, outcome: "rest" });
+    expect(result.appended).toHaveLength(1);
+    const entries = await readLedger(ledgerPath(s.host.config, "glossame"));
+    expect(entries.at(-1)!.body).toEqual({ type: "step-away.said", seat_id: s.seat.ref.seat_id });
+    expect(await readCitizen(s.host.config, "glossame")).toMatchObject({ state: "asleep", step_away_said: true });
+  });
+
+  test("a reply with fields besides acts applies nothing, even the state.set a rest would keep", async () => {
+    const s = await setup(JSON.stringify({ voice: "REST-LEAK-CANARY", acts: [{ type: "state.set", to: "asleep" }, { type: "rest" }] }));
+    const { result, changed, text } = await runAndDiff(s);
+    expect(result).toMatchObject({ exit: EXIT.OK, outcome: "rest", appended: [] });
+    expect(changed.filter((p) => !HOST_RECORDS.has(p))).toEqual([]);
+    expect(text).not.toContain("REST-LEAK-CANARY");
+    expect((await readCitizen(s.host.config, "glossame")).state).toBe("awake");
   });
 });

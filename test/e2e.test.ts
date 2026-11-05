@@ -25,7 +25,7 @@ import { fetchVia, serveBeacon, serveOllama, startFakeServer, type FakeServer } 
 import { makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
 import { HOUR_MS, testClock, type TestClock } from "./helpers/clock.ts";
 import { TEST_ROOT_PUBLIC_B64 } from "./helpers/vectors.ts";
-import { E2E_CHILD, E2E_HOST_SEED, e2eKeychain, scenarioPath } from "./fixtures/e2e/host.ts";
+import { E2E_CHILD, E2E_HOST_SEED, E2E_SEAT_UID, e2eKeychain, scenarioPath } from "./fixtures/e2e/host.ts";
 
 const WORD = "glossame";
 const MODEL = "qwen2.5:7b";
@@ -101,6 +101,8 @@ beforeAll(async () => {
     tty: { isTTY: false, write: () => {}, readLine: async () => null },
     keychain: () => kc,
     seatArgv: (config, word, extra) => [process.execPath, E2E_CHILD, "seat", word, "--child", ...extra, "--config", config],
+    uid: () => E2E_SEAT_UID,
+    defaults: { config: configPath, halt_file: h.config.paths.halt_file },
   };
 
   // Seated before registered (3.3): the first entry is host-attested by the real signer.
@@ -219,7 +221,7 @@ describe("end to end: one citizen on one host", () => {
       expect(JSON.stringify(ns)).not.toContain("SHADOW today");
 
       const s = await status();
-      expect(s.halt).toEqual({ halted: false, raised: [], unreadable: [] });
+      expect(s.halt).toEqual({ halted: false, file: w.h.config.paths.halt_file, raised: [], unreadable: [] });
       expect(s.signer.state).toBe("ready");
       expect(s.fleet).toEqual({ beats_today: 1, ceiling: 24 });
       expect(s.citizens).toHaveLength(1);

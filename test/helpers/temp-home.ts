@@ -78,6 +78,12 @@ export function longSoul(word: Word): string {
 }
 
 export const TEST_HALT_FILE = "HALT";
+/**
+ * The uid a test's seat-side verbs claim to run as (CliDeps.uid). Every file a
+ * test writes is owned by the test's own user, which stands in for the
+ * operator, so the seat must be someone else, as on a host (KS-004 B2 R5).
+ */
+export const TEST_SEAT_UID = 4_000_000_001;
 /** The operator's directory beside the state dir: the HALT file lives here, never under state_dir (KS-004 B2 R5). */
 export const TEST_OPERATOR_DIR = "operator";
 
@@ -127,7 +133,7 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
     agenttool: { origin: "https://api.agenttool.dev", project_id: null },
     keychain: { path: join(root, "fake.keychain-db"), service: "dev.kingdom.citizen-seat.test", security_path: "/usr/bin/security", trusted_app: null },
     beacons: opts.beacons ?? [],
-    halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined), raise_beacons_argv: null },
+    halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined), raise_beacons_argv: null, also_files: [] },
     schedule: { wake_confirm_seat: true },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },

@@ -353,7 +353,7 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
   const refusal = own?.refusal ?? null;
   const how = sup.stopped_by ? `, stopped by ${sup.stopped_by}` : "";
   await note(outcome, word, refusal, `seat ${id} for ${word} (${verdict.why}): exit ${exit}${how}, ${sup.duration_ms} ms`);
-  return done({ exit, outcome, word, seat: { exit, outcome, seat_ref: seat.ref, refusal, appended: [] } });
+  return done({ exit, outcome, word, seat: { exit, outcome, seat_ref: seat.ref, refusal, appended: [] }, state_before: citizen.state });
 }
 
 async function refresh(deps: TickDeps): Promise<void> {

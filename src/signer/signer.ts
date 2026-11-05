@@ -116,8 +116,9 @@ export interface SignerResponse {
   json: unknown;
   /**
    * For a root-signed request, the request exactly as sent, whatever the
-   * answer. agenttool keeps no copy of a proof, so this is what a ledger entry
-   * carries to show the root authorised an op key (KS-004 re-review B2, R4).
+   * answer; with no answer, SignerSentUncertain carries it instead. agenttool
+   * keeps no copy of a proof, so this is what a ledger entry carries to show
+   * the root authorised an op key (KS-004 re-review B2, R4).
    */
   root_evidence?: RootEvidence;
 }
@@ -159,6 +160,22 @@ export class SignerNotSent extends Error {
   constructor(
     readonly code: "authority-read-failed" | "not-sent",
     message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * A root-signed act left the host and no answer was read back, so it may have
+ * landed. It carries the request as sent: agenttool keeps no copy of a proof,
+ * so if the act turns out to have landed (an op key installed), this copy is
+ * the only evidence a ledger entry can carry for it.
+ */
+export class SignerSentUncertain extends Error {
+  override readonly name = "SignerSentUncertain";
+  constructor(
+    message: string,
+    readonly root_evidence: RootEvidence,
   ) {
     super(message);
   }
@@ -801,7 +818,13 @@ export function createSigner(deps: SignerDeps): Signer {
       };
       base.Authorization = bearer;
       // Never retried here: after an uncertain result the caller re-reads the sequence (agenttool-wire.md 2).
-      return { ...(await http(req.method, req.target, base, req.body)), root_evidence: evidence };
+      let res: SignerResponse;
+      try {
+        res = await http(req.method, req.target, base, req.body);
+      } catch {
+        throw new SignerSentUncertain(`signer: ${req.method} ${req.target} did not complete; it may have reached agenttool`, evidence);
+      }
+      return { ...res, root_evidence: evidence };
     });
   }
 

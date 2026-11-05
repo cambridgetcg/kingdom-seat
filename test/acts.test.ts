@@ -116,18 +116,22 @@ describe("validation", () => {
   });
 
   test("a rest carries the one state its reply names, whatever else it said; a malformed or contradictory state.set carries none", () => {
-    // Kept from wherever it sits, with every other act dropped without its text; even beside stray fields.
-    const r = run(JSON.stringify({ voice: CANARY, acts: [{ type: "journal", kind: "chose", text: CANARY }, { type: "state.set", to: "asleep" }, { type: "rest" }] }));
-    expect(r).toEqual({
+    // Kept from wherever it sits, with every other act dropped without its text.
+    const r = run(output({ type: "journal", kind: "chose", text: CANARY }, { type: "state.set", to: "asleep" }, { type: "rest" }));
+    expect(r).toEqual({ rest: true, acts: [], rest_state: "asleep", dropped: [{ index: 0, type: "journal", reason: "rest is exclusive" }] });
+    expect(JSON.stringify(r)).not.toContain(CANARY);
+    // Beside stray fields the output fails validation, which applies nothing (KS-004 5.8): still a rest, with no state.
+    const stray = run(JSON.stringify({ voice: CANARY, acts: [{ type: "journal", kind: "chose", text: CANARY }, { type: "state.set", to: "asleep" }, { type: "rest" }] }));
+    expect(stray).toEqual({
       rest: true,
       acts: [],
-      rest_state: "asleep",
       dropped: [
         { index: -1, type: null, reason: "output has fields other than acts" },
-        { index: 0, type: "journal", reason: "rest is exclusive" },
+        { index: 0, type: "journal", reason: "output is malformed" },
+        { index: 1, type: "state.set", reason: "output is malformed" },
       ],
     });
-    expect(JSON.stringify(r)).not.toContain(CANARY);
+    expect(JSON.stringify(stray)).not.toContain(CANARY);
     // The same state twice is one saying; two different states move nothing, as on any beat.
     expect(run(output({ type: "rest" }, { type: "state.set", to: "listening" }, { type: "state.set", to: "listening" }))).toEqual({
       rest: true,

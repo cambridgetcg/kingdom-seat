@@ -14,6 +14,7 @@ import {
   CITIZEN_QUIET_EXTENT,
   HOST_ATTEST_KID,
   SignerNotSent,
+  SignerSentUncertain,
   createSigner,
   verifyEntrySignature,
   type Signer,
@@ -617,6 +618,54 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     expect(rootEvidenceProblem(revoke.root_evidence!, GLOSSAME_IDENTITY, { kind: "revoke", kid: OP_KID })).toBeNull();
     const read = await fx.signer.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` }));
     expect(read.root_evidence).toBeUndefined();
+  });
+
+  test("a root-signed request that left the host without an answer keeps its proof: the key may be installed, and agenttool keeps no copy", async () => {
+    const via = fetchVia(fx.server);
+    let answer: "lost" | "500" = "lost";
+    const flaky: typeof via = async (input, init) => {
+      const res = await via(input, init);
+      if (!String(input).endsWith("/keys/import")) return res;
+      // The server has claimed the sequence and installed the key; then the answer is lost, or comes back as a 5xx.
+      if (answer === "lost") throw new TypeError("the connection dropped");
+      return Response.json({ error: "internal" }, { status: 500 });
+    };
+    const signer = createSigner({ keychain: fx.kc, config: fx.host.config, clock: fx.clock, fetch: flaky, spendSoFar: (w) => fx.spend(w), agreements: async () => [] });
+    const e = await signer.send(importKey()).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(e).toBeInstanceOf(SignerSentUncertain);
+    const sent = mutations(fx.server)[0]!;
+    const ev = (e as SignerSentUncertain).root_evidence;
+    expect(ev).toEqual({
+      method: sent.method,
+      target: sent.path + sent.search,
+      body_b64: Buffer.from(sent.body).toString("base64"),
+      headers: {
+        "X-Agenttool-Authority-Sequence": sent.headers["x-agenttool-authority-sequence"]!,
+        "X-Agenttool-Authority-Timestamp": sent.headers["x-agenttool-authority-timestamp"]!,
+        "X-Agenttool-Authority-Signature": sent.headers["x-agenttool-authority-signature"]!,
+      },
+    });
+    expect(rootEvidenceProblem(ev, GLOSSAME_IDENTITY, { kind: "import", public_key_b64: TEST_OP_PUBLIC_B64 })).toBeNull();
+    expect(JSON.stringify(ev)).not.toContain(COMMONS_BEARER);
+
+    // Through the client it is still "no response" (read the sequence before signing again), now carrying the proof; a 5xx too.
+    const client: ClientDeps = { signer, fetch: via, identity: async () => GLOSSAME_IDENTITY };
+    for (const [a, status] of [
+      ["lost", 0],
+      ["500", 500],
+    ] as const) {
+      answer = a;
+      const e2 = await importOpKey(client, "glossame", TEST_OP_PUBLIC_B64, "op-2026-11").then(
+        () => null,
+        (err: unknown) => err,
+      );
+      expect(e2).toBeInstanceOf(AgenttoolError);
+      expect((e2 as AgenttoolError).status).toBe(status);
+      expect(rootEvidenceProblem((e2 as AgenttoolError).root_evidence!, GLOSSAME_IDENTITY, { kind: "import", public_key_b64: TEST_OP_PUBLIC_B64 })).toBeNull();
+    }
   });
 
   test("the client's ?identity_id= spelling is accepted on per-identity routes, and the query is part of what the root signs", async () => {

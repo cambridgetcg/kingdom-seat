@@ -19,8 +19,8 @@
 import { lstat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { isAbsolute, join } from "node:path";
-import { checkHalt, describeHalt, raiseBeacons, raiseHalt, readBeacons, readHaltFile } from "./halt.ts";
-import { ConfigError, DEFAULT_HALT_FILE, defaultConfigPath, loadConfig } from "./config.ts";
+import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
+import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
 import { ledgerPath, readLedger, verifyChain } from "./ledger.ts";
 import { pushMirror, stageMirror } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
@@ -31,7 +31,7 @@ import { hostSpendRecorder, usdSpentToday } from "./spend.ts";
 import { confirmYuPresent, type TtyIO } from "./signer/consent.ts";
 import { freeRuntime, loadModelsLock } from "./runtime/free.ts";
 import { summonRuntime } from "./runtime/summon.ts";
-import { listSeated, readCitizen, readCitizenRecord } from "./state.ts";
+import { listSeated, mirrorCardState, readCitizen, readCitizenRecord } from "./state.ts";
 import { buildStatus, renderStatus, writeStatus } from "./status.ts";
 import { appendHostNote, isResultNote, lastSeatOf, openedDetail, readHostNotes, seatIdOf, seatsOpenedToday } from "./notes.ts";
 import { LockStuck, acquireTickLock, lockOptionsFor, osBootTime, pidIsAlive, releaseTickLock, runTick } from "./tick.ts";
@@ -53,6 +53,7 @@ import {
   type HostNote,
   type Invoker,
   type Keychain,
+  type LifecycleState,
   type Outcome,
   type RuntimeAdapter,
   type RuntimeClass,
@@ -214,6 +215,10 @@ export interface CliDeps {
   isAlive(pid: number): boolean;
   /** When the host booted, so a lock left from before a reboot is known to be stale; null when unknown. */
   bootTime(): Date | null;
+  /** The uid this process runs as; every verb but halt runs as the seat user, which must not be able to write the config. */
+  uid(): number;
+  /** Where a verb looks without --config, and the HALT file `halt` raises when no config can be read. */
+  defaults: { config: string; halt_file: string };
 }
 
 const STD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -293,6 +298,11 @@ export function realDeps(over: Partial<CliDeps> = {}): CliDeps {
     seatArgv: (configPath, word, extra) => [process.execPath, CLI_PATH, "seat", word, "--child", ...extra, "--config", configPath],
     isAlive: pidIsAlive,
     bootTime: osBootTime,
+    uid: () => {
+      if (!process.getuid) throw new Error("no uid on this platform, so who may write the config cannot be checked");
+      return process.getuid();
+    },
+    defaults: { config: DEFAULT_CONFIG_PATH, halt_file: DEFAULT_HALT_FILE },
   };
   return Object.assign(deps, over);
 }
@@ -409,12 +419,30 @@ async function verbHalt(ctx: Ctx): Promise<ExitCode> {
   const r = await raiseHalt({ config: ctx.config, now: () => now(ctx), run: ctx.deps.run });
   const why = r.file === "failed" ? ` (${r.file_detail ?? "error"}; halt runs as the operator, who owns that directory)` : "";
   ctx.deps.out(`HALT file ${ctx.config.paths.halt_file}: ${r.file}${why}\n`);
+  for (const f of r.also_files) ctx.deps.out(`HALT file ${f.path}: ${f.file}${f.file === "failed" ? ` (${f.detail})` : ""}\n`);
   for (const b of r.beacons) ctx.deps.out(`beacon ${b.name}: ${b.result} (${b.detail})\n`);
   const failed = r.beacons.filter((b) => b.result === "failed").map((b) => b.name);
   if (failed.length > 0) ctx.deps.out(`Not raised: ${failed.join(", ")}.${r.file === "failed" ? "" : " The file alone halts this host."}\n`);
   ctx.deps.out("Only Yu lowers HALT, by hand: remove the file and end each beacon's quiet.\n");
   // Non-zero when any part this host should have raised was not, so the person who asked sees it.
-  return r.file === "failed" || failed.length > 0 ? EXIT.ERROR : EXIT.OK;
+  return r.file === "failed" || r.also_files.some((f) => f.file === "failed") || failed.length > 0 ? EXIT.ERROR : EXIT.OK;
+}
+
+/**
+ * halt when its config cannot be read, as when the operator cannot open it
+ * (KS4-HALT-1). The file needs no config, so the default HALT file is raised
+ * anyway. Still exit 1: no beacon was raised, nor any HALT file the config
+ * names elsewhere.
+ */
+async function haltWithoutConfig(deps: CliDeps): Promise<ExitCode> {
+  const path = deps.defaults.halt_file;
+  const t = deps.clock.now();
+  const r = await raiseHaltFileAt(path, `raised ${t.toISOString()} by halt, without a readable config\n`, t);
+  deps.out(`HALT file ${path}: ${r.file}${r.file === "failed" ? ` (${r.detail})` : ""}\n`);
+  deps.err(
+    `citizen-seat: without the config no beacon was raised, and only the default HALT file was tried. If the config names another HALT file, create it by hand, as the operator.\n`,
+  );
+  return EXIT.ERROR;
 }
 
 /**
@@ -478,7 +506,26 @@ async function verbVerify(ctx: Ctx, word: Word): Promise<ExitCode> {
   return EXIT.OK;
 }
 
-/** After a beat, stage and push the citizen's mirror if it keeps one; HALT is checked again first, because a push is public. */
+/**
+ * After a seat, stage and push the mirror when the seat changed what it
+ * shows: any beat, or a rest that kept a move of state (KS-004 B2 C7), which
+ * would otherwise leave the card's old state up until the next beat. A rest
+ * that moved nothing the card shows stages nothing, so it commits and pushes
+ * nothing. True when the mirror was tried.
+ */
+async function mirrorAfterSeat(ctx: Ctx, word: Word, outcome: Outcome, before: LifecycleState | null): Promise<boolean> {
+  if (outcome === "rest") {
+    const after = await readCitizen(ctx.config, word).then(
+      (c) => c.state,
+      () => null,
+    );
+    if (before === null || after === null || mirrorCardState(after) === mirrorCardState(before)) return false;
+  } else if (outcome !== "beat") return false;
+  await mirrorAfterBeat(ctx, word);
+  return true;
+}
+
+/** Stage and push the citizen's mirror if it keeps one; HALT is checked again first, because a push is public. */
 async function mirrorAfterBeat(ctx: Ctx, word: Word): Promise<void> {
   try {
     const citizen = await readCitizen(ctx.config, word);
@@ -512,10 +559,7 @@ async function verbTick(ctx: Ctx): Promise<ExitCode> {
       await refreshStatus(ctx, signer);
     },
   });
-  if (r.outcome === "beat" && r.word) {
-    await mirrorAfterBeat(ctx, r.word);
-    await refreshStatus(ctx, signer).catch(() => {});
-  }
+  if (r.word && (await mirrorAfterSeat(ctx, r.word, r.outcome, r.state_before ?? null))) await refreshStatus(ctx, signer).catch(() => {});
   // runTick returns before its own refresh when HALT is raised; the status must still say so, never go stale.
   if (r.outcome === "halted") await refreshStatus(ctx, signer).catch(() => {});
   ctx.deps.out(`tick: ${r.outcome}${r.word ? ` ${r.word}` : ""} (exit ${r.exit})\n`);
@@ -628,7 +672,7 @@ async function verbSeatParent(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>)
   } finally {
     await releaseTickLock(lock);
   }
-  if (outcome === "beat") await mirrorAfterBeat(ctx, cmd.word);
+  await mirrorAfterSeat(ctx, cmd.word, outcome, citizen.state);
   await refreshStatus(ctx, makeSigner(ctx)).catch(() => {});
   ctx.deps.out(`seat ${cmd.word}: ${outcome} (exit ${exit})\n`);
   return exit;
@@ -718,13 +762,13 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
 
   let ctx: Ctx;
   try {
-    const home = deps.env.HOME;
-    const configPath = cmd.config ?? (home ? defaultConfigPath(home) : null);
-    if (!configPath) throw new ConfigError("file", "no --config given and HOME is not set");
-    ctx = { deps, config: await loadConfig(configPath), configPath };
+    const configPath = cmd.config ?? deps.defaults.config;
+    // Every verb but halt runs as the seat user, which must not be able to have written the config (R5).
+    ctx = { deps, config: await loadConfig(configPath, cmd.verb === "halt" ? {} : { seatUid: deps.uid() }), configPath };
   } catch (e) {
     deps.err(`citizen-seat: ${describeError(e)}\n`);
-    if (cmd.verb === "halt") deps.err(`citizen-seat: HALT can still be raised by hand: as the operator, create the HALT file the config names (by default ${DEFAULT_HALT_FILE}).\n`);
+    // HALT never waits on a config: the file is raised whether or not the operator can read it.
+    if (cmd.verb === "halt") return haltWithoutConfig(deps);
     return EXIT.ERROR;
   }
 

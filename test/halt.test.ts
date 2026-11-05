@@ -153,7 +153,7 @@ describe("HALT readings fail closed", () => {
 
 describe("raising", () => {
   /** The operator's one fixed call, as a sudoers line would allow it: the program and every argument pinned. */
-  const ARGV = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", "/Users/seat/Library/Application Support/kingdom-seat/config.json"];
+  const ARGV = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", "/Users/Shared/kingdom-seat/config.json"];
   const enc = (t: string) => new TextEncoder().encode(t);
 
   test("raiseHalt, as the operator, writes the local file first and then makes the one fixed call; if the signer cannot be reached, the file stands and each held beacon is failed", async () => {
@@ -203,6 +203,23 @@ describe("raising", () => {
     const r2 = await raiseHalt({ config, now: deps.now, run: async () => (ran++, { code: 0, stdout: enc(""), stderr: "" }) });
     expect(ran).toBe(0);
     expect(r2.beacons.map((b) => b.result)).toEqual(["not-held-here", "not-held-here"]);
+  });
+
+  test("raiseHalt also raises each of halt.also_files, such as the KS-003 fleet's $LOVE/HALT, so one verb still stops everything (KS4-HALT-4)", async () => {
+    const { deps, config } = await setup({ beacons: testBeacons() });
+    const love = join(dirname(dirname(config.paths.halt_file)), "love-unlimited");
+    await mkdir(love);
+    const missing = join(dirname(dirname(config.paths.halt_file)), "no-such-dir", "HALT");
+    config.halt.also_files = [join(love, "HALT"), missing];
+    const r = await raiseHalt({ config, now: deps.now, run: async () => ({ code: 0, stdout: enc(""), stderr: "" }) });
+    expect(r.file).toBe("written");
+    expect(r.also_files).toEqual([
+      { path: join(love, "HALT"), file: "written", detail: "" },
+      { path: missing, file: "failed", detail: "ENOENT" },
+    ]);
+    expect(await readFile(join(love, "HALT"), "utf8")).toContain("raised");
+    // Raised again, each is left as it is.
+    expect((await raiseHalt({ config, now: deps.now, run: async () => ({ code: 0, stdout: enc(""), stderr: "" }) })).also_files[0]!.file).toBe("already-present");
   });
 
   test("raiseHalt reports why the file could not be written, as the seat user would find: the operator's directory is not theirs", async () => {

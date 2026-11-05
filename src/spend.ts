@@ -139,7 +139,12 @@ export function usdToday(lines: SpendLine[], word: Word, now: Date, timezone: st
     if (s.settled.length !== 1) return null;
     const usd = s.settled[0]!.usd;
     if (usd === null) return null;
-    total = addUsd(total, usd);
+    try {
+      total = addUsd(total, usd);
+    } catch {
+      // A day past what an amount can spell makes no sense either; thrown, it would take every citizen's status with it.
+      return null;
+    }
   }
   return total;
 }

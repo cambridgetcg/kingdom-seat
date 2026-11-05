@@ -10,6 +10,8 @@ import { fakeKeychain, type FakeKeychain } from "../../helpers/fake-keychain.ts"
 import { TEST_MNEMONIC } from "../../helpers/vectors.ts";
 
 export const E2E_CHILD = join(import.meta.dir, "child.ts");
+/** The seat user's uid in this layout: not the test's own, which owns the config as the operator would (KS-004 B2 R5). */
+export { TEST_SEAT_UID as E2E_SEAT_UID } from "../../helpers/temp-home.ts";
 export const SCENARIO_FILE = "e2e-scenario.json";
 
 /** The beacon this host can raise in the e2e layout (testBeacons names it). */

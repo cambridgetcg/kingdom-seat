@@ -13,6 +13,7 @@ import { summonRuntime } from "../src/runtime/summon.ts";
 import { openSeat, runSeat, type SeatDeps } from "../src/seat.ts";
 import { readCitizen } from "../src/state.ts";
 import { realDeps } from "../src/cli.ts";
+import { buildStatus } from "../src/status.ts";
 import { utf8 } from "../src/crypto.ts";
 import { DEFAULT_CEILINGS, EXIT, type HaltStatus, type SeatRef, type YuPresence } from "../src/types.ts";
 import { recordingRunner } from "./helpers/fake-runtime.ts";
@@ -73,6 +74,24 @@ describe("money as decimal strings", () => {
     for (const bad of [2.5, "-1", "1e2", "01", "", "two"]) expect(usdFromText(bad)).toBeNull();
     expect(usdFromNumber(1e21)).toBeNull();
   });
+
+  test("a measured cost whose float prints past 18 fractional digits is rounded up, never read as unknown", () => {
+    // 0.003 + 0.0004 in floats; before, these came back null, and one such summons closed the summon lane for the day.
+    expect(usdFromNumber(0.0034000000000000002)).toBe("0.003400000000000001");
+    expect(usdFromNumber(0.0012586499999999998)).toBe("0.00125865");
+    expect(usdFromNumber(1e-20)).toBe("0.000000000000000001");
+    // Within 18 places the text is kept exactly, as before.
+    expect(usdFromNumber(0.30000000000000004)).toBe("0.30000000000000004");
+    // Costs built the way a runtime builds them (tokens times a price, summed): none unknown, none counted low.
+    let seed = 7;
+    const rnd = () => (seed = (seed * 48271) % 2147483647) / 2147483647;
+    for (let i = 0; i < 2000; i++) {
+      const n = Math.floor(rnd() * 100_000) * 3e-6 + Math.floor(rnd() * 5_000) * 1.5e-5 + Math.floor(rnd() * 2_000) * 3e-7;
+      const usd = usdFromNumber(n);
+      expect(usd, String(n)).not.toBeNull();
+      expect(Number(usd)).toBeGreaterThanOrEqual(n);
+    }
+  });
 });
 
 describe("the host's spend record", () => {
@@ -106,6 +125,38 @@ describe("the host's spend record", () => {
       // The ceiling then has nothing left to give: unknown is none.
       expect(usdRemaining({ word: WORD, usd_today: usdToday([...today, ...more], WORD, NOW, "Europe/London"), credits_month: 0 }, { ...DEFAULT_CEILINGS, usd_per_citizen_per_day: "5" }), why).toBeNull();
     }
+  });
+
+  test("a day whose sum is past what an amount can spell is unknown, never a throw that takes every citizen's status with it", async () => {
+    // Each amount alone is canonical, so each line passes the record's own checks.
+    const huge = [...seat(1, "2026-11-05T09:00:00.000Z", "9000000000000000"), ...seat(2, "2026-11-05T10:00:00.000Z", "9000000000000000")];
+    expect(usdToday(huge, WORD, NOW, "Europe/London")).toBeNull();
+
+    host = await makeTempHost();
+    const config = host.config;
+    const signer = fakeSigner();
+    for (const w of [WORD, "shemme"]) {
+      await host.addCitizen(w);
+      await host.seatLedger(w, signer.signEntry);
+    }
+    const rec = hostSpendRecorder(config, { now: () => new Date("2026-11-05T09:00:00.000Z") });
+    const settled: [string, string, string][] = [
+      ["44444444-4444-4444-8444-444444444441", WORD, "9000000000000000"],
+      ["44444444-4444-4444-8444-444444444442", WORD, "9000000000000000"],
+      ["44444444-4444-4444-8444-444444444443", "shemme", "0.1"],
+    ];
+    for (const [seat_id, word, usd] of settled) {
+      const ref: SeatRef = { format: "kingdom-seat-seat/v1", seat_id, host: "test-host", word, runtime: "summon", invoker: { kind: "summons", who: "yu", why: "test" }, opened_at: "2026-11-05T09:00:00.000Z" };
+      await rec.begin(ref);
+      await rec.settle(ref, { usd, usd_basis: "reported", credits: 0 });
+    }
+    // Unknown is at the ceiling, for the seat (exit 3, not 1) and in status, and the other citizen still reads.
+    expect(await usdSpentToday(config, WORD, NOW)).toBeNull();
+    const status = await buildStatus({ config, now: NOW, halt: { halted: false, readings: [] }, signerState: "ready" });
+    expect(status.citizens.map((c) => [c.word, c.usd_today])).toEqual([
+      [WORD, null],
+      ["shemme", "0.1"],
+    ]);
   });
 
   test("a record that cannot be read, is torn, holds a float, or was lost after it started, is unknown", async () => {

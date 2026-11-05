@@ -24,7 +24,7 @@ import {
   type Word,
   type YuPresence,
 } from "../types.ts";
-import { SignerNotSent, type Signer, type SignerRequest, type SignerResponse } from "../signer/signer.ts";
+import { SignerNotSent, SignerSentUncertain, type Signer, type SignerRequest, type SignerResponse } from "../signer/signer.ts";
 import { AGENTTOOL_ORIGIN, isCanonicalIso, jsonBody, validateBoxPublicKey, validateExpression, type Expression } from "./wire.ts";
 
 /**
@@ -60,6 +60,12 @@ export class AgenttoolError extends Error {
     readonly status: number,
     readonly code: string | null,
     message: string,
+    /**
+     * A root-signed request that may have landed (no answer, a 5xx, or a 2xx
+     * that does not read), as sent: agenttool keeps no copy of the proof, so
+     * this is what a ledger entry needs if the act turns out to have happened.
+     */
+    readonly root_evidence: RootEvidence | null = null,
   ) {
     super(message);
   }
@@ -107,13 +113,14 @@ export function errorCode(json: unknown): string | null {
 
 // Messages name the call, the status and the code only. A response body is
 // never echoed, so nothing a server or proxy reflects can reach a log.
-function refused(what: string, res: SignerResponse | { status: number; json: unknown }): AgenttoolError {
+function refused(what: string, res: SignerResponse | { status: number; json: unknown }, evidence: RootEvidence | null = null): AgenttoolError {
   const code = errorCode(res.json);
-  return new AgenttoolError(res.status, code, `agenttool ${what} answered ${res.status}${code ? ` ${code}` : ""}`);
+  // A 4xx is the server refusing before anything changed, so its proof shows nothing happened and is not kept.
+  return new AgenttoolError(res.status, code, `agenttool ${what} answered ${res.status}${code ? ` ${code}` : ""}`, res.status >= 500 ? evidence : null);
 }
 
-function malformed(what: string, status: number, detail: string): AgenttoolError {
-  return new AgenttoolError(status, "malformed_response", `agenttool ${what}: ${detail}`);
+function malformed(what: string, status: number, detail: string, evidence: RootEvidence | null = null): AgenttoolError {
+  return new AgenttoolError(status, "malformed_response", `agenttool ${what}: ${detail}`, evidence);
 }
 
 const ok = (status: number) => status >= 200 && status <= 299;
@@ -168,7 +175,8 @@ async function send(deps: ClientDeps, word: Word, call: Call, auth: ActAuth | un
   } catch (e) {
     // A wall refused, or the signer stopped before sending: either answer is definite.
     if (e instanceof Refusal || e instanceof SignerNotSent) throw e;
-    throw new AgenttoolError(NO_RESPONSE, "no_response", `agenttool ${call.op}: no response; read the authority sequence before signing again`);
+    const evidence = e instanceof SignerSentUncertain ? evidenceOf(call, e.root_evidence) : null;
+    throw new AgenttoolError(NO_RESPONSE, "no_response", `agenttool ${call.op}: no response; read the authority sequence before signing again`, evidence);
   }
 }
 
@@ -291,11 +299,14 @@ export async function listKeys(deps: ClientDeps, word: Word): Promise<KeyRow[]> 
  * op key, and agenttool keeps none, so an answer without it is not usable.
  */
 function evidenceFor(what: string, call: Call, res: SignerResponse): RootEvidence {
-  const ev = res.root_evidence;
-  if (!ev || ev.method !== call.method || ev.target !== call.target || ev.body_b64 !== toB64(call.body)) {
-    throw malformed(what, res.status, "the signer kept no copy of this root-signed request");
-  }
+  const ev = evidenceOf(call, res.root_evidence);
+  if (!ev) throw malformed(what, res.status, "the signer kept no copy of this root-signed request");
   return ev;
+}
+
+/** The signer's copy of a root-signed request, or null when it kept none that is this call as sent. */
+function evidenceOf(call: Call, ev: RootEvidence | null | undefined): RootEvidence | null {
+  return ev && ev.method === call.method && ev.target === call.target && ev.body_b64 === toB64(call.body) ? ev : null;
 }
 
 /** Root-signed POST keys/import of the op key; the kid comes back from the server, the root evidence from the signer. */
@@ -312,10 +323,12 @@ export async function importOpKey(deps: ClientDeps, word: Word, publicKeyB64: st
   if (publicKeyB64 === id.root_public_key_b64) throw new Refusal("invalid-request", "the root is never imported as the op key");
   const call: Call = { op: "keys.import", method: "POST", target: identityRoute(id.identity_id, "/keys/import"), body: jsonBody({ public_key: publicKeyB64, label }), credits: 0 };
   const res = await rootAct(deps, word, id, call, auth);
-  if (!ok(res.status)) throw refused(what, res);
+  // From here the request was answered: when the answer leaves it unknown whether the key was installed, its proof goes with the error.
+  const sent = evidenceOf(call, res.root_evidence);
+  if (!ok(res.status)) throw refused(what, res, sent);
   const j = res.json;
-  if (!isObject(j) || typeof j.kid !== "string" || !UUID_PATTERN.test(j.kid)) throw malformed(what, res.status, "no lowercase kid");
-  if (j.public_key !== publicKeyB64) throw malformed(what, res.status, "the stored key is not the key sent");
+  if (!isObject(j) || typeof j.kid !== "string" || !UUID_PATTERN.test(j.kid)) throw malformed(what, res.status, "no lowercase kid", sent);
+  if (j.public_key !== publicKeyB64) throw malformed(what, res.status, "the stored key is not the key sent", sent);
   return { kid: j.kid, evidence: evidenceFor(what, call, res) };
 }
 
@@ -327,7 +340,7 @@ export async function revokeKey(deps: ClientDeps, word: Word, kid: string, auth?
   if (kid === id.root_kid) throw new Refusal("invalid-request", "the root key row can never be revoked");
   const call: Call = { op: "keys.revoke", method: "DELETE", target: identityRoute(id.identity_id, `/keys/${kid}`), body: EMPTY, credits: 0 };
   const res = await rootAct(deps, word, id, call, auth);
-  if (!ok(res.status)) throw refused(what, res);
+  if (!ok(res.status)) throw refused(what, res, evidenceOf(call, res.root_evidence));
   return { evidence: evidenceFor(what, call, res) };
 }
 

@@ -235,6 +235,14 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
   // tried to rest, and it must never let the rest of the reply through, except
   // one well-formed state.set, which the seat keeps only toward less activity.
   if (items.some((item) => isPlainObject(item) && item.type === "rest")) {
+    if (!topOk) {
+      // An output that fails validation applies nothing (KS-004 5.8): the rest is honoured whole, and keeps no state.
+      const dropped: DroppedAct[] = [{ index: -1, type: null, reason: "output has fields other than acts" }];
+      items.forEach((item, index) => {
+        if (!(isPlainObject(item) && item.type === "rest")) dropped.push({ index, type: knownType(item), reason: "output is malformed" });
+      });
+      return { rest: true, acts: [], dropped };
+    }
     const others: RestOther[] = [];
     items.forEach((item, index) => {
       if (isPlainObject(item) && item.type === "rest") return;
@@ -242,9 +250,7 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
       const r = type === "state.set" && index < ACT_LIMITS.max_acts ? validateAct(item, ctx) : null;
       others.push({ index, type, to: r !== null && "act" in r && r.act.type === "state.set" ? r.act.to : null });
     });
-    const out = restWith(others);
-    if (!topOk) out.dropped.unshift({ index: -1, type: null, reason: "output has fields other than acts" });
-    return out;
+    return restWith(others);
   }
 
   if (!topOk) {

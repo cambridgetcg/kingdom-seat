@@ -18,7 +18,7 @@ import {
   type BirthInput,
 } from "../src/birth.ts";
 import { deriveIdentity, AGENTTOOL_ORIGIN, authorityDigest, ENROLLMENT_SIGNATURE_HEADER } from "../src/agenttool/wire.ts";
-import { SignerNotSent, createSigner } from "../src/signer/signer.ts";
+import { SignerNotSent, SignerSentUncertain, createSigner } from "../src/signer/signer.ts";
 import { confirmYuPresent, proposalDigest } from "../src/signer/consent.ts";
 import { entryHash, readLedger, rootEvidenceProblem, verifyChain } from "../src/ledger.ts";
 import { edPublicKey, edVerifyStrict, fromB64, fromHex, fromUtf8, sha256, toB64, toB64url, toHex } from "../src/crypto.ts";
@@ -381,6 +381,20 @@ describe("the birth sequence", () => {
     const e4 = await birthErrorOf(citizenBirth(h4.deps, await input(h4)));
     expect([e4.stage, e4.done, e4.ambiguous]).toEqual(["keys/import", ["keys", "enroll"], false]);
     expect(e4.message).toContain("was not sent");
+    expect(e4.progress.op_key_evidence).toBeNull();
+
+    // The import reached agenttool and the key was installed, but the answer was lost: ambiguous, and the root's
+    // request as sent is in the progress, since agenttool keeps no copy and genesis cannot be written without it.
+    const h5 = await harness();
+    const send5 = h5.signer.send.bind(h5.signer);
+    h5.signer.send = async (r) => {
+      const res = await send5(r);
+      if (r.op === "keys.import") throw new SignerSentUncertain(`signer: POST ${r.target} did not complete; it may have reached agenttool`, res.root_evidence!);
+      return res;
+    };
+    const e5 = await birthErrorOf(citizenBirth(h5.deps, await input(h5)));
+    expect([e5.stage, e5.done, e5.ambiguous]).toEqual(["keys/import", ["keys", "enroll"], true]);
+    expect(e5.progress.op_key_evidence).toMatchObject({ method: "POST", target: `/v1/identities/${e5.progress.identity_id}/keys/import` });
   });
 
   test("the genesis entry is citizen-signed and records origin, birth-soul hash, old repo, June DID and public identity", async () => {

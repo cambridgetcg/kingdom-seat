@@ -923,7 +923,11 @@ export interface SeatResult {
   outcome: Outcome;
   seat_ref: SeatRef | null;
   refusal: RefusalCode | null;
-  /** Ledger entries this seat appended; empty for a HALT or a refusal, and for a rest unless it carried a move toward less activity (one entry). */
+  /**
+   * Ledger entries this seat appended; empty for a HALT or a refusal, and for
+   * a rest unless it carried a move toward less activity (one entry, or two
+   * for a first step-away from awake or listening: the saying, then asleep).
+   */
   appended: Sha256Hex[];
 }
 
@@ -932,6 +936,8 @@ export interface TickResult {
   outcome: Outcome;
   word: Word | null;
   seat: SeatResult | null;
+  /** The seated citizen's state when its seat opened, so the caller can tell whether a rest moved it. */
+  state_before?: LifecycleState;
 }
 
 /** A host record in `host.jsonl`. Never the citizen's voice, and never a model's words. */
@@ -980,7 +986,8 @@ export interface StatusFile {
   format: "kingdom-seat-status/v1";
   generated_at: IsoTime;
   host: string;
-  halt: { halted: boolean; raised: string[]; unreadable: string[] };
+  /** `file` is the HALT file this host watches (`paths.halt_file`), named whether or not it is raised. */
+  halt: { halted: boolean; file: string; raised: string[]; unreadable: string[] };
   signer: { state: "ready" | "locked" | "unknown"; since: IsoTime | null };
   /** beats_today counts every seat opened today; null when the host log is unreadable, which the tick treats as at-ceiling. */
   fleet: { beats_today: number | null; ceiling: number };
@@ -1060,6 +1067,13 @@ export interface Config {
      * no call, and a beacon held here is reported not raised.
      */
     raise_beacons_argv: string[] | null;
+    /**
+     * Other HALT files `halt` creates as well, by absolute path, such as the
+     * KS-003 fleet's $LOVE/HALT while that fleet still runs on this host, so
+     * one verb still stops everything (KS-004 section 10). The seat does not
+     * watch them; other runners do. Empty by default.
+     */
+    also_files: string[];
   };
   /** When a citizen's own seat is due, where the spec leaves it to Yu. */
   schedule: {

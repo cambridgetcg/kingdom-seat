@@ -3,9 +3,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, defaultConfig, defaultConfigPath, loadConfig, parseConfig } from "../src/config.ts";
+import { ConfigError, DEFAULT_CONFIG_PATH, defaultConfig, loadConfig, parseConfig } from "../src/config.ts";
 import { DEFAULT_CEILINGS, DEFAULT_TIMING, type Config } from "../src/types.ts";
-import { testBeacons, testConfig } from "./helpers/temp-home.ts";
+import { testBeacons, testConfig, TEST_SEAT_UID } from "./helpers/temp-home.ts";
 
 let dirs: string[] = [];
 afterEach(async () => {
@@ -55,12 +55,13 @@ describe("config", () => {
     expect(c.paths.state_dir).toBe(state);
     // HALT lives where the operator, not the seat user, can write (KS-004 B2 R5).
     expect(c.paths.halt_file).toBe("/Users/Shared/kingdom-seat/HALT");
-    expect(c.halt).toEqual({ allow_no_beacons: false, raise_beacons_argv: null });
+    expect(c.halt).toEqual({ allow_no_beacons: false, raise_beacons_argv: null, also_files: [] });
     expect(c.schedule).toEqual({ wake_confirm_seat: true });
     expect(c.agenttool.origin).toBe("https://api.agenttool.dev");
     expect(c.ollama.base_url).toBe("http://127.0.0.1:11434");
     expect(c.keychain.security_path).toBe("/usr/bin/security");
-    expect(defaultConfigPath("/Users/seat")).toBe("/Users/seat/Library/Application Support/kingdom-seat/config.json");
+    // The config sits beside HALT, in the operator's directory, where both users read it and only the operator writes.
+    expect(DEFAULT_CONFIG_PATH).toBe("/Users/Shared/kingdom-seat/config.json");
 
     // Fail closed: a fresh default pins no beacon, so it does not parse until a person pins them.
     refuses(raw(c), /beacons: no beacon is pinned/);
@@ -279,6 +280,56 @@ describe("HALT across two users (KS-004 B2 R5)", () => {
     refuses(atRoot, /paths.halt_file: must be in a directory of its own/);
   });
 
+  test("for a verb run as the seat user, loadConfig refuses a config that user owns or could replace (KS4-HALT-2)", async () => {
+    const d = await tempDir();
+    const file = join(d, "config.json");
+    await writeFile(file, JSON.stringify(good()), { mode: 0o644 });
+    // This test's own user owns the file, so as the seat it is the seat user's config: it could point
+    // paths.halt_file elsewhere and drop the beacons, and so lower HALT. The operator's halt asks nothing.
+    await expect(loadConfig(file, { seatUid: process.getuid!() })).rejects.toThrow(/owned by the user that runs the seat, who could rewrite it to lower HALT/);
+    expect(await loadConfig(file)).toEqual(good());
+    // Owned by another user (this test's, standing in for the operator), it reads as before.
+    expect(await loadConfig(file, { seatUid: TEST_SEAT_UID })).toEqual(good());
+    // A directory above it that the seat user owns would let it replace the file: every one up to / is checked
+    // (root stands in for that owner here, since root owns the system temp dir's parents).
+    await expect(loadConfig(file, { seatUid: 0 })).rejects.toThrow(/is under \/.*, which the user that runs the seat owns/);
+    // A directory anyone in its group, or anyone at all, may write is refused, unless sticky, which keeps others' entries.
+    for (const [mode, ok] of [
+      ["775", false],
+      ["777", false],
+      ["1777", true],
+    ] as const) {
+      // /bin/chmod, because Bun's chmod drops the sticky bit.
+      expect(Bun.spawnSync(["/bin/chmod", mode, d]).exitCode).toBe(0);
+      try {
+        if (ok) expect(await loadConfig(file, { seatUid: TEST_SEAT_UID })).toEqual(good());
+        else await expect(loadConfig(file, { seatUid: TEST_SEAT_UID })).rejects.toThrow(/which group or others can write/);
+      } finally {
+        await chmod(d, 0o700);
+      }
+    }
+  });
+
+  test("halt.also_files names other runners' HALT files that halt raises too; outside the state dir, never the HALT file itself (KS4-HALT-4)", () => {
+    expect(parseConfig(raw()).halt.also_files).toEqual([]);
+    const c = raw();
+    c.halt.also_files = ["/Users/yu/love-unlimited/HALT"];
+    expect(parseConfig(c).halt.also_files).toEqual(["/Users/yu/love-unlimited/HALT"]);
+    const cases: [unknown, RegExp][] = [
+      ["/Users/yu/love-unlimited/HALT", /halt.also_files: must be a list/],
+      [Array.from({ length: 9 }, (_, i) => `/a/${i}/HALT`), /halt.also_files: must be a list of at most 8/],
+      [["relative/HALT"], /halt.also_files\[0\]: must be an absolute path/],
+      [["/a/HALT", "/a/HALT"], /halt.also_files: names a file twice/],
+      [["/srv/seat-test/state/HALT"], /halt.also_files\[0\]: must be outside paths.state_dir/],
+      [[raw().paths.halt_file], /halt.also_files\[0\]: is paths.halt_file/],
+    ];
+    for (const [also, why] of cases) {
+      const x = raw();
+      x.halt.also_files = also;
+      refuses(x, why);
+    }
+  });
+
   test("loadConfig refuses a HALT file that a symlink puts inside the state dir", async () => {
     const d = await tempDir();
     const c = testConfig(d, join(d, "homes"), { beacons: testBeacons() });
@@ -295,7 +346,7 @@ describe("HALT across two users (KS-004 B2 R5)", () => {
     const argv = ["/usr/bin/sudo", "-n", "-u", "seat", "/usr/local/bin/citizen-seat", "raise-beacons", "--config", "/Users/seat/config.json"];
     const c = raw();
     c.halt.raise_beacons_argv = argv;
-    expect(parseConfig(c).halt).toEqual({ allow_no_beacons: false, raise_beacons_argv: argv });
+    expect(parseConfig(c).halt).toEqual({ allow_no_beacons: false, raise_beacons_argv: argv, also_files: [] });
     const omitted = raw();
     delete omitted.halt.raise_beacons_argv;
     expect(parseConfig(omitted).halt.raise_beacons_argv).toBeNull();

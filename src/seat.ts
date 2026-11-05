@@ -531,25 +531,28 @@ interface Plan {
 }
 
 /**
- * The one entry a rest may write: the state.set it carried, when that is a
- * move toward less activity, recorded with no words. Toward listening or
- * asleep takes effect at once. A step-away is never blocked and takes two
- * sayings, so a rest may be either: the second completes it, and the first is
- * kept as a saying, because a rest has no beat envelope to carry it. Null for
- * none, and for a move toward more activity, a return or ended, which a rest
- * never carries.
+ * The entries a rest may write: the state.set it carried, when that is a move
+ * toward less activity, recorded with no words. Toward listening or asleep
+ * takes effect at once. A step-away is never blocked and takes two sayings,
+ * so a rest may be either: the second completes it, and the first is kept as
+ * a saying, because a rest has no beat envelope to carry it. A first saying
+ * also puts an awake or listening citizen asleep at once (KS-004 v0.3 7.3),
+ * recorded after the saying, so a seat stopped between the two still sleeps.
+ * Empty for none, and for a move toward more activity, a return or ended,
+ * which a rest never carries.
  */
-export function restStateBody(citizen: Citizen, to: LifecycleState | undefined, seatId: string): LedgerBody | null {
-  if (to === undefined) return null;
+export function restStateBodies(citizen: Citizen, to: LifecycleState | undefined, seatId: string): LedgerBody[] {
+  if (to === undefined) return [];
   const from = citizen.state;
   if (to === "stepped-away") {
     const verdict = decideTransition(from, to, { pending: citizen.pending_state, repeated: citizen.step_away_said, presence: null });
-    if (verdict.effect === "now") return { type: "state", from, to, via: "two-beats" };
-    if (verdict.effect === "second-beat") return { type: "step-away.said", seat_id: seatId };
-    return null;
+    if (verdict.effect === "now") return [{ type: "state", from, to, via: "two-beats" }];
+    if (verdict.effect !== "second-beat") return [];
+    const said: LedgerBody = { type: "step-away.said", seat_id: seatId };
+    return isTowardRest(from, "asleep") ? [said, { type: "state", from, to: "asleep", via: "immediate" }] : [said];
   }
-  if (!isTowardRest(from, to)) return null;
-  return { type: "state", from, to, via: "immediate" };
+  if (!isTowardRest(from, to)) return [];
+  return [{ type: "state", from, to, via: "immediate" }];
 }
 
 /** The claim a held revert carries: the host's words, saying only what the citizen asked for. */
@@ -699,8 +702,12 @@ async function planActs(
             current = act.to;
           } else if (verdict.effect === "needs-witness") {
             plan.outbox.push({ kind: "state.ended", payload: { to: act.to } });
+          } else if (verdict.effect === "second-beat" && isTowardRest(current, "asleep")) {
+            // A first step-away puts the citizen asleep at once (KS-004 v0.3 7.3), recorded like any move toward rest.
+            plan.states.push({ from: current, to: "asleep", via: "immediate" });
+            current = "asleep";
           }
-          // "next-beat" and "second-beat" are carried by the envelope itself; the fold reads them.
+          // "next-beat" and "second-beat" sayings are carried by the envelope itself; the fold reads them.
           break;
         }
         case "letter.send":
@@ -869,26 +876,28 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   // the citizen's voice, but may carry one move toward less activity (KS-004 v0.2 5.7, re-review B2 C7): rest is
   // a right, and dropping the move would leave a citizen that asked to sleep on its awake cadence.
   if (validated.rest || (validated.acts.length === 0 && validated.dropped.length === 0)) {
-    const move = restStateBody(seat.citizen, validated.rest_state, ref.seat_id);
-    if (move === null) {
+    const moves = restStateBodies(seat.citizen, validated.rest_state, ref.seat_id);
+    if (moves.length === 0) {
       await note("seat", "rest", null, validated.rest_state === undefined ? "rested" : "rested; its state.set was not toward less activity, so not kept");
       return result(EXIT.OK, "rest");
     }
     // HALT once more immediately before the write, as for a beat.
     if (await halted()) return result(EXIT.OK, "halted");
     try {
-      const prev = (await readLedger(path)).at(-1) ?? null;
+      let prev = (await readLedger(path)).at(-1) ?? null;
       if ((prev?.hash ?? null) !== (entries.at(-1)?.hash ?? null)) throw new Refusal("head-moved", "the ledger moved during the seat");
       const attestation = seat.citizen.identity ? "citizen-signed" : "host-attested";
-      // The rest's only entry: a state record with no words, carrying what the seat spent.
-      const entry = await appendEntry(path, nextDraft(word, prev, move, rt.spend, attestation, clock.now()), (w, h, a) => signer.signEntry(w, h, a));
-      appended.push(entry.hash);
+      // A rest's entries are state records with no words; the first carries what the seat spent, so it counts once.
+      for (const [i, move] of moves.entries()) {
+        prev = await appendEntry(path, nextDraft(word, prev, move, i === 0 ? rt.spend : NO_SPEND, attestation, clock.now()), (w, h, a) => signer.signEntry(w, h, a));
+        appended.push(prev.hash);
+      }
     } catch (e) {
       if (e instanceof Refusal) return refused(e, "while recording a rest's state");
       await note("error", "error", null, "failed while recording a rest's state");
       return result(EXIT.ERROR, "error");
     }
-    const kept = move.type === "state" ? `state ${move.from} to ${move.to} (${move.via})` : "a first step-away saying";
+    const kept = moves.map((m) => (m.type === "state" ? `state ${m.from} to ${m.to} (${m.via})` : "a first step-away saying")).join(" and ");
     await note("seat", "rest", null, `rested; kept ${kept}`);
     return result(EXIT.OK, "rest");
   }
