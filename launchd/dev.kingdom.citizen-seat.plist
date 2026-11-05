@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template only. A person installs this in slice S5, on the lease host, as an
+  agent of the dedicated `seat` user (outside group staff), after pinning the
+  Ollama digest in models.lock. Nothing in this repo loads, bootstraps or
+  enables it. The paths below are placeholders for that user.
+
+  Why each key (runtimes-and-host.md 3.1):
+  - RunAtLoad false: a reboot or a fresh bootstrap never fires a beat before
+    HALT and Keychain state are settled. KeepAlive stays unset, since it
+    implies RunAtLoad.
+  - StartInterval 1800: launchd never overlaps two runs of this job, and a
+    tick slept through is missed, not owed. The mkdir lock still guards
+    manual and kickstart runs.
+  - Absolute paths everywhere: launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin.
+  - Umask 63 (octal 077): logs and state are private to the seat user.
+  - AbandonProcessGroup unset: a stray child dies with the tick.
+  - ProgramArguments run bun on the source for now. Before S5, point it at a
+    compiled, stably signed binary instead, so the Keychain ACL can trust
+    that binary alone rather than the bun interpreter and every script it runs.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.kingdom.citizen-seat</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/seat/.bun/bin/bun</string>
+    <string>/Users/seat/kingdom-seat/src/cli.ts</string>
+    <string>tick</string>
+    <string>--config</string>
+    <string>/Users/seat/Library/Application Support/kingdom-seat/config.json</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/seat/Library/Application Support/kingdom-seat</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Umask</key><integer>63</integer>
+  <key>ExitTimeOut</key><integer>20</integer>
+  <key>StandardOutPath</key><string>/Users/seat/Library/Logs/kingdom-seat/tick.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/seat/Library/Logs/kingdom-seat/tick.err.log</string>
+</dict>
+</plist>

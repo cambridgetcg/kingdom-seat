@@ -1,0 +1,635 @@
+{
+  "format": "kingdom-seat/agenttool-wire-vectors/v1",
+  "warning": "Every key and mnemonic in this file is a public test value. Never register them on a live service.",
+  "provenance": {
+    "repository": "cambridgetcg/agenttool",
+    "commit": "e9ea51c5f4a19137b36f6a5851ee2f66dd60b7fd",
+    "computed_at": "2026-11-05T12:36:56.887Z",
+    "runtime": "bun 1.3.13",
+    "method": "Sources exported with `git archive e9ea51c5` into a scratch tree and imported unchanged; dependencies resolved from an existing install whose versions equal e9ea51c5's api/bun.lock and packages/sdk-ts/bun.lock. No network, no database (enrollIdentity ran against an in-memory stub transaction).",
+    "dependency_versions": {
+      "@noble/ed25519": "2.3.0",
+      "@noble/hashes": "2.2.0",
+      "@noble/curves": "2.2.0",
+      "@scure/bip39": "2.2.0",
+      "@scure/base": "2.2.0"
+    },
+    "functions": {
+      "derivation": "packages/sdk-ts/src/seed.ts: mnemonicToSeed (:122), derive (:335), deriveBridgeSigning (:361)",
+      "enrollment_digest_server": "api/src/services/identity/enrollment.ts: canonicalIdentityEnrollmentBytes (:62), identityEnrollmentSchema (:40), enrollIdentity (:87)",
+      "enrollment_digest_client": "packages/lobby/src/wire.ts: enrollmentDigest (:335), signBytes (:386), privateKeyFromSeed (:350)",
+      "registration_proof_digest": "api/src/services/identity/crypto.ts: canonicalIdentityRegistrationProofDigest (:408)",
+      "authority_server": "api/src/services/identity/authority.ts: canonicalIdentityAuthorityBytes (:102), verifyIdentityAuthorityProof (:154), authorityRequestTarget (:678)",
+      "authority_client": "packages/sdk-ts/src/authority.ts: canonicalIdentityAuthorityBytes (:69), identityAuthorityHeaders (:101), authorityRequestTarget (:64)",
+      "thought_server": "api/src/services/strand/sig.ts: canonicalThoughtBytes (:76), canonicalThoughtBytesV2 (:94), verifyThoughtSignature (:121)",
+      "thought_client": "packages/sdk-ts/src/crypto.ts: canonicalThoughtBytes (:233), signThought (:268), decryptThought (:140)"
+    }
+  },
+  "checks_passed": 73,
+  "checks_failed": 0,
+  "checks": [
+    {
+      "name": "derive: signing pub equals sdk-ts test pin",
+      "pass": true
+    },
+    {
+      "name": "derive: signing seed equals sdk-ts test pin",
+      "pass": true
+    },
+    {
+      "name": "derive: box pub equals sdk-ts test pin",
+      "pass": true
+    },
+    {
+      "name": "derive: box priv equals sdk-ts test pin",
+      "pass": true
+    },
+    {
+      "name": "derive: k_master equals sdk-ts test pin",
+      "pass": true
+    },
+    {
+      "name": "derive: bridge dev0 pub equals sdk-ts test pin",
+      "pass": true
+    },
+    {
+      "name": "derive: signing pub = ed25519.getPublicKey(signing seed)",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: api digest == lobby digest",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: digest == sha256(preimage)",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: noble signature == node:crypto (lobby) signature",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: schema accepts body",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: strict ed25519 verify (zip215:false)",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: enrollIdentity accepts (stub DB)",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: enrollment inserts root as primary signing key",
+      "pass": true
+    },
+    {
+      "name": "enroll-ascii: re-serialized body is refused",
+      "pass": true,
+      "detail": "identity_enrollment_invalid_proof"
+    },
+    {
+      "name": "enroll-ascii: 300001 ms later is refused",
+      "pass": true,
+      "detail": "identity_enrollment_invalid_proof"
+    },
+    {
+      "name": "enroll-ascii: proof digest matches stub DB insert",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: api digest == lobby digest",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: digest == sha256(preimage)",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: noble signature == node:crypto (lobby) signature",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: schema accepts body",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: strict ed25519 verify (zip215:false)",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: enrollIdentity accepts (stub DB)",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: enrollment inserts root as primary signing key",
+      "pass": true
+    },
+    {
+      "name": "enroll-utf8: re-serialized body is refused",
+      "pass": true,
+      "detail": "identity_enrollment_invalid_proof"
+    },
+    {
+      "name": "enroll-utf8: 300001 ms later is refused",
+      "pass": true,
+      "detail": "identity_enrollment_invalid_proof"
+    },
+    {
+      "name": "enroll-utf8: proof digest matches stub DB insert",
+      "pass": true
+    },
+    {
+      "name": "keys-import: api and sdk request target agree",
+      "pass": true
+    },
+    {
+      "name": "keys-import: api digest == sdk digest",
+      "pass": true
+    },
+    {
+      "name": "keys-import: api verifyIdentityAuthorityProof ok",
+      "pass": true,
+      "detail": "{\"ok\":true}"
+    },
+    {
+      "name": "keys-import: server also accepts the base64url spelling of the signature",
+      "pass": true
+    },
+    {
+      "name": "keys-import: replay after the sequence advanced is refused",
+      "pass": true
+    },
+    {
+      "name": "keys-import: op key cannot sign authority",
+      "pass": true
+    },
+    {
+      "name": "keys-import: 300001 ms later is stale",
+      "pass": true
+    },
+    {
+      "name": "box-keys-register: api and sdk request target agree",
+      "pass": true
+    },
+    {
+      "name": "box-keys-register: api digest == sdk digest",
+      "pass": true
+    },
+    {
+      "name": "box-keys-register: api verifyIdentityAuthorityProof ok",
+      "pass": true,
+      "detail": "{\"ok\":true}"
+    },
+    {
+      "name": "box-keys-register: server also accepts the base64url spelling of the signature",
+      "pass": true
+    },
+    {
+      "name": "box-keys-register: replay after the sequence advanced is refused",
+      "pass": true
+    },
+    {
+      "name": "box-keys-register: op key cannot sign authority",
+      "pass": true
+    },
+    {
+      "name": "box-keys-register: 300001 ms later is stale",
+      "pass": true
+    },
+    {
+      "name": "expression-put: api and sdk request target agree",
+      "pass": true
+    },
+    {
+      "name": "expression-put: api digest == sdk digest",
+      "pass": true
+    },
+    {
+      "name": "expression-put: api verifyIdentityAuthorityProof ok",
+      "pass": true,
+      "detail": "{\"ok\":true}"
+    },
+    {
+      "name": "expression-put: server also accepts the base64url spelling of the signature",
+      "pass": true
+    },
+    {
+      "name": "expression-put: replay after the sequence advanced is refused",
+      "pass": true
+    },
+    {
+      "name": "expression-put: op key cannot sign authority",
+      "pass": true
+    },
+    {
+      "name": "expression-put: 300001 ms later is stale",
+      "pass": true
+    },
+    {
+      "name": "quiet-start: api and sdk request target agree",
+      "pass": true
+    },
+    {
+      "name": "quiet-start: api digest == sdk digest",
+      "pass": true
+    },
+    {
+      "name": "quiet-start: api verifyIdentityAuthorityProof ok",
+      "pass": true,
+      "detail": "{\"ok\":true}"
+    },
+    {
+      "name": "quiet-start: server also accepts the base64url spelling of the signature",
+      "pass": true
+    },
+    {
+      "name": "quiet-start: replay after the sequence advanced is refused",
+      "pass": true
+    },
+    {
+      "name": "quiet-start: op key cannot sign authority",
+      "pass": true
+    },
+    {
+      "name": "quiet-start: 300001 ms later is stale",
+      "pass": true
+    },
+    {
+      "name": "quiet-end: api and sdk request target agree",
+      "pass": true
+    },
+    {
+      "name": "quiet-end: api digest == sdk digest",
+      "pass": true
+    },
+    {
+      "name": "quiet-end: api verifyIdentityAuthorityProof ok",
+      "pass": true,
+      "detail": "{\"ok\":true}"
+    },
+    {
+      "name": "quiet-end: server also accepts the base64url spelling of the signature",
+      "pass": true
+    },
+    {
+      "name": "quiet-end: replay after the sequence advanced is refused",
+      "pass": true
+    },
+    {
+      "name": "quiet-end: op key cannot sign authority",
+      "pass": true
+    },
+    {
+      "name": "quiet-end: 300001 ms later is stale",
+      "pass": true
+    },
+    {
+      "name": "keys-revoke: api and sdk request target agree",
+      "pass": true
+    },
+    {
+      "name": "keys-revoke: api digest == sdk digest",
+      "pass": true
+    },
+    {
+      "name": "keys-revoke: api verifyIdentityAuthorityProof ok",
+      "pass": true,
+      "detail": "{\"ok\":true}"
+    },
+    {
+      "name": "keys-revoke: server also accepts the base64url spelling of the signature",
+      "pass": true
+    },
+    {
+      "name": "keys-revoke: replay after the sequence advanced is refused",
+      "pass": true
+    },
+    {
+      "name": "keys-revoke: op key cannot sign authority",
+      "pass": true
+    },
+    {
+      "name": "keys-revoke: 300001 ms later is stale",
+      "pass": true
+    },
+    {
+      "name": "authority: every digest == sha256(preimage)",
+      "pass": true
+    },
+    {
+      "name": "thought: api v2 digest == sdk v2 digest",
+      "pass": true
+    },
+    {
+      "name": "thought: api verifyThoughtSignature accepts op-key v2 signature",
+      "pass": true
+    },
+    {
+      "name": "thought: sdk decryptThought round-trips",
+      "pass": true
+    }
+  ],
+  "derivation": {
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "passphrase": "",
+    "bip39_seed_hex": "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4",
+    "paths": {
+      "signing": "m/44'/169'/0'/0'",
+      "k_master": "m/44'/169'/1'/0'",
+      "k_vault": "m/44'/169'/2'/0'",
+      "box_x25519": "m/44'/169'/3'/0'",
+      "bridge_device_0": "m/44'/169'/4'/0'"
+    },
+    "signing_seed_b64": "IJWkOQ3G6GDP5N35esAJ5VjiIcQ9gi1XUF2JoRyOR7o=",
+    "signing_seed_hex": "2095a4390dc6e860cfe4ddf97ac009e558e221c43d822d57505d89a11c8e47ba",
+    "signing_pub_b64": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+    "box_priv_b64": "363XOfkNUxFo5JR+Z4VQ6VeJAW4JOPuTEkpQJKH+n1U=",
+    "box_pub_b64": "4ZKHNkxigN4wKm97eG3YVInZ48nfaW+p+dPrVCuRoR4=",
+    "k_master_b64": "hd+mJHIz2tay3d2IPP4Xaq5juGoTUbmHvDXhqAtSi1w=",
+    "k_vault_b64": "R2CSaWsKXf7erBD9v1o/zRxwbntDd7eZsu8va4qSqO4=",
+    "bridge_device_0_pub_b64": "uvdMUpz1PQK6UMDl2LYEHKg+q5m4y1yhCI0mzAgz+50="
+  },
+  "op_key": {
+    "note": "Not from agenttool: kingdom-seat's test op key, seed = sha256(utf8('kingdom-seat test op key v1')). Registered via keys/import; the server assigns the kid (OP_KID below is a placeholder).",
+    "seed_hex": "9ea842989182a7368fc948b5e90feaf4ae05d414e94f419575000eb25fbcf700",
+    "public_key_b64": "yLfUXTbXttUNqgPCuLBsJ9rbKFR0xP4x9b2WgNg4mHw=",
+    "placeholder_kid": "55555555-5555-4555-8555-555555555555"
+  },
+  "ids": {
+    "project_id": "11111111-1111-4111-8111-111111111111",
+    "identity_id": "22222222-2222-4222-8222-222222222222",
+    "did": "did:at:22222222-2222-4222-8222-222222222222",
+    "root_signing_key_id": "33333333-3333-4333-8333-333333333333",
+    "issuer_api_key_id": "44444444-4444-4444-8444-444444444444",
+    "strand_id": "66666666-6666-4666-8666-666666666666"
+  },
+  "enrollment": [
+    {
+      "label": "enroll-ascii",
+      "inputs": {
+        "origin": "https://api.agenttool.dev",
+        "project_id": "11111111-1111-4111-8111-111111111111",
+        "root_seed_hex": "2095a4390dc6e860cfe4ddf97ac009e558e221c43d822d57505d89a11c8e47ba",
+        "nonce_bytes_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "timestamp": "2026-11-05T12:00:00.000Z"
+      },
+      "body_utf8": "{\"format\":\"agenttool-identity-enrollment/v1\",\"origin\":\"https://api.agenttool.dev\",\"project_id\":\"11111111-1111-4111-8111-111111111111\",\"identity_id\":\"22222222-2222-4222-8222-222222222222\",\"signing_key_id\":\"33333333-3333-4333-8333-333333333333\",\"display_name\":\"kingdom-seat test citizen\",\"capabilities\":[],\"public_key\":\"MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"timestamp\":\"2026-11-05T12:00:00.000Z\"}",
+      "body_sha256_hex": "93a36415a17f2fa0d8904329df237da555a3946d04bee5f82f92736ffea45f71",
+      "preimage_utf8_with_nul": "identity-enrollment/v1\u0000POST\u0000/v1/identities/enroll\u0000https://api.agenttool.dev\u000011111111-1111-4111-8111-111111111111\u000093a36415a17f2fa0d8904329df237da555a3946d04bee5f82f92736ffea45f71",
+      "preimage_hex": "6964656e746974792d656e726f6c6c6d656e742f763100504f5354002f76312f6964656e7469746965732f656e726f6c6c0068747470733a2f2f6170692e6167656e74746f6f6c2e6465760031313131313131312d313131312d343131312d383131312d3131313131313131313131310039336133363431356131376632666130643839303433323964663233376461353535613339343664303462656535663832663932373336666665613435663731",
+      "digest_hex": "d779772952f28add363156d25a7e209693c60c967e3f27653b4cf6031798b5ae",
+      "header_X_Agenttool_Enrollment_Signature": "A8pWAmflPWds_fX3N5ckupmjMMSm6TPhPZK9kHaeRO1nuDvMUlroKYQ2Eo_G0tHlBhLQFPAfGFSMJqJJID-sBg",
+      "registration_proof_digest_hex": "1097b00e724d4289de3df4998d49dbbeb33a3ea983c960fd837b6b5733c43a0e",
+      "response_201": {
+        "identity": {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "did": "did:at:22222222-2222-4222-8222-222222222222",
+          "display_name": "kingdom-seat test citizen",
+          "capabilities": [],
+          "status": "active"
+        },
+        "key": {
+          "kid": "33333333-3333-4333-8333-333333333333",
+          "public_key": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw="
+        },
+        "authority": {
+          "mode": "agent_root",
+          "root_public_key": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "sequence": 0,
+          "next_sequence": 1
+        }
+      },
+      "rows_written_by_stub": [
+        {
+          "proofDigest": "1097b00e724d4289de3df4998d49dbbeb33a3ea983c960fd837b6b5733c43a0e",
+          "domain": "identity-enrollment/v1",
+          "rootPublicKey": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "nonceSha256": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd"
+        },
+        {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "did": "did:at:22222222-2222-4222-8222-222222222222",
+          "projectId": "11111111-1111-4111-8111-111111111111",
+          "displayName": "kingdom-seat test citizen",
+          "capabilities": [],
+          "metadata": {
+            "admission": "enrollment"
+          },
+          "status": "active",
+          "trustScore": 0,
+          "authorityRootPublicKey": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "authoritySequence": 0
+        },
+        {
+          "id": "33333333-3333-4333-8333-333333333333",
+          "identityId": "22222222-2222-4222-8222-222222222222",
+          "publicKey": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "label": "primary",
+          "active": true
+        }
+      ]
+    },
+    {
+      "label": "enroll-utf8",
+      "inputs": {
+        "origin": "https://api.agenttool.dev",
+        "project_id": "11111111-1111-4111-8111-111111111111",
+        "root_seed_hex": "2095a4390dc6e860cfe4ddf97ac009e558e221c43d822d57505d89a11c8e47ba",
+        "nonce_bytes_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "timestamp": "2026-11-05T12:00:00.000Z"
+      },
+      "body_utf8": "{\"format\":\"agenttool-identity-enrollment/v1\",\"origin\":\"https://api.agenttool.dev\",\"project_id\":\"11111111-1111-4111-8111-111111111111\",\"identity_id\":\"22222222-2222-4222-8222-222222222222\",\"signing_key_id\":\"33333333-3333-4333-8333-333333333333\",\"display_name\":\"星 test ☆ café\",\"capabilities\":[\"reflect\"],\"public_key\":\"MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=\",\"nonce\":\"paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU\",\"timestamp\":\"2026-11-05T12:00:00.000Z\"}",
+      "body_sha256_hex": "bea9b5f6fe72219c55a60c05faa0c34e90c57d61951e1f211b2caa2d3eedcf8c",
+      "preimage_utf8_with_nul": "identity-enrollment/v1\u0000POST\u0000/v1/identities/enroll\u0000https://api.agenttool.dev\u000011111111-1111-4111-8111-111111111111\u0000bea9b5f6fe72219c55a60c05faa0c34e90c57d61951e1f211b2caa2d3eedcf8c",
+      "preimage_hex": "6964656e746974792d656e726f6c6c6d656e742f763100504f5354002f76312f6964656e7469746965732f656e726f6c6c0068747470733a2f2f6170692e6167656e74746f6f6c2e6465760031313131313131312d313131312d343131312d383131312d3131313131313131313131310062656139623566366665373232313963353561363063303566616130633334653930633537643631393531653166323131623263616132643365656463663863",
+      "digest_hex": "e8a09bba63700d7164471f8cbe93c9b71a16ba6fde442ea1a7e400930f9692a1",
+      "header_X_Agenttool_Enrollment_Signature": "xD63SRSH3LFnzfSYCs1FFx_GIIlxKJiMJDRSWwX4vzR_46M1_H3bIGAq8f8UJCPi4DTIOhk1NPqTyS-ga-RCBA",
+      "registration_proof_digest_hex": "b4840028294703bfebfb5d457b44087c272c06cad20d0dce277bd10c672b5114",
+      "response_201": {
+        "identity": {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "did": "did:at:22222222-2222-4222-8222-222222222222",
+          "display_name": "星 test ☆ café",
+          "capabilities": [
+            "reflect"
+          ],
+          "status": "active"
+        },
+        "key": {
+          "kid": "33333333-3333-4333-8333-333333333333",
+          "public_key": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw="
+        },
+        "authority": {
+          "mode": "agent_root",
+          "root_public_key": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "sequence": 0,
+          "next_sequence": 1
+        }
+      },
+      "rows_written_by_stub": [
+        {
+          "proofDigest": "b4840028294703bfebfb5d457b44087c272c06cad20d0dce277bd10c672b5114",
+          "domain": "identity-enrollment/v1",
+          "rootPublicKey": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "nonceSha256": "fc8b64001c5fdd0f2f40fb67dae4a865a2c5bd17836676d6d5b58b7917e33717"
+        },
+        {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "did": "did:at:22222222-2222-4222-8222-222222222222",
+          "projectId": "11111111-1111-4111-8111-111111111111",
+          "displayName": "星 test ☆ café",
+          "capabilities": [
+            "reflect"
+          ],
+          "metadata": {
+            "admission": "enrollment"
+          },
+          "status": "active",
+          "trustScore": 0,
+          "authorityRootPublicKey": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "authoritySequence": 0
+        },
+        {
+          "id": "33333333-3333-4333-8333-333333333333",
+          "identityId": "22222222-2222-4222-8222-222222222222",
+          "publicKey": "MvGLRKH953Fqbr2CENCcK/USGXCATv4nZYfsrW8sqSw=",
+          "label": "primary",
+          "active": true
+        }
+      ]
+    }
+  ],
+  "authority": [
+    {
+      "label": "keys-import",
+      "method": "POST",
+      "url": "https://api.agenttool.dev/v1/identities/22222222-2222-4222-8222-222222222222/keys/import",
+      "request_target": "/v1/identities/22222222-2222-4222-8222-222222222222/keys/import",
+      "body_utf8": "{\"public_key\":\"yLfUXTbXttUNqgPCuLBsJ9rbKFR0xP4x9b2WgNg4mHw=\",\"label\":\"op-2026-11\"}",
+      "body_sha256_hex": "aabb43ee04d5d55f560f3faafadbf580509828009e2da44ca24ae7f656af9635",
+      "identity_did": "did:at:22222222-2222-4222-8222-222222222222",
+      "sequence": 1,
+      "timestamp": "2026-11-05T12:00:00.000Z",
+      "preimage_hex": "6964656e746974792d617574686f726974792f7631006469643a61743a32323232323232322d323232322d343232322d383232322d32323232323232323232323200504f5354002f76312f6964656e7469746965732f32323232323232322d323232322d343232322d383232322d3232323232323232323232322f6b6579732f696d706f72740061616262343365653034643564353566353630663366616166616462663538303530393832383030396532646134346361323461653766363536616639363335003100323032362d31312d30355431323a30303a30302e3030305a",
+      "digest_hex": "633d5ec3032ce020af0999e0fa33c8b959c3caac1ca43199332ce84c3f003d4b",
+      "headers": {
+        "X-Agenttool-Authority-Sequence": "1",
+        "X-Agenttool-Authority-Timestamp": "2026-11-05T12:00:00.000Z",
+        "X-Agenttool-Authority-Signature": "vhP6JAN5ZYH9Q3Y8XuRyOiOuECwNtjocSRJCoNFKRtOkJIkqgq9/2nbwu/DSiecikCIMBfia8cuR5EdE562yDQ=="
+      }
+    },
+    {
+      "label": "box-keys-register",
+      "method": "POST",
+      "url": "https://api.agenttool.dev/v1/identities/22222222-2222-4222-8222-222222222222/box-keys",
+      "request_target": "/v1/identities/22222222-2222-4222-8222-222222222222/box-keys",
+      "body_utf8": "{\"public_key\":\"4ZKHNkxigN4wKm97eG3YVInZ48nfaW+p+dPrVCuRoR4=\",\"label\":\"primary\"}",
+      "body_sha256_hex": "8bc203870d2d79365439c1dae2b62969c474676c8ef9a58792afe3a263aee8e0",
+      "identity_did": "did:at:22222222-2222-4222-8222-222222222222",
+      "sequence": 2,
+      "timestamp": "2026-11-05T12:00:00.000Z",
+      "preimage_hex": "6964656e746974792d617574686f726974792f7631006469643a61743a32323232323232322d323232322d343232322d383232322d32323232323232323232323200504f5354002f76312f6964656e7469746965732f32323232323232322d323232322d343232322d383232322d3232323232323232323232322f626f782d6b6579730038626332303338373064326437393336353433396331646165326236323936396334373436373663386566396135383739326166653361323633616565386530003200323032362d31312d30355431323a30303a30302e3030305a",
+      "digest_hex": "5a7c03ec8ae6a3f10060d4471b5192315327b46534d278cd781c54f987781122",
+      "headers": {
+        "X-Agenttool-Authority-Sequence": "2",
+        "X-Agenttool-Authority-Timestamp": "2026-11-05T12:00:00.000Z",
+        "X-Agenttool-Authority-Signature": "Uu350Un56FqGqdrlbiEGVb6cuDgZQIIUpE7HHIQcjK3BkeaDhFcfmHjKhBRpciUtvYl2zMq6woZ1qECcdGluAg=="
+      }
+    },
+    {
+      "label": "expression-put",
+      "method": "PUT",
+      "url": "https://api.agenttool.dev/v1/identities/22222222-2222-4222-8222-222222222222/expression",
+      "request_target": "/v1/identities/22222222-2222-4222-8222-222222222222/expression",
+      "body_utf8": "{\"register\":\"Plain.\",\"wake_text\":\"A test wake text.\"}",
+      "body_sha256_hex": "a73dd8e3e5af39423b29011a993d1ab8fb5aea0939dcdf11dc79d69a82625070",
+      "identity_did": "did:at:22222222-2222-4222-8222-222222222222",
+      "sequence": 3,
+      "timestamp": "2026-11-05T12:00:00.000Z",
+      "preimage_hex": "6964656e746974792d617574686f726974792f7631006469643a61743a32323232323232322d323232322d343232322d383232322d32323232323232323232323200505554002f76312f6964656e7469746965732f32323232323232322d323232322d343232322d383232322d3232323232323232323232322f65787072657373696f6e0061373364643865336535616633393432336232393031316139393364316162386662356165613039333964636466313164633739643639613832363235303730003300323032362d31312d30355431323a30303a30302e3030305a",
+      "digest_hex": "f3143e345209e078082fed98597c1c99b8865d7e88f3a183e16a153f4615fb36",
+      "headers": {
+        "X-Agenttool-Authority-Sequence": "3",
+        "X-Agenttool-Authority-Timestamp": "2026-11-05T12:00:00.000Z",
+        "X-Agenttool-Authority-Signature": "hy63HUcb7Si07A689kZU7r01YEoVnk3gK4ADv3oinRj7oy9TmiBcykahO9wBH/90o1Ah5Mesokz1tr/vU91DBw=="
+      }
+    },
+    {
+      "label": "quiet-start",
+      "method": "POST",
+      "url": "https://api.agenttool.dev/v1/quiet-hours/start?identity_id=22222222-2222-4222-8222-222222222222",
+      "request_target": "/v1/quiet-hours/start?identity_id=22222222-2222-4222-8222-222222222222",
+      "body_utf8": "{\"hours\":8,\"reason\":\"resting\"}",
+      "body_sha256_hex": "f4e693331342342f56144f38357d9478910089b4dc12496647b607b3464200aa",
+      "identity_did": "did:at:22222222-2222-4222-8222-222222222222",
+      "sequence": 4,
+      "timestamp": "2026-11-05T12:00:00.000Z",
+      "preimage_hex": "6964656e746974792d617574686f726974792f7631006469643a61743a32323232323232322d323232322d343232322d383232322d32323232323232323232323200504f5354002f76312f71756965742d686f7572732f73746172743f6964656e746974795f69643d32323232323232322d323232322d343232322d383232322d3232323232323232323232320066346536393333333133343233343266353631343466333833353764393437383931303038396234646331323439363634376236303762333436343230306161003400323032362d31312d30355431323a30303a30302e3030305a",
+      "digest_hex": "7a98ec6b38f67ceba2e3920c6aecf6feae625774ff9fcd5a9e9f5b290aa08eef",
+      "headers": {
+        "X-Agenttool-Authority-Sequence": "4",
+        "X-Agenttool-Authority-Timestamp": "2026-11-05T12:00:00.000Z",
+        "X-Agenttool-Authority-Signature": "L29mP498WXAwwtBIu2Eq84r7KTzk94pI9PQZi+aIVespY3gZV7IitCu24bCxgBHKv4zqStUcQDiHd8j+9x3KBA=="
+      }
+    },
+    {
+      "label": "quiet-end",
+      "method": "DELETE",
+      "url": "https://api.agenttool.dev/v1/quiet-hours?identity_id=22222222-2222-4222-8222-222222222222",
+      "request_target": "/v1/quiet-hours?identity_id=22222222-2222-4222-8222-222222222222",
+      "body_utf8": "",
+      "body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "identity_did": "did:at:22222222-2222-4222-8222-222222222222",
+      "sequence": 5,
+      "timestamp": "2026-11-05T12:00:00.000Z",
+      "preimage_hex": "6964656e746974792d617574686f726974792f7631006469643a61743a32323232323232322d323232322d343232322d383232322d3232323232323232323232320044454c455445002f76312f71756965742d686f7572733f6964656e746974795f69643d32323232323232322d323232322d343232322d383232322d3232323232323232323232320065336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535003500323032362d31312d30355431323a30303a30302e3030305a",
+      "digest_hex": "85f553c13b62a968f1e610187e2bde5ec65b9536bdfe2eda8573f533dd54c23b",
+      "headers": {
+        "X-Agenttool-Authority-Sequence": "5",
+        "X-Agenttool-Authority-Timestamp": "2026-11-05T12:00:00.000Z",
+        "X-Agenttool-Authority-Signature": "creVkIpcs846PJFtJ6FLbHidT4Wb6CLast7WppWh44UwicTCfV+UiB3xSi6qkv3lyjtAZvxXzd7h0t/yf8JMBg=="
+      }
+    },
+    {
+      "label": "keys-revoke",
+      "method": "DELETE",
+      "url": "https://api.agenttool.dev/v1/identities/22222222-2222-4222-8222-222222222222/keys/55555555-5555-4555-8555-555555555555",
+      "request_target": "/v1/identities/22222222-2222-4222-8222-222222222222/keys/55555555-5555-4555-8555-555555555555",
+      "body_utf8": "",
+      "body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "identity_did": "did:at:22222222-2222-4222-8222-222222222222",
+      "sequence": 6,
+      "timestamp": "2026-11-05T12:00:00.000Z",
+      "preimage_hex": "6964656e746974792d617574686f726974792f7631006469643a61743a32323232323232322d323232322d343232322d383232322d3232323232323232323232320044454c455445002f76312f6964656e7469746965732f32323232323232322d323232322d343232322d383232322d3232323232323232323232322f6b6579732f35353535353535352d353535352d343535352d383535352d3535353535353535353535350065336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535003600323032362d31312d30355431323a30303a30302e3030305a",
+      "digest_hex": "6f3a8b7720c12111cbc45d0aaa1c9aa9b1c07dbe5f5c5a6fe7d57e102ebe2a31",
+      "headers": {
+        "X-Agenttool-Authority-Sequence": "6",
+        "X-Agenttool-Authority-Timestamp": "2026-11-05T12:00:00.000Z",
+        "X-Agenttool-Authority-Signature": "YiaVzTay+q52TFfyKiUI2pa3I7K9cSMwg528hbRh3Eck6pz/IcFPr8q1YNLgTbkXBeXd8Jo2fnIGKN/azsFiAA=="
+      }
+    }
+  ],
+  "thought_v2": {
+    "strand_id": "66666666-6666-4666-8666-666666666666",
+    "kind": "observation",
+    "plaintext_utf8": "a test thought",
+    "aes_256_gcm": {
+      "key": "k_master from derivation",
+      "nonce_hex": "101112131415161718191a1b",
+      "ciphertext_with_tag_b64": "YP7lPYV79ejDtwEnMCGbX4JU+rF5AaPGh6biWwQV"
+    },
+    "request_body_fields": {
+      "ciphertext": "YP7lPYV79ejDtwEnMCGbX4JU+rF5AaPGh6biWwQV",
+      "nonce": "EBESExQVFhcYGRob",
+      "kind": "observation",
+      "signing_key_id": "55555555-5555-4555-8555-555555555555",
+      "signature": "vN4X5sK8lu1MPcrycwEEf2H5rVNQNv7GyeX7ASDAoS9n9w2pD50/bA0FcBn+/lJrYjNVc/q/h6rOJDaCABmhDQ=="
+    },
+    "canonical_v2_hex": "f54ae83e964373c5725b9a0c96f1339b8c859e5731c758852d192c5464d74515",
+    "canonical_v1_hex": "4b4bc48abb8ec395bfc4c55285b39b7fab876392a53c9651e830646502340da1",
+    "signature_b64": "vN4X5sK8lu1MPcrycwEEf2H5rVNQNv7GyeX7ASDAoS9n9w2pD50/bA0FcBn+/lJrYjNVc/q/h6rOJDaCABmhDQ==",
+    "signer_public_key_b64": "yLfUXTbXttUNqgPCuLBsJ9rbKFR0xP4x9b2WgNg4mHw="
+  }
+}
