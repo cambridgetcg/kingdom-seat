@@ -26,7 +26,10 @@ import {
   authorityHeaders,
   deriveIdentity,
   encryptThought,
+  inboxDigest,
   isCanonicalIso,
+  openInbox,
+  sealInbox,
   thoughtDigestV2,
 } from "../agenttool/wire.ts";
 import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, fromUtf8, parseStrictJson, randomBytes, toB64, toB64url, wipe } from "../crypto.ts";
@@ -138,6 +141,15 @@ export interface SealedThought {
   signing_key_id: string;
 }
 
+/** A letter's envelope, sealed to the recipient's box key and signed by the sender's op key (inbox-message/v1); padded standard base64. */
+export interface SealedLetter {
+  ciphertext: string;
+  nonce: string;
+  ephemeral_pubkey: string;
+  signature: string;
+  signing_key_id: string;
+}
+
 export interface Signer {
   /** Public keys for a citizen, read from Keychain-derived material without returning any secret. */
   publicKeys(word: Word): Promise<PublicKeys>;
@@ -154,6 +166,14 @@ export interface Signer {
   signEnrollment(word: Word, digest: Uint8Array, presence: YuPresence): Promise<string>;
   /** Encrypt a thought under K_master and sign it with the op key, after checking the credit ceiling. */
   sealThought(word: Word, strandId: string, plaintext: string, kind: string): Promise<SealedThought>;
+  /**
+   * Seal a letter to another citizen's box key and sign its envelope with the
+   * op key (inbox-message/v1), after checking the credit ceiling: agenttool
+   * charges a letter before it checks it (routes/inbox/messages.ts:70).
+   */
+  sealLetter(word: Word, to: { did: string; box_public_key_b64: string }, plaintext: string): Promise<SealedLetter>;
+  /** Open a letter sealed to this citizen's own box key, derived from its mnemonic; the key never leaves the signer. */
+  openLetter(word: Word, letter: { recipient_did: string; ciphertext: string; nonce: string; ephemeral_pubkey: string }): Promise<string>;
   /**
    * An SSHSIG over one mirror commit, in the git namespace only (KS-004 4.4,
    * 6.2): by the op key once the citizen is registered, by the host key
@@ -212,8 +232,17 @@ export const CITIZEN_QUIET_EXTENT = "a citizen's own quiet_until, at most the si
 /** A beacon never lapses on its own (3.6), so its `until` must be at least this far ahead. */
 const BEACON_MIN_AHEAD_MS = 100 * 365 * 86_400_000;
 
-/** What each route charges at least, whatever the caller says (route-credits.ts:49-50). */
-const MIN_CREDITS: Partial<Record<SignerOp, number>> = { "strand.create": 1, "thought.post": 1 };
+/** What each route charges at least, whatever the caller says (route-credits.ts:49-50, :53). */
+const MIN_CREDITS: Partial<Record<SignerOp, number>> = { "strand.create": 1, "thought.post": 1, "inbox.send": 2 };
+
+/**
+ * The only fields a letter's body carries (routes/inbox/messages.ts:43-60):
+ * the envelope its signature covers and the ids that name both ends. The
+ * route also takes a subject, refs, metadata and a reply-to, which the
+ * envelope signature does not cover (services/inbox/sig.ts:9-18), so in them
+ * the bearer, not the citizen, would be speaking; a letter sends none.
+ */
+const LETTER_FIELDS = ["ciphertext", "ephemeral_pubkey", "nonce", "recipient_box_key_id", "sender_did", "signature", "signing_key_id", "to_did"];
 
 type ActorKind = "citizen" | "operator" | "relay";
 
@@ -235,6 +264,7 @@ const AS = `(?:\\?identity_id=(${UUID}))?`;
 const ROUTES: Readonly<Record<Exclude<SignerOp, "ledger.sign" | "read">, { method: string; path: RegExp; actor: ActorKind; ids: number[]; root: boolean }>> = {
   "strand.create": { method: "POST", path: new RegExp(`^/v1/strands${AS}$`), actor: "citizen", ids: [1], root: false },
   "thought.post": { method: "POST", path: new RegExp(`^/v1/strands/(${UUID})/thoughts${AS}$`), actor: "citizen", ids: [2], root: false },
+  "inbox.send": { method: "POST", path: /^\/v1\/inbox$/, actor: "citizen", ids: [], root: false },
   "keys.import": { method: "POST", path: new RegExp(`^/v1/identities/(${UUID})/keys/import${AS}$`), actor: "citizen", ids: [1, 2], root: true },
   "keys.revoke": { method: "DELETE", path: new RegExp(`^/v1/identities/(${UUID})/keys/(${UUID})${AS}$`), actor: "citizen", ids: [1, 3], root: true },
   "box-keys.register": { method: "POST", path: new RegExp(`^/v1/identities/(${UUID})/box-keys${AS}$`), actor: "citizen", ids: [1, 2], root: true },
@@ -690,6 +720,25 @@ export function createSigner(deps: SignerDeps): Signer {
         if (actor.identity.self_strand_id === null || m[1] !== actor.identity.self_strand_id) throw new Refusal("beyond-self", "a thought goes only to the citizen's own strand");
         return;
       }
+      case "inbox.send": {
+        const b = jsonObjectBody(req.body, req.op);
+        if (actor.kind !== "citizen") invalid("a letter is sent by a registered citizen");
+        const id = actor.identity;
+        if (Object.keys(b).sort().join(",") !== LETTER_FIELDS.join(",")) invalid("a letter carries its envelope and both ends' ids, and nothing the envelope signature does not cover");
+        if (b.sender_did !== id.did || b.signing_key_id !== id.op_kid) invalid("a letter is the citizen's own, signed by its op key, never the root");
+        if (typeof b.to_did !== "string" || !DID_PATTERN.test(b.to_did) || b.to_did === id.did) invalid("a letter goes to another identity's DID");
+        if (typeof b.recipient_box_key_id !== "string" || !UUID_PATTERN.test(b.recipient_box_key_id)) invalid("recipient_box_key_id is not a lowercase UUID");
+        // The envelope must be one this citizen's op key signed for exactly that recipient, as sealLetter makes it.
+        let signed = false;
+        try {
+          const digest = inboxDigest(b.to_did, fromB64(String(b.ciphertext)), fromB64(String(b.nonce), 12), fromB64(String(b.ephemeral_pubkey), 32));
+          signed = edVerifyStrict(fromB64(String(b.signature), 64), digest, fromB64(id.op_public_key_b64, 32));
+        } catch {
+          signed = false;
+        }
+        if (!signed) invalid("the letter's envelope is not signed by the citizen's op key for that recipient");
+        return;
+      }
       case "keys.revoke":
         if (actor.kind === "citizen" && m[2] === actor.identity.root_kid) invalid("the root key row can never be revoked");
         return;
@@ -948,6 +997,67 @@ export function createSigner(deps: SignerDeps): Signer {
         return { ciphertext: sealed.ciphertext_b64, nonce: sealed.nonce_b64, kind, signature: toB64(edSign(digest, seed)), signing_key_id: identity.op_kid };
       } finally {
         wipe(seed);
+      }
+    },
+
+    async sealLetter(word, to, plaintext) {
+      assertWord(word);
+      if (!isPlainObject(to) || typeof to.did !== "string" || !DID_PATTERN.test(to.did)) invalid("a letter goes to a did:at");
+      if (typeof plaintext !== "string" || plaintext.length === 0) invalid("a letter has text");
+      let boxPub: Uint8Array;
+      try {
+        boxPub = fromB64(to.box_public_key_b64, 32);
+      } catch {
+        invalid("the recipient's box key is not canonical base64 of 32 bytes");
+      }
+      const identity = await registered(word);
+      if (to.did === identity.did) invalid("a letter goes to another identity");
+      // Charged before the server checks it (routes/inbox/messages.ts:70), so the budget is checked before it is even sealed.
+      await assertCredits({ kind: "citizen", word, identity }, MIN_CREDITS["inbox.send"]!);
+      const eph = random(32);
+      let sealed: Awaited<ReturnType<typeof sealInbox>>;
+      try {
+        sealed = await sealInbox(plaintext, boxPub, { ephemeralPrivate: eph, nonce: random(12) });
+      } finally {
+        wipe(eph);
+      }
+      const seed = await readOpSeed(word, identity);
+      try {
+        const digest = inboxDigest(to.did, sealed.ciphertext, sealed.nonce, sealed.ephemeral_pub);
+        return {
+          ciphertext: toB64(sealed.ciphertext),
+          nonce: toB64(sealed.nonce),
+          ephemeral_pubkey: toB64(sealed.ephemeral_pub),
+          signature: toB64(edSign(digest, seed)),
+          signing_key_id: identity.op_kid,
+        };
+      } finally {
+        wipe(seed);
+      }
+    },
+
+    async openLetter(word, letter) {
+      assertWord(word);
+      if (!isPlainObject(letter)) invalid("a letter is an object");
+      const identity = await registered(word);
+      // Only the citizen's own letters: one sealed to a sibling's DID is never opened here, even with the bearer that listed it.
+      if (letter.recipient_did !== identity.did) throw new Refusal("beyond-self", "a letter is opened only by the citizen it was sent to");
+      let parts: [Uint8Array, Uint8Array, Uint8Array];
+      try {
+        parts = [fromB64(letter.ciphertext), fromB64(letter.nonce, 12), fromB64(letter.ephemeral_pubkey, 32)];
+      } catch {
+        invalid("a letter's envelope is not base64 of the right lengths");
+      }
+      const d = await derive({ kind: "citizen-mnemonic", word });
+      wipe(d.root_seed);
+      wipe(d.k_master);
+      try {
+        if (identity.box_public_key_b64 !== null && toB64(d.box_public) !== identity.box_public_key_b64) {
+          throw new Refusal("invalid-record", `the mnemonic in Keychain does not derive ${word}'s box key`);
+        }
+        return await openInbox(parts[0], parts[1], parts[2], d.box_private);
+      } finally {
+        wipe(d.box_private);
       }
     },
 

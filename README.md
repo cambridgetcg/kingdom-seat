@@ -78,7 +78,11 @@ one is something it does, not something it hopes.
   `reason`, `self.affirm` a `ref`, `letter.send` and `propose.beyond` a
   `text`; `state.set` may name an awake `interval_h` and, toward listening
   or asleep, `quiet_days`). Rest is exclusive except for one state.set toward
-  less activity, which is kept as a state record with no words.
+  less activity, which is kept as a state record with no words. A seat
+  stages at most one `self.propose`. Acts that do not validate, or that the
+  host cannot complete, are dropped while the rest of the reply is kept; the
+  beat entry records each one's type and the host's reason (never its
+  words), and the citizen's next seat shows them back.
 - `runtime/free.ts` (Ollama on 127.0.0.1 by manifest digest, never a cloud
   model, and no seat when the whole context would not fit `num_ctx`, counted
   as UTF-8 bytes plus the template and `num_predict`) and
@@ -90,14 +94,31 @@ one is something it does, not something it hopes.
   refused as not v1), lifecycle states folded from it, and self-authorship
   (propose, affirm, apply, revert; at most one change a week unattended; a
   large rewrite, a loosened wall or any change to the porch, a public
-  invitation, goes beyond self as a proposal for Yu and Ai).
+  invitation, goes beyond self as a proposal for Yu and Ai, and so does a
+  revert that would loosen a wall or move the porch).
+- `letters.ts`: a letter goes where its recipient's own covenants admit it,
+  never by the sender's list; a citizen with no covenants file admits only
+  Yu. An unregistered citizen's letter, and any letter to Yu or the gardener
+  desk, is held for Yu alone in the outbox (no proposal, no digest). Between
+  two registered citizens on this host it goes through agenttool's inbox:
+  sealed to the recipient's box key and signed by the sender's op key in the
+  signer, 2 credits within the ceiling, carrying nothing the envelope
+  signature does not cover. A registered citizen's seat reads its own inbox
+  beside `letters/`, showing a letter only from a sender its covenants admit
+  and whose op key signed the envelope. A send that is not made is held for
+  Yu, saying why.
+- `registration.ts`: an answer about registration (`propose.beyond`, subject
+  `registration`) goes to Yu and Ai; once both agree, the next seat shows it
+  back, and the citizen's `self.affirm` naming it is its confirmed yes. Birth
+  takes the ledger digest of that beat, and refuses any other.
 - `signer/*`: the only code that reads keys and bearers (through
   `/usr/bin/security`, so any process of the seat user could read them too),
   with ceilings, decision records it reads itself from the consent dir, the
   30-day cap on a citizen's quiet, and no op that lowers HALT.
-- `agenttool/*`, `birth.ts`: byte-exact enrollment and authority recipes
-  (checked against `docs/research/vectors.json`), the client, and birth,
-  which needs Yu present and consent bound to the citizen's own affirmed yes.
+- `agenttool/*`, `birth.ts`: byte-exact enrollment, authority and inbox
+  recipes (checked against `docs/research/vectors.json` and agenttool's own
+  inbox vectors), the client, and birth, which needs Yu present and consent
+  bound to the citizen's own confirmed yes.
 - `agenttool/sync.ts`, `quiet.ts`: a registered citizen's self on agenttool,
   wired in production through the signer. A change that binds updates the
   private expression (one root-signed read-modify-write PUT; a self that does
@@ -110,8 +131,10 @@ one is something it does, not something it hopes.
   30), the tick renews it while the citizen stays there, and a wake ends it,
   all under the standing agreement Yu and Ai file in `consent/standing/`.
 - `status.ts`, `mirror.ts`, `config.ts`: the generated status file (with the
-  host key's public half, and for a registered citizen its expression lag,
-  deferred backups and quiet), the sealed fast-forward-only mirror pusher
+  host key's public half, each citizen's last refusal and its reason, a tick
+  lock a live owner has held for more than 2 hours, which nothing reclaims,
+  and for a registered citizen its expression lag, deferred backups and
+  quiet), the sealed fast-forward-only mirror pusher
   (which writes a host-generated `.citizen/allowed_signers` beside the card
   and SSH-signs each commit through the signer: the op key once registered,
   the host key before), and strict config.
@@ -137,8 +160,12 @@ one is something it does, not something it hopes.
 - **A deferred strand backup is not posted later.** The `apply` entry says
   it was deferred and status counts it; nothing yet posts it once credits
   return.
-- **Letters do not use agenttool yet** (review C M3); that is another step
-  of this round.
+- **An inbox letter wakes no one.** A letter in a listening or asleep
+  citizen's agenttool inbox waits for its next seat; only a file letter in
+  `letters/` can wake it, because the tick reads no inbox.
+- **Letters through agenttool reach only citizens on this host.** A
+  recipient's covenants, and a sender's op key, are read from this host's
+  records, so a citizen on another host is neither written to nor shown.
 - **Op-key rotation is not wired.** The ledger accepts an op key only with
   the root's evidence and `verify` checks it, but nothing writes a `key`
   entry yet.

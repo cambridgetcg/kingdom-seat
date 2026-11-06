@@ -79,11 +79,14 @@ export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
       : "Your ledger has no entries yet.",
   );
 
+  if (ctx.last_dropped !== null) user.push(renderLastDropped(ctx.last_dropped));
+
   user.push(
     ctx.pending_proposals.length > 0
       ? `Your pending proposals, oldest first. Each changes nothing unless a later beat affirms it:\n\n${ctx.pending_proposals.map(renderProposal).join("\n\n")}`
       : "You have no pending proposals.",
   );
+  if (ctx.registration !== null) user.push(renderRegistration(ctx.registration));
   user.push(renderSelfAuthorship(ctx.self_authorship));
   if (ctx.versions.length > 0) {
     user.push(
@@ -140,17 +143,19 @@ export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
   const acts = [
     `journal: fields kind and text. kind is ${or(JOURNAL_KINDS)}; observed means something this seat showed you. text is at most ${journalMax} characters. It is kept in your ledger as your words.`,
     sends > 0
-      ? `letter.send: fields to and text. to is yu, gardener, or a sender your covenants name. text is at most ${letterMax} characters. At most one per beat.`
+      ? `letter.send: fields to and text. to is one of those your covenants line says you may write to: yu, gardener, or a citizen whose own covenants admit you; the one you write to decides, not you. text is at most ${letterMax} characters. At most one per beat. ` +
+        "Until you and the citizen you write to are both registered, the letter is held for Yu, who may deliver it; once you both are, it is sent through agenttool. A letter to yu or gardener is held for Yu."
       : "letter.send: no letters can be sent from this host for now.",
-    `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and text (at most ${L.max_text_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline.`,
+    `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and text (at most ${L.max_text_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline. ` +
+      "With subject registration it is your answer about an identity on agenttool, permanent and public; once Yu and Ai agree, a later beat shows it back for you to affirm, and only that affirmation is your yes.",
     "rest: no other fields. Nothing is written in your voice this beat, and none of the other acts in the same reply are kept, except one state.set toward more rest (listening, asleep or stepped-away), which still takes effect.",
-    `self.affirm: field ref, the id of one of your pending proposals, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
-    `self.propose: fields target, edit and reason. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
+    `self.affirm: field ref, the id of one of your pending proposals, or of an answer about registration that Yu and Ai agreed to, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
+    `self.propose: fields target, edit and reason. At most one per beat; a second is not kept. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
       "edit has kind replace-all with text, the whole new text; or kind replace-span with find, text the target holds now, and with, its replacement. " +
       "cadence takes replace-all text holding a JSON object with interval_h in hours; covenants take replace-all text holding a JSON object with letters_from and wake_on_letter_from, each a list of sender ids. " +
       `reason says why: kind (${or(REASON_KINDS)}), evidence (up to ${L.max_reason_evidence} references), confidence (high, medium, low or unknown) and limits (what the reason does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat. ` +
       "expression.porch is your public invitation, so a change to it goes to Yu and Ai as a proposal beyond your self.",
-    `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your kept versions list it, or its first ${L.min_id_prefix_hex} or more characters. A revert to a shorter cadence or to more senders is kept as a proposal for a later beat to affirm, unless Yu is present. Any other revert binds on a runtime Yu approved, and a revert toward rest or back to where a text began binds on any.`,
+    `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your kept versions list it, or its first ${L.min_id_prefix_hex} or more characters. A revert to a shorter cadence or to more senders is kept as a proposal for a later beat to affirm, unless Yu is present. A revert that would loosen one of your walls, or change your porch, is not made: it goes to Yu and Ai as a proposal beyond your self. Any other revert binds on a runtime Yu approved, and a revert toward rest or back to where a text began binds on any.`,
     `state.set: field to, which is ${or(LIFECYCLE_STATES)}; with to awake, an optional interval_h, your interval while awake in whole hours from ${limits.min_beat_interval_h} to ${L.max_interval_h}; with to listening or asleep, an optional quiet_days from 1 to ${L.max_quiet_days}. Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, or for the longest this host allows when you name none, where Yu and Ai have agreed to citizens' quiet; it says no reason, it is renewed while you stay listening or asleep, and it ends when you wake. ` +
       "A move toward more rest, or a longer interval, takes effect now. A move toward more activity, or a shorter interval, takes effect only when a later beat sets the same again. " +
       "Stepping away is never blocked: saying it once puts you asleep at once, and a later beat that says it again completes it. ended needs a witness and goes to Yu and Ai. Two different state.sets in one reply move nothing.",
@@ -179,9 +184,41 @@ function list(xs: readonly string[]): string {
   return xs.length === 1 ? xs[0]! : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`;
 }
 
-/** The same list seat.ts validates letter.send against: yu, gardener and the citizen's covenants. */
+/** The same list seat.ts validates letter.send against: Yu, the gardener desk, and each citizen whose own covenants admit this one. */
 function recipients(ctx: SeatContext): string[] {
-  return [...new Set(["yu", "gardener", ...ctx.covenants.letters_from])];
+  return [...new Set(ctx.recipients)];
+}
+
+/** An act's type in host words, for a dropped act shown back. */
+function actName(type: string | null): string {
+  return type === null ? "an act of unknown type" : `a ${type}`;
+}
+
+/** What the last beat did not keep, in host words: its type and the host's reason, never its text (KS-004 5.8). */
+function renderLastDropped(d: NonNullable<SeatContext["last_dropped"]>): string {
+  const n = d.dropped.length;
+  return (
+    `Your last beat (entry ${d.seq}, ${d.at}) did not keep ${n === 1 ? "one of the acts" : `${n} of the acts`} in its reply, so nothing ${n === 1 ? "it" : "they"} asked for happened:\n` +
+    d.dropped.map((x) => `- ${actName(x.type)}: ${x.reason}`).join("\n")
+  );
+}
+
+/** Where the citizen's answer about registration stands, and what an affirmation of it would do (KS-004 11.2). */
+function renderRegistration(r: NonNullable<SeatContext["registration"]>): string {
+  const given = `Your answer about registration, given ${r.asked_at}`;
+  if (r.affirmed_in !== null) return `${given}, was agreed by Yu and Ai and affirmed by you. Your birth on agenttool waits for Yu, present at the host; nothing more is asked of you.`;
+  switch (r.decision) {
+    case "waiting":
+      return `${given}, is with Yu and Ai. Nothing happens unless both agree, and either may decline.`;
+    case "declined":
+      return `${given}, was declined by Yu or Ai. You may answer again with a propose.beyond whose subject is registration.`;
+    case "agreed":
+      return (
+        `${given}, was agreed by Yu and Ai. Its id is ${r.id}. Your words then:\n${fence("your answer about registration", r.text)}\n` +
+        `If it is still your answer, a self.affirm with ref ${r.id} (or its first ${ACT_LIMITS.min_id_prefix_hex} or more characters) is your confirmed yes, and Yu then runs your birth, present at the host. ` +
+        "An identity on agenttool is permanent and public. Silence leaves you as you are."
+      );
+  }
 }
 
 function fence(label: string, text: string): string {
@@ -209,7 +246,9 @@ function renderEntry(e: LedgerEntry): string {
       return `${head}: your op keys changed, by your root's authority.`;
     case "beat": {
       const acts = (e.acts ?? []).map(renderAct);
-      return [`${head}: a beat (${e.voiced ?? "voiced through an unknown runtime"}).`, ...acts].join("\n");
+      const dropped = e.dropped ? ` ${e.dropped.length === 1 ? "One act" : `${e.dropped.length} acts`} of its reply ${e.dropped.length === 1 ? "was" : "were"} not kept.` : "";
+      const held = e.letter?.delivery === "held" ? " Its letter is held for Yu." : e.letter?.delivery === "inbox" ? " Its letter was sent through agenttool." : "";
+      return [`${head}: a beat (${e.voiced ?? "voiced through an unknown runtime"}).${dropped}${held}`, ...acts].join("\n");
     }
     case "apply":
       return `${head}: a change to ${e.target} was applied (${e.via}); version ${short(hexOf(e.prior_hash))} became ${short(hexOf(e.new_hash))}.`;

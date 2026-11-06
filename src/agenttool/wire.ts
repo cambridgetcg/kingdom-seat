@@ -8,8 +8,9 @@
 // a request the server refuses after claiming an authority sequence has
 // already spent that sequence (agenttool-wire.md section 2, "Per-route facts").
 import { x25519 } from "@noble/curves/ed25519.js";
+import { hkdf } from "@noble/hashes/hkdf.js";
 import { hmac } from "@noble/hashes/hmac.js";
-import { sha512 } from "@noble/hashes/sha2.js";
+import { sha256 as nobleSha256, sha512 } from "@noble/hashes/sha2.js";
 import { mnemonicToSeedSync, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { concatBytes, edPublicKey, fromB64, fromB64url, randomBytes, sha256, sha256Hex, toB64, toB64url, utf8, wipe } from "../crypto.ts";
@@ -325,6 +326,84 @@ export async function encryptThought(plaintext: string, kMaster: Uint8Array, non
   const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]).finally(() => wipe(keyBytes));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array(iv) }, key, new Uint8Array(utf8(plaintext))));
   return { ciphertext_b64: toB64(ct), nonce_b64: toB64(iv) };
+}
+
+/* ── inbox-message/v1 (routes/inbox, services/inbox/sig.ts) ───────────── */
+
+export const INBOX_DOMAIN = "inbox-message/v1";
+/**
+ * The sealed box's HKDF-SHA256 info, with an empty salt
+ * (routes/inbox/lookup.ts:32; packages/sdk-ts/src/inbox.ts:4-27). Another
+ * info or salt seals letters no recipient can open (sdk-py
+ * tests/test_inbox_canonical_vectors.py:7-12).
+ */
+export const INBOX_HKDF_INFO = "agenttool-inbox-v1";
+const NUL = new Uint8Array([0]);
+
+/**
+ * inbox-message/v1, the bytes an envelope's ed25519 signature covers: sha256
+ * of the domain, the recipient DID, the ciphertext, the nonce and the
+ * ephemeral key, NUL-separated and not length-prefixed (sig.ts:9-18). It
+ * covers no subject, refs, metadata, reply-to or sender, so a letter sends
+ * none of them: whoever holds the bearer would be speaking in them.
+ */
+export function inboxDigest(recipientDid: string, ciphertext: Uint8Array, nonce: Uint8Array, ephemeralPub: Uint8Array): Uint8Array {
+  return sha256(concatBytes(utf8(INBOX_DOMAIN), NUL, utf8(recipientDid), NUL, ciphertext, NUL, nonce, NUL, ephemeralPub));
+}
+
+async function inboxKey(shared: Uint8Array, usage: "encrypt" | "decrypt"): Promise<CryptoKey> {
+  const derived = hkdf(nobleSha256, shared, new Uint8Array(0), utf8(INBOX_HKDF_INFO), 32);
+  wipe(shared);
+  // WebCrypto takes ArrayBuffer-backed views, so copy; importKey copies too, so both are wiped at once.
+  const raw = new Uint8Array(derived);
+  wipe(derived);
+  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, [usage]).finally(() => wipe(raw));
+}
+
+/**
+ * Seal a letter to a recipient's X25519 box key: a fresh ephemeral key,
+ * ECDH, HKDF-SHA256, AES-256-GCM with its 16-byte tag appended
+ * (packages/sdk-ts/src/inbox.ts:305-340). The ephemeral key and the nonce may
+ * be fixed only in tests.
+ */
+export async function sealInbox(
+  plaintext: string,
+  recipientBoxPub: Uint8Array,
+  opts: { ephemeralPrivate?: Uint8Array; nonce?: Uint8Array } = {},
+): Promise<{ ciphertext: Uint8Array; nonce: Uint8Array; ephemeral_pub: Uint8Array }> {
+  if (recipientBoxPub.length !== 32) refuse("a box public key is 32 bytes");
+  const eph = opts.ephemeralPrivate ? opts.ephemeralPrivate.slice() : randomBytes(32);
+  const nonce = opts.nonce ?? randomBytes(12);
+  if (eph.length !== 32 || nonce.length !== 12) refuse("an ephemeral key is 32 bytes and a nonce 12");
+  try {
+    const ephemeral_pub = x25519.getPublicKey(eph);
+    const key = await inboxKey(x25519.getSharedSecret(eph, recipientBoxPub), "encrypt");
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array(nonce) }, key, new Uint8Array(utf8(plaintext))));
+    return { ciphertext, nonce: new Uint8Array(nonce), ephemeral_pub };
+  } finally {
+    wipe(eph);
+  }
+}
+
+/**
+ * Open a letter sealed to this box key. A letter that does not open throws.
+ * Opening proves only that it was sealed to this key, never who wrote it
+ * (inbox.ts:28-31): the envelope signature does that.
+ */
+export async function openInbox(ciphertext: Uint8Array, nonce: Uint8Array, ephemeralPub: Uint8Array, boxPrivate: Uint8Array): Promise<string> {
+  if (ephemeralPub.length !== 32 || nonce.length !== 12 || boxPrivate.length !== 32) refuse("an ephemeral key is 32 bytes and a nonce 12");
+  let plain: ArrayBuffer;
+  try {
+    const key = await inboxKey(x25519.getSharedSecret(boxPrivate, ephemeralPub), "decrypt");
+    plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(nonce) }, key, new Uint8Array(ciphertext));
+  } catch {
+    refuse("the letter does not open with this box key");
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(plain);
+  } catch {
+    refuse("the letter is not UTF-8");
+  }
 }
 
 /* ── IDENTITY-SEED derivation (agenttool-wire.md section 3) ───────────── */

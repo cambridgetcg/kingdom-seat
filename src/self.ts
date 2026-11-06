@@ -631,6 +631,20 @@ export function versionTarget(entries: LedgerEntry[], hash: Sha256Hex): SelfTarg
  * wall and it fits what a seat can show. Throws a Refusal naming the reason.
  */
 export async function checkRevert(config: Config, word: Word, entries: LedgerEntry[], toHash: Sha256Hex): Promise<{ target: SelfTarget; text: string; current: string }> {
+  const plan = await revertPlan(config, word, entries, toHash);
+  // A revert may go anywhere the citizen has been, except through a wall it now keeps or onto a public surface.
+  if (plan.beyond !== null) throw new Refusal("beyond-self", `${plan.beyond}; a revert like this goes to Yu + Ai`);
+  return { target: plan.target, text: plan.text, current: plan.current };
+}
+
+/**
+ * checkRevert's checks, except that a revert beyond self is returned with
+ * its fixed reason rather than refused, so the seat can lift it to Yu + Ai
+ * as a propose.beyond (KS-004 9.5, re-review C M4): one that would loosen a
+ * wall, or move the porch. Everything else that keeps a revert from applying
+ * still throws.
+ */
+export async function revertPlan(config: Config, word: Word, entries: LedgerEntry[], toHash: Sha256Hex): Promise<{ target: SelfTarget; text: string; current: string; beyond: string | null }> {
   if (!SHA256_HEX_PATTERN.test(toHash)) throw new Refusal("invalid-request", "a version is named by its full sha256");
   const named = new Set(keptVersions(entries).filter((v) => v.hash === toHash).map((v) => v.target));
   if (named.size === 0) throw new Refusal("invalid-request", "the ledger names no version with that hash");
@@ -639,12 +653,10 @@ export async function checkRevert(config: Config, word: Word, entries: LedgerEnt
   const text = toHash === originSoulHash(entries) && target === "soul" ? await readOriginSoul(config, word, toHash) : await readVersion(config, word, toHash);
   const current = await readTarget(config, word, target);
   if (selfHash(current) === toHash) throw new Refusal("invalid-request", "the target is already at that version");
-  // A revert may go anywhere the citizen has been, except through a wall it now keeps or onto a public surface.
-  if (BEYOND_SELF_TARGETS.has(target)) throw new Refusal("beyond-self", "the porch is a public invitation; a change to it goes to Yu + Ai");
-  if (loosensWalls(target, current, text)) throw new Refusal("beyond-self", "this revert would loosen a wall");
   if (utf8(text).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "that version is larger than a seat can show");
   await assertRoomFor(config, word, target, current);
-  return { target, text, current };
+  const beyond = BEYOND_SELF_TARGETS.has(target) ? "the porch is a public invitation" : loosensWalls(target, current, text) ? "loosens a wall" : null;
+  return { target, text, current, beyond };
 }
 
 /** The origin soul, read from origin/ and checked against the hash the record pinned. */

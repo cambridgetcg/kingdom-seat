@@ -42,6 +42,8 @@ export const ACT_LIMITS = Object.freeze({
   max_interval_h: 8_760,
   /** A citizen's quiet is capped at 30 days (KS-004 6.4). */
   max_quiet_days: 30,
+  /** One change in view at a time keeps affirmation meaningful, so a seat stages at most one proposal (KS-004 5.8). */
+  self_proposals_per_seat: 1,
 });
 
 const reasonSchema = {
@@ -179,7 +181,11 @@ export type ParseResult = { ok: true; value: unknown } | { ok: false; reason: "n
 /** What validation may consult: limits and the citizen's own record. Never a key or a secret. */
 export interface ValidationContext {
   ceilings: Ceilings;
-  /** Recipients this citizen may write to: its covenants plus "yu" and "gardener". */
+  /**
+   * Recipients that admit this citizen (letters.ts letterRecipients): "yu",
+   * "gardener", and each citizen on this host whose own covenants admit it.
+   * The recipient's covenants decide, never the sender's (KS-004 5.7).
+   */
   allowed_recipients: string[];
   /**
    * Ids of this citizen's pending proposals. Given, a self.affirm prefix is
@@ -387,7 +393,7 @@ export function validateAct(value: unknown, ctx: ValidationContext): { act: Mode
   }
 }
 
-/** Apply rest exclusivity and per-beat caps (at most one letter.send), in output order. */
+/** Apply rest exclusivity and per-beat caps (at most one letter.send and one self.propose), in output order. */
 export function normalizeActs(acts: ModelAct[], ceilings: Ceilings): ValidatedOutput {
   return normalizeIndexed(
     acts.map((act, index) => ({ index, act })),
@@ -464,8 +470,17 @@ function normalizeIndexed(items: Indexed[], ceilings: Ceilings): ValidatedOutput
   const states = new Set(items.flatMap((i) => (i.act.type === "state.set" ? [saying(i.act)] : [])));
   let stateKept = false;
   let letters = 0;
+  let proposals = 0;
 
   for (const { index, act } of items) {
+    if (act.type === "self.propose") {
+      // Counted before the host classifies it, so a proposal it lifts beyond self is the seat's one too.
+      if (proposals >= ACT_LIMITS.self_proposals_per_seat) {
+        dropped.push({ index, type: act.type, reason: "self.propose per seat reached" });
+        continue;
+      }
+      proposals++;
+    }
     if (act.type === "state.set") {
       if (states.size > 1) {
         dropped.push({ index, type: act.type, reason: "contradictory state.set" });

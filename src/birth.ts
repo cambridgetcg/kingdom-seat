@@ -37,6 +37,7 @@ import { appendEntry, entryHash, evidenceToLedger, ledgerKey, ledgerPath, nextDr
 import { AgenttoolError, importOpKey, putExpression, registerBoxKey, type ActAuth, type ClientDeps, type ClientIdentity } from "./agenttool/client.ts";
 import { AmbiguousEnrollment, assertBirthConsent, assertYuPresentFor, citizenCapabilities, enroll, prepareEnrollment, type EnrollDeps } from "./agenttool/enrollment.ts";
 import { presenceConfirmedHere, readConsentFor } from "./signer/consent.ts";
+import { assertConfirmedYes } from "./registration.ts";
 import { deriveIdentity, didFor, validateExpression, type DerivedIdentity, type Expression } from "./agenttool/wire.ts";
 
 export interface BirthInput {
@@ -56,9 +57,11 @@ export interface BirthInput {
   proposal: { subject: string; body: string; extent: string };
   /**
    * The ledger digest ("sha256:<hex>") of the beat in which the citizen
-   * affirmed its yes (3b step 1). The proposal body must name it and the
-   * citizen's own ledger must hold it, so the consent is bound to this
-   * citizen's confirmed answer.
+   * affirmed its yes (3b step 1; KS-004 11.2): a self.affirm naming its
+   * answer about registration, which Yu and Ai agreed to on a decision
+   * record filed for that answer's text (registration.ts). The proposal body
+   * must name it and the citizen's own ledger must hold it, so the consent is
+   * bound to this citizen's confirmed answer.
    */
   citizen_yes: string;
 }
@@ -255,10 +258,9 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
   if (canonicalJson(originEntry.origin) !== canonicalJson(originToLedger(input.origin))) {
     throw new Refusal("invalid-request", `the origin given for ${word} is not the one its origin entry pinned`);
   }
-  // A citizen answers yes on its own beats, so its yes is in its ledger.
-  if (!prior.some((e) => entryHash(e) === input.citizen_yes && e.word === word && e.type === "beat")) {
-    throw new Refusal("consent-missing", `${word}'s ledger holds no beat ${input.citizen_yes.slice(0, 19)}… with its affirmed yes`);
-  }
+  // A citizen answers yes on its own beats, so its yes is in its ledger: the beat that affirmed an answer about
+  // registration Yu and Ai agreed to, given on an earlier beat (KS-004 11.2). A beat that says yes in words is not one.
+  await assertConfirmedYes(deps.config, prior, word, input.citizen_yes, deps.clock.now());
 
   // From here something is written, so every failure says how far birth got.
   const done: BirthStage[] = [];

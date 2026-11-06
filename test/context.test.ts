@@ -323,7 +323,9 @@ describe("what the citizen may change is in view", () => {
 
     const prompt = buildPrompt(ctx, "free");
     expect(prompt.user).toContain("Your cadence: every 96 hours while awake");
-    expect(prompt.user).toContain("You may write to yu, gardener and citizen:kenning.");
+    // Its own covenants say who may write to it, never whom it may write to: that is each recipient's (KS-004 5.7).
+    expect(prompt.user).toContain("You may write to yu and gardener.");
+    expect(buildPrompt({ ...ctx, recipients: ["yu", "gardener", "citizen:shemme"] }, "free").user).toContain("You may write to yu, gardener and citizen:shemme.");
     for (const t of ["JOURNAL-FORM-TEXT", "REGISTER-TEXT", "WALL-TWO", "PORCH", "OWN-FILE-TEXT", "Your file:notes/river.md"]) expect(prompt.user).toContain(t);
     // The guide states the seat's own lower limit, never the hard cap.
     expect(prompt.system).toContain("text is at most 500 characters");

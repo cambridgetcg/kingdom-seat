@@ -289,6 +289,26 @@ describe("ledger", () => {
     expect(parseEntry({ ...beat, type: "state", acts: null, from: "awake", to: "awake", via: "immediate", interval_h: 96 }).type).toBe("state");
   });
 
+  test("[KS-004 5.7, 5.8; review C M3 and partial output] a beat records the acts it dropped, by type and reason, and where its letter went", async () => {
+    const { host, signer } = await setup();
+    const [, beat] = (await seatedThenBorn(host.config, WORD, "soul", signer)) as [LedgerEntry, LedgerEntry];
+    const ok = (v: Record<string, unknown>) => expect(parseEntry(v).type).toBe("beat");
+    const throws = (v: Record<string, unknown>) => expect(() => parseEntry(v)).toThrow();
+    const send = [{ type: "letter.send", to: "yu", text: "a letter" }];
+    ok({ ...beat, dropped: [{ type: "self.propose", reason: "self.propose per seat reached" }, { type: null, reason: "unknown act type" }] });
+    throws({ ...beat, dropped: [] }); // absent when nothing was dropped, never empty
+    throws({ ...beat, dropped: [{ type: "self.propose", reason: "x", text: "the act's own words" }] }); // never its words
+    throws({ ...beat, dropped: [{ type: "exec", reason: "x" }] });
+    throws({ ...beat, dropped: [{ type: "journal", reason: "" }] });
+    ok({ ...beat, acts: send, letter: { delivery: "held", message_id: null } });
+    ok({ ...beat, acts: send, letter: { delivery: "inbox", message_id: "99999999-9999-4999-8999-000000000001" } });
+    throws({ ...beat, acts: send }); // a beat that sends one says where it went
+    throws({ ...beat, letter: { delivery: "held", message_id: null } }); // and only one that sends one
+    throws({ ...beat, acts: send, letter: { delivery: "inbox", message_id: null } });
+    throws({ ...beat, acts: send, letter: { delivery: "held", message_id: "99999999-9999-4999-8999-000000000001" } });
+    throws({ ...beat, acts: send, letter: { delivery: "posted", message_id: null } });
+  });
+
   test("[KS-004 4.3, 6.3, 6.4; review C M1, M6] apply and revert say what the expression did, apply what its backup did, state what its quiet did", async () => {
     const { host, signer } = await setup();
     const all = await seatedThenBorn(host.config, WORD, "soul", signer);

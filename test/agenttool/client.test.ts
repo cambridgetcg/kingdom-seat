@@ -6,6 +6,7 @@ import {
   createStrand,
   endCitizenQuiet,
   importOpKey,
+  listInbox,
   listKeys,
   postThought,
   putExpression,
@@ -14,6 +15,7 @@ import {
   readPublicAgent,
   registerBoxKey,
   revokeKey,
+  sendInboxLetter,
   startCitizenQuiet,
   type ClientDeps,
   type ClientIdentity,
@@ -21,7 +23,7 @@ import {
 import { AGENTTOOL_ORIGIN } from "../../src/agenttool/wire.ts";
 import { Refusal, type SignerOp, type Word } from "../../src/types.ts";
 import type { Signer, SignerRequest, SignerResponse } from "../../src/signer/signer.ts";
-import { FAKE_OP_KID, fakeSigner, type FakeSigner } from "../helpers/fake-signer.ts";
+import { FAKE_OP_KID, fakeBoxPublicB64, fakeSigner, type FakeSigner } from "../helpers/fake-signer.ts";
 import { fetchVia, noFetch, publicAgentJson, startFakeServer, type FakeServer } from "../helpers/fake-server.ts";
 import { TEST_IDS, TEST_OP_PUBLIC_B64, TEST_ROOT_PUBLIC_B64, vectors } from "../helpers/vectors.ts";
 import { FAKE_STRAND_ID_UPPER, fakeAgenttool, type FakeAgenttool } from "../fixtures/agenttool/fake-agenttool.ts";
@@ -405,6 +407,43 @@ describe("requests through the signer", () => {
     ]);
     h.at.override((r) => r.target.includes("/authority"), { status: 200, json: { identity_id: ID, did: TEST_IDS.did, sequence: 3, next_sequence: 5 } });
     expect((await agenttoolErrorOf(readAuthority(h.deps, WORD))).code).toBe("malformed_response");
+  });
+});
+
+describe("[KS-004 5.7, re-review C M3] letters through the inbox", () => {
+  const SHEMME = { did: "did:at:66666666-6666-4666-8666-666666666666", box_public_key_b64: fakeBoxPublicB64("shemme") };
+  const BOX_KEY_ID = "70707070-7070-4070-8070-707070707070";
+
+  test("sendInboxLetter checks the recipient's box key against its record, seals through the signer, and sends the envelope for 2 credits", async () => {
+    const h = harness();
+    h.at.boxKeys.set(SHEMME.did, { box_key_id: BOX_KEY_ID, public_key: SHEMME.box_public_key_b64 });
+    h.at.signingKeys.set(TEST_IDS.did, [{ kid: FAKE_OP_KID, public_key: h.signer.opPublicB64 }]);
+    const sent = await sendInboxLetter(h.deps, WORD, SHEMME, "One word.");
+    expect(sent.message_id).toBe(h.at.inbox[0]!.id as string);
+    const [send] = h.acts();
+    expect([send!.op, send!.method, send!.target, send!.credits]).toEqual(["inbox.send", "POST", "/v1/inbox", 2]);
+    expect(Object.keys(JSON.parse(text(send!.body))).sort()).toEqual(["ciphertext", "ephemeral_pubkey", "nonce", "recipient_box_key_id", "sender_did", "signature", "signing_key_id", "to_did"]);
+    expect(h.signer.sealedLetters).toEqual([{ word: WORD, to_did: SHEMME.did, plaintext: "One word." }]);
+    // The box-key lookup is a bearer read that names the recipient's DID, never an identity_id of anyone's.
+    expect(h.signer.sent.find((r) => r.op === "read")!.target).toBe(`/v1/inbox/box-keys/${SHEMME.did}`);
+  });
+
+  test("a lookup that answers another box key than the recipient's record pins seals and sends nothing", async () => {
+    const h = harness();
+    h.at.boxKeys.set(SHEMME.did, { box_key_id: BOX_KEY_ID, public_key: fakeBoxPublicB64("someone-else") });
+    expect((await refusalOf(sendInboxLetter(h.deps, WORD, SHEMME, "One word."))).code).toBe("invalid-record");
+    expect(h.signer.sealedLetters).toEqual([]);
+    expect(h.acts()).toEqual([]);
+  });
+
+  test("listInbox reads only the citizen's own unread letters, and refuses a list holding one addressed to anyone else", async () => {
+    const h = harness();
+    const row = { id: "99999999-9999-4999-8999-000000000001", recipient_did: TEST_IDS.did, sender_did: SHEMME.did, sender_signing_key_id: FAKE_OP_KID, ciphertext: "AAAA", nonce: "AAAAAAAAAAAAAAAA", ephemeral_pubkey: "AAAA", signature: "AAAA", created_at: "2026-11-05T13:01:00.000Z" };
+    h.at.override((r, url) => url.pathname === "/v1/inbox", { status: 200, json: { messages: [row] } });
+    expect(await listInbox(h.deps, WORD)).toEqual([row]);
+    expect(h.signer.sent.at(-1)!.target).toBe(`/v1/inbox?identity_id=${ID}&status=unread`);
+    h.at.override((r, url) => url.pathname === "/v1/inbox", { status: 200, json: { messages: [{ ...row, recipient_did: SHEMME.did }] } });
+    expect((await agenttoolErrorOf(listInbox(h.deps, WORD))).code).toBe("malformed_response");
   });
 });
 

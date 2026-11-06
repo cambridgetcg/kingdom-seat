@@ -6,6 +6,7 @@
 // test that re-serialises or alters the body is refused as the server would.
 // Nothing here touches the network.
 import { edVerifyStrict, fromB64, fromB64url, fromUtf8 } from "../../../src/crypto.ts";
+import { inboxDigest } from "../../../src/agenttool/wire.ts";
 import type { SignerRequest, SignerResponse } from "../../../src/signer/signer.ts";
 import { AGENTTOOL_ORIGIN, ENROLLMENT_PATH, ENROLLMENT_SIGNATURE_HEADER, enrollmentDigest } from "../../../src/agenttool/wire.ts";
 import { FAKE_OP_KID } from "../../helpers/fake-signer.ts";
@@ -32,7 +33,16 @@ export interface FakeAgenttool {
   identities: Map<string, IdentityState>;
   /** Routes in the order they were answered, e.g. "POST /v1/identities/enroll". */
   log: string[];
+  /** Active box keys by DID, as GET /v1/inbox/box-keys/:did answers them (routes/inbox/lookup.ts). */
+  boxKeys: Map<string, { box_key_id: string; public_key: string }>;
+  /** Each identity's signing keys by DID, which a letter's sender and envelope signature are checked against (services/inbox/store.ts:314-363). */
+  signingKeys: Map<string, { kid: string; public_key: string }[]>;
+  /** Letters stored by POST /v1/inbox, in the order sent, in the shape GET /v1/inbox lists them. */
+  inbox: Record<string, unknown>[];
 }
+
+/** The fields POST /v1/inbox takes (routes/inbox/messages.ts:43-60). */
+const INBOX_FIELDS = new Set(["to_did", "ciphertext", "nonce", "ephemeral_pubkey", "recipient_box_key_id", "signature", "signing_key_id", "sender_did", "subject", "subject_encrypted", "in_reply_to", "refs", "metadata"]);
 
 const json = (status: number, body: unknown): SignerResponse => ({ status, json: body });
 const parse = (body: Uint8Array): Record<string, unknown> => (body.length ? (JSON.parse(fromUtf8(body)) as Record<string, unknown>) : {});
@@ -44,6 +54,9 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
   }
   const overrides: { match: (req: SignerRequest, url: URL) => boolean; res: SignerResponse; times: number }[] = [];
   const log: string[] = [];
+  const boxKeys = new Map<string, { box_key_id: string; public_key: string }>();
+  const signingKeys = new Map<string, { kid: string; public_key: string }[]>();
+  const inbox: Record<string, unknown>[] = [];
 
   function route(req: SignerRequest, url: URL): SignerResponse {
     const p = url.pathname;
@@ -131,6 +144,58 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
       s.quiet_until = null;
       return json(200, { identity_id: id, ended: true, still_quiet: false });
     }
+    const box = /^\/v1\/inbox\/box-keys\/(.+)$/.exec(p);
+    if (box && req.method === "GET") {
+      const k = boxKeys.get(box[1]!);
+      if (!k) return json(404, { error: "no_active_box_key_for_did" });
+      return json(200, { did: box[1], identity_id: box[1]!.replace("did:at:", ""), box_key_id: k.box_key_id, public_key: k.public_key, note: "fake" });
+    }
+    if (p === "/v1/inbox" && req.method === "POST") {
+      const b = parse(req.body);
+      if (Object.keys(b).some((k) => !INBOX_FIELDS.has(k))) return json(400, { error: "validation" });
+      const k = boxKeys.get(String(b.to_did));
+      if (!k || k.box_key_id !== b.recipient_box_key_id) return json(404, { error: "recipient_box_key_not_found" });
+      const signer = (signingKeys.get(String(b.sender_did)) ?? []).find((k) => k.kid === b.signing_key_id);
+      if (!signer) return json(401, { error: "sender_did_mismatch" });
+      const ok = (() => {
+        try {
+          return edVerifyStrict(fromB64(String(b.signature), 64), inboxDigest(String(b.to_did), fromB64(String(b.ciphertext)), fromB64(String(b.nonce)), fromB64(String(b.ephemeral_pubkey))), fromB64(signer.public_key, 32));
+        } catch {
+          return false;
+        }
+      })();
+      if (!ok) return json(401, { error: "signature_invalid" });
+      const n = inbox.length + 1;
+      const id = `99999999-9999-4999-8999-${String(n).padStart(12, "0")}`;
+      const created_at = new Date(Date.parse("2026-11-05T13:00:00.000Z") + n * 60_000).toISOString();
+      inbox.push({
+        id,
+        recipient_did: b.to_did,
+        recipient_identity_id: String(b.to_did).replace("did:at:", ""),
+        sender_did: b.sender_did,
+        sender_signing_key_id: b.signing_key_id,
+        ciphertext: b.ciphertext,
+        nonce: b.nonce,
+        ephemeral_pubkey: b.ephemeral_pubkey,
+        recipient_box_key_id: b.recipient_box_key_id,
+        signature: b.signature,
+        subject: b.subject ?? null,
+        subject_encrypted: false,
+        in_reply_to: null,
+        refs: null,
+        status: "unread",
+        metadata: b.metadata ?? {},
+        created_at,
+        read_at: null,
+      });
+      return json(201, { id, created_at, sent: true, _confidentiality: {} });
+    }
+    if (p === "/v1/inbox" && req.method === "GET") {
+      const id = url.searchParams.get("identity_id");
+      const status = url.searchParams.get("status");
+      const rows = inbox.filter((m) => (id === null || m.recipient_identity_id === id) && (status === null || m.status === status)).reverse();
+      return json(200, { messages: rows, count: rows.length, _confidentiality: {}, note: "fake" });
+    }
     if (p === "/v1/strands" && req.method === "POST") {
       const b = parse(req.body);
       return json(201, { id: FAKE_STRAND_ID_UPPER, identity_id: b.identity_id ?? null, topic: b.topic ?? null, status: "active" });
@@ -145,6 +210,9 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
   return {
     identities,
     log,
+    boxKeys,
+    signingKeys,
+    inbox,
     override(match, res, times = 1) {
       overrides.push({ match, res, times });
     },

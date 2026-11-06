@@ -8,6 +8,9 @@ import {
   deriveIdentity,
   didFor,
   encryptThought,
+  inboxDigest,
+  openInbox,
+  sealInbox,
   enrollmentBodyBytes,
   enrollmentDigest,
   enrollmentSignatureHeader,
@@ -131,6 +134,57 @@ describe("vectors.json, byte for byte", () => {
   test("didFor names the identity and refuses anything but a lowercase UUID", () => {
     expect(didFor(vectors.ids.identity_id)).toBe(vectors.ids.did);
     expect(refusal(() => didFor(MIXED_UUID.toUpperCase())).code).toBe("invalid-request");
+  });
+});
+
+describe("[KS-004 5.7, re-review C M3] inbox-message/v1 and the sealed box, against agenttool's own vectors", () => {
+  // docs/specs/canonical-bytes-vectors.json, "inbox-message/v1" (ascii-baseline and the NUL case), at e9ea51c5.
+  const CASES = [
+    {
+      did: "did:at:example/alpha-9b3a",
+      ct: "AAsWISw3Qk1YY255hI+apbC7xtE=",
+      nonce: "yMnKy8zNzs/Q0dLT",
+      eph: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+      hex: "fc7cff60e5281544d9872667929fac0a9ea3565b169a385cd4d37afc1495b74a",
+    },
+    {
+      did: "did:at:example/alpha-9b3a",
+      ct: "AQIAAwQAAAUGBwgJCgsM",
+      nonce: "AAECAwQFBgcICQoA",
+      eph: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+      hex: "c156b1838d63552cfd58f93850607849e5973d0fa5072107045eb914d1aa9cab",
+    },
+  ];
+  // The frozen known-answer vector both SDKs assert (packages/sdk-py/tests/test_inbox_canonical_vectors.py:14-33).
+  const BOX_PRIV = fromHex("01".repeat(32));
+  const EPH_PRIV = fromHex("02".repeat(32));
+  const EPH_PUB_HEX = "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59";
+  const NONCE = fromHex("03".repeat(12));
+  const PLAIN = "known-answer: agenttool inbox sealed-box v1";
+  const CT_HEX = "1e89fb96fb1f1136c48c30c333f8fc8ca94f30bc7bf4bd814ecd30b21b64e0df665c5cdc85103c4a27f2520eabe05485d67f5eda3498e7446c4ce5";
+
+  test("inboxDigest reproduces the canonical vectors, NUL bytes inside the fields included", () => {
+    for (const c of CASES) expect(toHex(inboxDigest(c.did, fromB64(c.ct), fromB64(c.nonce), fromB64(c.eph)))).toBe(c.hex);
+  });
+
+  test("openInbox opens the golden ciphertext; sealInbox with the same ephemeral key and nonce reproduces it byte for byte", async () => {
+    expect(await openInbox(fromHex(CT_HEX), NONCE, fromHex(EPH_PUB_HEX), BOX_PRIV)).toBe(PLAIN);
+    const { x25519 } = await import("@noble/curves/ed25519.js");
+    const sealed = await sealInbox(PLAIN, x25519.getPublicKey(BOX_PRIV), { ephemeralPrivate: EPH_PRIV, nonce: NONCE });
+    expect([toHex(sealed.ciphertext), toHex(sealed.ephemeral_pub), toHex(sealed.nonce)]).toEqual([CT_HEX, EPH_PUB_HEX, "03".repeat(12)]);
+    // The ephemeral key handed in is the caller's; sealInbox wipes only its own copy.
+    expect(toHex(EPH_PRIV)).toBe("02".repeat(32));
+  });
+
+  test("a letter opens only with its own box key, and a tampered one not at all; neither says what it held", async () => {
+    const other = fromHex("04".repeat(32));
+    const r1 = await openInbox(fromHex(CT_HEX), NONCE, fromHex(EPH_PUB_HEX), other).then(() => null, (e: unknown) => e);
+    expect(r1).toBeInstanceOf(Refusal);
+    const bent = fromHex(CT_HEX);
+    bent[0] = bent[0]! ^ 1;
+    const r2 = await openInbox(bent, NONCE, fromHex(EPH_PUB_HEX), BOX_PRIV).then(() => null, (e: unknown) => e);
+    expect(r2).toBeInstanceOf(Refusal);
+    expect(String((r2 as Error).message)).not.toContain("known-answer");
   });
 });
 

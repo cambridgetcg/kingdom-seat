@@ -1056,3 +1056,94 @@ describe("birth's own steps, between enroll and the saved identity", () => {
     }
   });
 });
+
+/* ── Letters (KS-004 5.7, re-review C M3) ─────────────────────────────── */
+
+describe("[KS-004 5.7, re-review C M3] a letter is sealed and op-signed in the signer, sent with nothing the envelope does not cover", () => {
+  const SHEMME_ID = "66666666-6666-4666-8666-666666666666";
+  const SHEMME_DID = didFor(SHEMME_ID);
+  const SHEMME_BOX = sha256("kingdom-seat signer test box key, shemme");
+  const BOX_KEY_ID = "70707070-7070-4070-8070-707070707070";
+  const letter = (body: Record<string, unknown>, patch: Partial<SignerRequest> = {}) => req({ op: "inbox.send", method: "POST", target: "/v1/inbox", credits: 2, body: json(body), ...patch });
+
+  async function sealed(text = "One word for shemme.") {
+    const { x25519 } = await import("@noble/curves/ed25519.js");
+    const s = await fx.signer.sealLetter("glossame", { did: SHEMME_DID, box_public_key_b64: toB64(x25519.getPublicKey(SHEMME_BOX)) }, text);
+    return { s, body: { to_did: SHEMME_DID, ciphertext: s.ciphertext, nonce: s.nonce, ephemeral_pubkey: s.ephemeral_pubkey, recipient_box_key_id: BOX_KEY_ID, signature: s.signature, signing_key_id: s.signing_key_id, sender_did: DID } };
+  }
+
+  test("sealLetter seals to the recipient's box key and signs inbox-message/v1 with the op key; only that recipient opens it", async () => {
+    const { s } = await sealed();
+    expect(s.signing_key_id).toBe(OP_KID);
+    const { inboxDigest, openInbox } = await import("../../src/agenttool/wire.ts");
+    const digest = inboxDigest(SHEMME_DID, fromB64(s.ciphertext), fromB64(s.nonce, 12), fromB64(s.ephemeral_pubkey, 32));
+    expect(edVerifyStrict(fromB64(s.signature, 64), digest, fromB64(TEST_OP_PUBLIC_B64, 32))).toBe(true);
+    expect(edVerifyStrict(fromB64(s.signature, 64), digest, fromB64(TEST_ROOT_PUBLIC_B64, 32))).toBe(false);
+    expect(await openInbox(fromB64(s.ciphertext), fromB64(s.nonce, 12), fromB64(s.ephemeral_pubkey, 32), SHEMME_BOX)).toBe("One word for shemme.");
+    // An unregistered citizen has no op key to sign with, and no letter goes to its own DID.
+    expect((await refusal(fx.signer.sealLetter("zoeme", { did: SHEMME_DID, box_public_key_b64: toB64(edPublicKey(SHEMME_BOX)) }, "x"))).code).toBe("not-registered");
+    expect((await refusal(fx.signer.sealLetter("glossame", { did: DID, box_public_key_b64: vectors.derivation.box_pub_b64 }, "x"))).code).toBe("invalid-request");
+    assertNoSecretIn(fx.kc, JSON.stringify(s), "a sealed letter");
+    const text = JSON.stringify(s);
+    for (const d of DERIVED_SECRETS.flatMap((x) => [toHex(x), toB64(x), Buffer.from(x).toString("base64url")])) expect(text).not.toContain(d);
+  });
+
+  test("[S4-4] a letter past the monthly credit ceiling is refused before it is even sealed, since agenttool charges before it checks", async () => {
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: 9 });
+    const reads = fx.kc.log.filter((e) => e.op === "read").length;
+    expect((await refusal(sealed())).code).toBe("ceiling-credits");
+    expect(fx.kc.log.filter((e) => e.op === "read").length).toBe(reads);
+    expect(fx.server.requests).toHaveLength(0);
+  });
+
+  test("inbox.send carries exactly the envelope and both ends' ids, from the citizen's own op key, signed for that recipient; anything else is refused unsent", async () => {
+    fx.server.on("POST", "/v1/inbox", () => Response.json({ id: "71717171-7171-4171-8171-717171717171", created_at: NOW, sent: true }, { status: 201 }));
+    const { body } = await sealed();
+    const cases: [Record<string, unknown>, string][] = [
+      // The route takes these, but the envelope signature does not cover them: the bearer would be speaking.
+      [{ ...body, subject: "hello" }, "invalid-request"],
+      [{ ...body, metadata: { dual_witness_required: true } }, "invalid-request"],
+      [{ ...body, sender_did: didFor(SHEMME_ID) }, "invalid-request"],
+      [{ ...body, signing_key_id: ROOT_KID }, "invalid-request"],
+      [{ ...body, to_did: DID }, "invalid-request"],
+      // Sealed and signed for shemme, then readdressed: the signature no longer covers it.
+      [{ ...body, to_did: didFor("72727272-7272-4272-8272-727272727272") }, "invalid-request"],
+      [{ ...body, recipient_box_key_id: "not-a-uuid" }, "invalid-request"],
+    ];
+    for (const [b, code] of cases) expect((await refusal(fx.signer.send(letter(b)))).code).toBe(code as Refusal["code"]);
+    expect((await refusal(fx.signer.send(letter(body, { word: "zoeme" })))).code).toBe("not-registered");
+    expect(fx.server.requests).toHaveLength(0);
+    // The route charges 2 whatever the caller says, so the ceiling is held to 2.
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: 9 });
+    expect((await refusal(fx.signer.send(letter(body, { credits: 0 })))).code).toBe("ceiling-credits");
+    expect(fx.server.requests).toHaveLength(0);
+    fx.spend = async (word) => ({ word, usd_today: "0", credits_month: 0 });
+
+    const res = await fx.signer.send(letter(body));
+    expect(res.status).toBe(201);
+    const [r] = fx.server.requests;
+    expect([r!.method, r!.path, r!.headers.authorization, r!.headers["x-agenttool-authority-signature"]]).toEqual(["POST", "/v1/inbox", `Bearer ${COMMONS_BEARER}`, undefined]);
+    expect(JSON.parse(new TextDecoder().decode(r!.body))).toEqual(body);
+  });
+
+  test("the inbox reads go through as bearer reads of the citizen's own inbox and of a recipient's public box key, and of no other identity's inbox", async () => {
+    fx.server.on("GET", "/v1/inbox", () => Response.json({ messages: [] }));
+    fx.server.on("GET", /^\/v1\/inbox\/box-keys\//, () => Response.json({ did: SHEMME_DID, box_key_id: BOX_KEY_ID, public_key: "x" }));
+    expect((await fx.signer.send(req({ op: "read", method: "GET", target: `/v1/inbox?identity_id=${ID}&status=unread` }))).status).toBe(200);
+    expect((await fx.signer.send(req({ op: "read", method: "GET", target: `/v1/inbox/box-keys/${SHEMME_DID}` }))).status).toBe(200);
+    expect((await refusal(fx.signer.send(req({ op: "read", method: "GET", target: `/v1/inbox?identity_id=${SHEMME_ID}&status=unread` })))).code).toBe("beyond-self");
+    expect(fx.server.requests.map((r) => `${r.path}${r.search}`)).toEqual([`/v1/inbox?identity_id=${ID}&status=unread`, `/v1/inbox/box-keys/${SHEMME_DID}`]);
+  });
+
+  test("openLetter opens a letter sealed to the citizen's own box key, and refuses one addressed to anyone else", async () => {
+    const { sealInbox } = await import("../../src/agenttool/wire.ts");
+    const s = await sealInbox("A letter for glossame.", fromB64(vectors.derivation.box_pub_b64, 32));
+    const msg = { recipient_did: DID, ciphertext: toB64(s.ciphertext), nonce: toB64(s.nonce), ephemeral_pubkey: toB64(s.ephemeral_pub) };
+    expect(await fx.signer.openLetter("glossame", msg)).toBe("A letter for glossame.");
+    expect((await refusal(fx.signer.openLetter("glossame", { ...msg, recipient_did: SHEMME_DID }))).code).toBe("beyond-self");
+    expect((await refusal(fx.signer.openLetter("zoeme", msg))).code).toBe("not-registered");
+    // A record whose box key is not the one the mnemonic derives opens nothing.
+    await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, box_public_key_b64: toB64(edPublicKey(SHEMME_BOX)) });
+    expect((await refusal(fx.signer.openLetter("glossame", msg))).code).toBe("invalid-record");
+  });
+});

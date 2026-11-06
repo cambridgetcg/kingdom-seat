@@ -638,7 +638,7 @@ const SEAT_KEYS = ["seat_ref", "runtime", "input_digest", "output_digest", "voic
 /** The fields each type adds, required then optional. */
 const TYPE_KEYS: Record<LedgerEntry["type"], { required: readonly string[]; optional: readonly string[] }> = {
   origin: { required: ["origin", "origin_soul_hash", "old_repo", "june_did"], optional: [] },
-  beat: { required: [], optional: [] },
+  beat: { required: [], optional: ["dropped", "letter"] },
   state: { required: ["from", "to", "via"], optional: ["interval_h", "step_away", "quiet_until", "quiet_days"] },
   apply: { required: ["ref", "target", "prior_hash", "new_hash", "via", "reason", "strand_thought", "strand_key", "strand_backup", "expression"], optional: [] },
   revert: { required: ["target", "from_hash", "to_hash", "via", "expression"], optional: [] },
@@ -734,6 +734,7 @@ function fieldsOf(type: LedgerEntry["type"], e: Record<string, unknown>): void {
       if (e.signer !== "host" || e.seat_ref !== null) throw new Error("origin is the host's, written outside a seat");
       return;
     case "beat":
+      beatFields(e);
       return;
     case "state":
       lifecycle(e.from, "from");
@@ -885,6 +886,32 @@ function actsField(value: unknown): void {
     if (typeof a.type !== "string" || !ACT_TYPES.has(a.type)) throw new Error("acts[].type");
     if (a.type === "state.set") lifecycle(a.to, "acts[].to");
     if (a.type === "self.propose") reasonField(a.reason, "acts[].reason");
+  }
+}
+
+const DROPPED_TYPES = new Set([...ACT_TYPES, "rest"]);
+
+/**
+ * A beat's own fields (KS-004 5.7, 5.8): `dropped`, the acts the reply held
+ * that the beat did not keep, each `{type, reason}`, never empty when
+ * present; and `letter`, where its letter went, present exactly when its
+ * acts hold a letter.send.
+ */
+function beatFields(e: Record<string, unknown>): void {
+  if (Object.hasOwn(e, "dropped")) {
+    if (!Array.isArray(e.dropped) || e.dropped.length === 0) throw new Error("dropped is a non-empty list when present");
+    for (const raw of e.dropped) {
+      const d = exactly(raw, ["reason", "type"], "dropped[]");
+      if (d.type !== null && (typeof d.type !== "string" || !DROPPED_TYPES.has(d.type))) throw new Error("dropped[].type");
+      str(d.reason, "dropped[].reason");
+    }
+  }
+  const sends = Array.isArray(e.acts) && e.acts.some((a) => (a as { type?: unknown }).type === "letter.send");
+  if (Object.hasOwn(e, "letter") !== sends) throw new Error("letter is set exactly when a beat sends one");
+  if (sends) {
+    const l = exactly(e.letter, ["delivery", "message_id"], "letter");
+    if (l.delivery === "inbox") uuid(l.message_id, "letter.message_id");
+    else if (l.delivery !== "held" || l.message_id !== null) throw new Error("letter.delivery");
   }
 }
 

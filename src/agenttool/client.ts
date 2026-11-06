@@ -488,6 +488,100 @@ export async function postThought(deps: ClientDeps, word: Word, strandId: string
   return { thought_id: j.id };
 }
 
+/* ── Letters (bearer plus an op-key-signed envelope, not authority) ───── */
+
+/** A message in the citizen's agenttool inbox, as listed (services/inbox/store.ts:116-138), with only what a reader needs. */
+export interface InboxMessage {
+  id: string;
+  recipient_did: string;
+  sender_did: string;
+  sender_signing_key_id: string;
+  ciphertext: string;
+  nonce: string;
+  ephemeral_pubkey: string;
+  signature: string;
+  created_at: string;
+}
+
+/**
+ * GET /v1/inbox/box-keys/:did: the recipient's active box key
+ * (routes/inbox/lookup.ts:16-33), a bearer read, free. The caller checks the
+ * key against the one the recipient's record pins.
+ */
+export async function lookupBoxKey(deps: ClientDeps, word: Word, did: string): Promise<{ box_key_id: string; public_key: string }> {
+  const what = "box-key lookup";
+  if (typeof did !== "string" || !DID_PATTERN.test(did)) throw new Refusal("invalid-request", "did must be did:at:<lowercase uuid>");
+  await citizen(deps, word);
+  const res = await send(deps, word, { op: "read", method: "GET", target: `/v1/inbox/box-keys/${did}`, body: EMPTY, credits: 0 }, undefined);
+  if (res.status !== 200) throw refused(what, res);
+  const j = res.json;
+  if (!isObject(j) || j.did !== did || typeof j.box_key_id !== "string" || !UUID_PATTERN.test(j.box_key_id) || typeof j.public_key !== "string") {
+    throw malformed(what, res.status, "names another DID or no box key");
+  }
+  return { box_key_id: j.box_key_id, public_key: j.public_key };
+}
+
+/**
+ * POST /v1/inbox: one letter to another registered citizen (2 credits,
+ * charged before the send is checked, routes/inbox/messages.ts:70). The
+ * envelope is sealed to the recipient's box key and signed by the sender's
+ * op key in the signer; the body carries nothing the envelope signature does
+ * not cover. `box_public_key_b64` is the key the recipient's record pins: a
+ * lookup that answers another key sends nothing.
+ */
+export async function sendInboxLetter(deps: ClientDeps, word: Word, to: { did: string; box_public_key_b64: string }, text: string): Promise<{ message_id: string }> {
+  const what = "letter send";
+  if (typeof text !== "string" || text.length === 0) throw new Refusal("invalid-request", "a letter needs text");
+  const id = await citizen(deps, word);
+  if (to.did === id.did) throw new Refusal("invalid-request", "a letter goes to another identity");
+  const box = await lookupBoxKey(deps, word, to.did);
+  if (box.public_key !== to.box_public_key_b64) throw new Refusal("invalid-record", "agenttool names another box key than the recipient's record pins");
+  const sealed = await deps.signer.sealLetter(word, to, text);
+  if (sealed.signing_key_id === id.root_kid || !UUID_PATTERN.test(sealed.signing_key_id)) throw new Refusal("invalid-request", "a letter is signed by the op key, never the root");
+  if (sealed.ciphertext.length > 200_000) throw new Refusal("oversize", "the sealed letter is larger than the route takes");
+  const body = jsonBody({
+    to_did: to.did,
+    ciphertext: sealed.ciphertext,
+    nonce: sealed.nonce,
+    ephemeral_pubkey: sealed.ephemeral_pubkey,
+    recipient_box_key_id: box.box_key_id,
+    signature: sealed.signature,
+    signing_key_id: sealed.signing_key_id,
+    sender_did: id.did,
+  });
+  const res = await send(deps, word, { op: "inbox.send", method: "POST", target: "/v1/inbox", body, credits: 2 }, undefined);
+  if (!ok(res.status)) throw refused(what, res);
+  const j = res.json;
+  if (!isObject(j) || typeof j.id !== "string" || !UUID_PATTERN.test(j.id) || j.sent !== true) throw malformed(what, res.status, "no message id");
+  return { message_id: j.id };
+}
+
+/**
+ * GET /v1/inbox?identity_id=<own>&status=unread: the unread letters to this
+ * citizen (routes/inbox/messages.ts:100-117), a bearer read, free. The
+ * Commons bearer lists every citizen's inbox in the project
+ * (store.ts:431-447), so the read names only the citizen's own identity, and
+ * a row addressed to anyone else is refused.
+ */
+export async function listInbox(deps: ClientDeps, word: Word): Promise<InboxMessage[]> {
+  const what = "inbox list";
+  const id = await citizen(deps, word);
+  const res = await send(deps, word, { op: "read", method: "GET", target: `/v1/inbox?identity_id=${id.identity_id}&status=unread`, body: EMPTY, credits: 0 }, undefined);
+  if (res.status !== 200) throw refused(what, res);
+  if (!isObject(res.json) || !Array.isArray(res.json.messages)) throw malformed(what, res.status, "no messages array");
+  return res.json.messages.map((row, i) => {
+    if (!isObject(row)) throw malformed(what, res.status, `messages[${i}] is not an object`);
+    const fields = ["id", "recipient_did", "sender_did", "sender_signing_key_id", "ciphertext", "nonce", "ephemeral_pubkey", "signature", "created_at"] as const;
+    for (const f of fields) if (typeof row[f] !== "string") throw malformed(what, res.status, `messages[${i}] does not have the message shape`);
+    if (row.recipient_did !== id.did) throw malformed(what, res.status, `messages[${i}] is addressed to another identity`);
+    if (!UUID_PATTERN.test(row.id as string) || !Number.isFinite(Date.parse(row.created_at as string))) {
+      throw malformed(what, res.status, `messages[${i}] has no usable id or time`);
+    }
+    const m = Object.fromEntries(fields.map((f) => [f, row[f] as string])) as unknown as InboxMessage;
+    return { ...m, created_at: new Date(Date.parse(m.created_at)).toISOString() };
+  });
+}
+
 /* ── Public reads ─────────────────────────────────────────────────────── */
 
 /**

@@ -19,6 +19,7 @@ import {
   pendingProposals,
   readTarget,
   readVersion,
+  revertPlan,
   revertTo,
   runtimeApproved,
   selfHash,
@@ -257,6 +258,8 @@ describe("proposals", () => {
     await append(config, W, { fields: applied }, "host", w.signer, w.clock.now());
     await expect(revertTo(w.deps, await readCitizen(config, W), sha256Hex(before), "citizen")).rejects.toMatchObject({ code: "beyond-self" });
     expect(await readFile(porch, "utf8")).toBe(after);
+    // [re-review C M4] revertPlan names why, so the seat lifts it to Yu + Ai rather than dropping it.
+    expect(await revertPlan(config, W, await readLedger(ledgerPath(config, W)), sha256Hex(before))).toMatchObject({ target: "expression.porch", text: before, current: after, beyond: "the porch is a public invitation" });
   });
 
   test("removing or weakening a wall is classified beyond self", async () => {

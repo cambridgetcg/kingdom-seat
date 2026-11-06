@@ -325,11 +325,12 @@ describe("folding and records", () => {
     c = await readCitizen(config, "glossame");
     expect(c).toMatchObject({ state: "awake", last_beat_at: t(1).toISOString() });
 
-    // A missing covenants file lets nobody in; a missing cadence is the default interval, never faster.
+    // [KS-004 5.7, re-review C M3] A missing covenants file admits Yu's letters only, and wakes it for no one;
+    // a missing cadence is the default interval, never faster.
     await rm(join(fx.dir, "self", "covenants.json"));
     await rm(join(fx.dir, "self", "cadence.json"));
     c = await readCitizen(config, "glossame");
-    expect(c.covenants).toEqual({ letters_from: [], wake_on_letter_from: [] });
+    expect(c.covenants).toEqual({ letters_from: ["yu"], wake_on_letter_from: [] });
     expect(c.cadence).toEqual({ interval_h: config.ceilings.min_beat_interval_h });
 
     await symlink(join(host.root, "models.lock"), join(fx.dir, "self", "cadence.json"));

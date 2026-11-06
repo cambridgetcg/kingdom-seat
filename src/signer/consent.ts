@@ -31,6 +31,8 @@ const OP_CLASS: Readonly<Record<SignerOp, ConsentClass>> = Object.freeze({
   "ledger.sign": "within-self",
   "strand.create": "within-self",
   "thought.post": "within-self",
+  // Letters within the credit budget are within self (KS-004 8.1); the recipient's covenants decide whether it is admitted.
+  "inbox.send": "within-self",
   "keys.import": "within-self",
   "keys.revoke": "within-self",
   "box-keys.register": "within-self",

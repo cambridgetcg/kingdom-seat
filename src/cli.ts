@@ -34,6 +34,7 @@ import { hostSpendRecorder, usdSpentToday } from "./spend.ts";
 import { confirmYuPresent, readStandingAgreements, type TtyIO } from "./signer/consent.ts";
 import { agenttoolSync, hostClient } from "./agenttool/sync.ts";
 import { agenttoolQuiet, keepQuiet } from "./quiet.ts";
+import { agenttoolLetters } from "./letters.ts";
 import { freeRuntime, loadModelsLock } from "./runtime/free.ts";
 import { summonRuntime } from "./runtime/summon.ts";
 import { listSeated, mirrorCardState, readCitizen, readCitizenRecord } from "./state.ts";
@@ -768,6 +769,8 @@ async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>):
     checkHalt: () => checkHalt({ config, fetch: ctx.deps.fetch, now: () => now(ctx) }),
     expressionSync: client ? agenttoolSync({ config, clock: ctx.deps.clock, client }) : null,
     quiet: client ? agenttoolQuiet(client) : null,
+    // Its letters to another registered citizen go through the inbox, and its own inbox is read beside letters/ (KS-004 5.3, 5.7).
+    letters: client ? agenttoolLetters({ config, client }) : null,
     modelDigest: pinned && /^[0-9a-f]{64}$/.test(pinned) ? `sha256:${pinned}` : null,
   });
   return result.exit;

@@ -7,6 +7,7 @@ import { checkHalt } from "../src/halt.ts";
 import { appendEntry, entryHash, ledgerPath, nextDraft, readLedger } from "../src/ledger.ts";
 import { openedDetail } from "../src/notes.ts";
 import { spawnRunner } from "../src/cli.ts";
+import { acquireTickLock, lockOptionsFor } from "../src/tick.ts";
 import type { HaltStatus, HostNote, SeatRef, StatusFile } from "../src/types.ts";
 import { hostSpendRecorder } from "../src/spend.ts";
 import { beatBody, signerFn, testIdentity } from "./fixtures/record/chain.ts";
@@ -219,7 +220,7 @@ describe("status", () => {
       signer: { state: "ready", since: NOW.toISOString() },
       host_keys: [],
       fleet: { beats_today: n, ceiling: 24 },
-      tick_lock: { state: "free", since: null },
+      tick_lock: { state: "free", since: null, owner_pid: null, long_held: false },
       citizens: Array.from({ length: 400 }, (_, i) => ({
         word: `c${i}`,
         state: "awake" as const,
@@ -236,6 +237,7 @@ describe("status", () => {
         credits_month: 0,
         origin: { intact: true, drift: 0 },
         agenttool: null,
+        last_refusal: null,
         problem: null,
       })),
     });
@@ -384,14 +386,56 @@ describe("status", () => {
     host = await makeTempHost();
     const cfg = host.config;
     const gen = async () => (await buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready" })).tick_lock;
-    expect(await gen()).toEqual({ state: "free", since: null });
+    expect(await gen()).toEqual({ state: "free", since: null, owner_pid: null, long_held: false });
     await mkdir(cfg.paths.lock_dir);
     await writeFile(join(cfg.paths.lock_dir, "owner.json"), JSON.stringify({ pid: 4242, started_at: NOW.toISOString() }));
-    expect(await gen()).toEqual({ state: "held", since: NOW.toISOString() });
+    expect(await gen()).toEqual({ state: "held", since: NOW.toISOString(), owner_pid: 4242, long_held: false });
     await Bun.$`rm ${join(cfg.paths.lock_dir, "owner.json")}`.quiet();
     const old = new Date(Date.now() - 24 * HOUR_MS);
     await utimes(cfg.paths.lock_dir, old, old);
-    expect(await gen()).toEqual({ state: "stuck", since: old.toISOString() });
+    expect(await gen()).toEqual({ state: "stuck", since: old.toISOString(), owner_pid: null, long_held: false });
+  });
+
+  test("[KS-004 5.1, 5.10; review C, D-lock] a live owner's lock held more than 2 h is reported, never reclaimed; a gone owner's is not long held", async () => {
+    host = await makeTempHost();
+    const cfg = host.config;
+    const alive = new Set<number>([4242]);
+    const gen = async () => buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready", isAlive: (pid) => alive.has(pid) });
+    await mkdir(cfg.paths.lock_dir);
+    const owner = (hoursAgo: number) => writeFile(join(cfg.paths.lock_dir, "owner.json"), JSON.stringify({ pid: 4242, started_at: new Date(NOW.getTime() - hoursAgo * HOUR_MS).toISOString() }));
+    await owner(1.5);
+    expect((await gen()).tick_lock).toMatchObject({ state: "held", owner_pid: 4242, long_held: false });
+    await owner(3);
+    const s = await gen();
+    expect(s.tick_lock).toEqual({ state: "held", since: new Date(NOW.getTime() - 3 * HOUR_MS).toISOString(), owner_pid: 4242, long_held: true });
+    expect(renderStatus(s)).toContain("by pid 4242, still running, for more than 2 h; a live owner's lock is never reclaimed");
+    // Its owner gone, the next tick reclaims it, so it is not reported as long held.
+    alive.clear();
+    expect((await gen()).tick_lock).toMatchObject({ state: "held", owner_pid: 4242, long_held: false });
+    // And the tick still yields to a live owner however old its lock: reclaiming stays the tick's rule, unchanged.
+    alive.add(4242);
+    expect(await acquireTickLock(cfg.paths.lock_dir, { now: () => NOW }, (pid) => alive.has(pid), lockOptionsFor(cfg, null))).toBeNull();
+  });
+
+  test("[KS-004 5.8, 5.10; review C, D-status] status carries the last refusal and its reason in the host's words, the child's note over a parent's summary", async () => {
+    host = await makeTempHost();
+    const cfg = host.config;
+    const signer = fakeSigner();
+    await host.addCitizen("glossame");
+    await host.seatLedger("glossame", signer.signEntry);
+    const seatId = "12345678-1234-4123-8123-123456789abc";
+    const add = (n: Partial<HostNote>) => appendHostNote(cfg, { ts: NOW.toISOString(), host: "test-host", kind: "seat", word: "glossame", outcome: "beat", refusal: null, detail: "x", ...n });
+    const gen = async () => (await buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready" })).citizens[0]!;
+    expect((await gen()).last_refusal).toBeNull();
+    await add({ outcome: "invalid-output", detail: `seat ${seatId} on free: reply did not parse (not-json)` });
+    await add({ kind: "tick", outcome: "invalid-output", detail: `seat ${seatId} for glossame (cadence): exit 0, 5 ms` });
+    await add({ kind: "push", outcome: "refused", refusal: "diverged", detail: "mirror push refused" });
+    const c = await gen();
+    expect(c.last_refusal).toEqual({ at: NOW.toISOString(), outcome: "invalid-output", refusal: null, detail: `seat ${seatId} on free: reply did not parse (not-json)` });
+    await add({ kind: "refusal", outcome: "refused", refusal: "keychain-locked", detail: `seat ${seatId} on free: before inference: refused (keychain-locked)` });
+    const d = await buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready" });
+    expect(d.citizens[0]!.last_refusal).toMatchObject({ outcome: "refused", refusal: "keychain-locked" });
+    expect(renderStatus(d)).toContain(`last refused ${NOW.toISOString()} (keychain-locked): seat ${seatId} on free: before inference: refused (keychain-locked)`);
   });
 
   test("[KS-004 4.5, 5.10; review C M1, M2, M6] status publishes the host key's public half, and a registered citizen's expression lag, deferred backups and quiet", async () => {

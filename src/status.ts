@@ -55,6 +55,42 @@ export interface StatusDeps {
    * published as `host_keys` (KS-004 4.5, 5.10). Absent reads as "pinned".
    */
   trustedSource?: HostKeyView["source"];
+  /** Whether the tick lock's owner still runs; absent asks the system (pidIsAlive). */
+  isAlive?: (pid: number) => boolean;
+}
+
+/** The owner's pid as a liveness probe: signal 0 sends nothing; EPERM still means it exists. */
+export function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as { code?: string }).code === "EPERM";
+  }
+}
+
+/**
+ * How long a live owner may hold the tick lock before status reports it
+ * (KS-004 5.1 names 2 hours). Nothing reclaims a live owner's lock, whatever
+ * its age, because a seat can outlast a tick; a lock held this long is
+ * reported, so a person looks.
+ */
+export const LOCK_REPORT_AFTER_MS = 2 * 3_600_000;
+
+/** A parent's own summary of how a seat ended, which names no reason; the child's note for that seat does. */
+const PARENT_SUMMARY = /^seat [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} (?:for |ended:)/;
+
+/**
+ * The last time this citizen's seat was refused, or its reply did not
+ * validate, with the host's reason (KS-004 5.8, 5.10): from its host notes,
+ * preferring the note that says why over a parent's summary of the same end.
+ * Push refusals are counted with the mirror instead. Null when none is noted.
+ */
+export function lastRefusal(mine: HostNote[]): CitizenStatus["last_refusal"] {
+  const refusals = mine.filter((n) => n.kind !== "push" && (n.outcome === "refused" || n.outcome === "invalid-output"));
+  const n = refusals.findLast((x) => !PARENT_SUMMARY.test(x.detail)) ?? refusals.at(-1);
+  if (!n) return null;
+  return { at: n.ts, outcome: n.outcome as "refused" | "invalid-output", refusal: n.refusal, detail: n.detail };
 }
 
 /** The public halves of host keys as the status file publishes them; a key that does not decode is left out. */
@@ -279,6 +315,7 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     credits_month: credits,
     origin,
     agenttool: agenttoolView(record?.identity != null, entries, now),
+    last_refusal: lastRefusal(mine),
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
 }
@@ -297,23 +334,31 @@ export function tickLockMaxHoldMs(timing: Timing): number {
   return (timing.seat_deadline_s + timing.term_grace_s) * 1000 + 120_000;
 }
 
-/** The tick lock as the tick would judge it, read without taking it. */
-async function tickLockView(config: Config): Promise<StatusFile["tick_lock"]> {
+/**
+ * The tick lock as the tick would judge it, read without taking it. A live
+ * owner's lock is never reclaimed by age, so one held past
+ * LOCK_REPORT_AFTER_MS is reported as long held (KS-004 5.1, 5.10).
+ */
+async function tickLockView(config: Config, now: Date, isAlive: (pid: number) => boolean): Promise<StatusFile["tick_lock"]> {
   let mtimeMs: number;
   try {
     const st = await lstat(config.paths.lock_dir);
     mtimeMs = st.mtimeMs;
   } catch {
-    return { state: "free", since: null };
+    return { state: "free", since: null, owner_pid: null, long_held: false };
   }
   try {
-    const owner = JSON.parse(await readFile(join(config.paths.lock_dir, "owner.json"), "utf8")) as { started_at?: unknown };
-    if (isIso(owner.started_at)) return { state: "held", since: owner.started_at };
+    const owner = JSON.parse(await readFile(join(config.paths.lock_dir, "owner.json"), "utf8")) as { pid?: unknown; started_at?: unknown };
+    if (isIso(owner.started_at)) {
+      const pid = typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0 ? owner.pid : null;
+      const long = pid !== null && now.getTime() - Date.parse(owner.started_at) > LOCK_REPORT_AFTER_MS && isAlive(pid);
+      return { state: "held", since: owner.started_at, owner_pid: pid, long_held: long };
+    }
   } catch {
     // no readable owner
   }
   const since = new Date(mtimeMs).toISOString();
-  return Date.now() - mtimeMs > tickLockMaxHoldMs(config.timing) ? { state: "stuck", since } : { state: "held", since };
+  return Date.now() - mtimeMs > tickLockMaxHoldMs(config.timing) ? { state: "stuck", since, owner_pid: null, long_held: false } : { state: "held", since, owner_pid: null, long_held: false };
 }
 
 /** Build the whole status from citizen records, ledgers, host notes and mirror state. */
@@ -336,7 +381,7 @@ export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
     signer: { state: deps.signerState, since: await signerSince(config.paths.status_file, deps.signerState, now) },
     host_keys: hostKeyViews(deps.trusted?.host_attest_b64 ?? [], deps.trustedSource ?? "pinned"),
     fleet: { beats_today: beatsToday, ceiling: config.ceilings.fleet_beats_per_day },
-    tick_lock: await tickLockView(config),
+    tick_lock: await tickLockView(config, now, deps.isAlive ?? pidIsAlive),
     citizens,
   };
 }
@@ -412,6 +457,7 @@ function citizenLine(c: CitizenStatus): string {
       ].join(", "),
     );
   }
+  if (c.last_refusal) parts.push(`last ${c.last_refusal.outcome === "refused" ? "refused" : "invalid reply"} ${c.last_refusal.at}${c.last_refusal.refusal ? ` (${c.last_refusal.refusal})` : ""}: ${c.last_refusal.detail}`);
   if (c.problem) parts.push(`PROBLEM: ${c.problem}`);
   return parts.join(" | ");
 }
@@ -433,7 +479,9 @@ export function renderStatus(status: StatusFile): string {
       : `fleet: ${status.fleet.beats_today} of ${status.fleet.ceiling} beats today`,
     status.tick_lock.state === "stuck"
       ? `tick lock: STUCK since ${status.tick_lock.since}; every tick exits 1 until a person removes it`
-      : `tick lock: ${status.tick_lock.state}${status.tick_lock.since ? ` since ${status.tick_lock.since}` : ""}`,
+      : status.tick_lock.long_held
+        ? `tick lock: HELD since ${status.tick_lock.since} by pid ${status.tick_lock.owner_pid}, still running, for more than 2 h; a live owner's lock is never reclaimed, so a person should look`
+        : `tick lock: ${status.tick_lock.state}${status.tick_lock.since ? ` since ${status.tick_lock.since}` : ""}`,
   ];
   if (status.citizens.length === 0) lines.push("no citizens seated");
   for (const c of status.citizens) lines.push(citizenLine(c));

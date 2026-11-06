@@ -14,7 +14,7 @@ import { evidenceToLedger, ledgerPath, OLD_LAYOUT_REASON, readLedger, signingDig
 import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
 import { Refusal, type Config, type LedgerEntry, type ModelAct, type StatusFile } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fake-keychain.ts";
-import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
+import { fakeBoxPublicB64, fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, waitFor, type RecordingRunner } from "./helpers/fake-runtime.ts";
 import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { citizenSnapshot, makeTempHost, testBeacons, TEST_SEAT_UID, type TempHost } from "./helpers/temp-home.ts";
@@ -939,6 +939,43 @@ describe("a registered citizen's self on agenttool, as production wires it (revi
     expect(x.signer.sent.map((r) => r.op)).toContain("quiet.start.citizen");
     expect((await readLedger(ledgerPath(x.h.config, "glossame"))).at(-1)).toMatchObject({ type: "state", via: "quiet", from: "asleep", to: "asleep", quiet_days: 2 });
     expect(at.identities.get(identity.identity_id)!.quiet_until).toBe(new Date(clock.now().getTime() + 2 * 86_400_000).toISOString());
+  });
+});
+
+describe("letters between registered citizens, as production wires them (review C M3)", () => {
+  test("[KS-004 5.3, 5.7] the seat child sends a registered citizen's letter through the agenttool inbox, and the recipient's seat child reads it beside letters/", async () => {
+    const x = await harness();
+    const clock = x.deps.clock as TestClock;
+    const at = fakeAgenttool({ project_id: TEST_IDS.project_id });
+    x.signer.respond((req) => at.respond(req));
+    const shemmeId = "66666666-6666-4666-8666-666666666666";
+    const ids = {
+      glossame: { ...testIdentity(x.signer), self_strand_id: null, box_public_key_b64: fakeBoxPublicB64("glossame") },
+      shemme: { ...testIdentity(x.signer), did: `did:at:${shemmeId}`, identity_id: shemmeId, root_kid: "67676767-6767-4767-8767-676767676767", self_strand_id: null, box_public_key_b64: fakeBoxPublicB64("shemme") },
+    };
+    for (const [word, id] of Object.entries(ids)) {
+      await seated(x, word);
+      await x.h.enrollLedger(word, x.signer.signEntry, id);
+      at.boxKeys.set(id.did, { box_key_id: `${id.identity_id.slice(0, 24)}000000000077`, public_key: id.box_public_key_b64 });
+      at.signingKeys.set(id.did, [{ kid: id.op_kid, public_key: id.op_public_key_b64 }]);
+      x.signer.didOf.set(word, id.did);
+    }
+    await writeFile(join(x.h.config.paths.citizens_dir, "shemme", "self", "covenants.json"), JSON.stringify({ letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: ["yu"] }));
+    const run = (reply: ModelAct[]) => {
+      const rt = scriptedRuntime([output(...reply)]);
+      return { deps: { ...x.deps, runtime: async () => rt }, rt };
+    };
+    const send = run([{ type: "letter.send", to: "citizen:shemme", text: "A word across the river." }]);
+    expect(await main(await parentOpens(x, "glossame"), send.deps)).toBe(0);
+    expect(at.inbox).toHaveLength(1);
+    expect((await readLedger(ledgerPath(x.h.config, "glossame"))).at(-1)).toMatchObject({ type: "beat", letter: { delivery: "inbox", message_id: at.inbox[0]!.id }, cost: { credits: 2 } });
+
+    clock.advance(73 * 3_600_000);
+    const read = run([{ type: "journal", kind: "reflected", text: "A letter came across." }]);
+    expect(await main(await parentOpens(x, "shemme"), read.deps)).toBe(0);
+    expect(read.rt.calls[0]!.prompt.user).toContain("A letter from citizen:glossame");
+    expect(read.rt.calls[0]!.prompt.user).toContain("A word across the river.");
+    expect(await readdir(join(x.h.config.paths.citizens_dir, "shemme", "receipts"))).toEqual([`inbox-${at.inbox[0]!.id}`]);
   });
 });
 

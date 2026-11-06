@@ -16,7 +16,21 @@ import { join } from "node:path";
 import { sha256Hex } from "./crypto.ts";
 import { ACT_LIMITS } from "./acts.ts";
 import { MAX_SKILLS, SELF_FILE_MAX_BYTES, keptVersions, originSoulHash, targetRelPath } from "./self.ts";
-import { Refusal, WORD_PATTERN, type Citizen, type Config, type Letter, type LedgerEntry, type NowView, type SeatContext, type SeatLimits, type SeatRef, type SelfProposal } from "./types.ts";
+import { HOST_RECIPIENTS } from "./letters.ts";
+import {
+  Refusal,
+  WORD_PATTERN,
+  type Citizen,
+  type Config,
+  type Letter,
+  type LedgerEntry,
+  type NowView,
+  type RegistrationView,
+  type SeatContext,
+  type SeatLimits,
+  type SeatRef,
+  type SelfProposal,
+} from "./types.ts";
 
 // Strict, and keeping a byte-order mark: the text shown is exactly the bytes
 // read, so a hash checked on the bytes is a hash of what the citizen sees.
@@ -60,12 +74,23 @@ export async function readRegularText(path: string, maxBytes: number): Promise<s
  * The oldest unseen letter from an allowed sender, read as a regular file;
  * symlinks and others are set aside, never counted as mail. A citizen that
  * stepped away is shown only Yu's letter, because that is the offer of a
- * return its seat opened for.
+ * return its seat opened for. `inbox` is what a registered citizen's
+ * agenttool inbox holds for it (letters.ts, already admitted by its
+ * covenants and unseen); the oldest of all is shown, still only one.
  */
-export async function pickLetter(config: Config, citizen: Citizen): Promise<Letter | null> {
+export async function pickLetter(config: Config, citizen: Citizen, inbox: readonly Letter[] = []): Promise<Letter | null> {
   const allowed = new Set(citizen.covenants.letters_from);
-  if (citizen.state === "stepped-away") return scanLetters(config, citizen, (from) => from === "yu" && allowed.has(from));
-  return scanLetters(config, citizen, (from) => allowed.has(from));
+  const away = citizen.state === "stepped-away";
+  const file = await scanLetters(config, citizen, (from) => allowed.has(from) && (!away || from === "yu"));
+  const all = [...(file ? [file] : []), ...inbox.filter((l) => allowed.has(l.from) && (!away || l.from === "yu"))];
+  all.sort((a, b) => (a.received_at < b.received_at ? -1 : a.received_at > b.received_at ? 1 : 0));
+  return all[0] ?? null;
+}
+
+/** Whether a letter was already shown: a host receipt under its id, for a file letter and an inbox letter alike. */
+export async function letterSeen(config: Config, citizen: Pick<Citizen, "word">, id: string): Promise<boolean> {
+  if (!isPlainFileName(id)) return true;
+  return exists(join(citizenDir(config, citizen.word), "receipts", id));
 }
 
 /**
@@ -220,7 +245,16 @@ export async function buildContext(
   citizen: Citizen,
   recent: LedgerEntry[],
   pending: SelfProposal[],
-  opts: { history?: LedgerEntry[]; selfAuthorship?: SeatContext["self_authorship"] } = {},
+  opts: {
+    history?: LedgerEntry[];
+    selfAuthorship?: SeatContext["self_authorship"];
+    /** What its agenttool inbox holds for it, once registered (letters.ts LetterPost.unread). */
+    inbox?: readonly Letter[];
+    /** Whom it may write to (letters.ts letterRecipients); default Yu and the gardener desk. */
+    recipients?: readonly string[];
+    /** Its answer about registration (registration.ts registrationView). */
+    registration?: RegistrationView | null;
+  } = {},
 ): Promise<SeatContext> {
   if (seat.word !== citizen.word) throw new Refusal("invalid-request", "the seat was opened for a different citizen");
   const k = Math.max(0, Math.floor(deps.config.ceilings.ledger_context_entries));
@@ -228,6 +262,9 @@ export async function buildContext(
   const own = recent.filter((e) => e.word === citizen.word);
   const all = (opts.history ?? recent).filter((e) => e.word === citizen.word);
   const versions = listedVersions(all);
+  // What its last beat did not keep, from that beat's own entry, so it knows what did not happen (KS-004 5.8).
+  const lastBeat = all.findLast((e) => e.type === "beat");
+  const lastDropped = lastBeat?.type === "beat" && lastBeat.dropped ? { seq: lastBeat.seq, at: lastBeat.ts, dropped: lastBeat.dropped.map((d) => ({ ...d })) } : null;
   return {
     seat_ref: seat,
     self: await readSelf(deps.config, citizen),
@@ -241,11 +278,14 @@ export async function buildContext(
     versions,
     self_authorship: opts.selfAuthorship ?? { runtime_approved: null, window_opens_at: null, yu_present: false },
     now: describeNow(deps.now, deps.config.timezone),
-    letter: await pickLetter(deps.config, citizen),
+    letter: await pickLetter(deps.config, citizen, opts.inbox ?? []),
     invoker: seat.invoker,
     cadence: { ...citizen.cadence },
     covenants: { letters_from: [...citizen.covenants.letters_from], wake_on_letter_from: [...citizen.covenants.wake_on_letter_from] },
     limits: seatLimits(deps.config),
+    recipients: [...(opts.recipients ?? HOST_RECIPIENTS)],
+    last_dropped: lastDropped,
+    registration: opts.registration ?? null,
   };
 }
 

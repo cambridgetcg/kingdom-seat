@@ -345,10 +345,27 @@ async function readCadence(path: string, defaultH: number): Promise<Cadence> {
   }
 }
 
+/**
+ * A citizen's own covenants, as a recipient's letters are admitted by them
+ * (KS-004 5.7): `citizens/<word>/self/covenants.json`, read as a regular file
+ * under real directories, without folding its ledger.
+ */
+export async function readOwnCovenants(config: Config, word: Word): Promise<Covenants> {
+  const dir = await citizenDir(config, word);
+  const self = join(dir, "self");
+  await refuseLink(self);
+  return readCovenants(join(self, "covenants.json"));
+}
+
+/** Who a citizen admits before it sets its own covenants: Yu only (KS-004 5.7). A letter from Yu still does not wake it. */
+export function defaultCovenants(): Covenants {
+  return { letters_from: ["yu"], wake_on_letter_from: [] };
+}
+
 async function readCovenants(path: string): Promise<Covenants> {
   const text = await readRegularText(path, { maxBytes: 64 * 1024 });
-  // No covenants yet: nobody may write or wake, which is the closed side.
-  if (text === null) return { letters_from: [], wake_on_letter_from: [] };
+  // No covenants yet: Yu's letters only, and no one wakes it, which is the closed side.
+  if (text === null) return defaultCovenants();
   try {
     return parseCovenants(text);
   } catch (err) {

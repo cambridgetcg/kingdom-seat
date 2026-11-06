@@ -95,6 +95,17 @@ describe("the honest prompt", () => {
     for (const old of ["proposal_id", "claim", "body"]) expect([old, guide.includes(old)]).toEqual([old, false]);
   });
 
+  test("[re-review C M3, M4, M5, D-affirm] the guide says what the host now does with a letter, a revert beyond self, a second proposal and an answer about registration", () => {
+    const guide = renderActsGuide();
+    const line = (act: string) => guide.split("\n").find((l) => l.startsWith(`- ${act}:`)) ?? "";
+    expect(line("self.propose")).toContain("At most one per beat; a second is not kept.");
+    expect(line("letter.send")).toContain("a citizen whose own covenants admit you; the one you write to decides, not you.");
+    expect(line("letter.send")).toContain("Until you and the citizen you write to are both registered, the letter is held for Yu, who may deliver it; once you both are, it is sent through agenttool.");
+    expect(line("self.revert")).toContain("A revert that would loosen one of your walls, or change your porch, is not made: it goes to Yu and Ai as a proposal beyond your self.");
+    expect(line("propose.beyond")).toContain("With subject registration it is your answer about an identity on agenttool, permanent and public; once Yu and Ai agree, a later beat shows it back for you to affirm, and only that affirmation is your yes.");
+    expect(line("self.affirm")).toContain("or of an answer about registration that Yu and Ai agreed to");
+  });
+
   test("a pending awake interval is shown with the move it waits on", async () => {
     const fx = await host.addCitizen("glossame");
     const ctx = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), citizenOf(fx.record, { pending_state: "awake", pending_interval_h: 96 }), [], []);

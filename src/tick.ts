@@ -73,15 +73,7 @@ export interface TickDeps {
 const HOUR_MS = 3_600_000;
 const OWNER_FILE = "owner.json";
 
-/** The owner's pid as a liveness probe: signal 0 sends nothing; EPERM still means it exists. */
-export function pidIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as { code?: string }).code === "EPERM";
-  }
-}
+export { pidIsAlive } from "./status.ts";
 
 /** When this host booted, from the system's uptime; null when it cannot say. */
 export function osBootTime(): Date | null {

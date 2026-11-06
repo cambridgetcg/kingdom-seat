@@ -263,6 +263,24 @@ describe("validation", () => {
     expect(long.dropped).toEqual([{ index: 0, type: "letter.send", reason: "text is over the limit" }]);
   });
 
+  test("[KS-004 5.8, re-review C M5] at most one self.propose per seat; the next is an invalid act, dropped with its reason", () => {
+    const reason = { ...CLAIM, evidence: [...CLAIM.evidence] };
+    const soul: ModelAct = { type: "self.propose", target: "soul", edit: { kind: "replace-span", find: "light", with: "lamp" }, reason };
+    const will: ModelAct = { type: "self.propose", target: "will", edit: { kind: "replace-all", text: "Receive two words." }, reason };
+    const r = run(output(soul, { type: "journal", kind: "reflected", text: "between" }, will, soul));
+    expect(r.rest).toBe(false);
+    expect(r.acts).toEqual([soul, { type: "journal", kind: "reflected", text: "between" }]);
+    expect(r.dropped).toEqual([
+      { index: 2, type: "self.propose", reason: "self.propose per seat reached" },
+      { index: 3, type: "self.propose", reason: "self.propose per seat reached" },
+    ]);
+    // One that does not validate is not the seat's proposal: the next valid one is kept.
+    const first = run(output({ ...will, target: "ceilings" } as unknown as ModelAct, will));
+    expect(first.acts).toEqual([will]);
+    expect(first.dropped).toEqual([{ index: 0, type: "self.propose", reason: "target is not within self" }]);
+    expect(ACT_LIMITS.self_proposals_per_seat).toBe(1);
+  });
+
   test("journal text above journal_max_chars is dropped, not truncated", () => {
     const max = DEFAULT_CEILINGS.journal_max_chars;
     const r = run(

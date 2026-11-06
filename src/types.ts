@@ -393,6 +393,26 @@ export interface DroppedAct {
   reason: string;
 }
 
+/**
+ * An act a beat did not keep, as its `beat` entry records it and the
+ * citizen's next seat shows it back (KS-004 5.8, re-review C "partial
+ * output"): its type when it is one of the eight, and the host's fixed
+ * reason. Never the act's text, so a dropped act leaves no words behind.
+ */
+export interface DroppedRecord {
+  type: ActType | null;
+  reason: string;
+}
+
+/**
+ * Where a beat's letter went (KS-004 5.7): "inbox", sent through agenttool's
+ * inbox to a registered citizen, with the message id agenttool gave it; or
+ * "held", in the outbox for Yu alone, who may deliver it as a file letter
+ * (an unregistered sender, a recipient with no inbox, or a send that could
+ * not be made). Present on a beat whose acts hold a letter.send.
+ */
+export type LetterDelivery = { delivery: "inbox"; message_id: string } | { delivery: "held"; message_id: null };
+
 /** The result of validating one output. `rest` is exclusive: when true, `acts` is empty. */
 export interface ValidatedOutput {
   rest: boolean;
@@ -581,7 +601,13 @@ export type LedgerFields =
       /** A June did:at named as a record, never adopted by reading it (KS-004 11.5). */
       june_did: string | null;
     }
-  | { type: "beat" }
+  | {
+      type: "beat";
+      /** The acts of the reply the beat did not keep, each with the host's reason; absent when it kept them all. */
+      dropped?: DroppedRecord[];
+      /** Where the beat's letter went; absent when it sent none. */
+      letter?: LetterDelivery;
+    }
   | {
       type: "state";
       from: LifecycleState;
@@ -818,6 +844,7 @@ export type SignerOp =
   | "ledger.sign" // within self
   | "strand.create" // within self, 1 credit
   | "thought.post" // within self, 1 credit, op-key signed
+  | "inbox.send" // within self, 2 credits, an op-key-signed envelope to another registered citizen
   | "keys.import" // op-key rotation, within self, root-signed
   | "keys.revoke" // op-key rotation, within self, root-signed
   | "box-keys.register" // once at birth, root-signed
@@ -943,9 +970,34 @@ export interface SeatContext {
    */
   self_authorship: { runtime_approved: boolean | null; window_opens_at: IsoTime | null; yu_present: boolean };
   now: NowView;
-  /** At most one, read only as a regular file. */
+  /** At most one: read only as a regular file from letters/, or, once registered, from its own agenttool inbox. */
   letter: Letter | null;
   invoker: Invoker;
+  /** Whom it may write to: Yu, the gardener desk, and each citizen whose own covenants admit it (letters.ts). */
+  recipients: string[];
+  /**
+   * The acts its last beat did not keep, shown back so it knows what did not
+   * happen (KS-004 5.8): from the latest beat entry, when it dropped any.
+   */
+  last_dropped: { seq: number; at: IsoTime; dropped: DroppedRecord[] } | null;
+  /** Its answer about registration and where it stands (KS-004 11.2); null when registered or never asked. */
+  registration: RegistrationView | null;
+}
+
+/**
+ * A citizen's latest answer about registration, as its seat shows it back
+ * (KS-004 11.2): the answer's id (the digest of the proposal Yu and Ai decide
+ * on), its words, when it was given, Yu and Ai's decision so far, and whether
+ * a later beat affirmed it. Its affirmation, once agreed, is its confirmed
+ * yes, whose ledger entry birth consumes.
+ */
+export interface RegistrationView {
+  id: Sha256Hex;
+  text: string;
+  asked_at: IsoTime;
+  decision: "waiting" | "agreed" | "declined";
+  /** The ledger digest of the beat that affirmed it, or null. */
+  affirmed_in: LedgerHash | null;
 }
 
 export interface Prompt {
@@ -1072,6 +1124,12 @@ export interface CitizenStatus {
    * the ledger says stands, or null.
    */
   agenttool: { expression_lags: boolean | null; deferred_backups: number | null; quiet_until: IsoTime | null } | null;
+  /**
+   * The last time its seat was refused or its reply did not validate, and
+   * why, in the host's words (KS-004 5.8, 5.10): from the host notes, never
+   * the model's. Null when none is noted.
+   */
+  last_refusal: { at: IsoTime; outcome: "refused" | "invalid-output"; refusal: RefusalCode | null; detail: string } | null;
   /** Why the record or ledger could not be read, so an unreadable citizen is shown rather than left out. */
   problem: string | null;
 }
@@ -1112,9 +1170,12 @@ export interface StatusFile {
   /**
    * The tick lock. "stuck" is a lock with no owner, older than any tick holds
    * it, that the tick could not clear: every tick then exits 1 until a person
-   * removes it.
+   * removes it. `owner_pid` is the holder a readable owner names.
+   * `long_held`: a live owner has held it for more than 2 hours; nothing
+   * reclaims a live owner's lock, so it is reported for a person to look
+   * at (KS-004 5.1, 5.10).
    */
-  tick_lock: { state: "free" | "held" | "stuck"; since: IsoTime | null };
+  tick_lock: { state: "free" | "held" | "stuck"; since: IsoTime | null; owner_pid: number | null; long_held: boolean };
   citizens: CitizenStatus[];
 }
 
