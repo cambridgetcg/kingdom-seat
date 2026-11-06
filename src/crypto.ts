@@ -100,6 +100,19 @@ export function fromB64url(s: string, length?: number): Uint8Array {
   return bytes;
 }
 
+/** "SHA256:<unpadded base64 of sha256(public key)>", in the style ssh prints; throws unless the key is 32 bytes. */
+export function keyFingerprint(publicKey: Uint8Array): string {
+  if (!(publicKey instanceof Uint8Array) || publicKey.length !== 32) throw new Error("keyFingerprint: a public key here is 32 bytes");
+  return `SHA256:${toB64(sha256(publicKey)).replace(/=+$/, "")}`;
+}
+
+/** True when two byte strings are equal; for public values only (it is not constant-time). */
+export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export function randomBytes(n: number): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(n));
 }
@@ -124,7 +137,7 @@ export function edSign(message: Uint8Array, seed: Uint8Array): Uint8Array {
 /**
  * RFC 8032 strict verification (zip215: false), as agenttool's enrollment
  * uses. It refuses nothing a conforming signer produces, so the ledger
- * verifies its own envelopes this way. Any malformed input is `false`.
+ * verifies its own entries this way. Any malformed input is `false`.
  */
 export function edVerifyStrict(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean {
   if (signature.length !== 64 || publicKey.length !== 32) return false;
@@ -162,4 +175,36 @@ export function canonicalJson(value: unknown): string {
     default:
       throw new Error(`canonicalJson: cannot encode ${typeof value}`);
   }
+}
+
+/**
+ * Parse JSON strictly: malformed UTF-8 and duplicate object keys throw.
+ * JSON.parse keeps the last of two equal keys, so a record could show a
+ * person one value and hand the code another; agenttool's own strict reader
+ * refuses duplicates for the same reason (strict-json.ts:38-53).
+ */
+export function parseStrictJson(input: Uint8Array | string): unknown {
+  const text = typeof input === "string" ? input : fromUtf8(input);
+  const value: unknown = JSON.parse(text);
+  // The text is valid JSON from here on, so strings are well formed and the scan cannot run off the end.
+  const scopes: (Set<string> | null)[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      let k = j + 1;
+      while (text[k] === " " || text[k] === "\t" || text[k] === "\n" || text[k] === "\r") k++;
+      const scope = scopes[scopes.length - 1];
+      if (text[k] === ":" && scope) {
+        const key = JSON.parse(text.slice(i, j + 1)) as string;
+        if (scope.has(key)) throw new Error(`parseStrictJson: duplicate key ${JSON.stringify(key)}`);
+        scope.add(key);
+      }
+      i = j;
+    } else if (c === "{") scopes.push(new Set());
+    else if (c === "[") scopes.push(null);
+    else if (c === "}" || c === "]") scopes.pop();
+  }
+  return value;
 }

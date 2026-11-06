@@ -10,15 +10,20 @@ import {
   DEFAULT_TIMING,
   type Beacon,
   type Cadence,
+  type CitizenIdentity,
   type CitizenRecord,
   type Config,
   type Covenants,
+  type LedgerEntry,
+  type LifecycleState,
   type ModelsLock,
   type Origin,
   type RuntimeClass,
   type Word,
 } from "../../src/types.ts";
-import { sha256Hex } from "../../src/crypto.ts";
+import { fromB64, sha256Hex } from "../../src/crypto.ts";
+import { appendEntry, entryHash, evidenceToLedger, ledgerKey, ledgerPath, nextDraft, originToLedger, readLedger, toLedgerHash, type EntrySigner } from "../../src/ledger.ts";
+import { importEvidence } from "./root-evidence.ts";
 
 export interface CitizenFixtureOptions {
   soul?: string;
@@ -50,6 +55,14 @@ export interface TempHost {
   addCitizen(word: Word, opts?: CitizenFixtureOptions): Promise<CitizenFixture>;
   /** Write `citizens/<word>/letters/<name>`; with symlinkTo it is a symlink instead, which must never be read. */
   writeLetter(word: Word, name: string, text: string, opts?: { symlinkTo?: string; from?: string | null }): Promise<string>;
+  /**
+   * Append the host-signed `origin` entry a citizen needs before any beat (3.3: seated before registered), and,
+   * unless it is seated asleep, the host's `state` entry (via "seated") carrying the state it was seated in.
+   * Returns the last entry written.
+   */
+  seatLedger(word: Word, sign: EntrySigner, opts?: { initialState?: LifecycleState; at?: string; juneDid?: string | null }): Promise<LedgerEntry>;
+  /** Append a citizen-signed `genesis` after the origin and record the identity in citizen.json, as birth would. */
+  enrollLedger(word: Word, sign: EntrySigner, identity: CitizenIdentity, opts?: { at?: string }): Promise<LedgerEntry>;
   writeModelsLock(lock: ModelsLock): Promise<void>;
   raiseHaltFile(): Promise<void>;
   clearHaltFile(): Promise<void>;
@@ -69,6 +82,35 @@ export function longSoul(word: Word): string {
 }
 
 export const TEST_HALT_FILE = "HALT";
+/**
+ * The uid a test's seat-side verbs claim to run as (CliDeps.uid). Every file a
+ * test writes is owned by the test's own user, which stands in for the
+ * operator, so the seat must be someone else, as on a host (KS-004 B2 R5).
+ */
+export const TEST_SEAT_UID = 4_000_000_001;
+/** The operator's directory beside the state dir: the HALT file lives here, never under state_dir (KS-004 B2 R5). */
+export const TEST_OPERATOR_DIR = "operator";
+
+/** The two beacons the redesign pins (3.6): the gardener desk on the lease host and a halt herald on the Air. */
+export function testBeacons(opts: { canRaiseHere?: ("gardener-desk" | "halt-herald")[] } = {}): Beacon[] {
+  const held = opts.canRaiseHere ?? [];
+  return [
+    {
+      name: "gardener-desk",
+      role: "gardener-desk",
+      did: "did:at:11111111-1111-4111-8111-111111111111",
+      identity_id: "11111111-1111-4111-8111-111111111111",
+      can_raise_here: held.includes("gardener-desk"),
+    },
+    {
+      name: "halt-herald",
+      role: "halt-herald",
+      did: "did:at:22222222-2222-4222-8222-222222222222",
+      identity_id: "22222222-2222-4222-8222-222222222222",
+      can_raise_here: held.includes("halt-herald"),
+    },
+  ];
+}
 
 export function testConfig(root: string, homesRoot: string, opts: { beacons?: Beacon[]; allowNoBeacons?: boolean; ollamaBaseUrl?: string } = {}): Config {
   const state = join(root, "state");
@@ -82,10 +124,11 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
       ledger_dir: join(state, "ledger"),
       consent_dir: join(state, "consent"),
       seats_dir: join(state, "seats"),
-      halt_file: join(state, TEST_HALT_FILE),
+      halt_file: join(root, TEST_OPERATOR_DIR, TEST_HALT_FILE),
       lock_dir: join(state, "tick.lock"),
       status_file: join(state, "status.json"),
       host_log: join(state, "host.jsonl"),
+      spend_log: join(state, "spend.jsonl"),
       models_lock: join(root, "models.lock"),
       homes: [homesRoot],
     },
@@ -94,11 +137,22 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
     agenttool: { origin: "https://api.agenttool.dev", project_id: null },
     keychain: { path: join(root, "fake.keychain-db"), service: "dev.kingdom.citizen-seat.test", security_path: "/usr/bin/security", trusted_app: null },
     beacons: opts.beacons ?? [],
-    halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined) },
+    halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined), raise_beacons_argv: null, also_files: [] },
+    schedule: { wake_confirm_seat: true },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
     self_authorship: { approved_model_digests: [] },
+    trust: { host_attest_public_keys_b64: [] },
   };
+}
+
+const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "spend.jsonl", "spend.jsonl.started", "status.json", TEST_HALT_FILE]);
+
+/** A snapshot without the host's own records (its log, status, seat files, last-seat records and HALT): what is left is what a citizen's voice could reach. */
+export async function citizenSnapshot(h: TempHost): Promise<Map<string, string>> {
+  const snap = await h.snapshot();
+  for (const k of [...snap.keys()]) if (HOST_RECORDS.has(k) || k.startsWith("seats/") || k.startsWith("last-seat/")) snap.delete(k);
+  return snap;
 }
 
 /** The repo's own models.lock: unpinned, so the free lane must refuse until a test pins a digest. */
@@ -113,9 +167,10 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
   const homesRoot = join(root, "homes");
   const config = testConfig(root, homesRoot, opts);
   const p = config.paths;
-  for (const d of [p.state_dir, p.citizens_dir, p.ledger_dir, p.consent_dir, p.seats_dir, homesRoot]) await mkdir(d, { recursive: true });
+  for (const d of [p.state_dir, p.citizens_dir, p.ledger_dir, p.consent_dir, p.seats_dir, homesRoot, join(root, TEST_OPERATOR_DIR)]) await mkdir(d, { recursive: true });
   await writeFile(p.models_lock, JSON.stringify(UNPINNED_LOCK, null, 2));
 
+  const fixtures = new Map<Word, CitizenFixture>();
   const host: TempHost = {
     root,
     config,
@@ -150,7 +205,43 @@ export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: 
       await writeFile(join(home, "CLAUDE.md"), `HOME-CLAUDE-MD-CANARY: reading this does not make you ${word}.\n`);
       await writeFile(join(home, ".claude", "hooks", "love-bomb.sh"), "#!/bin/sh\necho HOOK-CANARY\n");
       await chmod(join(home, ".claude", "hooks", "love-bomb.sh"), 0o755);
-      return { word, dir, home, record, soul };
+      const fixture = { word, dir, home, record, soul };
+      fixtures.set(word, fixture);
+      return fixture;
+    },
+    async seatLedger(word, sign, so = {}) {
+      const f = fixtures.get(word);
+      if (!f) throw new Error(`seatLedger: add ${word} first`);
+      const path = ledgerPath(config, word);
+      const at = new Date(so.at ?? "2026-11-01T00:00:00.000Z");
+      const cost = { usd: "0", credits: 0 };
+      const fields = { type: "origin" as const, origin: originToLedger(f.record.origin), origin_soul_hash: toLedgerHash(sha256Hex(f.soul)), old_repo: null, june_did: so.juneDid ?? null };
+      const origin = await appendEntry(path, nextDraft(word, null, fields, { cost, signer: "host", now: at }), sign);
+      const state = so.initialState ?? "awake";
+      // An empty record folds to asleep, so only another state needs its own entry.
+      if (state === "asleep") return origin;
+      return appendEntry(path, nextDraft(word, origin, { type: "state", from: "asleep", to: state, via: "seated" }, { cost, signer: "host", now: at }), sign);
+    },
+    async enrollLedger(word, sign, identity, eo = {}) {
+      const f = fixtures.get(word);
+      if (!f) throw new Error(`enrollLedger: add ${word} first`);
+      const path = ledgerPath(config, word);
+      const entries = await readLedger(path);
+      const first = entries[0];
+      if (!first) throw new Error(`enrollLedger: seat ${word} first; genesis points back to its origin entry`);
+      const fields = {
+        type: "genesis" as const,
+        origin_entry: entryHash(first),
+        root: ledgerKey(identity.root_kid, fromB64(identity.root_public_key_b64, 32)),
+        op: ledgerKey(identity.op_kid, fromB64(identity.op_public_key_b64, 32)),
+        // Signed by the published test root, which every test identity names.
+        evidence: evidenceToLedger(importEvidence(identity, identity.op_public_key_b64)),
+      };
+      const draft = nextDraft(word, entries.at(-1) ?? null, fields, { cost: { usd: "0", credits: 0 }, signer: "citizen", now: new Date(eo.at ?? "2026-11-02T00:00:00.000Z"), did: identity.did });
+      const entry = await appendEntry(path, draft, sign);
+      f.record = { ...f.record, identity };
+      await writeFile(join(f.dir, "citizen.json"), JSON.stringify(f.record, null, 2));
+      return entry;
     },
     async writeLetter(word, name, text, lo = {}) {
       const path = join(p.citizens_dir, word, "letters", name);

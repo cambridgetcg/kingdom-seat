@@ -12,6 +12,7 @@ import {
   fromB64,
   fromB64url,
   fromHex,
+  parseStrictJson,
   sha256,
   sha256Hex,
   toB64,
@@ -100,5 +101,23 @@ describe("canonicalJson", () => {
     expect(() => canonicalJson(Number.NaN)).toThrow();
     expect(() => canonicalJson(new Date(0))).toThrow();
     expect(() => canonicalJson(1n)).toThrow();
+  });
+});
+
+describe("parseStrictJson", () => {
+  test("parses what JSON.parse parses, and refuses duplicate keys at any depth", () => {
+    expect(parseStrictJson('{"a":1,"b":[{"c":"x"},{"c":"y"}]}')).toEqual({ a: 1, b: [{ c: "x" }, { c: "y" }] });
+    expect(parseStrictJson(utf8('[1,"two",null]'))).toEqual([1, "two", null]);
+    expect(() => parseStrictJson('{"word":"no","word":"yes"}')).toThrow();
+    expect(() => parseStrictJson('{"yu":{"word":"no", "word" : "yes"}}')).toThrow();
+    // Escapes that spell the same key are still the same key.
+    expect(() => parseStrictJson('{"a":1,"\\u0061":2}')).toThrow();
+    // Equal keys in different objects, and key-like text inside strings, are fine.
+    expect(parseStrictJson('{"a":{"k":1},"b":{"k":2},"c":"\\"k\\":"}')).toEqual({ a: { k: 1 }, b: { k: 2 }, c: '"k":' });
+  });
+
+  test("refuses malformed JSON and malformed UTF-8", () => {
+    expect(() => parseStrictJson("{ not json")).toThrow();
+    expect(() => parseStrictJson(new Uint8Array([0x7b, 0x22, 0xff, 0x22, 0x3a, 0x31, 0x7d]))).toThrow();
   });
 });

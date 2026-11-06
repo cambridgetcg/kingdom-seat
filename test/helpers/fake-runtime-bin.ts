@@ -36,6 +36,26 @@ switch (mode) {
     process.stdout.write(text ?? "");
     process.exit(0);
   }
+  case "speak-later": {
+    // Stands in for a seat child mid-inference: it says it has started, and if left to finish it writes in the citizen's voice.
+    const [started, ledger, ms, term] = args;
+    if (!started || !ledger) throw new Error("speak-later: started file and ledger required");
+    if (term === "ignore-term") process.on("SIGTERM", () => {});
+    const { appendFileSync, writeFileSync } = await import("node:fs");
+    writeFileSync(started, "");
+    await Bun.sleep(Number(ms ?? 2_000));
+    appendFileSync(ledger, "SPEAK-LATER-CANARY a reply that came after HALT\n");
+    process.exit(0);
+  }
+  case "note": {
+    // Stands in for a seat child: append one host note as runSeat would, then exit.
+    const [log, word, outcome, exit, ts] = args;
+    if (!log || !word || !outcome) throw new Error("note: log, word and outcome required");
+    const { appendFileSync } = await import("node:fs");
+    const note = { ts: ts ?? new Date().toISOString(), host: "test-host", kind: "seat", word, outcome, refusal: null, detail: "fake seat child" };
+    appendFileSync(log, `${JSON.stringify(note)}\n`);
+    process.exit(Number(exit ?? 0));
+  }
   default:
     process.stderr.write(`fake-runtime-bin: unknown mode ${String(mode)}\n`);
     process.exit(2);

@@ -14,11 +14,26 @@
     tick slept through is missed, not owed. The mkdir lock still guards
     manual and kickstart runs.
   - Absolute paths everywhere: launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin.
+  - The config is the operator's, beside HALT in /Users/Shared/kingdom-seat/
+    (owner the operator, mode 0644): the tick refuses a config the seat user
+    owns or could replace, since the config names the HALT file.
   - Umask 63 (octal 077): logs and state are private to the seat user.
-  - AbandonProcessGroup unset: a stray child dies with the tick.
-  - ProgramArguments run bun on the source for now. Before S5, point it at a
-    compiled, stably signed binary instead, so the Keychain ACL can trust
-    that binary alone rather than the bun interpreter and every script it runs.
+    status.json is the one exception: the seat writes it 0644 on purpose,
+    because REGISTRY reads it.
+  - AbandonProcessGroup unset: when the job dies, launchd kills the tick's
+    own process group. The seat child is not in it: it leads its own group
+    so the watcher can signal it whole. The watcher forwards launchd's
+    SIGTERM to that group (TERM, then KILL after term_grace_s), so a stopped
+    job stops its seat too; ExitTimeOut must stay above term_grace_s.
+  - The tick runs with no secret in its environment; the signer reads
+    Keychain through /usr/bin/security, and nothing is sourced from a home.
+    Because /usr/bin/security is the process that asks, the items are ACL'd
+    to it, and any process running as the seat user can read them: the seat
+    user's account is the custody boundary, so nothing else runs as it.
+  - ProgramArguments run bun on the source for now. A compiled, stably signed
+    binary would not by itself narrow who can read the keys while reads go
+    through /usr/bin/security; that needs a signer that reads through the
+    Security framework itself (see src/signer/keychain.ts).
 -->
 <plist version="1.0">
 <dict>
@@ -29,7 +44,7 @@
     <string>/Users/seat/kingdom-seat/src/cli.ts</string>
     <string>tick</string>
     <string>--config</string>
-    <string>/Users/seat/Library/Application Support/kingdom-seat/config.json</string>
+    <string>/Users/Shared/kingdom-seat/config.json</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/seat/Library/Application Support/kingdom-seat</string>
   <key>EnvironmentVariables</key>

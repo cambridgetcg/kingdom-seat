@@ -1,48 +1,501 @@
 // The generated status file (3.2 "Status file", 3.1 principle 6): written
 // from what the runner reads, never kept by hand. Per citizen it shows the
-// last beat against its interval, divergence, push refusals, unsigned commits
-// and spend. REGISTRY probes it. Host notes are the host's record of ticks,
-// rests and refusals; they never carry a citizen's voice or a model's words.
-import type { Config, HaltStatus, HostNote, StatusFile, Word } from "./types.ts";
+// last beat against its interval (by the tick's own rule), divergence, push
+// refusals, unsigned commits, spend and the pinned origin. REGISTRY probes
+// it. Host notes, which it reads, live in notes.ts.
+import { constants } from "node:fs";
+import { chmod, lstat, open, readFile, rename, rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { NO_BEACONS_ID } from "./halt.ts";
+import { fromB64, keyFingerprint } from "./crypto.ts";
+import { entryHash, hostKid, ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
+import { standingQuiet } from "./quiet.ts";
+import { countUnsigned, localDivergence } from "./mirror.ts";
+import { creditsFromLedger } from "./signer/ceilings.ts";
+import { readSpendRecord, usdToday, type SpendLine } from "./spend.ts";
+import { foldState, listSeated, readCitizen, readCitizenRecord } from "./state.ts";
+import { lastDroppedView, readLastSeat, wakingLetter } from "./context.ts";
+import { isDue } from "./due.ts";
+import { isResultNote, lastSeatOf, readHostNotes, seatsOpenedToday } from "./notes.ts";
+import { driftFromOrigin, originIntact } from "./self.ts";
+import {
+  Refusal,
+  type Citizen,
+  type CitizenRecord,
+  type CitizenStatus,
+  type CommandRunner,
+  type Config,
+  type DivergenceState,
+  type HaltStatus,
+  type HostKeyView,
+  type HostNote,
+  type IsoTime,
+  type LedgerEntry,
+  type StatusFile,
+  type Timing,
+  type Word,
+} from "./types.ts";
 
 export interface StatusDeps {
   config: Config;
   now: Date;
   halt: HaltStatus | null;
   signerState: "ready" | "locked" | "unknown";
+  /**
+   * The host attest keys chains are verified against. Without them a chain
+   * with host-attested entries cannot be confirmed, so it reads chain_ok
+   * false: unknown trust is not reported as good.
+   */
+  trusted?: Pick<TrustedKeys, "host_attest_b64"> | null;
+  /** Runs read-only git in mirror worktrees (no fetch); absent leaves mirror divergence unknown. */
+  run?: CommandRunner | null;
+  /**
+   * Where the trusted host keys came from: "pinned" (the config's trust list)
+   * or "signer" (the host's own key, read through the signer). They are
+   * published as `host_keys` (KS-004 4.5, 5.10). Absent reads as "pinned".
+   */
+  trustedSource?: HostKeyView["source"];
+  /** Whether the tick lock's owner still runs; absent asks the system (pidIsAlive). */
+  isAlive?: (pid: number) => boolean;
 }
 
-/** Append one host note to host.jsonl; `detail` is checked to hold no model output. */
-export async function appendHostNote(config: Config, note: HostNote): Promise<void> {
-  throw new Error("unimplemented");
+/** The owner's pid as a liveness probe: signal 0 sends nothing; EPERM still means it exists. */
+export function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as { code?: string }).code === "EPERM";
+  }
 }
 
-/** Host notes since a time, oldest first; null when the log is unreadable (callers treat that as fail-closed). */
-export async function readHostNotes(config: Config, since: Date): Promise<HostNote[] | null> {
-  throw new Error("unimplemented");
+/**
+ * How long a live owner may hold the tick lock before status reports it
+ * (KS-004 5.1 names 2 hours). Nothing reclaims a live owner's lock, whatever
+ * its age, because a seat can outlast a tick; a lock held this long is
+ * reported, so a person looks.
+ */
+export const LOCK_REPORT_AFTER_MS = 2 * 3_600_000;
+
+/** A parent's own summary of how a seat ended, which names no reason; the child's note for that seat does. */
+const PARENT_SUMMARY = /^seat [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} (?:for |ended:)/;
+
+/**
+ * The last time this citizen's seat was refused, or its reply did not
+ * validate, with the host's reason (KS-004 5.8, 5.10): from its host notes,
+ * preferring the note that says why over a parent's summary of the same end.
+ * Push refusals are counted with the mirror instead. Null when none is noted.
+ */
+export function lastRefusal(mine: HostNote[]): CitizenStatus["last_refusal"] {
+  const refusals = mine.filter((n) => n.kind !== "push" && (n.outcome === "refused" || n.outcome === "invalid-output"));
+  const n = refusals.findLast((x) => !PARENT_SUMMARY.test(x.detail)) ?? refusals.at(-1);
+  if (!n) return null;
+  return { at: n.ts, outcome: n.outcome as "refused" | "invalid-output", refusal: n.refusal, detail: n.detail };
 }
 
-/** Build the whole status from citizen records, ledgers, host notes and mirror state. */
-export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
-  throw new Error("unimplemented");
+/** The public halves of host keys as the status file publishes them; a key that does not decode is left out. */
+export function hostKeyViews(keysB64: readonly string[], source: HostKeyView["source"]): HostKeyView[] {
+  const out: HostKeyView[] = [];
+  for (const b64 of keysB64) {
+    let pub: Uint8Array;
+    try {
+      pub = fromB64(b64, 32);
+    } catch {
+      continue;
+    }
+    out.push({ public_key_b64: b64, fingerprint: keyFingerprint(pub), kid: hostKid(pub), source });
+  }
+  return out;
 }
 
-/** Write atomically (temp file in the same directory, fsync, rename), mode 0644. */
-export async function writeStatus(path: string, status: StatusFile): Promise<void> {
-  throw new Error("unimplemented");
+/**
+ * A registered citizen's self on agenttool, as its ledger records it (KS-004
+ * 4.3, 6.3, 6.4): whether the last change that touched the expression left it
+ * lagging, how many strand backups were deferred, and the quiet declaration
+ * that stands now. Null for an unregistered citizen.
+ */
+export function agenttoolView(registered: boolean, entries: LedgerEntry[] | null, now: Date): CitizenStatus["agenttool"] {
+  if (!registered) return null;
+  if (!entries) return { expression_lags: null, deferred_backups: null, quiet_until: null };
+  let lags = false;
+  let deferred = 0;
+  for (const e of entries) {
+    if ((e.type === "apply" || e.type === "revert") && e.expression !== null) lags = e.expression === "lags";
+    if (e.type === "apply" && e.strand_backup === "deferred") deferred++;
+  }
+  const quiet = standingQuiet(entries);
+  return { expression_lags: lags, deferred_backups: deferred, quiet_until: quiet && Date.parse(quiet.until) > now.getTime() ? quiet.until : null };
 }
 
-/** Plain-text view for `citizen-seat status`, one line per citizen plus the HALT and signer lines. */
-export function renderStatus(status: StatusFile): string {
-  throw new Error("unimplemented");
-}
+/* ── Host notes ───────────────────────────────────────────────────────── */
 
-/** Last beat versus interval for one citizen, for REGISTRY's per-citizen probe. */
+// Host notes live in notes.ts; these names are kept here for callers that read status and notes together.
+export { HOST_DETAIL_MAX, appendHostNote, hostDetailProblem, readHostNotes } from "./notes.ts";
+
+/* ── Building the status ──────────────────────────────────────────────── */
+
+const HOUR_MS = 3_600_000;
+
+/** Last beat versus interval for one citizen, for REGISTRY's per-citizen probe. Null means nothing to measure against. */
 export function overdue(lastBeatAt: string | null, intervalH: number, now: Date): boolean {
-  throw new Error("unimplemented");
+  if (lastBeatAt === null) return false;
+  const last = Date.parse(lastBeatAt);
+  if (!Number.isFinite(last) || !Number.isFinite(intervalH) || intervalH <= 0) return true; // unreadable reads as behind
+  return now.getTime() - last > intervalH * HOUR_MS;
 }
 
 /** The words status reports on, in roster order. */
 export async function statusWords(config: Config): Promise<Word[]> {
-  throw new Error("unimplemented");
+  // The roster is the seated list itself: a host-side admission list, sorted, never a second hand-kept file.
+  return listSeated(config);
+}
+
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function isIso(v: unknown): v is IsoTime {
+  return typeof v === "string" && ISO.test(v) && new Date(Date.parse(v)).toISOString() === v;
+}
+
+/** How a HALT reading is named in the status file: the source and its id, so "beacon <name>" reads as such. */
+function haltLabel(r: HaltStatus["readings"][number]): string {
+  if (r.source === "file") return `file ${r.id}`;
+  if (r.id === NO_BEACONS_ID) return "no beacon pinned";
+  return `beacon ${r.id}`;
+}
+
+function haltSection(halt: HaltStatus | null, file: string): StatusFile["halt"] {
+  // A HALT check that did not run is unreadable, and unreadable halts.
+  if (halt === null) return { halted: true, file, raised: [], unreadable: ["halt check"] };
+  return {
+    halted: halt.halted,
+    file,
+    raised: halt.readings.filter((r) => r.state === "raised").map(haltLabel),
+    unreadable: halt.readings.filter((r) => r.state === "unreadable").map(haltLabel),
+  };
+}
+
+/**
+ * When the signer entered its present state: kept from the last generated
+ * status while the state is unchanged, so "locked since" counts from the
+ * first status that saw it locked.
+ */
+async function signerSince(statusFile: string, state: StatusFile["signer"]["state"], now: Date): Promise<IsoTime> {
+  try {
+    const text = await readRegularText(statusFile, { missing: "null", maxBytes: 16 * 1024 * 1024 });
+    if (text) {
+      const prev = JSON.parse(text) as { format?: unknown; signer?: { state?: unknown; since?: unknown } };
+      if (prev.format === "kingdom-seat-status/v1" && prev.signer?.state === state && isIso(prev.signer.since) && Date.parse(prev.signer.since) <= now.getTime()) {
+        return prev.signer.since;
+      }
+    }
+  } catch {
+    // An unreadable earlier status only means the state is new as far as this status knows.
+  }
+  return now.toISOString();
+}
+
+function codeOf(e: unknown): string {
+  return e instanceof Refusal ? e.code : "unreadable";
+}
+
+async function ledgerExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+}
+
+async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | null, spendLines: SpendLine[] | null, halted: boolean): Promise<CitizenStatus> {
+  const { config, now } = deps;
+  const problems: string[] = [];
+  // The tick seats only a citizen readCitizen accepts, so status reads it the same way.
+  let citizen: Citizen | null = null;
+  try {
+    citizen = await readCitizen(config, word);
+  } catch (e) {
+    citizen = null;
+    problems.push(`its own files do not read (${codeOf(e)}), so no tick seats it`);
+  }
+  let record: CitizenRecord | null = citizen;
+  if (!record) {
+    try {
+      record = await readCitizenRecord(config, word);
+    } catch (e) {
+      // Shown rather than left out: a citizen that vanished from status would look like one that was never seated.
+      record = null;
+      problems.push(`citizen.json does not read (${codeOf(e)})`);
+    }
+  }
+  let entries: LedgerEntry[] | null;
+  try {
+    // A citizen with a record has a ledger from the moment it is seated; a missing one is a lost history, not an empty one.
+    if (!(await ledgerExists(ledgerPath(config, word)))) {
+      entries = null;
+      problems.push("no ledger; its history is missing, so it is not seated");
+    } else entries = await readLedger(ledgerPath(config, word));
+  } catch (e) {
+    entries = null;
+    problems.push(`the ledger does not parse (${codeOf(e)})`);
+  }
+
+  const folded = entries ? foldState(entries) : null;
+  const state = citizen?.state ?? folded?.state ?? "asleep";
+  const lastBeat = citizen?.last_beat_at ?? folded?.last_beat_at ?? null;
+  const ownH = citizen?.cadence.interval_h ?? config.ceilings.min_beat_interval_h;
+  const intervalH = Math.max(ownH, config.ceilings.min_beat_interval_h);
+
+  const mine = (notes ?? []).filter((n) => n.word === word);
+  const lastSeat = lastSeatOf(mine, word);
+  // What its last seat came to: a push or a signer note (a quiet kept or not, a mirror commit left unsigned) is not a seat.
+  const lastOutcome = mine.filter((n) => n.kind !== "push" && n.kind !== "signer" && isResultNote(n)).at(-1)?.outcome ?? null;
+
+  // Overdue by the tick's own rule, so status never says a beat is owed that the tick would not give:
+  // only a seat that is due, more than one tick late, while HALT is lowered. Rest is not a debt.
+  // A citizen never seated counts from its seating.
+  let isOverdue = false;
+  let awaitsYu = false;
+  if (citizen) {
+    const letter = await wakingLetter(config, citizen).catch(() => false);
+    const since = lastSeat ?? (citizen.last_beat_at === null ? citizen.seated_at : null);
+    const verdict = isDue(citizen, letter, now, config.ceilings.min_beat_interval_h, since, config.schedule);
+    const graceH = config.timing.tick_interval_s / 3600;
+    isOverdue = !halted && verdict.due && verdict.overdue_h > graceH;
+    // A citizen whose seat would be due on the free lane, but whose runtime runs only with Yu, waits for Yu.
+    awaitsYu = citizen.runtime !== "free" && isDue({ ...citizen, runtime: "free" }, letter, now, config.ceilings.min_beat_interval_h, since, config.schedule).due;
+  }
+
+  // Without a record there is no identity to check the chain against, so it is not reported as verified.
+  const chain = entries && record ? verifyChainFor(entries, deps.trusted ?? null, record) : null;
+  // USD from the host's spend record, which holds the seats that wrote no entry too; credits from the ledger.
+  const usd = spendLines ? usdToday(spendLines, word, now, config.timezone) : null;
+  const credits = entries ? creditsFromLedger(entries, now, config.timezone) : null;
+
+  // The pinned origin: unknown stays null, and a changed one is a problem, because drift is measured against it.
+  let origin: CitizenStatus["origin"] = { intact: null, drift: null };
+  if (entries && entries.length > 0) {
+    const intact = await originIntact(config, word, entries).catch(() => null);
+    const drift = intact ? await driftFromOrigin(config, word).then((d) => d.fraction).catch(() => null) : null;
+    origin = { intact, drift };
+    if (intact === false) problems.push("origin/ no longer matches the origin its record pinned");
+  }
+
+  let mirror: CitizenStatus["mirror"] = null;
+  if (record?.mirror) {
+    let divergence: DivergenceState | null = null;
+    // Unknown until counted: an unchecked mirror is never reported as having no unsigned commits.
+    let unsigned: number | null = null;
+    if (deps.run) {
+      divergence = await localDivergence(deps.run, record.mirror.worktree).catch(() => null);
+      unsigned = await countUnsigned(deps.run, record.mirror.worktree).catch(() => null);
+    }
+    const pushRefusals = mine.filter((n) => n.kind === "push" && n.refusal !== null).length;
+    mirror = { divergence, push_refusals: pushRefusals, unsigned_commits: unsigned };
+  }
+
+  return {
+    word,
+    state,
+    runtime: record?.runtime ?? null,
+    registered: record?.identity != null,
+    last_beat_at: lastBeat,
+    interval_h: intervalH,
+    overdue: isOverdue,
+    awaits_yu: awaitsYu,
+    last_outcome: lastOutcome,
+    ledger: {
+      entries: entries?.length ?? 0,
+      head: entries && entries.length > 0 ? entryHash(entries.at(-1)!) : null,
+      chain_ok: chain?.ok ?? false,
+      host_attested: entries?.filter((e) => e.signer === "host").length ?? 0,
+    },
+    mirror,
+    usd_today: usd,
+    credits_month: credits,
+    origin,
+    agenttool: agenttoolView(record?.identity != null, entries, now),
+    last_refusal: lastRefusal(mine),
+    last_dropped: await lastDroppedFor(config, word, entries),
+    problem: problems.length > 0 ? problems.join("; ") : null,
+  };
+}
+
+/** What its last seat with a reply did not keep (KS-004 5.8, 5.10), as its next seat is shown it; types and fixed reasons only. */
+async function lastDroppedFor(config: Config, word: Word, entries: LedgerEntry[] | null): Promise<CitizenStatus["last_dropped"]> {
+  const view = lastDroppedView(entries ?? [], await readLastSeat(config, word));
+  return view === null ? null : { at: view.at, outcome: view.outcome, dropped: view.dropped };
+}
+
+function verifyChainFor(entries: LedgerEntry[], trusted: Pick<TrustedKeys, "host_attest_b64"> | null, record: CitizenRecord) {
+  // An empty trust list confirms no host-attested entry: unknown trust fails closed.
+  return verifyChain(entries, { host_attest_b64: trusted?.host_attest_b64 ?? [], identity: record.identity });
+}
+
+/**
+ * The longest a tick holds its lock: one seat's deadline and TERM grace, plus
+ * two minutes for selection, the host notes and the status refresh. A lock
+ * with no owner that is older than this was left by a process that died.
+ */
+export function tickLockMaxHoldMs(timing: Timing): number {
+  return (timing.seat_deadline_s + timing.term_grace_s) * 1000 + 120_000;
+}
+
+/**
+ * The tick lock as the tick would judge it, read without taking it. A live
+ * owner's lock is never reclaimed by age, so one held past
+ * LOCK_REPORT_AFTER_MS is reported as long held (KS-004 5.1, 5.10).
+ */
+async function tickLockView(config: Config, now: Date, isAlive: (pid: number) => boolean): Promise<StatusFile["tick_lock"]> {
+  let mtimeMs: number;
+  try {
+    const st = await lstat(config.paths.lock_dir);
+    mtimeMs = st.mtimeMs;
+  } catch {
+    return { state: "free", since: null, owner_pid: null, long_held: false };
+  }
+  try {
+    const owner = JSON.parse(await readFile(join(config.paths.lock_dir, "owner.json"), "utf8")) as { pid?: unknown; started_at?: unknown };
+    if (isIso(owner.started_at)) {
+      const pid = typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0 ? owner.pid : null;
+      const long = pid !== null && now.getTime() - Date.parse(owner.started_at) > LOCK_REPORT_AFTER_MS && isAlive(pid);
+      return { state: "held", since: owner.started_at, owner_pid: pid, long_held: long };
+    }
+  } catch {
+    // no readable owner
+  }
+  const since = new Date(mtimeMs).toISOString();
+  return Date.now() - mtimeMs > tickLockMaxHoldMs(config.timing) ? { state: "stuck", since, owner_pid: null, long_held: false } : { state: "held", since, owner_pid: null, long_held: false };
+}
+
+/** Build the whole status from citizen records, ledgers, host notes and mirror state. */
+export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
+  const { config, now } = deps;
+  const notes = await readHostNotes(config, new Date(0));
+  // The file is named even while lowered: the path is configurable and outside the state dir, so a reader must be told which one stops the seat.
+  const halt = haltSection(deps.halt, config.paths.halt_file);
+  // An unreadable log is a count no one can know: null, which the tick treats as at-ceiling.
+  const beatsToday = notes === null ? null : seatsOpenedToday(notes, now, config.timezone);
+
+  const spendLines = await readSpendRecord(config);
+  const citizens: CitizenStatus[] = [];
+  for (const word of await statusWords(config)) citizens.push(await citizenStatus(deps, word, notes, spendLines, halt.halted));
+  return {
+    format: "kingdom-seat-status/v1",
+    generated_at: now.toISOString(),
+    host: config.host,
+    halt,
+    signer: { state: deps.signerState, since: await signerSince(config.paths.status_file, deps.signerState, now) },
+    host_keys: hostKeyViews(deps.trusted?.host_attest_b64 ?? [], deps.trustedSource ?? "pinned"),
+    fleet: { beats_today: beatsToday, ceiling: config.ceilings.fleet_beats_per_day },
+    tick_lock: await tickLockView(config, now, deps.isAlive ?? pidIsAlive),
+    citizens,
+  };
+}
+
+/** Write atomically (temp file in the same directory, fsync, rename), mode 0644. */
+export async function writeStatus(path: string, status: StatusFile): Promise<void> {
+  const dir = dirname(path);
+  const tmp = join(dir, `.${basename(path)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const bytes = new TextEncoder().encode(`${JSON.stringify(status, null, 2)}\n`);
+  // O_EXCL and O_NOFOLLOW: the temp name is new, so nothing planted there can redirect the write.
+  const fh = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+  try {
+    try {
+      let off = 0;
+      while (off < bytes.length) off += (await fh.write(bytes, off, bytes.length - off)).bytesWritten;
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    // The status is published (REGISTRY reads it), so it is world-readable whatever the umask.
+    await chmod(tmp, 0o644);
+    // rename replaces the name itself, never a file a symlink at `path` points to.
+    await rename(tmp, path);
+  } catch (e) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw e;
+  }
+  await syncDir(dir);
+}
+
+/* ── Rendering ────────────────────────────────────────────────────────── */
+
+function haltLine(h: StatusFile["halt"]): string {
+  const watching = ` (HALT file ${h.file})`;
+  if (!h.halted) return `HALT: not halted${watching}`;
+  const parts: string[] = [];
+  if (h.raised.length > 0) parts.push(`halted by ${h.raised.join(", ")}`);
+  if (h.unreadable.length > 0) parts.push(`halted: ${h.unreadable.join(", ")} unreadable, which counts as raised`);
+  return `HALT: ${parts.length > 0 ? parts.join("; ") : "halted"}${watching}`;
+}
+
+function money(usd: string | null): string {
+  return usd === null ? "spend unknown today" : `$${usd} today`;
+}
+
+function citizenLine(c: CitizenStatus): string {
+  const parts = [
+    `${c.word}: ${c.state}`,
+    c.runtime ?? "runtime unknown",
+    c.registered ? "registered" : "not registered",
+    c.last_beat_at ? `last beat ${c.last_beat_at}` : "no beat yet",
+    `every ${c.interval_h} h`,
+    c.overdue ? "OVERDUE" : c.awaits_yu ? "awaits Yu" : "not overdue",
+    `last ${c.last_outcome ?? "nothing"}`,
+    `ledger ${c.ledger.entries} entries, chain ${c.ledger.chain_ok ? "ok" : "NOT verified"}, ${c.ledger.host_attested} host-attested`,
+  ];
+  if (c.mirror) {
+    parts.push(
+      `mirror ${c.mirror.divergence ?? "unchecked"}, ${c.mirror.push_refusals} push refusals, ${c.mirror.unsigned_commits === null ? "unsigned commits unknown" : `${c.mirror.unsigned_commits} unsigned commits`}`,
+    );
+  }
+  parts.push(money(c.usd_today), c.credits_month === null ? "credits unknown this month" : `${c.credits_month} credits this month`);
+  parts.push(
+    c.origin.intact === null ? "origin unchecked" : c.origin.intact ? `origin intact, soul drift ${c.origin.drift === null ? "unknown" : `${Math.round(c.origin.drift * 100)}%`}` : "origin CHANGED",
+  );
+  if (c.agenttool) {
+    const a = c.agenttool;
+    parts.push(
+      [
+        a.expression_lags === null ? "expression unknown" : a.expression_lags ? "expression LAGS the ledger" : "expression in step",
+        a.deferred_backups === null ? "strand backups unknown" : `${a.deferred_backups} strand backups deferred`,
+        a.quiet_until ? `quiet until ${a.quiet_until}` : "not quiet",
+      ].join(", "),
+    );
+  }
+  if (c.last_refusal) parts.push(`last ${c.last_refusal.outcome === "refused" ? "refused" : "invalid reply"} ${c.last_refusal.at}${c.last_refusal.refusal ? ` (${c.last_refusal.refusal})` : ""}: ${c.last_refusal.detail}`);
+  if (c.last_dropped) {
+    const d = c.last_dropped;
+    parts.push(`last ${d.outcome === "invalid-output" ? "invalid reply" : d.outcome} ${d.at} did not keep ${d.dropped.length}: ${d.dropped.map((x) => `${x.type ?? "unknown"} (${x.reason})`).join(", ")}`);
+  }
+  if (c.problem) parts.push(`PROBLEM: ${c.problem}`);
+  return parts.join(" | ");
+}
+
+function hostKeyLine(keys: StatusFile["host_keys"]): string {
+  if (keys.length === 0) return "host key: unknown (none pinned, and the signer did not say)";
+  return `host key: ${keys.map((k) => `${k.fingerprint} (${k.source})`).join(", ")}`;
+}
+
+/** Plain-text view for `citizen-seat status`, one line per citizen plus the HALT and signer lines. */
+export function renderStatus(status: StatusFile): string {
+  const lines = [
+    `kingdom-seat status for ${status.host} at ${status.generated_at}`,
+    haltLine(status.halt),
+    `signer: ${status.signer.state}${status.signer.since ? ` since ${status.signer.since}` : ""}`,
+    hostKeyLine(status.host_keys),
+    status.fleet.beats_today === null
+      ? `fleet: beats today unknown (host log unreadable), which counts as the ceiling of ${status.fleet.ceiling}`
+      : `fleet: ${status.fleet.beats_today} of ${status.fleet.ceiling} beats today`,
+    status.tick_lock.state === "stuck"
+      ? `tick lock: STUCK since ${status.tick_lock.since}; every tick exits 1 until a person removes it`
+      : status.tick_lock.long_held
+        ? `tick lock: HELD since ${status.tick_lock.since} by pid ${status.tick_lock.owner_pid}, still running, for more than 2 h; a live owner's lock is never reclaimed, so a person should look`
+        : `tick lock: ${status.tick_lock.state}${status.tick_lock.since ? ` since ${status.tick_lock.since}` : ""}`,
+  ];
+  if (status.citizens.length === 0) lines.push("no citizens seated");
+  for (const c of status.citizens) lines.push(citizenLine(c));
+  return `${lines.join("\n")}\n`;
 }
