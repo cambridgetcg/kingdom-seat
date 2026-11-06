@@ -362,11 +362,12 @@ export function validateAct(value: unknown, ctx: ValidationContext): { act: Mode
         act.interval_h = h as number;
       }
       if (Object.hasOwn(value, "quiet_days")) {
-        // A quiet declaration is asked for only toward listening or asleep, and never past the 30-day cap (KS-004 6.4).
+        // A quiet declaration is asked for only toward listening or asleep, in whole days up to KS-004 6.4's 30. A host
+        // whose cap is lower declares at most its cap (quiet.ts quietDays clamps), so asking past it never costs the move
+        // itself: a move toward rest takes effect whatever its quiet comes to.
         if (value.to !== "listening" && value.to !== "asleep") return no("quiet_days goes only with listening or asleep");
         const d = value.quiet_days;
-        const cap = Math.min(ACT_LIMITS.max_quiet_days, ctx.ceilings.citizen_quiet_max_days);
-        if (!Number.isSafeInteger(d) || (d as number) < 1 || (d as number) > cap) return no("quiet_days is not whole days within the cap");
+        if (!Number.isSafeInteger(d) || (d as number) < 1 || (d as number) > ACT_LIMITS.max_quiet_days) return no("quiet_days is not whole days from 1 to 30");
         act.quiet_days = d as number;
       }
       return { act };

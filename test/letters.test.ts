@@ -82,8 +82,88 @@ describe("[KS-004 5.7, re-review C M3] letters.ts", () => {
     expect(await letters.unread(await readCitizen(h.config, "shemme"), never)).toEqual([]);
     // kenning names glossame by its DID: shown, under that id, with its text.
     const shown = await letters.unread(await readCitizen(h.config, "kenning"), never);
-    expect(shown).toEqual([{ id: inboxLetterId(at.inbox[1]!.id as string), from: `did:at:${IDS.glossame}`, received_at: at.inbox[1]!.created_at as string, text: "For kenning.", sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }]);
+    expect(shown).toEqual([{ id: inboxLetterId(at.inbox[1]! as never), from: `did:at:${IDS.glossame}`, received_at: at.inbox[1]!.created_at as string, text: "For kenning.", sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }]);
+    expect(shown[0]!.id).toMatch(/^inbox-[0-9a-f]{64}$/);
     // A letter already receipted is not shown again.
     expect(await letters.unread(await readCitizen(h.config, "kenning"), async (id) => id === shown[0]!.id)).toEqual([]);
+  });
+
+  test("a letter is receipted by its envelope: the same envelope posted again by a bearer holder, under a new message id, is not shown again (wire F2)", async () => {
+    const { h, at, signer } = await registeredHost({
+      glossame: { letters_from: ["yu"], wake_on_letter_from: [] },
+      kenning: { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: [] },
+    });
+    const letters = agenttoolLetters({ config: h.config, client: hostClient(h.config, signer, noFetch) });
+    await letters.send("glossame", await readCitizen(h.config, "kenning"), "Meet me at dawn.");
+    const receipts = new Set<string>();
+    const seen = async (id: string) => receipts.has(id);
+    const [first] = await letters.unread(await readCitizen(h.config, "kenning"), seen);
+    receipts.add(first!.id);
+    // Anyone holding the Commons bearer can list the inbox and post the stored envelope again; agenttool takes it as new.
+    const original = signer.sent.find((q) => q.op === "inbox.send")!;
+    expect(at.respond(original).status).toBe(201);
+    expect(at.inbox.map((m) => m.id)).toHaveLength(2);
+    expect(at.inbox[1]!.id).not.toBe(at.inbox[0]!.id);
+    expect(await letters.unread(await readCitizen(h.config, "kenning"), seen)).toEqual([]);
+    // Both copies name one letter; a second honest letter, freshly sealed, is a different one and is shown.
+    expect(inboxLetterId(at.inbox[0]! as never)).toBe(inboxLetterId(at.inbox[1]! as never));
+    await letters.send("glossame", await readCitizen(h.config, "kenning"), "Meet me at dawn.");
+    const [second] = await letters.unread(await readCitizen(h.config, "kenning"), seen);
+    expect(second).toMatchObject({ text: "Meet me at dawn." });
+    expect(second!.id).not.toBe(first!.id);
+  });
+
+  test("a failure before the paid send spends nothing and is never uncertain: no box key, or a lookup with no answer (wire F3)", async () => {
+    const { h, at, signer } = await registeredHost({
+      glossame: { letters_from: ["yu"], wake_on_letter_from: [] },
+      kenning: { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: [] },
+    });
+    const letters = agenttoolLetters({ config: h.config, client: hostClient(h.config, signer, noFetch) });
+    const kenning = await readCitizen(h.config, "kenning");
+    at.boxKeys.delete(kenning.identity!.did);
+    expect(await letters.send("glossame", kenning, "No inbox.")).toEqual({ message_id: null, held_because: "no-inbox", code: null, credits: 0 });
+    signer.respond((req) => {
+      if (req.target.startsWith("/v1/inbox/box-keys/")) throw new Error("socket closed");
+      return at.respond(req);
+    });
+    expect(await letters.send("glossame", kenning, "No answer.")).toEqual({ message_id: null, held_because: "refused", code: null, credits: 0 });
+    expect(signer.sent.filter((q) => q.op === "inbox.send")).toEqual([]);
+    expect(signer.sealedLetters).toEqual([]);
+    expect(at.inbox).toEqual([]);
+  });
+
+  test("an answer agenttool gives before charging spends nothing: a 402 is credits short, a 400 validation is refused; after the charge it counts (wire F6)", async () => {
+    const { h, at, signer } = await registeredHost({
+      glossame: { letters_from: ["yu"], wake_on_letter_from: [] },
+      kenning: { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: [] },
+    });
+    const letters = agenttoolLetters({ config: h.config, client: hostClient(h.config, signer, noFetch) });
+    const kenning = await readCitizen(h.config, "kenning");
+    const cases: [number, string, Record<string, unknown>][] = [
+      [402, "insufficient_credits", { held_because: "credits", code: "ceiling-credits", credits: 0 }],
+      [400, "validation", { held_because: "refused", code: null, credits: 0 }],
+      [401, "signature_invalid", { held_because: "refused", code: null, credits: 2 }],
+      [503, "unavailable", { held_because: "uncertain", code: null, credits: 2 }],
+    ];
+    for (const [status, error, want] of cases) {
+      at.override((req) => req.op === "inbox.send", { status, json: { error } });
+      expect(await letters.send("glossame", kenning, `Answered ${status}.`), `${status}`).toEqual({ message_id: null, ...want } as never);
+    }
+  });
+
+  test("an inbox read asks for agenttool's whole window of 200, so an admitted letter is not lost behind 50 newer ones (wire F7)", async () => {
+    const { h, at, signer } = await registeredHost({
+      glossame: { letters_from: ["yu"], wake_on_letter_from: [] },
+      shemme: { letters_from: ["yu"], wake_on_letter_from: [] },
+      kenning: { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: [] },
+    });
+    const letters = agenttoolLetters({ config: h.config, client: hostClient(h.config, signer, noFetch) });
+    await letters.send("glossame", await readCitizen(h.config, "kenning"), "The one that matters.");
+    // 50 newer letters from a sender kenning does not admit, all left unread on agenttool.
+    for (let i = 0; i < 50; i++) await letters.send("shemme", await readCitizen(h.config, "kenning"), `Noise ${i}.`);
+    const [shown] = await letters.unread(await readCitizen(h.config, "kenning"), async () => false);
+    expect(shown).toMatchObject({ text: "The one that matters." });
+    const reads = signer.sent.filter((q) => q.op === "read" && q.target.startsWith("/v1/inbox?"));
+    expect(reads.at(-1)!.target).toBe(`/v1/inbox?identity_id=${IDS.kenning}&status=unread&limit=200`);
   });
 });

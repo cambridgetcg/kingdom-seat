@@ -54,7 +54,7 @@ import {
   type Word,
   type YuPresence,
 } from "../types.ts";
-import { hostKid, type EntrySignature } from "../ledger.ts";
+import { LEDGER_FORMAT, hostKid, signingDigest, type EntrySignature, type LedgerDraft } from "../ledger.ts";
 import { GIT_NAMESPACE, sshsigArmor, sshsigSignedData } from "../ssh.ts";
 import { checkCitizenQuiet, checkCredits, type SpendSoFar } from "./ceilings.ts";
 import { agreementCovers, classifyOp, presenceConfirmedHere, presenceValid, proposalDigest, readConsentFor, verifyConsent } from "./consent.ts";
@@ -155,11 +155,12 @@ export interface Signer {
   publicKeys(word: Word): Promise<PublicKeys>;
   /**
    * Sign a ledger entry: the op key for a "citizen" entry, the host key for a
-   * "host" one; never the root. The signature covers the kid, so the signer
-   * names it first and `digestFor` gives the 32-byte digest of the entry with
-   * it (ledger.signingDigest).
+   * "host" one; never the root. It takes the unsigned draft, which must name
+   * this word and this signer, and computes the kingdom-seat-ledger/v1
+   * signing digest itself (ledger.signingDigest, covering the kid it names),
+   * so no caller can have it sign any other 32 bytes (KS-004 4.5).
    */
-  signEntry(word: Word, signer: LedgerSigner, digestFor: (kid: string) => Uint8Array): Promise<EntrySignature>;
+  signEntry(word: Word, signer: LedgerSigner, draft: LedgerDraft): Promise<EntrySignature>;
   /** Authorise and send one agenttool request: ceilings, consent and quiet cap first, then bearer and root proof attached. */
   send(req: SignerRequest): Promise<SignerResponse>;
   /** Sign the identity-enrollment/v1 digest with the citizen's root. Birth only, with Yu present. */
@@ -917,14 +918,17 @@ export function createSigner(deps: SignerDeps): Signer {
       return { root_b64, op_b64, op_kid: identity?.op_kid ?? null, box_b64, host_attest_b64 };
     },
 
-    async signEntry(word, signer, digestFor) {
+    async signEntry(word, signer, draft) {
       assertWord(word);
-      if (typeof digestFor !== "function") invalid("signEntry needs the entry's digest");
-      const digestOf = (kid: string): Uint8Array => {
-        const d = digestFor(kid);
-        if (!(d instanceof Uint8Array) || d.length !== 32) invalid("an entry digest is 32 bytes");
-        return d;
-      };
+      // Only a ledger entry of this citizen's, for this signer: the digest is computed here, under the ledger's own
+      // domain tag, so the entry-signing path can never be asked to sign a thought's or a letter's digest.
+      if (typeof draft !== "object" || draft === null || Array.isArray(draft)) invalid("signEntry needs the unsigned entry");
+      const d = draft as Partial<LedgerDraft> & { kid?: unknown; sig?: unknown };
+      if (d.format !== LEDGER_FORMAT) invalid("the entry is not a kingdom-seat-ledger/v1 entry");
+      if (d.word !== word) invalid("the entry names another citizen");
+      if (d.signer !== signer) invalid("the entry names another signer");
+      if ("kid" in d || "sig" in d) invalid("the entry to sign carries a kid or sig already");
+      const digestOf = (kid: string): Uint8Array => signingDigest({ ...(draft as LedgerDraft), kid });
       const { identity } = await readCitizen(word);
       if (signer === "citizen") {
         if (!identity) throw new Refusal("not-registered", `${word} has no op key yet; its entries are the host's`);

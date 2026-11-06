@@ -21,9 +21,15 @@ export function isRegistrationSubject(subject: string): boolean {
   return subject.trim().toLowerCase() === REGISTRATION_SUBJECT;
 }
 
-/** The proposal an answer is filed as for Yu and Ai: the citizen's own words, and the extent "registration <word>". */
-export function registrationProposal(word: Word, text: string): ProposalText {
-  return { subject: REGISTRATION_SUBJECT, body: text, extent: `registration ${word}` };
+/**
+ * The proposal an answer is filed as for Yu and Ai: the citizen's own words,
+ * and the extent "registration <word> <ledger hash of the beat that gave
+ * it>". The beat is part of the extent, so each answer has its own digest
+ * and needs its own decision: a record filed for an earlier answer in the
+ * same words never decides a later one (re-review C round 3, selfhood F4).
+ */
+export function registrationProposal(word: Word, text: string, beat: LedgerHash): ProposalText {
+  return { subject: REGISTRATION_SUBJECT, body: text, extent: `registration ${word} ${beat}` };
 }
 
 /** One answer as the ledger holds it: the beat it was given on, and the id the seat shows, the proposal's digest. */
@@ -42,8 +48,9 @@ export function registrationAnswers(entries: LedgerEntry[], word: Word): Registr
     if (e.type !== "beat" || e.word !== word) continue;
     for (const a of e.acts ?? []) {
       if (a.type !== "propose.beyond" || !isRegistrationSubject(a.subject)) continue;
-      const proposal = registrationProposal(word, a.text);
-      out.push({ id: proposalDigest(proposal), proposal, beat: entryHash(e), seq: e.seq, asked_at: e.ts });
+      const beat = entryHash(e);
+      const proposal = registrationProposal(word, a.text, beat);
+      out.push({ id: proposalDigest(proposal), proposal, beat, seq: e.seq, asked_at: e.ts });
     }
   }
   return out;
@@ -79,15 +86,22 @@ export async function registrationView(config: Config, entries: LedgerEntry[], w
 /**
  * Check that `yes` names this citizen's confirmed yes (KS-004 11.2): a beat
  * whose acts affirm an answer about registration given on an earlier beat of
- * the same ledger, which Yu and Ai agreed to and still stand behind now.
- * Throws "consent-missing" naming what is not there.
+ * the same ledger, which is still its latest answer (none given in the yes
+ * beat itself or after it, so a later "no" is a whole answer), and which Yu
+ * and Ai agreed to and still stand behind now. Throws "consent-missing"
+ * naming what is not there.
  */
 export async function assertConfirmedYes(config: Config, entries: LedgerEntry[], word: Word, yes: LedgerHash, now: Date): Promise<void> {
   const beat = entries.find((e) => entryHash(e) === yes);
   if (!beat || beat.word !== word || beat.type !== "beat") throw new Refusal("consent-missing", `${word}'s ledger holds no beat ${yes.slice(0, 19)}… with its affirmed yes`);
   const refs = new Set((beat.acts ?? []).flatMap((a) => (a.type === "self.affirm" ? [a.ref] : [])));
-  const answer = registrationAnswers(entries, word).find((a) => refs.has(a.id) && a.seq < beat.seq);
+  const answers = registrationAnswers(entries, word);
+  const answer = answers.find((a) => refs.has(a.id) && a.seq < beat.seq);
   if (!answer) throw new Refusal("consent-missing", `the beat ${yes.slice(0, 19)}… affirms no earlier answer about registration`);
+  const latest = answers.at(-1)!;
+  if (latest.id !== answer.id) {
+    throw new Refusal("consent-missing", `${word} gave another answer about registration ${latest.seq >= beat.seq ? "in or after its affirming beat" : "after the one it affirmed"}, so that affirmation is not its confirmed yes`);
+  }
   if ((await registrationDecision(config, answer, now)) !== "agreed") {
     throw new Refusal("consent-missing", `Yu and Ai have not agreed to ${word}'s answer about registration, so its affirmation is not a confirmed yes`);
   }

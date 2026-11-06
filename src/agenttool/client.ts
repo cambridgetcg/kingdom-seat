@@ -71,6 +71,39 @@ export class AgenttoolError extends Error {
   }
 }
 
+/**
+ * A letter that never left the host: the free box-key lookup failed, or the
+ * key agenttool named, or sealing it, did. Nothing paid was sent, so it
+ * spent nothing, and nothing can have been delivered (re-review C round 3,
+ * wire F3). `no_inbox` is a recipient with no active box key (a 404 from the
+ * lookup, routes/inbox/lookup.ts:21-24).
+ */
+export class InboxNotSent extends Error {
+  override readonly name = "InboxNotSent";
+  constructor(
+    readonly no_inbox: boolean,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * An answered refusal that agenttool returns before it charges (KS-004 6.3):
+ * a 402 insufficient_credits, whose conditional debit took nothing
+ * (billing/charge.ts:289-321), or a 400 validation, which the paid routes
+ * answer from their schema before charge() (routes/strand/strands.ts:66-74,
+ * routes/strand/thoughts.ts:53-61, routes/inbox/messages.ts:64-70). "credits"
+ * says the Commons pool is short; null for anything else, which may have
+ * been charged.
+ */
+export function notCharged(e: unknown): "credits" | "invalid" | null {
+  if (!(e instanceof AgenttoolError)) return null;
+  if (e.status === 402 && e.code === "insufficient_credits") return "credits";
+  if (e.status === 400 && e.code === "validation") return "invalid";
+  return null;
+}
+
 /** The public profile fields a beacon reader and an existence check need (agents.ts:109-136). */
 export interface PublicAgent {
   did: string;
@@ -483,9 +516,11 @@ export async function postThought(deps: ClientDeps, word: Word, strandId: string
   const res = await send(deps, word, { op: "thought.post", method: "POST", target: `/v1/strands/${sid}/thoughts`, body, credits: 1 }, undefined);
   if (!ok(res.status)) throw refused(what, res);
   const j = res.json;
-  if (!isObject(j) || typeof j.id !== "string" || j.id.length === 0) throw malformed(what, res.status, "no thought id");
+  // A thought id is a uuid column (db/schema/strand.ts:69). It goes into a signed ledger entry, so nothing else the
+  // server might send is taken: any other answer is malformed, and the credit still counts.
+  if (!isObject(j) || typeof j.id !== "string" || !UUID_PATTERN.test(j.id.toLowerCase())) throw malformed(what, res.status, "no thought id");
   if (j.strand_id !== undefined && j.strand_id !== sid) throw malformed(what, res.status, "the thought landed on another strand");
-  return { thought_id: j.id };
+  return { thought_id: j.id.toLowerCase() };
 }
 
 /* ── Letters (bearer plus an op-key-signed envelope, not authority) ───── */
@@ -534,9 +569,19 @@ export async function sendInboxLetter(deps: ClientDeps, word: Word, to: { did: s
   if (typeof text !== "string" || text.length === 0) throw new Refusal("invalid-request", "a letter needs text");
   const id = await citizen(deps, word);
   if (to.did === id.did) throw new Refusal("invalid-request", "a letter goes to another identity");
-  const box = await lookupBoxKey(deps, word, to.did);
-  if (box.public_key !== to.box_public_key_b64) throw new Refusal("invalid-record", "agenttool names another box key than the recipient's record pins");
-  const sealed = await deps.signer.sealLetter(word, to, text);
+  // Everything before the paid POST is free and sends no letter, so a failure here is a definite not-sent:
+  // a wall stays a Refusal, and anything else becomes InboxNotSent, never a charge or an "uncertain" (wire F3).
+  let box: { box_key_id: string; public_key: string };
+  let sealed: Awaited<ReturnType<Signer["sealLetter"]>>;
+  try {
+    box = await lookupBoxKey(deps, word, to.did);
+    if (box.public_key !== to.box_public_key_b64) throw new Refusal("invalid-record", "agenttool names another box key than the recipient's record pins");
+    sealed = await deps.signer.sealLetter(word, to, text);
+  } catch (e) {
+    if (e instanceof Refusal) throw e;
+    const noInbox = e instanceof AgenttoolError && e.status === 404;
+    throw new InboxNotSent(noInbox, noInbox ? "the recipient has no active box key on agenttool" : "the letter was not sent: the box-key lookup or sealing failed");
+  }
   if (sealed.signing_key_id === id.root_kid || !UUID_PATTERN.test(sealed.signing_key_id)) throw new Refusal("invalid-request", "a letter is signed by the op key, never the root");
   if (sealed.ciphertext.length > 200_000) throw new Refusal("oversize", "the sealed letter is larger than the route takes");
   const body = jsonBody({
@@ -556,17 +601,22 @@ export async function sendInboxLetter(deps: ClientDeps, word: Word, to: { did: s
   return { message_id: j.id };
 }
 
+/** The most unread letters one inbox read returns: agenttool's own cap (services/inbox/store.ts:440-446); it defaults to 50. */
+export const INBOX_LIST_LIMIT = 200;
+
 /**
- * GET /v1/inbox?identity_id=<own>&status=unread: the unread letters to this
- * citizen (routes/inbox/messages.ts:100-117), a bearer read, free. The
- * Commons bearer lists every citizen's inbox in the project
+ * GET /v1/inbox?identity_id=<own>&status=unread&limit=200: the unread letters
+ * to this citizen, newest first (routes/inbox/messages.ts:100-117), a bearer
+ * read, free. The Commons bearer lists every citizen's inbox in the project
  * (store.ts:431-447), so the read names only the citizen's own identity, and
- * a row addressed to anyone else is refused.
+ * a row addressed to anyone else is refused. The route has no cursor, and
+ * nothing here marks a letter read (that would be the bearer acting for the
+ * citizen), so the newest 200 unread letters are all a seat can see.
  */
 export async function listInbox(deps: ClientDeps, word: Word): Promise<InboxMessage[]> {
   const what = "inbox list";
   const id = await citizen(deps, word);
-  const res = await send(deps, word, { op: "read", method: "GET", target: `/v1/inbox?identity_id=${id.identity_id}&status=unread`, body: EMPTY, credits: 0 }, undefined);
+  const res = await send(deps, word, { op: "read", method: "GET", target: `/v1/inbox?identity_id=${id.identity_id}&status=unread&limit=${INBOX_LIST_LIMIT}`, body: EMPTY, credits: 0 }, undefined);
   if (res.status !== 200) throw refused(what, res);
   if (!isObject(res.json) || !Array.isArray(res.json.messages)) throw malformed(what, res.status, "no messages array");
   return res.json.messages.map((row, i) => {

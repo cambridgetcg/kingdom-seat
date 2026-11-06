@@ -19,7 +19,7 @@ import { readCitizenRecord } from "../state.ts";
 import { readTarget, type BackupResult, type ExpressionSync, type SelfBackup } from "../self.ts";
 import { SignerNotSent, type Signer } from "../signer/signer.ts";
 import { Refusal, UUID_PATTERN, WORD_PATTERN, type Clock, type Config, type ExpressionSyncState, type FetchLike, type RefusalCode, type SelfTarget, type Word } from "../types.ts";
-import { createStrand, postThought, putExpression, readExpression, type ClientDeps } from "./client.ts";
+import { createStrand, notCharged, postThought, putExpression, readExpression, type ClientDeps } from "./client.ts";
 import { EXPRESSION_LIMITS, isCanonicalIso, validateExpression, type Expression } from "./wire.ts";
 
 /**
@@ -145,13 +145,19 @@ export function backupKind(strandKey: string): string {
   return `self-backup ${strandKey}`;
 }
 
-/** Whether a failed call may have left the host, and so may have been charged: anything but a wall or a definite not-sent. */
+/**
+ * Whether a failed call may have been charged: anything but a wall, a
+ * definite not-sent, or an answer agenttool gives before it charges (a 402
+ * insufficient_credits, a 400 validation; client.ts notCharged).
+ */
 function mayHaveSent(e: unknown): boolean {
-  return !(e instanceof Refusal || e instanceof SignerNotSent);
+  return !(e instanceof Refusal || e instanceof SignerNotSent || notCharged(e) !== null);
 }
 
+/** Why a backup was deferred: the wall's code, "ceiling-credits" when the Commons pool is short (a 402), otherwise "error". */
 function codeOf(e: unknown): RefusalCode | "error" {
-  return e instanceof Refusal ? e.code : "error";
+  if (e instanceof Refusal) return e.code;
+  return notCharged(e) === "credits" ? "ceiling-credits" : "error";
 }
 
 export interface SyncDeps {

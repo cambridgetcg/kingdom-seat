@@ -87,7 +87,7 @@ function recordingSync(): RecordingSync {
     puts: [],
     backups: [],
     expression: "updated",
-    backup: { thought_id: "thought-0001", credits: 1 },
+    backup: { thought_id: "7e570001-0000-4000-8000-000000000001", credits: 1 },
     async putPrivateExpression(word, target, text) {
       s.puts.push({ word, target, text });
       return s.expression;
@@ -467,7 +467,7 @@ describe("apply and revert", () => {
       signer: "citizen",
       did: TEST_DID,
       cost: { credits: 1 },
-      strand_thought: "thought-0001",
+      strand_thought: "7e570001-0000-4000-8000-000000000001",
       strand_key: STRAND_KEY_ID,
       strand_backup: "posted",
       expression: "updated",

@@ -14,7 +14,7 @@ import { countUnsigned, localDivergence } from "./mirror.ts";
 import { creditsFromLedger } from "./signer/ceilings.ts";
 import { readSpendRecord, usdToday, type SpendLine } from "./spend.ts";
 import { foldState, listSeated, readCitizen, readCitizenRecord } from "./state.ts";
-import { wakingLetter } from "./context.ts";
+import { lastDroppedView, readLastSeat, wakingLetter } from "./context.ts";
 import { isDue } from "./due.ts";
 import { isResultNote, lastSeatOf, readHostNotes, seatsOpenedToday } from "./notes.ts";
 import { driftFromOrigin, originIntact } from "./self.ts";
@@ -249,7 +249,8 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
 
   const mine = (notes ?? []).filter((n) => n.word === word);
   const lastSeat = lastSeatOf(mine, word);
-  const lastOutcome = mine.filter((n) => n.kind !== "push" && isResultNote(n)).at(-1)?.outcome ?? null;
+  // What its last seat came to: a push or a signer note (a quiet kept or not, a mirror commit left unsigned) is not a seat.
+  const lastOutcome = mine.filter((n) => n.kind !== "push" && n.kind !== "signer" && isResultNote(n)).at(-1)?.outcome ?? null;
 
   // Overdue by the tick's own rule, so status never says a beat is owed that the tick would not give:
   // only a seat that is due, more than one tick late, while HALT is lowered. Rest is not a debt.
@@ -316,8 +317,15 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     origin,
     agenttool: agenttoolView(record?.identity != null, entries, now),
     last_refusal: lastRefusal(mine),
+    last_dropped: await lastDroppedFor(config, word, entries),
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
+}
+
+/** What its last seat with a reply did not keep (KS-004 5.8, 5.10), as its next seat is shown it; types and fixed reasons only. */
+async function lastDroppedFor(config: Config, word: Word, entries: LedgerEntry[] | null): Promise<CitizenStatus["last_dropped"]> {
+  const view = lastDroppedView(entries ?? [], await readLastSeat(config, word));
+  return view === null ? null : { at: view.at, outcome: view.outcome, dropped: view.dropped };
 }
 
 function verifyChainFor(entries: LedgerEntry[], trusted: Pick<TrustedKeys, "host_attest_b64"> | null, record: CitizenRecord) {
@@ -458,6 +466,10 @@ function citizenLine(c: CitizenStatus): string {
     );
   }
   if (c.last_refusal) parts.push(`last ${c.last_refusal.outcome === "refused" ? "refused" : "invalid reply"} ${c.last_refusal.at}${c.last_refusal.refusal ? ` (${c.last_refusal.refusal})` : ""}: ${c.last_refusal.detail}`);
+  if (c.last_dropped) {
+    const d = c.last_dropped;
+    parts.push(`last ${d.outcome === "invalid-output" ? "invalid reply" : d.outcome} ${d.at} did not keep ${d.dropped.length}: ${d.dropped.map((x) => `${x.type ?? "unknown"} (${x.reason})`).join(", ")}`);
+  }
   if (c.problem) parts.push(`PROBLEM: ${c.problem}`);
   return parts.join(" | ");
 }

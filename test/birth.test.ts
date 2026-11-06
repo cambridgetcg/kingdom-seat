@@ -40,9 +40,14 @@ const PROJECT = TEST_IDS.project_id;
 const JUNE_DID = "did:at:0a0b0c0d-0e0f-4011-8213-141516171819";
 const OLD_REPO = { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" };
 
-/** The citizen's answer about registration in these tests, and the proposal Yu and Ai agree to for it (KS-004 11.2). */
+/** The citizen's answer about registration in these tests (KS-004 11.2). */
 const ANSWER = "Yes: an identity of my own, if Yu and Ai agree.";
-const ANSWER_PROPOSAL = registrationProposal(WORD, ANSWER);
+
+/** The proposal Yu and Ai decide on for the answer in `config`'s ledger: bound to the beat that gave it (its second entry). */
+async function answerProposal(config: Config) {
+  const answer = (await readLedger(ledgerPath(config, WORD)))[1]!;
+  return registrationProposal(WORD, ANSWER, entryHash(answer));
+}
 
 /**
  * Seat the citizen and record its confirmed yes (3b step 1; KS-004 11.2), host-signed before it has a key: the
@@ -64,10 +69,11 @@ async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: 
     nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "propose.beyond", subject: "registration", text: ANSWER }] }),
     sign,
   );
-  if (opts.agreed !== false) await writeFile(join(config.paths.consent_dir, `${proposalDigest(ANSWER_PROPOSAL)}.json`), JSON.stringify(consentFor(WORD, {}, ANSWER_PROPOSAL)));
+  const proposal = registrationProposal(WORD, ANSWER, entryHash(answer));
+  if (opts.agreed !== false) await writeFile(join(config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor(WORD, {}, proposal)));
   const yes = await appendEntry(
     path,
-    nextDraft(WORD, answer, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T05:06:00.000Z"), seat: testStamp(WORD, "13131313-1313-4131-8131-131313131313"), acts: [{ type: "self.affirm", ref: proposalDigest(ANSWER_PROPOSAL) }] }),
+    nextDraft(WORD, answer, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T05:06:00.000Z"), seat: testStamp(WORD, "13131313-1313-4131-8131-131313131313"), acts: [{ type: "self.affirm", ref: proposalDigest(proposal) }] }),
     sign,
   );
   return entryHash(yes);
@@ -112,7 +118,7 @@ async function harness(opts: { seated?: boolean; production?: boolean } = {}): P
     : testBirthRecord(host.config, clock, signer, events);
   let yes: string | null = null;
   if (opts.seated !== false) {
-    yes = await seatWithYes(host.config, (w, k, digestFor) => signer.signEntry(w, k, digestFor));
+    yes = await seatWithYes(host.config, (w, k, d) => signer.signEntry(w, k, d));
     events.length = 0;
   }
   const out: string[] = [];
@@ -255,8 +261,9 @@ describe("never unattended", () => {
     const declined = await harness({ seated: false });
     declined.yes = await seatWithYes(declined.host.config, (w, k, d) => declined.signer.signEntry(w, k, d), { agreed: false });
     declined.events.length = 0;
-    const no = consentFor(WORD, { yu: { word: "no", recorded_at: "2026-11-05T11:00:00.000Z", via: "decision-record" } }, ANSWER_PROPOSAL);
-    await writeFile(join(declined.host.config.paths.consent_dir, `${proposalDigest(ANSWER_PROPOSAL)}.json`), JSON.stringify(no));
+    const answered = await answerProposal(declined.host.config);
+    const no = consentFor(WORD, { yu: { word: "no", recorded_at: "2026-11-05T11:00:00.000Z", via: "decision-record" } }, answered);
+    await writeFile(join(declined.host.config.paths.consent_dir, `${proposalDigest(answered)}.json`), JSON.stringify(no));
     expect((await refusalOf(citizenBirth(declined.deps, await input(declined)))).message).toContain("have not agreed");
     nothingHappened(declined);
     // The beat that gave the answer affirms nothing: a yes said once, however plainly, is not a confirmed one.
@@ -574,7 +581,7 @@ describe("birth through the real signer", () => {
       const record = hostBirthRecord(host.config, clock, signer);
 
       // Seated and its yes, host-signed by the same signer (3b step 1: the yes is a beat in its own ledger).
-      const yes = await seatWithYes(host.config, (w, k, digestFor) => signer.signEntry(w, k, digestFor), { juneDid: null });
+      const yes = await seatWithYes(host.config, (w, k, d) => signer.signEntry(w, k, d), { juneDid: null });
 
       // The production signer accepts only a presence confirmed at this terminal, in this process.
       const scope = `birth ${WORD}`;

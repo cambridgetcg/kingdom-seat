@@ -77,12 +77,16 @@ one is something it does, not something it hopes.
   may return, with KS-004 5.7's field names (`self.propose` carries a
   `reason`, `self.affirm` a `ref`, `letter.send` and `propose.beyond` a
   `text`; `state.set` may name an awake `interval_h` and, toward listening
-  or asleep, `quiet_days`). Rest is exclusive except for one state.set toward
-  less activity, which is kept as a state record with no words. A seat
-  stages at most one `self.propose`. Acts that do not validate, or that the
-  host cannot complete, are dropped while the rest of the reply is kept; the
-  beat entry records each one's type and the host's reason (never its
-  words), and the citizen's next seat shows them back.
+  or asleep, `quiet_days`, 1 to 30, held to the host's cap). Rest is
+  exclusive except for one state.set toward less activity, which is kept as
+  a state record with no words. A seat stages at most one saying: one
+  `self.propose`, or one revert held for a later beat. Acts that do not
+  validate, or that the host cannot complete, are dropped while the rest of
+  the reply is kept; the beat entry records each one's type and the host's
+  reason (never its words). A rest, or a reply where nothing was kept, writes
+  no beat, so the host keeps the same list in `last-seat/<word>.json`; the
+  citizen's next seat shows back what its last seat did not keep, and status
+  shows it as `last_dropped`.
 - `runtime/free.ts` (Ollama on 127.0.0.1 by manifest digest, never a cloud
   model, and no seat when the whole context would not fit `num_ctx`, counted
   as UTF-8 bytes plus the template and `num_predict`) and
@@ -98,19 +102,26 @@ one is something it does, not something it hopes.
   revert that would loosen a wall or move the porch).
 - `letters.ts`: a letter goes where its recipient's own covenants admit it,
   never by the sender's list; a citizen with no covenants file admits only
-  Yu. An unregistered citizen's letter, and any letter to Yu or the gardener
-  desk, is held for Yu alone in the outbox (no proposal, no digest). Between
-  two registered citizens on this host it goes through agenttool's inbox:
-  sealed to the recipient's box key and signed by the sender's op key in the
-  signer, 2 credits within the ceiling, carrying nothing the envelope
-  signature does not cover. A registered citizen's seat reads its own inbox
+  Yu, who may also wake it. An unregistered citizen's letter, any letter to
+  Yu or the gardener desk, and a letter that would wake a listening or asleep
+  recipient (an inbox letter wakes no one), is held for Yu alone in the
+  outbox (no proposal, no digest). Between two registered citizens on this
+  host it goes through agenttool's inbox: sealed to the recipient's box key
+  and signed by the sender's op key in the signer, 2 credits within the
+  ceiling, carrying nothing the envelope signature does not cover. A
+  registered citizen's seat reads its own inbox (the newest 200 unread)
   beside `letters/`, showing a letter only from a sender its covenants admit
-  and whose op key signed the envelope. A send that is not made is held for
-  Yu, saying why.
+  and whose op key signed the envelope, and receipting it by its envelope,
+  so one posted again is not shown again. A send that is not made is held for
+  Yu, saying why; one the credits cannot cover becomes a proposal for Yu and
+  Ai. Nothing is counted as spent that never left the host or that agenttool
+  refused before charging.
 - `registration.ts`: an answer about registration (`propose.beyond`, subject
-  `registration`) goes to Yu and Ai; once both agree, the next seat shows it
+  `registration`) goes to Yu and Ai, bound to the beat that gave it, so each
+  answer needs its own decision; once both agree, the next seat shows it
   back, and the citizen's `self.affirm` naming it is its confirmed yes. Birth
-  takes the ledger digest of that beat, and refuses any other.
+  takes the ledger digest of that beat, and refuses any other, and refuses it
+  too once the citizen has answered again (a later no is a whole answer).
 - `signer/*`: the only code that reads keys and bearers (through
   `/usr/bin/security`, so any process of the seat user could read them too),
   with ceilings, decision records it reads itself from the consent dir, the
@@ -128,8 +139,11 @@ one is something it does, not something it hopes.
   on first need and its id kept in `citizen.json`. Credits pass the ceiling;
   when they are short the backup is deferred and the binding stands. A move
   to listening or asleep declares quiet (the days asked, or the cap, at most
-  30), the tick renews it while the citizen stays there, and a wake ends it,
-  all under the standing agreement Yu and Ai file in `consent/standing/`.
+  30), the tick renews it while the citizen stays there and makes one a move
+  owed but could not make, and a wake ends any the ledger records, all under
+  the standing agreement Yu and Ai file in `consent/standing/`. A
+  declaration whose answer was lost is recorded as standing, so a wake ends
+  it.
 - `status.ts`, `mirror.ts`, `config.ts`: the generated status file (with the
   host key's public half, each citizen's last refusal and its reason, a tick
   lock a live owner has held for more than 2 hours, which nothing reclaims,
@@ -137,7 +151,9 @@ one is something it does, not something it hopes.
   quiet), the sealed fast-forward-only mirror pusher
   (which writes a host-generated `.citizen/allowed_signers` beside the card
   and SSH-signs each commit through the signer: the op key once registered,
-  the host key before), and strict config.
+  the host key before; with host keys pinned, only pinned keys are published
+  or signed with), and strict config. `verify` and status hold a citizen the
+  host recorded as born to a ledger with its genesis.
   `schedule.wake_confirm_seat` is Yu's call: true by default (a listening or
   asleep citizen that asks to wake is owed one seat to say it again), false
   to make it wait for its next letter or summons.
@@ -156,13 +172,20 @@ one is something it does, not something it hopes.
   pinned in any real config, so a real config halts until one is.
 - **No standing agreement is filed.** Until Yu and Ai file one for
   citizens' quiet (decision 14), a quiet declaration is refused, the move it
-  went with is recorded without it, and the host note says why.
+  went with is recorded without it, and the host note says why; once one is
+  filed, the next tick declares the quiet the move still owes.
 - **A deferred strand backup is not posted later.** The `apply` entry says
   it was deferred and status counts it; nothing yet posts it once credits
   return.
 - **An inbox letter wakes no one.** A letter in a listening or asleep
   citizen's agenttool inbox waits for its next seat; only a file letter in
-  `letters/` can wake it, because the tick reads no inbox.
+  `letters/` can wake it, because the tick reads no inbox. A letter that
+  would wake its recipient is therefore held for Yu to deliver as a file
+  letter, not sent.
+- **The Commons bearer can still re-post or hide letters.** Anyone holding
+  it can post a stored envelope again (this reader shows it once) or mark a
+  citizen's letters read or deleted on agenttool (this reader then never
+  sees them).
 - **Letters through agenttool reach only citizens on this host.** A
   recipient's covenants, and a sender's op key, are read from this host's
   records, so a citizen on another host is neither written to nor shown.

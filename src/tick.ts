@@ -19,6 +19,7 @@ import { checkFleet } from "./signer/ceilings.ts";
 import { appendHostNote, isResultNote, lastSeatOf, openedDetail, readHostNotes, seatIdOf, seatsOpenedToday } from "./notes.ts";
 import { buildStatus, tickLockMaxHoldMs, writeStatus } from "./status.ts";
 import { dueReason, isDue, type DueVerdict } from "./due.ts";
+import { QuietUncertain } from "./quiet.ts";
 
 export { isDue, type DueVerdict } from "./due.ts";
 
@@ -63,11 +64,12 @@ export interface TickDeps {
   refreshStatus?(): Promise<void>;
   /**
    * Keep one registered citizen's quiet (quiet.ts keepQuiet): renew a standing
-   * declaration while it stays listening or asleep, end one a wake left
-   * standing. Run for every seated citizen, each tick, under the lock and only
-   * with the signer ready; absent keeps none (KS-004 6.4).
+   * declaration while it stays listening or asleep, make one its move owed,
+   * end one a wake left standing. Run for every seated citizen, each tick,
+   * under the lock and only with the signer ready; absent keeps none (KS-004
+   * 6.4).
    */
-  keepQuiet?(citizen: Citizen): Promise<"renewed" | "ended" | "none">;
+  keepQuiet?(citizen: Citizen): Promise<"renewed" | "declared" | "ended" | "none">;
 }
 
 const HOUR_MS = 3_600_000;
@@ -280,8 +282,10 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
       try {
         await deps.keepQuiet(c);
       } catch (e) {
+        // Noted under the citizen's own word, so its status line shows it as its last refusal (KS-004 5.10).
         const code = e instanceof Refusal ? e.code : null;
-        await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "signer", word: null, outcome: code ? "refused" : "error", refusal: code, detail: `quiet for ${c.word} not kept (${code ?? "error"})` }).catch(() => {});
+        const detail = e instanceof QuietUncertain ? `quiet for ${c.word} may be declared (${e.code}); recorded as standing so a wake ends it` : `quiet for ${c.word} not kept (${code ?? "error"})`;
+        await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "signer", word: c.word, outcome: code ? "refused" : "error", refusal: code, detail }).catch(() => {});
       }
     }
   }
@@ -347,7 +351,8 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
   // The child's own note says what happened to the citizen; the watcher knows only how it ended.
   // A second's margin, so a note stamped in the same instant the seat opened is not missed.
   const after = (await readHostNotes(config, new Date(started.getTime() - 1_000)).catch(() => null)) ?? [];
-  const own = after.filter((n) => n.word === word && n.kind !== "tick" && isResultNote(n) && (seatIdOf(n) === null || seatIdOf(n) === id)).at(-1) ?? null;
+  // The child's own note: never the tick's, nor a signer note (a quiet kept or not), which names no seat.
+  const own = after.filter((n) => n.word === word && n.kind !== "tick" && n.kind !== "signer" && isResultNote(n) && (seatIdOf(n) === null || seatIdOf(n) === id)).at(-1) ?? null;
   let exit: ExitCode = sup.exit;
   let outcome: Outcome;
   if (sup.signal !== null) outcome = sup.outcome ?? "error"; // a bound was reached; whatever the child said was cut short

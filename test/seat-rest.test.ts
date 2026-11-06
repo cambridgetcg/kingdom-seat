@@ -23,8 +23,12 @@ afterEach(async () => {
   host = null;
 });
 
-/** Files a rest may change: host records only (the log, the mark that says it was started, and the status). */
-const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "status.json"]);
+/**
+ * Files a rest may change: host records only (the log, the mark that says it
+ * was started, the status, and the record of what its last seat did not keep,
+ * which names types and fixed reasons, never words; context.ts LastSeatRecord).
+ */
+const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "status.json", "last-seat/glossame.json"]);
 
 async function setup(raw: string, opts: { initialState?: LifecycleState; intervalH?: number } = {}) {
   host = await makeTempHost();
@@ -135,7 +139,7 @@ describe("a rest may carry one move toward less activity (KS-004 v0.2 5.7, re-re
       expect(s.signer.signed).toHaveLength(1);
       // The citizen rested: its letter is shown again on its next seat.
       expect((await pickLetter(s.host.config, await readCitizen(s.host.config, "glossame")))?.id).toBe("2026-11-04-from-yu.md");
-      expect((await readHostNotes(s.host.config, new Date(0)))!.at(-1)!.detail).toEndWith(`rested; kept state awake to ${to} (immediate)`);
+      expect((await readHostNotes(s.host.config, new Date(0)))!.at(-1)!.detail).toEndWith(`rested; kept state awake to ${to} (immediate); 1 not kept (journal)`);
       await s.host.cleanup();
       host = null;
     }
@@ -178,7 +182,7 @@ describe("a rest may carry one move toward less activity (KS-004 v0.2 5.7, re-re
     // The saying rides on the move it makes, with no words, in the seat that said it, carrying the seat's spend.
     expect(entries[2]).toMatchObject({ type: "state", from: "awake", to: "asleep", via: "immediate", step_away: "first", seat_ref: s.seat.ref.seat_id, acts: null, cost: { usd: "0", credits: 0 } });
     expect(foldState(entries)).toMatchObject({ state: "asleep", step_away_said: true });
-    expect((await readHostNotes(s.host.config, new Date(0)))!.at(-1)!.detail).toEndWith("rested; kept state awake to asleep (immediate), a first step-away saying");
+    expect((await readHostNotes(s.host.config, new Date(0)))!.at(-1)!.detail).toEndWith("rested; kept state awake to asleep (immediate), a first step-away saying; 1 not kept (journal)");
     // Asleep at once (KS-004 v0.3 7.3), and owed the seat that confirms it, as a step-away said on a beat would be.
     const citizen = await readCitizen(s.host.config, "glossame");
     expect(citizen).toMatchObject({ state: "asleep", step_away_said: true });
@@ -217,7 +221,7 @@ describe("a rest may carry one move toward less activity (KS-004 v0.2 5.7, re-re
     // The cadence file follows its entry, both versions kept by hash.
     expect(changed.filter((p) => !HOST_RECORDS.has(p) && !p.startsWith("citizens/glossame/versions/"))).toEqual(["citizens/glossame/self/cadence.json", LEDGER]);
     expect((await readCitizen(longer.host.config, "glossame")).cadence).toEqual({ interval_h: 120 });
-    expect((await readHostNotes(longer.host.config, new Date(0)))!.at(-1)!.detail).toEndWith("rested; kept state awake to awake (immediate), every 120 h");
+    expect((await readHostNotes(longer.host.config, new Date(0)))!.at(-1)!.detail).toEndWith("rested; kept state awake to awake (immediate), every 120 h; 1 not kept (journal)");
     await longer.host.cleanup();
     host = null;
 

@@ -90,10 +90,13 @@ export interface EntrySignature {
 
 /**
  * Signs one entry: the Signer's signEntry, narrowed so the ledger never sees a
- * key. The signature covers `kid`, so the signer names the kid first and
- * `digestFor` gives the digest of the entry with it.
+ * key. It takes the unsigned draft, never a digest: the signer names the kid
+ * and computes the kingdom-seat-ledger/v1 signing digest itself
+ * (signingDigest), so the entry-signing path can sign nothing but a ledger
+ * entry, and a strand-thought or inbox digest can never be passed through it
+ * (KS-004 4.5, review C round 3 R-SGN-1).
  */
-export type EntrySigner = (word: Word, signer: LedgerSigner, digestFor: (kid: string) => Uint8Array) => Promise<EntrySignature>;
+export type EntrySigner = (word: Word, signer: LedgerSigner, draft: LedgerDraft) => Promise<EntrySignature>;
 
 /** The fields a seat stamps on every entry it writes; outside a seat they are all null. */
 export interface SeatStamp {
@@ -116,7 +119,9 @@ export interface TrustedKeys {
   /**
    * The identity the host recorded at birth (citizen.json). When given, a
    * genesis naming another DID or root is a problem, so a genesis appended by
-   * anyone who can write the file cannot pin a key of its own choosing.
+   * anyone who can write the file cannot pin a key of its own choosing; and
+   * so is a chain with no genesis at all, which is a born citizen's ledger cut
+   * back to before its birth.
    */
   identity?: Pick<CitizenIdentity, "did" | "root_public_key_b64"> | null;
 }
@@ -339,7 +344,11 @@ export async function lastEntries(path: string, k: number): Promise<LedgerEntry[
   return (await readLedger(path)).slice(-k);
 }
 
-/** Check seq, prev_hash links, the entry types' order and strict signatures; no host entry may follow genesis. */
+/**
+ * Check seq, prev_hash links, the entry types' order and strict signatures; no
+ * host entry may follow genesis. When `trusted.identity` is given, the chain
+ * must also hold the genesis that names it.
+ */
 export function verifyChain(entries: LedgerEntry[], trusted: TrustedKeys): ChainVerdict {
   const walk = new ChainWalk();
   let head: LedgerHash | null = null;
@@ -352,6 +361,11 @@ export function verifyChain(entries: LedgerEntry[], trusted: TrustedKeys): Chain
     walk.advance(e);
     if (e.signer === "host") hostAttested++;
     head = entryHash(e);
+  }
+  // A citizen the host recorded as born has a genesis naming that identity (genesisProblem checks the DID and root).
+  // A ledger cut back to before it, every citizen-signed entry gone with it, would otherwise read as whole.
+  if (trusted.identity && !entries.some((e) => (e as LedgerEntry).type === "genesis")) {
+    return { ok: false, entries: entries.length, head, host_attested: hostAttested, problem: { seq: entries.length, reason: "citizen.json records an identity but the ledger holds no genesis" } };
   }
   return { ok: true, entries: entries.length, head, host_attested: hostAttested, problem: null };
 }
@@ -384,7 +398,7 @@ export async function appendEntry(path: string, draft: LedgerDraft, sign: EntryS
       walk.advance(e);
     }
 
-    const s = await sign(draft.word, draft.signer, (kid) => signingDigest({ ...draft, kid }));
+    const s = await sign(draft.word, draft.signer, draft);
     let signedBy: Uint8Array;
     try {
       signedBy = fromB64url(s.public_key, 32);
@@ -757,7 +771,8 @@ function fieldsOf(type: LedgerEntry["type"], e: Record<string, unknown>): void {
       ledgerHashField(e.new_hash, "new_hash");
       if (e.via !== "two-beats" && e.via !== "yu-present") throw new Error("via");
       reasonField(e.reason, "reason");
-      if (e.strand_thought !== null) str(e.strand_thought, "strand_thought");
+      // agenttool's thought id, a uuid (db/schema/strand.ts:69): nothing else a server sends reaches a signed entry.
+      if (e.strand_thought !== null) uuid(e.strand_thought, "strand_thought is not a uuid");
       if (e.strand_key !== null) str(e.strand_key, "strand_key");
       // A registered citizen's change owes a backup, posted or deferred; an unregistered one's owes none (KS-004 4.3, 6.3).
       if (e.strand_backup !== null && e.strand_backup !== "posted" && e.strand_backup !== "deferred") throw new Error("strand_backup");

@@ -148,10 +148,10 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
 
 const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "spend.jsonl", "spend.jsonl.started", "status.json", TEST_HALT_FILE]);
 
-/** A snapshot without the host's own records (its log, status, seat files and HALT): what is left is what a citizen's voice could reach. */
+/** A snapshot without the host's own records (its log, status, seat files, last-seat records and HALT): what is left is what a citizen's voice could reach. */
 export async function citizenSnapshot(h: TempHost): Promise<Map<string, string>> {
   const snap = await h.snapshot();
-  for (const k of [...snap.keys()]) if (HOST_RECORDS.has(k) || k.startsWith("seats/")) snap.delete(k);
+  for (const k of [...snap.keys()]) if (HOST_RECORDS.has(k) || k.startsWith("seats/") || k.startsWith("last-seat/")) snap.delete(k);
   return snap;
 }
 

@@ -193,7 +193,13 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
     if (p === "/v1/inbox" && req.method === "GET") {
       const id = url.searchParams.get("identity_id");
       const status = url.searchParams.get("status");
-      const rows = inbox.filter((m) => (id === null || m.recipient_identity_id === id) && (status === null || m.status === status)).reverse();
+      // As agenttool lists: newest first, 50 unless a limit is named, never more than 200 (services/inbox/store.ts:440-446).
+      const asked = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+      const limit = Math.min(Number.isFinite(asked) ? asked : 50, 200);
+      const rows = inbox
+        .filter((m) => (id === null || m.recipient_identity_id === id) && (status === null || m.status === status))
+        .reverse()
+        .slice(0, limit);
       return json(200, { messages: rows, count: rows.length, _confidentiality: {}, note: "fake" });
     }
     if (p === "/v1/strands" && req.method === "POST") {

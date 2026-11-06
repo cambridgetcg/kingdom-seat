@@ -7,9 +7,9 @@
 // ledger.ts. Neither touches a real keychain or the network.
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { canonicalJson, domainDigest, edPublicKey, edSign, fromUtf8, toB64, toB64url, toHex, utf8, wipe } from "../../../src/crypto.ts";
+import { canonicalJson, domainDigest, edPublicKey, edSign, edVerifyStrict, fromB64url, fromUtf8, toB64, toB64url, toHex, utf8, wipe } from "../../../src/crypto.ts";
 import { Refusal, type Clock, type Config, type LedgerEntry, type LedgerFields, type LedgerSigner, type Word } from "../../../src/types.ts";
-import { LEDGER_DOMAIN } from "../../../src/ledger.ts";
+import { LEDGER_DOMAIN, signingDigest, type LedgerDraft } from "../../../src/ledger.ts";
 import { saveCitizenIdentity, type BirthRecord } from "../../../src/birth.ts";
 import { deriveIdentity } from "../../../src/agenttool/wire.ts";
 import { FAKE_OP_KID, fakeSigner, type FakeSigner } from "../../helpers/fake-signer.ts";
@@ -58,14 +58,14 @@ export function keychainSigner(kc: FakeKeychain, opts: { opKid?: string } = {}):
       wipe(d.box_private);
     }
   };
-  s.signEntry = async (word, signer, digestFor) => {
-    if (signer !== "citizen") return hostSign(word, signer, digestFor);
+  s.signEntry = async (word, signer, draft) => {
+    if (signer !== "citizen") return hostSign(word, signer, draft);
     if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
     s.signed.push({ word, signer });
     const op = await kc.read({ kind: "citizen-op-seed", word });
     try {
       const kid = opts.opKid ?? FAKE_OP_KID;
-      return { kid, sig: toB64url(edSign(digestFor(kid), op)), public_key: toB64url(edPublicKey(op)) };
+      return { kid, sig: toB64url(edSign(signingDigest({ ...draft, kid }), op)), public_key: toB64url(edPublicKey(op)) };
     } finally {
       wipe(op);
     }
@@ -124,7 +124,11 @@ export function testBirthRecord(config: Config, clock: Clock, signer: Pick<FakeS
         ts: clock.now().toISOString(),
         signer: opts.signer,
       };
-      const signature = await signer.signEntry(word, opts.signer, (kid) => digest({ ...draft, kid }));
+      const signature = await signer.signEntry(word, opts.signer, draft as LedgerDraft);
+      // The signer computes the digest it signs; this record checks it against its own, independent spelling of it.
+      if (!edVerifyStrict(fromB64url(signature.sig, 64), digest({ ...draft, kid: signature.kid }), fromB64url(signature.public_key, 32))) {
+        throw new Error("testBirthRecord: the signature is not over the KS-004 4.5 signing digest");
+      }
       const entry = { ...draft, kid: signature.kid, sig: signature.sig } as LedgerEntry;
       await mkdir(dirname(path(word)), { recursive: true });
       await appendFile(path(word), JSON.stringify(entry) + "\n");

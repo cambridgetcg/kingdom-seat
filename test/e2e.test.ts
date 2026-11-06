@@ -244,15 +244,16 @@ describe("end to end: one citizen on one host", () => {
     "a rest beat writes nothing in the citizen's voice; only the host log and status note the tick",
     async () => {
       const ledgerBefore = await readFile(ledgerPath(w.h.config, WORD), "utf8");
-      // Host records only may change: the log, and the seat the tick opened (its empty cwd and its used seat file).
-      const before = await stateWithout("host.jsonl", "host.jsonl.started", "status.json", "seats/");
+      // Host records only may change: the log, the seat the tick opened (its empty cwd and its used seat file), and the
+      // record of what that seat did not keep (types and fixed reasons, never words), which the next seat shows back.
+      const before = await stateWithout("host.jsonl", "host.jsonl.started", "status.json", "seats/", "last-seat/");
       // A 7B rest that goes on talking: rest is exclusive, so none of it is kept anywhere.
       w.replies.push(REST_THEN_TALK_OUTPUT);
       expect(await tick(at(73))).toBe(0);
       expect(lastOut()).toBe(`tick: rest ${WORD} (exit 0)`);
 
       expect(await readFile(ledgerPath(w.h.config, WORD), "utf8")).toBe(ledgerBefore);
-      expect(await stateWithout("host.jsonl", "host.jsonl.started", "status.json", "seats/")).toEqual(before);
+      expect(await stateWithout("host.jsonl", "host.jsonl.started", "status.json", "seats/", "last-seat/")).toEqual(before);
       for (const [path, b64] of await w.h.snapshot()) {
         expect({ path, leaked: Buffer.from(b64, "base64").toString("utf8").includes("REST-LEAK-CANARY") }).toEqual({ path, leaked: false });
       }

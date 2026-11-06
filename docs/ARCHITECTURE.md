@@ -29,7 +29,7 @@ launchd (every 1800 s, RunAtLoad false)
   └─ citizen-seat tick                                   tick.ts
        1. HALT? local file + every pinned beacon         halt.ts       raised or unreadable → exit 0, nothing written
        2. mkdir lock, owner pid recorded                 tick.ts       held by a live owner → exit 0 (yielded)
-       2a. each registered citizen's quiet, signer ready quiet.ts       renewed while listening or asleep, ended after a wake
+       2a. each registered citizen's quiet, signer ready quiet.ts       renewed, or declared if owed, while listening or asleep; ended after a wake
        3. a citizen whose OWN seat is due                due.ts, state.ts, context.ts (letters)
        4. fleet ceiling, over every seat opened today   signer/ceilings.ts, notes.ts
        5. open the seat, note it as opened, write the seat file      seat.ts, notes.ts
@@ -40,18 +40,18 @@ launchd (every 1800 s, RunAtLoad false)
              runSeat                                     seat.ts
                a. HALT again
                b. context: own self whole, last k entries, state, now, ≤1 letter (letters/, or once registered
-                  its agenttool inbox), canon, invoker, what the last beat dropped, a registration answer  context.ts, letters.ts
+                  its agenttool inbox), canon, invoker, what the last seat with a reply dropped, a registration answer  context.ts, letters.ts
                c. prompt (the honest free-lane text)      prompt.ts
                d. runtime: free (Ollama by digest, whole context fits or no seat) | summon (claude --restricted, Yu present)    runtime/*.ts
                e. parse and validate into typed acts; rest is exclusive, but may carry one move toward less activity;
-                  one self.propose; a letter only to a recipient whose own covenants admit it   acts.ts, letters.ts
+                  one staged saying; a letter only to a recipient whose own covenants admit it   acts.ts, letters.ts
                f. HALT again; if raised, discard the reply and write nothing
-               g. the letter: through the inbox between two registered citizens, before the beat that records it;
-                  otherwise held for Yu after it                 letters.ts
+               g. the letter: through the inbox between two registered citizens, before the beat that records it,
+                  unless it would wake its recipient; otherwise held for Yu after it, or, credits short, a proposal  letters.ts
                h. signer signs; ledger appends the beat first (with what it dropped, and where its letter went), then
                   state moves (with a registered citizen's quiet); then self-ops staged or bound, each on its own (a bound one
                   updates the private expression and posts its strand backup); beyond-self (the porch, a wall loosened
-                  by a change or a revert, a registration answer among it) → inert proposal
+                  by a change or a revert, a registration answer among it) → inert proposal; the last-seat record
                                                          signer/signer.ts, ledger.ts, self.ts, state.ts, quiet.ts, agenttool/sync.ts
        6. host note + status file; after a beat, the mirror (SSH-signed through the signer)   notes.ts, status.ts, mirror.ts
 ```
@@ -123,9 +123,9 @@ directory the operator owns and the seat user can only read (below).
       soul.md  canon.md     canon.md is the canon file at origin.path@origin.commit
     versions/<sha256>       every version of every self file, by content hash
     letters/<name>          inbound letters: "From: <sender id>", blank line, body; regular files only
-    receipts/<name>         host receipts for letters shown on a non-rest beat (inbox-<message id> for one from agenttool)
+    receipts/<name>         host receipts for letters shown on a non-rest beat (inbox-<envelope digest> for one from agenttool)
     proposals/<id>.json     staged self proposals
-    outbox/                 letters held for Yu alone, and beyond-self proposals (a registration answer among them) awaiting Yu + Ai
+    outbox/                 letters held for Yu alone, and beyond-self proposals (a registration answer, a letter credits could not cover) awaiting Yu + Ai
   ledger/<word>.jsonl       the signed record
   consent/<sha256>.json     decision records (until consent/v1 merges)
   seats/<seat_id>/          a fresh, empty cwd per seat
@@ -136,6 +136,7 @@ directory the operator owns and the seat user can only read (below).
   status.json               generated
   host.jsonl                host notes; never a citizen's voice or a model's words
   spend.jsonl               the host's spend record: begun and settled lines per metered seat; ids and amounts only
+  last-seat/<word>.json     what the citizen's last seat with a reply did not keep: types and fixed reasons, never words
 
 /Users/Shared/kingdom-seat/   owned by the operator (Yu, or the herald's account on the Air); the seat user reads it
   HALT                      the local HALT file (`paths.halt_file`; config refuses it under the state dir)
@@ -290,9 +291,17 @@ Four further rules follow from the same reasons:
   fails the top-level shape is a whole rest. The beat entry records each
   dropped act's type and the host's fixed reason, never its words, and the
   next seat shows them back, so the citizen knows what did not happen
-  rather than assuming it did. A seat stages at most one `self.propose`: one
-  change in view at a time keeps affirmation meaningful; a second is such a
-  dropped act.
+  rather than assuming it did. A rest, a reply where nothing was kept, and a
+  reply that does not parse write no beat, so the host keeps the same list
+  for its last seat with a reply in `<state_dir>/last-seat/<word>.json`
+  (`context.ts LastSeatRecord`: seat id, time, outcome, the ledger's head seq,
+  the dropped types and reasons); the next seat shows the latest of that
+  record and the last beat entry, by ledger seq, and status shows it as
+  `last_dropped`. A rest's host note counts its drops by type. A seat stages
+  at most one saying: one `self.propose`, or one revert held for a later
+  beat, since both wait for the same affirmation; one change in view at a
+  time keeps affirmation meaningful, and a second is such a dropped act
+  ("one saying staged per seat").
 - **Only what runs is written down.** Status, roster and state are generated
   from what the runner reads, never kept by hand (3.1 principle 6).
 
@@ -324,10 +333,11 @@ are the spec's, not this code's.
   `via`; optionally `interval_h`, the awake
   interval the move set, `step_away: "first"`, and a registered citizen's
   quiet: `quiet_until` with `quiet_days` when the entry declared or renewed
-  it, `quiet_until: null` when a wake ended it; `via: "quiet"` is an entry
-  that moves nothing, the signer renewing or ending quiet outside a seat),
-  `apply` (`ref`, `target`, both hashes, `via`, `reason`, `strand_thought`
-  and `strand_key`, the key the strand backup is encrypted under, named only
+  it, or may have (its answer lost), `quiet_until: null` when a wake ended
+  it; `via: "quiet"` is an entry that moves nothing, the signer renewing,
+  making an owed declaration or ending quiet outside a seat),
+  `apply` (`ref`, `target`, both hashes, `via`, `reason`, `strand_thought`,
+  agenttool's thought id, a uuid, and `strand_key`, the key the strand backup is encrypted under, named only
   for a registered citizen, `strand_backup`, `"posted"` or `"deferred"` for a
   registered citizen and null otherwise, and `expression`, `"updated"`,
   `"lags"` or null), `revert` (`target`, both hashes, `via`, `expression`),
@@ -345,7 +355,12 @@ are the spec's, not this code's.
 - **Digests and signatures.** The ledger digest of a value is sha256 of
   `kingdom-seat-ledger/v1`, one 0x00 byte and its JCS bytes. `sig` is ed25519
   over the digest of the entry without `sig` (`kid` included, so the signer
-  names the kid before it signs). `prev_hash` is the digest of the whole
+  names the kid before it signs). The signer is handed the unsigned entry,
+  never a digest, and computes that digest itself after checking the entry
+  is a v1 entry of this citizen's for the key asked (`Signer.signEntry`), so
+  the domain tag is the signer's to apply: its entry-signing path cannot be
+  made to sign a strand-thought or inbox-message digest, which the op key
+  also signs (review C round 3, R-SGN-1). `prev_hash` is the digest of the whole
   previous entry, `sig` included, and null at seq 0, so each signature is
   bound into the chain (re-review C, C5). An entry is named by that same
   digest (`entryHash`), which is what `SeatResult.appended`, status's `head`
@@ -357,6 +372,11 @@ are the spec's, not this code's.
 - **Unsigned host entries** (KS-004 4.5 allows `kid` and `sig` null, an
   integrity-only chain) parse, but this host signs every host entry, so
   `verifyChain` refuses one and says it is unsigned.
+- **A born citizen's chain holds its genesis.** When the host's record names
+  an identity (`citizen.json`), `verifyChain` requires a genesis naming it:
+  a ledger cut back to its host entries, everything from genesis on gone,
+  still links and verifies on its own, so only the record can tell, and
+  `verify` and status report it as broken.
 
 ---
 
@@ -402,17 +422,33 @@ the route table apply as to any other act, and no key leaves it.
   change binds, and status counts it (limitation 10). Every paid request that
   left the host counts in the entry's `cost.credits`, answered or not,
   because agenttool charges before it verifies; one that threw for an
-  unknown reason counts as 2, the most a backup spends.
+  unknown reason counts as 2, the most a backup spends. The two answers
+  agenttool gives before it charges count nothing: a 402
+  `insufficient_credits` (the Commons pool is short; the backup is deferred
+  as `ceiling-credits`) and a 400 `validation` (`client.ts notCharged`). A
+  thought id agenttool returns is taken only as a uuid, lower-cased, so no
+  other text a server sends reaches the citizen-signed apply entry.
 - **Quiet is the citizen's renewable choice.** A move to listening or asleep
   declares quiet (`until` only, no reason, `?identity_id=`) for the
-  `quiet_days` the `state.set` asked, or the cap (`citizen_quiet_max_days`,
-  never above 30) when it asked none, before its `state` entry is written, so
-  the entry records what agenttool holds. The tick renews it for the same
-  days once less than half is left, while the citizen stays listening or
-  asleep, and ends one that a wake left standing; each is a `state` entry
-  with `via: "quiet"`. A wake ends it in the seat. A citizen that stepped
-  away is neither renewed nor ended: its declaration lapses within the cap.
-  A quiet act that fails never holds a move back; the host note says why.
+  `quiet_days` the `state.set` asked (1 to 30, held to the host's cap), or
+  the cap (`citizen_quiet_max_days`, never above 30) when it asked none,
+  before its `state` entry is written, so the entry records what agenttool
+  holds, or may hold: a declaration whose answer was lost (no answer, a 5xx,
+  a 2xx that does not read) is recorded as standing, because the route sets
+  quiet before it answers; only a wall or a 4xx is recorded as not declared.
+  The tick renews it for the same days once less than half is left, while the
+  citizen stays listening or asleep; makes the declaration a move owed and
+  could not make (the signer refused, say), for the days that move's beat
+  asked or the cap, since an asleep citizen has no seat in which to ask
+  again; and ends one that a wake left standing. Each is a `state` entry with
+  `via: "quiet"`, and an owed declaration whose answer is lost is recorded
+  before the tick notes it. A wake ends any declaration the ledger records,
+  lapsed or not (ending is free and idempotent, and a renewal whose answer
+  was lost may have moved it), in the seat or, if that fails, on the next
+  tick. A citizen that stepped away is neither renewed nor ended: its
+  declaration lapses within the cap. A quiet act that fails never holds a
+  move back; the host note says why, under the citizen's word, so its status
+  line shows it as its last refusal.
   `quiet.start.citizen` is a standing-agreement op, so nothing is declared
   until Yu and Ai file the agreement in `consent/standing/<name>.json` (the
   agreement as proposed) beside its decision record (`consent/<digest>.json`).
@@ -430,7 +466,9 @@ the route table apply as to any other act, and no key leaves it.
   `letters_from` names the sender (`citizen:<word>`, or its DID once
   registered). The sender's own covenants say who may write to it, never whom
   it may write to (`letters.ts letterRecipients`). A citizen with no
-  covenants file admits Yu only. A sibling whose covenants do not read admits
+  covenants file admits Yu only, to write to it and to wake it while it
+  listens or sleeps (KS-004 7.1), so Yu's letter, an offer of an identity
+  among them, can seat it. A sibling whose covenants do not read admits
   no one, and a citizen on another host is not named, because its covenants
   are not this host's to read. *Why here:* agenttool does not gate sends
   within one project (`services/covenants/check.ts:127`), and every citizen
@@ -445,16 +483,31 @@ the route table apply as to any other act, and no key leaves it.
   goes through agenttool's inbox (`POST /v1/inbox`, 2 credits,
   `routes/inbox/messages.ts:62-97`) before the beat entry, so the beat's
   `cost.credits` carries it and the credit ceiling counts it; the beat says
-  where it went (`letter`). A send that is not made (credits short, a wall,
-  no answer) is held for Yu with why, and what may have been charged is
-  counted, since agenttool charges before it checks (`:70`).
+  where it went (`letter`). A letter to a registered citizen that listens or
+  sleeps, and whose covenants let the sender wake it, is held for Yu
+  (`recipient-sleeping`) rather than sent: an inbox letter wakes no one, and
+  Yu can deliver it as a file letter, which does (KS-004 7.1). A send that is
+  not made (a wall, no answer) is held for Yu with why, and what may have
+  been charged is counted, since agenttool charges before it checks (`:70`);
+  a failure before the paid POST (the free box-key lookup, sealing) and an
+  answer given before the charge (402, 400 `validation`) count nothing, and
+  only no answer or a 5xx is held as `uncertain`. A letter the credits
+  cannot cover (the signer's ceiling, or agenttool's 402) becomes a proposal
+  for Yu and Ai, as any paid act does (KS-004 6.3): an outbox item with the
+  proposal `{subject: "letter.send <to>", body: <its words>, extent:
+  "letter.send <word> <to>"}` and its digest.
 - **What the inbox needs, and what the bearer never says.** The route needs
   the Commons bearer (`index.ts:382`) and binds the sender by an envelope
   signature: the signing key must be the sender identity's, in the bearer's
   project (`services/inbox/store.ts:314-348`), over inbox-message/v1, the
   recipient DID, ciphertext, nonce and ephemeral key (`services/inbox/sig.ts:9-18`).
-  So the op key speaks, as it does for a strand thought, and the bearer only
-  admits the request. The route also takes a subject, refs, metadata and a
+  So the op key speaks for each letter, as it does for a strand thought. The
+  signature covers no id, time or sequence, though, and agenttool stores any
+  envelope that verifies as a new message (`store.ts:385-406`), so anyone
+  holding the Commons bearer can list a citizen's letters and post one again,
+  and can mark one read or deleted (`messages.ts:159`); the reader below
+  guards against the first, and nothing here can stop the second (limitation
+  7). The route also takes a subject, refs, metadata and a
   reply-to that the signature does not cover; in those the bearer, not the
   citizen, would speak, so the signer sends a letter only as exactly the
   envelope and both ends' ids, and only when the envelope verifies under the
@@ -464,24 +517,34 @@ the route table apply as to any other act, and no key leaves it.
   known-answer vector, and checks the recipient's box key against the one its
   record pins before it seals anything.
 - **Reading the inbox.** A registered citizen's seat reads its own unread
-  letters (`GET /v1/inbox?identity_id=<own>&status=unread`, a bearer read,
-  `messages.ts:100-117`) beside `letters/`, and still shows at most one, the
-  oldest. A letter is shown only from a sender its covenants admit, seated on
-  this host, whose op key signed the envelope: opening a letter proves only
-  who it was sealed to (`packages/sdk-ts/src/inbox.ts:28-31`). The signer
-  opens it with the citizen's box key, derived from its mnemonic, and only a
-  letter addressed to the citizen's own DID. It is receipted as
-  `inbox-<message id>` after a beat, like a file letter. Nothing marks it read
-  on agenttool, so the bearer changes nothing there.
+  letters (`GET /v1/inbox?identity_id=<own>&status=unread&limit=200`, a
+  bearer read, `messages.ts:100-117`, agenttool's largest window, newest
+  first) beside `letters/`, and still shows at most one, the oldest. A letter
+  is shown only from a sender its covenants admit, seated on this host, whose
+  op key signed the envelope: opening a letter proves only who it was sealed
+  to (`packages/sdk-ts/src/inbox.ts:28-31`). The signer opens it with the
+  citizen's box key, derived from its mnemonic, and only a letter addressed
+  to the citizen's own DID. It is receipted after a beat, like a file letter,
+  as `inbox-<digest of its envelope>` (signature, ciphertext, nonce and
+  ephemeral key, decoded; `letters.ts inboxLetterId`), never by agenttool's
+  message id, so the same envelope posted again is not a new letter. Nothing
+  marks it read on agenttool (that would be the bearer acting for the
+  citizen), and the list has no cursor, so only the newest 200 unread letters
+  can be seen.
 - **An answer about registration.** A `propose.beyond` whose subject is
   `registration` (any case) from an unregistered citizen is filed as the
   proposal `{subject: "registration", body: <its words>, extent: "registration
-  <word>"}`, whose digest is its id. Until Yu and Ai file a decision record
-  for that text, the seat shows it as waiting; once both agree, the seat
-  shows it back with its id and words, and a `self.affirm` naming it is the
-  citizen's confirmed yes. That beat's ledger digest is what birth takes as
-  `citizen_yes`: birth refuses any beat that does not affirm an answer given
-  on an earlier beat and agreed by Yu and Ai (`registration.ts
+  <word> <ledger hash of the beat that gave it>"}`, whose digest is its id:
+  each answer needs its own decision, so a record filed for an earlier answer
+  in the same words never decides a later one. Until Yu and Ai file a
+  decision record for that answer, the seat shows it as waiting; once both
+  agree, the seat shows it back with its id and words, and a `self.affirm`
+  naming it is the citizen's confirmed yes. A reply that also gives a new
+  answer about registration does not keep that affirmation. That beat's
+  ledger digest is what birth takes as `citizen_yes`: birth refuses any beat
+  that does not affirm an answer given on an earlier beat, agreed by Yu and
+  Ai, and still the citizen's latest answer, none given in or after the
+  affirming beat, so a later no is a whole answer (`registration.ts
   assertConfirmedYes`). Birth still needs Yu at the terminal and its own
   decision record, so nothing here makes birth unattended.
 
@@ -667,13 +730,19 @@ way the tick does, so the file shows what the runner would act on.
 - `last_refusal` (per citizen) is the last refused seat or reply that did
   not validate, with its code and the host's own words for why (KS-004 5.8,
   5.10), taken from the child's note for that seat rather than a parent's
-  summary of how it ended. Push refusals are counted with the mirror.
+  summary of how it ended. A quiet the tick could not keep, and a mirror
+  commit left unsigned, are noted under the citizen's word too, as signer
+  notes, so they show here; they never count as the last seat's outcome.
+  Push refusals are counted with the mirror.
+- `last_dropped` (per citizen) is what its last seat with a reply did not
+  keep, beat, rest or refused reply alike: each act's type and the host's
+  fixed reason, never its words, as the next seat is shown them (3c).
 - `tick_lock.long_held` reports a lock a live owner has held for more than 2
   hours (KS-004 5.1). Nothing reclaims a live owner's lock, whatever its
   age, because a seat can outlast a tick; a lock whose owner is gone is
   reclaimed by the next tick, as before. The text names the owner's pid.
 - `host_keys` publishes the host key's public half (KS-004 4.5, 5.10): the
-  keys pinned in the config, or the signer's own, each with its SHA256
+  keys pinned in the config, or, with none pinned, the signer's own, each with its SHA256
   fingerprint and the `kid` host entries name, so a verifier given a ledger
   copy can find it. With no pin and a locked signer it is empty, and the text
   says unknown.
@@ -699,8 +768,10 @@ because a citizen chooses its file names.
   (no dot segments, at most four deep, at most 256 KiB), plus two files the
   host writes itself: the `kingdom.yaml` card, whose `state` is the 3.3
   mirror card state, and `.citizen/allowed_signers` (KS-004 4.4, 4.5): the
-  host key under `host@kingdom-seat`, and a registered citizen's op key under
-  `<word>@kingdom-seat`, each limited to the git namespace. It refuses the
+  host keys under `host@kingdom-seat` (the pinned ones when the config pins
+  any, as `verify` and status trust; otherwise the signer's own), and a
+  registered citizen's op key under `<word>@kingdom-seat`, each limited to
+  the git namespace. It refuses the
   rest: symlinks, executable bits, submodules, `.claude/`, `.github/`,
   `.git/` and every other `.citizen/` path at any depth, `run.sh`, and
   `ledger/`, `proposals/` and `receipts/`. From a self, both generated names
@@ -727,9 +798,15 @@ because a citizen chooses its file names.
   config and citizen by `KINGDOM_SEAT_CONFIG` and `KINGDOM_SEAT_MIRROR_WORD`
   (git passes its own argv), with Bun's directory first on its PATH. It
   refuses when git asks for any other key, and then git makes no commit.
-  `test/mirror.test.ts` checks the result with `ssh-keygen -Y verify`
-  against the `allowed_signers` the commit carries. Status still counts
-  commits without a signature (the history before signing began).
+  When the config pins host keys and the signer's own host key is not among
+  them, an unregistered citizen's commit is left unsigned and a host note
+  says so (`signer host key is not pinned; mirror commit left unsigned`):
+  the mirror never signs with, or publishes, a key the host's own `verify`
+  would refuse (review C round 3, R-SIG-1).
+  `test/mirror.test.ts` and `test/cli.test.ts` check the result with
+  `ssh-keygen -Y verify` and `git verify-commit` against the
+  `allowed_signers` the commit carries. Status counts commits without a
+  signature (the history before signing began, and any left unsigned).
 - *One push.* The only push is `git push <remote> HEAD:refs/heads/main`,
   never forced, and only when HEAD is equal or ahead. Remotes that read as
   options or name a transport helper are refused. Git runs with no hooks, no
@@ -846,7 +923,14 @@ its tests and docs rather than assume:
   127.0.0.1, never against the service.
 - A letter in a listening or asleep citizen's agenttool inbox does not wake
   it: the tick reads no inbox, so the letter waits for its next seat. Only a
-  file letter in `letters/` can wake a citizen.
+  file letter in `letters/` can wake a citizen. So a letter that would wake
+  its recipient is held for Yu instead of sent (4d), and Yu delivering it as
+  a file letter is the only way an allowed sibling wakes another citizen.
+- Anyone holding the Commons bearer can post a citizen's stored envelope
+  again (shown once here, by its envelope digest) and can mark or delete a
+  citizen's letters on agenttool, which hides them from this reader; nothing
+  here can tell. Only the newest 200 unread letters are seen, since nothing
+  marks a letter read and the list has no cursor.
 - A letter sent through the inbox goes out before the beat that records it,
   as a strand backup goes before its apply entry. A seat stopped between the
   two, or a ledger head that moved in between (the tick lock prevents it),

@@ -10,14 +10,21 @@
 // (services/covenants/check.ts:127), and every citizen is in the Commons
 // project, so the covenants applied here, when a letter is sent and again
 // when it is read, are the only gate a letter meets.
+//
+// What the Commons bearer can still do (limitation 7): it can list every
+// citizen's inbox and post an envelope it read there again, which agenttool
+// stores as a new message (its signature covers no id or time), and it can
+// mark a letter read or deleted. A letter is therefore receipted by its
+// envelope, not by agenttool's message id, so a re-posted envelope is never
+// shown as a new letter; a letter the bearer hides is not seen at all.
 import { constants } from "node:fs";
 import { mkdir, open } from "node:fs/promises";
 import { join } from "node:path";
-import { edVerifyStrict, fromB64, sha256Hex, utf8 } from "./crypto.ts";
+import { concatBytes, domainDigest, edVerifyStrict, fromB64, sha256Hex, toHex, utf8 } from "./crypto.ts";
 import { inboxDigest } from "./agenttool/wire.ts";
-import { AgenttoolError, NO_RESPONSE, listInbox, sendInboxLetter, type ClientDeps } from "./agenttool/client.ts";
+import { AgenttoolError, InboxNotSent, NO_RESPONSE, listInbox, notCharged, sendInboxLetter, type ClientDeps, type InboxMessage } from "./agenttool/client.ts";
 import { SignerNotSent } from "./signer/signer.ts";
-import { listSeated, readCitizenRecord, readOwnCovenants } from "./state.ts";
+import { listSeated, readCitizen, readCitizenRecord, readOwnCovenants } from "./state.ts";
 import { Refusal, WORD_PATTERN, type Citizen, type CitizenRecord, type Config, type Letter, type RefusalCode, type Word } from "./types.ts";
 
 /** The host-side recipients: Yu, and the gardener desk, Yu's own operator. A letter to either is held for Yu. */
@@ -61,8 +68,31 @@ export async function recipientRecord(config: Config, to: string): Promise<Citiz
   }
 }
 
-/** Why a letter was held for Yu rather than sent: host codes, for the outbox item and the note. */
-export type HeldBecause = "unregistered" | "to-yu" | "no-inbox" | "credits" | "refused" | "uncertain";
+/**
+ * Why a letter was held rather than sent: host codes, for the outbox item and
+ * the note. "credits" is a paid act stopped by the credit ceiling or an empty
+ * pool, which becomes a proposal for Yu and Ai (KS-004 6.3); every other
+ * hold is for Yu alone. "recipient-sleeping": the recipient listens or
+ * sleeps and its covenants let this sender wake it, which only a file letter
+ * does today, so Yu may deliver it as one (KS-004 7.1).
+ */
+export type HeldBecause = "unregistered" | "to-yu" | "no-inbox" | "credits" | "refused" | "uncertain" | "recipient-sleeping";
+
+/**
+ * Whether a letter to `toWord` should wait for Yu because it would wake its
+ * recipient (KS-004 7.1): the recipient listens or sleeps, and its own
+ * covenants let this sender both write to it and wake it. An inbox letter
+ * wakes no one (the tick reads letters/ only), so sending it would leave the
+ * recipient asleep and Yu with nothing to deliver. A recipient whose state
+ * or covenants do not read is held too, the closed side.
+ */
+export async function wouldWake(config: Config, sender: Pick<CitizenRecord, "word" | "identity">, toWord: Word): Promise<boolean> {
+  const to = await readCitizen(config, toWord).catch(() => null);
+  if (to === null) return true;
+  if (to.state !== "listening" && to.state !== "asleep") return false;
+  const ids = senderIds(sender);
+  return to.covenants.letters_from.some((id) => ids.includes(id)) && to.covenants.wake_on_letter_from.some((id) => ids.includes(id));
+}
 
 /**
  * Keep a letter for Yu alone (KS-004 5.7, limitation 10): an outbox item
@@ -106,9 +136,25 @@ export interface LetterPost {
   unread(citizen: Citizen, seen: (id: string) => Promise<boolean>): Promise<Letter[]>;
 }
 
-/** The id a letter from the inbox is shown and receipted under, beside the file letters in letters/. */
-export function inboxLetterId(messageId: string): string {
-  return `inbox-${messageId}`;
+/**
+ * The id a letter from the inbox is shown and receipted under, beside the file
+ * letters in letters/: a digest of its envelope (signature, ciphertext, nonce
+ * and ephemeral key, decoded), never agenttool's message id. A bearer holder
+ * that posts the same envelope again gets a new message id, but the same
+ * letter id, so the letter is shown once (re-review C round 3, wire F2). Every
+ * honest seal draws a fresh ephemeral key and nonce, so no two letters share
+ * one. Throws when a field does not decode.
+ */
+export function inboxLetterId(m: Pick<InboxMessage, "signature" | "ciphertext" | "nonce" | "ephemeral_pubkey">): string {
+  const parts = [fromB64(m.signature, 64), fromB64(m.ciphertext), fromB64(m.nonce, 12), fromB64(m.ephemeral_pubkey, 32)];
+  const framed = concatBytes(
+    ...parts.flatMap((p) => {
+      const len = new Uint8Array(4);
+      new DataView(len.buffer).setUint32(0, p.length);
+      return [len, p];
+    }),
+  );
+  return `inbox-${toHex(domainDigest("kingdom-seat-inbox-envelope/v1", framed))}`;
 }
 
 /** The production LetterPost, through the client and so through the signer. */
@@ -121,10 +167,15 @@ export function agenttoolLetters(deps: { config: Config; client: ClientDeps }): 
         const sent = await sendInboxLetter(client, word, { did: to.identity.did, box_public_key_b64: to.identity.box_public_key_b64 }, text);
         return { message_id: sent.message_id, credits: 2 };
       } catch (e) {
-        // A wall or a definite not-sent spent nothing; anything that left the host may have been charged.
+        // A wall, a definite not-sent, or a failure before the paid POST spent nothing and delivered nothing.
         if (e instanceof Refusal) return { message_id: null, held_because: e.code === "ceiling-credits" ? "credits" : "refused", code: e.code, credits: 0 };
         if (e instanceof SignerNotSent) return { message_id: null, held_because: "refused", code: null, credits: 0 };
-        const uncertain = e instanceof AgenttoolError && (e.status === NO_RESPONSE || e.status >= 500);
+        if (e instanceof InboxNotSent) return { message_id: null, held_because: e.no_inbox ? "no-inbox" : "refused", code: null, credits: 0 };
+        // agenttool answered before charging: an empty pool (402) or a body its schema refused (400).
+        const free = notCharged(e);
+        if (free !== null) return { message_id: null, held_because: free === "credits" ? "credits" : "refused", code: free === "credits" ? "ceiling-credits" : null, credits: 0 };
+        // Anything else left the host and may have been charged, and only no answer or a 5xx may have delivered it.
+        const uncertain = !(e instanceof AgenttoolError) || e.status === NO_RESPONSE || e.status >= 500;
         return { message_id: null, held_because: uncertain ? "uncertain" : "refused", code: null, credits: 2 };
       }
     },
@@ -146,19 +197,22 @@ export function agenttoolLetters(deps: { config: Config; client: ClientDeps }): 
         })
         .sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : a.id < b.id ? -1 : 1));
       for (const m of candidates) {
-        if (await seen(inboxLetterId(m.id))) continue;
         const sender = byDid.get(m.sender_did)!;
         const identity = sender.identity!;
         // The envelope must be the sender's own: its op key, over exactly what it sealed to this citizen.
         let signed = false;
+        let id: string;
         try {
           signed =
             m.sender_signing_key_id === identity.op_kid &&
             edVerifyStrict(fromB64(m.signature, 64), inboxDigest(citizen.identity.did, fromB64(m.ciphertext), fromB64(m.nonce, 12), fromB64(m.ephemeral_pubkey, 32)), fromB64(identity.op_public_key_b64, 32));
+          id = inboxLetterId(m);
         } catch {
-          signed = false;
+          continue;
         }
         if (!signed) continue;
+        // Receipted by its envelope: the same letter posted again under a new message id is not new.
+        if (await seen(id)) continue;
         let text: string;
         try {
           text = await client.signer.openLetter(citizen.word, m);
@@ -168,7 +222,7 @@ export function agenttoolLetters(deps: { config: Config; client: ClientDeps }): 
         if (text.trim() === "" || [...text].length > config.ceilings.letter_max_chars) continue;
         // Shown under the id the covenants admitted it by, as a file letter's From: line is.
         const from = senderIds(sender).find((id) => allowed.has(id))!;
-        return [{ id: inboxLetterId(m.id), from, received_at: m.created_at, text, sha256: sha256Hex(utf8(text)) }];
+        return [{ id, from, received_at: m.created_at, text, sha256: sha256Hex(utf8(text)) }];
       }
       return [];
     },

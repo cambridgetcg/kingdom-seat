@@ -450,7 +450,7 @@ export function hostBirthRecord(config: Config, clock: Clock, signer: Signer): B
     async append(word, fields, opts) {
       const prev = (await entries(word)).at(-1) ?? null;
       const draft = nextDraft(word, prev, fields, { cost: { usd: "0", credits: 0 }, signer: opts.signer, now: clock.now(), did: opts.did });
-      return appendEntry(ledgerPath(config, word), draft, (w, k, digestFor) => signer.signEntry(w, k, digestFor));
+      return appendEntry(ledgerPath(config, word), draft, (w, k, d) => signer.signEntry(w, k, d));
     },
   };
 }

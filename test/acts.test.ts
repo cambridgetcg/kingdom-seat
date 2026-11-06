@@ -350,7 +350,7 @@ describe("validation", () => {
       for (const d of [1, 30]) expect(kept({ type: "state.set", to, quiet_days: d }, ctx)).toEqual({ type: "state.set", to, quiet_days: d });
     }
     const interval = "interval_h is not whole hours within the ceiling";
-    const quiet = "quiet_days is not whole days within the cap";
+    const quiet = "quiet_days is not whole days from 1 to 30";
     const cases: [unknown, string][] = [
       [{ type: "state.set", to: "awake", interval_h: min - 1 }, interval],
       [{ type: "state.set", to: "awake", interval_h: 96.5 }, interval],
@@ -366,8 +366,11 @@ describe("validation", () => {
       [{ type: "state.set", interval_h: 96 }, "fields do not match the act"],
     ];
     for (const [value, reason] of cases) expect([JSON.stringify(value), reasonOf(value, ctx)]).toEqual([JSON.stringify(value), reason]);
-    // A host whose quiet cap is lower lowers the bound.
-    expect(reasonOf({ type: "state.set", to: "asleep", quiet_days: 10 }, validationContext({ ceilings: { ...DEFAULT_CEILINGS, citizen_quiet_max_days: 7 } }))).toBe(quiet);
+    // A host whose quiet cap is lower keeps the act whole: the move toward rest is the citizen's, and the host
+    // declares at most its own cap (quiet.ts quietDays clamps), so asking past it never costs the move (selfhood F3).
+    const low = validationContext({ ceilings: { ...DEFAULT_CEILINGS, citizen_quiet_max_days: 7 } });
+    expect(kept({ type: "state.set", to: "asleep", quiet_days: 10 }, low)).toEqual({ type: "state.set", to: "asleep", quiet_days: 10 });
+    expect(run(output({ type: "rest" }, { type: "state.set", to: "asleep", quiet_days: 20 }), low).rest_act).toEqual({ type: "state.set", to: "asleep", quiet_days: 20 });
 
     // A saying is the whole act: the same state with two intervals is two sayings, which move nothing, on a beat or a rest.
     const contra = run(output({ type: "state.set", to: "awake", interval_h: 96 }, { type: "state.set", to: "awake", interval_h: 120 }));

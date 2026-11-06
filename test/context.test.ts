@@ -316,7 +316,7 @@ describe("what the citizen may change is in view", () => {
     const { ctx, text } = await seat(c);
     expect(ctx.cadence).toEqual({ interval_h: 96 });
     expect(ctx.covenants).toEqual({ letters_from: ["yu", "citizen:kenning"], wake_on_letter_from: ["yu"] });
-    expect(ctx.limits).toEqual({ journal_max_chars: 500, letter_max_chars: 4000, letter_sends_per_beat: 1, min_beat_interval_h: 72 });
+    expect(ctx.limits).toEqual({ journal_max_chars: 500, letter_max_chars: 4000, letter_sends_per_beat: 1, min_beat_interval_h: 72, quiet_max_days: 30 });
     expect(ctx.self.journal_form).toBe("JOURNAL-FORM-TEXT\n");
     expect(ctx.self.expression).toEqual({ register: "REGISTER-TEXT\n", walls: "WALL-ONE\nWALL-TWO\n", wake_text: null, porch: '{"PORCH":1}' });
     expect(ctx.self.files).toEqual([{ path: "notes/river.md", text: "OWN-FILE-TEXT\n" }]);

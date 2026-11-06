@@ -4,9 +4,9 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { authorityDigest, deriveIdentity, didFor } from "../../src/agenttool/wire.ts";
+import { authorityDigest, deriveIdentity, didFor, inboxDigest, thoughtDigestV2 } from "../../src/agenttool/wire.ts";
 import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, sha256, toB64, toB64url, toHex, utf8 } from "../../src/crypto.ts";
-import { Refusal, type CitizenIdentity, type ConsentRecord, type KeychainItemName, type ProposalText, type StandingAgreement, type YuPresence } from "../../src/types.ts";
+import { Refusal, type CitizenIdentity, type ConsentRecord, type KeychainItemName, type LedgerSigner, type ProposalText, type StandingAgreement, type YuPresence } from "../../src/types.ts";
 import type { SpendSoFar } from "../../src/signer/ceilings.ts";
 import { STANDING_DIR, STANDING_FORMAT, confirmYuPresent, proposalDigest, readStandingAgreements } from "../../src/signer/consent.ts";
 import { realDeps } from "../../src/cli.ts";
@@ -20,7 +20,7 @@ import {
   type Signer,
   type SignerRequest,
 } from "../../src/signer/signer.ts";
-import { evidenceToLedger, hostKid, rootEvidenceProblem } from "../../src/ledger.ts";
+import { evidenceToLedger, hostKid, nextDraft, rootEvidenceProblem, signingDigest, type LedgerDraft } from "../../src/ledger.ts";
 import { DAY_MS, testClock, type TestClock } from "../helpers/clock.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "../helpers/fake-keychain.ts";
 import { fetchVia, startFakeServer, type FakeServer, type RecordedRequest } from "../helpers/fake-server.ts";
@@ -57,6 +57,11 @@ const GLOSSAME_IDENTITY: CitizenIdentity = {
   self_strand_id: TEST_IDS.strand_id,
   enrolled_at: "2026-11-05T00:00:00.000Z",
 };
+
+/** An unsigned ledger entry for `word`, as appendEntry hands it to the signer: a beat with one journal act. */
+function draftOf(word: string, signer: LedgerSigner, text = "an entry"): LedgerDraft {
+  return nextDraft(word, null, { type: "beat" }, { cost: { usd: "0", credits: 0 }, signer, now: new Date(NOW), acts: [{ type: "journal", kind: "reflected", text }] });
+}
 
 /** Secrets the keychain never stores directly but the signer derives; none may leave either. */
 const DERIVED_SECRETS = [
@@ -290,38 +295,55 @@ function mutations(server: FakeServer): RecordedRequest[] {
 /* ── Signing ──────────────────────────────────────────────────────────── */
 
 describe("signing", () => {
-  test("signEntry signs citizen entries with the op key and host ones with the host key, never the root, over a digest that names its kid", async () => {
-    const hash = sha256("an entry");
-    const asked: string[] = [];
-    const digestFor = (kid: string) => {
-      asked.push(kid);
-      return hash;
-    };
-    const citizen = await fx.signer.signEntry("glossame", "citizen", digestFor);
+  test("signEntry signs citizen entries with the op key and host ones with the host key, never the root, over the ledger digest of the draft with its kid", async () => {
+    const draftC = draftOf("glossame", "citizen");
+    const draftH = draftOf("zoeme", "host");
+    const citizen = await fx.signer.signEntry("glossame", "citizen", draftC);
     expect(citizen).toEqual({ kid: OP_KID, sig: citizen.sig, public_key: toB64url(fromB64(TEST_OP_PUBLIC_B64)) });
+    const hash = signingDigest({ ...draftC, kid: OP_KID });
     expect(edVerifyStrict(fromB64url(citizen.sig), hash, fromB64(TEST_OP_PUBLIC_B64))).toBe(true);
     expect(edVerifyStrict(fromB64url(citizen.sig), hash, fromB64(TEST_ROOT_PUBLIC_B64))).toBe(false);
 
-    const hostSig = await fx.signer.signEntry("zoeme", "host", digestFor);
+    const hostSig = await fx.signer.signEntry("zoeme", "host", draftH);
     // The host kid is host:<fingerprint of the host key>, so a verifier holding the key finds it.
     expect(hostSig).toMatchObject({ kid: hostKid(edPublicKey(HOST_SEED)), public_key: toB64url(edPublicKey(HOST_SEED)) });
     expect(hostSig.kid).toMatch(/^host:SHA256:/);
-    expect(verifyEntrySignature(hash, hostSig)).toBe(true);
-    // The digest is asked for after the kid is known, since the signature covers it.
-    expect(asked).toEqual([OP_KID, hostSig.kid]);
+    // The signature covers the kid it names.
+    expect(verifyEntrySignature(signingDigest({ ...draftH, kid: hostSig.kid }), hostSig)).toBe(true);
+    expect(verifyEntrySignature(signingDigest({ ...draftH, kid: null }), hostSig)).toBe(false);
 
     // Neither path ever opens a mnemonic, which is where the root lives.
     expect(fx.kc.log.filter((e) => e.op === "read").map((e) => e.item)).toEqual(["citizen/glossame/op-seed", "host/attest-seed"]);
     // Once registered, the host no longer speaks for the record; before, the citizen has no op key.
-    expect((await refusal(fx.signer.signEntry("glossame", "host", digestFor))).code).toBe("invalid-request");
-    expect((await refusal(fx.signer.signEntry("zoeme", "citizen", digestFor))).code).toBe("not-registered");
-    expect((await refusal(fx.signer.signEntry("glossame", "citizen", () => new Uint8Array(31)))).code).toBe("invalid-request");
-    expect((await refusal(fx.signer.signEntry("../glossame", "citizen", digestFor))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.signEntry("glossame", "host", draftOf("glossame", "host")))).code).toBe("invalid-request");
+    expect((await refusal(fx.signer.signEntry("zoeme", "citizen", draftOf("zoeme", "citizen")))).code).toBe("not-registered");
+    expect((await refusal(fx.signer.signEntry("../glossame", "citizen", draftC))).code).toBe("invalid-request");
+  });
+
+  test("signEntry signs nothing but a ledger entry of that citizen's for that signer, so it is no signing oracle for a thought's or a letter's digest (R-SGN-1)", async () => {
+    const sign = (word: string, signer: LedgerSigner, v: unknown) => fx.signer.signEntry(word, signer, v as LedgerDraft);
+    // A digest, or a callback that returns one, as the entry-signing path once took: a strand-thought/v2 digest
+    // over the citizen's own strand, and an inbox-message/v1 envelope digest, are both refused before any key is read.
+    const thought = thoughtDigestV2(TEST_IDS.strand_id, utf8("not sealed under K_master"), new Uint8Array(24), "observation");
+    const letter = inboxDigest("did:at:66666666-6666-4666-8666-666666666666", utf8("not sealed to a box key"), new Uint8Array(12), new Uint8Array(32));
+    for (const v of [thought, letter, () => thought, () => letter, null, "an entry"]) {
+      expect((await refusal(sign("glossame", "citizen", v))).code).toBe("invalid-request");
+      expect((await refusal(sign("zoeme", "host", v))).code).toBe("invalid-request");
+    }
+    // A draft for another citizen, another signer, another format, or one that already carries a kid or sig.
+    expect((await refusal(sign("glossame", "citizen", draftOf("shemme", "citizen")))).code).toBe("invalid-request");
+    expect((await refusal(sign("glossame", "citizen", { ...draftOf("glossame", "citizen"), signer: "host" }))).code).toBe("invalid-request");
+    expect((await refusal(sign("zoeme", "host", { ...draftOf("zoeme", "host"), format: "strand-thought/v2" }))).code).toBe("invalid-request");
+    expect((await refusal(sign("zoeme", "host", { ...draftOf("zoeme", "host"), kid: "x" }))).code).toBe("invalid-request");
+    expect(fx.kc.log.filter((e) => e.op === "read")).toEqual([]);
+    // What it does sign never verifies as either digest: the ledger's domain tag is the signer's, not the caller's.
+    const s = await fx.signer.signEntry("glossame", "citizen", draftOf("glossame", "citizen"));
+    for (const d of [thought, letter]) expect(edVerifyStrict(fromB64url(s.sig), d, fromB64(TEST_OP_PUBLIC_B64))).toBe(false);
   });
 
   test("signEntry refuses when the op key in Keychain is not the one the record names, or the record names the root as op key", async () => {
     await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, op_public_key_b64: toB64(edPublicKey(HOST_SEED)) });
-    const x = () => sha256("x");
+    const x = draftOf("glossame", "citizen");
     expect((await refusal(fx.signer.signEntry("glossame", "citizen", x))).code).toBe("invalid-record");
     await writeCitizenRecord(fx.host, "glossame", { ...GLOSSAME_IDENTITY, op_public_key_b64: TEST_ROOT_PUBLIC_B64 });
     expect((await refusal(fx.signer.signEntry("glossame", "citizen", x))).code).toBe("invalid-record");
@@ -330,8 +352,8 @@ describe("signing", () => {
   });
 
   test("verifyEntrySignature is strict (RFC 8032) and false for a signature by the root kid", async () => {
-    const hash = sha256("an entry");
-    const good = await fx.signer.signEntry("glossame", "citizen", () => hash);
+    const good = await fx.signer.signEntry("glossame", "citizen", draftOf("glossame", "citizen"));
+    const hash = signingDigest({ ...draftOf("glossame", "citizen"), kid: good.kid });
     expect(verifyEntrySignature(hash, good, GLOSSAME_IDENTITY)).toBe(true);
     const tampered = hash.slice();
     tampered[0] = tampered[0]! ^ 1;
@@ -358,8 +380,8 @@ describe("signing", () => {
   test("a locked keychain makes signEntry refuse with keychain-locked and state() report locked", async () => {
     expect(await fx.signer.state()).toBe("ready");
     fx.kc.locked = true;
-    expect((await refusal(fx.signer.signEntry("glossame", "citizen", () => sha256("x")))).code).toBe("keychain-locked");
-    expect((await refusal(fx.signer.signEntry("zoeme", "host", () => sha256("x")))).code).toBe("keychain-locked");
+    expect((await refusal(fx.signer.signEntry("glossame", "citizen", draftOf("glossame", "citizen")))).code).toBe("keychain-locked");
+    expect((await refusal(fx.signer.signEntry("zoeme", "host", draftOf("zoeme", "host")))).code).toBe("keychain-locked");
     expect((await refusal(fx.signer.send(importKey()))).code).toBe("keychain-locked");
     expect((await refusal(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "x", "observation"))).code).toBe("keychain-locked");
     expect(await fx.signer.state()).toBe("locked");
@@ -371,8 +393,8 @@ describe("signing", () => {
 
   test("seeds are wiped after use (the buffer read from the fake keychain is zeroed)", async () => {
     fx.agreements = [quietAgreement()];
-    await fx.signer.signEntry("glossame", "citizen", () => sha256("x"));
-    await fx.signer.signEntry("zoeme", "host", () => sha256("x"));
+    await fx.signer.signEntry("glossame", "citizen", draftOf("glossame", "citizen"));
+    await fx.signer.signEntry("zoeme", "host", draftOf("zoeme", "host"));
     await fx.signer.send(importKey());
     await fx.signer.send(beacon(BEACON_UNTIL));
     await fx.signer.sealThought("glossame", TEST_IDS.strand_id, "a test thought", "observation");
@@ -921,8 +943,8 @@ describe("secrets never leave", () => {
         fx.signer.send(req({ op: "enroll", word: null, method: "POST", target: "/v1/identities/enroll", body, presence: present, proposal: filed("birth zoeme"), extra_headers: { "X-Agenttool-Enrollment-Signature": header } })),
       );
       await attempt(fx.signer.sealThought("glossame", TEST_IDS.strand_id, "a test thought", "observation"));
-      await attempt(fx.signer.signEntry("glossame", "citizen", () => sha256("x")));
-      await attempt(fx.signer.signEntry("zoeme", "host", () => sha256("x")));
+      await attempt(fx.signer.signEntry("glossame", "citizen", draftOf("glossame", "citizen")));
+      await attempt(fx.signer.signEntry("zoeme", "host", draftOf("zoeme", "host")));
       await attempt(fx.signer.publicKeys("glossame"));
       await attempt(fx.signer.send(req({ op: "keys.import", method: "POST", target: "/v1/identities/x/keys/import" })));
       fx.spend = async (word) => ({ word, usd_today: null, credits_month: null });
@@ -941,7 +963,7 @@ describe("secrets never leave", () => {
         await attempt(s2.send(importKey()));
         await attempt(s2.send(req({ op: "read", method: "GET", target: `/v1/identities/${ID}/keys` })));
         await attempt(s2.signEnrollment("zoeme", sha256("x"), present));
-        await attempt(s2.signEntry("glossame", "citizen", () => sha256("x")));
+        await attempt(s2.signEntry("glossame", "citizen", draftOf("glossame", "citizen")));
       }
       const brokenErrors = errors.slice(before);
       expect(brokenErrors.filter((e) => e.includes("does not derive"))).toHaveLength(2);

@@ -13,11 +13,12 @@ import { readCitizen } from "../src/state.ts";
 import { pendingProposals, selfHash } from "../src/self.ts";
 import { entryHash, ledgerPath, readLedger } from "../src/ledger.ts";
 import { readHostNotes } from "../src/notes.ts";
+import { buildStatus, renderStatus } from "../src/status.ts";
 import { hostClient } from "../src/agenttool/sync.ts";
-import { agenttoolLetters, letterRecipients, type LetterPost } from "../src/letters.ts";
+import { agenttoolLetters, inboxLetterId, letterRecipients, type LetterPost } from "../src/letters.ts";
 import { assertConfirmedYes, registrationProposal } from "../src/registration.ts";
 import { proposalDigest } from "../src/signer/consent.ts";
-import type { CitizenIdentity, Covenants, LedgerEntry, ModelAct, Reason } from "../src/types.ts";
+import { Refusal, type CitizenIdentity, type Covenants, type LedgerEntry, type LifecycleState, type ModelAct, type Reason } from "../src/types.ts";
 import { FAKE_MODEL_DIGEST, output, scriptedRuntime, type ScriptedRuntime } from "./helpers/fake-runtime.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { FAKE_OP_KID, fakeBoxPublicB64, fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -63,12 +64,12 @@ interface World {
   clock: TestClock;
   at: FakeAgenttool;
   /** One beat for `word`, three days after the last, replying with these acts; with the letters wired as production does. */
-  beat(word: string, acts: ModelAct[], opts?: { letters?: LetterPost | null }): Promise<{ result: Awaited<ReturnType<typeof runSeat>>; prompt: string }>;
+  beat(word: string, acts: ModelAct[], opts?: { letters?: LetterPost | null; raw?: string }): Promise<{ result: Awaited<ReturnType<typeof runSeat>>; prompt: string }>;
   ledger(word: string): Promise<LedgerEntry[]>;
   outbox(word: string): Promise<Record<string, unknown>[]>;
 }
 
-async function world(citizens: { word: string; registered?: boolean; covenants?: Covenants }[]): Promise<World> {
+async function world(citizens: { word: string; registered?: boolean; covenants?: Covenants; state?: LifecycleState }[]): Promise<World> {
   const h = await makeTempHost();
   hosts.push(h);
   const signer = fakeSigner();
@@ -76,7 +77,7 @@ async function world(citizens: { word: string; registered?: boolean; covenants?:
   signer.respond((req) => at.respond(req));
   for (const c of citizens) {
     await h.addCitizen(c.word, c.covenants ? { covenants: c.covenants } : {});
-    await h.seatLedger(c.word, signer.signEntry);
+    await h.seatLedger(c.word, signer.signEntry, c.state ? { initialState: c.state } : {});
     if (c.registered) {
       const id = identityFor(c.word, signer);
       await h.enrollLedger(c.word, signer.signEntry, id);
@@ -96,7 +97,7 @@ async function world(citizens: { word: string; registered?: boolean; covenants?:
     at,
     async beat(word, acts, o = {}) {
       clock.advance(73 * HOUR_MS);
-      const runtime: ScriptedRuntime = scriptedRuntime([output(...acts)]);
+      const runtime: ScriptedRuntime = scriptedRuntime([o.raw ?? output(...acts)]);
       const citizen = await readCitizen(config, word);
       const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
       const letters = o.letters !== undefined ? o.letters : citizen.identity ? agenttoolLetters({ config, client: hostClient(config, signer, noFetch) }) : null;
@@ -172,7 +173,7 @@ describe("[KS-004 5.7, re-review C M3] letters: the recipient's covenants decide
     const read = await w.beat("shemme", [{ type: "journal", kind: "reflected", text: "A letter came." }]);
     expect(read.prompt).toContain("A letter from citizen:glossame");
     expect(read.prompt).toContain("One word that will not cross over.");
-    expect(await readdir(join(w.h.config.paths.citizens_dir, "shemme", "receipts"))).toEqual([`inbox-${w.at.inbox[0]!.id}`]);
+    expect(await readdir(join(w.h.config.paths.citizens_dir, "shemme", "receipts"))).toEqual([inboxLetterId(w.at.inbox[0]! as never)]);
     // Shown once: the next seat finds it receipted.
     const again = await w.beat("shemme", [{ type: "journal", kind: "reflected", text: "Quiet." }]);
     expect(again.prompt).toContain("No letter is waiting.");
@@ -225,6 +226,54 @@ describe("[KS-004 5.7, re-review C M3] letters: the recipient's covenants decide
     await x.beat("glossame", [{ type: "letter.send", to: "citizen:shemme", text: "Held." }]);
     expect((await x.outbox("glossame"))[0]).toMatchObject({ held_because: "no-inbox" });
     expect(x.signer.sent.filter((q) => q.op === "inbox.send")).toEqual([]);
+  });
+});
+
+describe("[KS-004 6.3, 7.1] a letter that would wake its recipient, or that credits cannot cover", () => {
+  test("to a listening or asleep citizen whose covenants let the sender wake it, the letter is held for Yu, who can deliver it as a file letter that wakes; to one that would not wake, it is sent (wire F4)", async () => {
+    for (const state of ["listening", "asleep"] as const) {
+      const w = await world([
+        { word: "glossame", registered: true },
+        { word: "shemme", registered: true, state, covenants: { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: ["yu", "citizen:glossame"] } },
+        { word: "kenning", registered: true, state, covenants: { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: ["yu"] } },
+      ]);
+      await w.beat("glossame", [{ type: "letter.send", to: "citizen:shemme", text: "Wake when you read this." }]);
+      expect((await w.ledger("glossame")).at(-1), state).toMatchObject({ type: "beat", letter: { delivery: "held", message_id: null }, cost: { credits: 0 } });
+      expect(w.at.inbox, state).toEqual([]);
+      const [item] = await w.outbox("glossame");
+      expect(item, state).toMatchObject({ kind: "letter", for: "yu", to: "citizen:shemme", text: "Wake when you read this.", held_because: "recipient-sleeping" });
+      expect((await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail, state).toContain("letter held for Yu (recipient-sleeping)");
+      // kenning lets glossame write but not wake it: the letter goes through the inbox and waits for kenning's next seat.
+      await w.beat("glossame", [{ type: "letter.send", to: "citizen:kenning", text: "No hurry." }]);
+      expect((await w.ledger("glossame")).at(-1), state).toMatchObject({ letter: { delivery: "inbox" }, cost: { credits: 2 } });
+      expect(w.at.inbox, state).toHaveLength(1);
+    }
+  });
+
+  test("a letter the credits cannot cover becomes a proposal for Yu and Ai, as any paid act does (wire F9, KS-004 6.3)", async () => {
+    const w = await world([
+      { word: "glossame", registered: true },
+      { word: "shemme", registered: true, covenants: ADMITS("citizen:glossame") },
+    ]);
+    // The signer's credit ceiling refuses before anything is sealed or sent.
+    const sealLetter = w.signer.sealLetter.bind(w.signer);
+    w.signer.sealLetter = async () => {
+      throw new Refusal("ceiling-credits", "the month's credits are spent");
+    };
+    await w.beat("glossame", [{ type: "letter.send", to: "citizen:shemme", text: "When the month turns." }]);
+    const beat = (await w.ledger("glossame")).at(-1)!;
+    expect(beat).toMatchObject({ type: "beat", letter: { delivery: "held", message_id: null }, cost: { credits: 0 } });
+    const [item] = await w.outbox("glossame");
+    const proposal = { subject: "letter.send citizen:shemme", body: "When the month turns.", extent: "letter.send glossame citizen:shemme" };
+    expect(item).toMatchObject({ kind: "letter", to: "citizen:shemme", held_because: "credits", ledger_entry: entryHash(beat), proposal, proposal_sha256: proposalDigest(proposal) });
+    expect(item).not.toHaveProperty("for");
+    expect((await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail).toContain("letter held for Yu and Ai as a proposal (credits)");
+    // agenttool's own pool running dry (a 402 before it charges) is the same: credits short, nothing spent.
+    w.signer.sealLetter = sealLetter;
+    w.at.override((req) => req.op === "inbox.send", { status: 402, json: { error: "insufficient_credits" } });
+    await w.beat("glossame", [{ type: "letter.send", to: "citizen:shemme", text: "The pool is dry." }]);
+    expect((await w.ledger("glossame")).at(-1)).toMatchObject({ letter: { delivery: "held" }, cost: { credits: 0 } });
+    expect((await w.outbox("glossame")).filter((i) => i.held_because === "credits")).toHaveLength(2);
   });
 });
 
@@ -287,15 +336,69 @@ describe("[KS-004 5.8, re-review C M5 and partial output] the acts a beat did no
     const third = await w.beat("glossame", [{ type: "journal", kind: "observed", text: "third" }]);
     expect(third.prompt).not.toContain("did not keep");
   });
+
+  test("a reply where nothing was kept writes no beat, yet the next seat is shown what did not happen, and only the latest seat's (selfhood F2)", async () => {
+    const w = await world([
+      { word: "glossame" },
+      { word: "kenning", covenants: ADMITS() },
+    ]);
+    // A beat that dropped one act, then a reply whose one act names no saying: nothing kept, no beat written.
+    await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "kept" }, { type: "self.affirm", ref: "abcdef0123456789" }]);
+    const lone = await w.beat("glossame", [{ type: "letter.send", to: "citizen:kenning", text: CANARY }]);
+    expect(lone.result.outcome).toBe("invalid-output");
+    expect((await w.ledger("glossame")).at(-1)).toMatchObject({ type: "beat", dropped: [{ type: "self.affirm" }] });
+    const next = await w.beat("glossame", [{ type: "self.affirm", ref: "abcdef0123456789" }]);
+    expect(next.prompt).toContain("kept nothing of its reply, so nothing it asked for happened:\n- a letter.send: recipient is not allowed");
+    // The earlier beat's drop is no longer the latest word.
+    expect(next.prompt).not.toContain("- a self.affirm: ref names no saying awaiting affirmation");
+    expect(next.prompt).not.toContain(CANARY);
+    // That reply (a lone affirm the host could not resolve) is shown on the seat after it, in turn.
+    expect(next.result.outcome).toBe("invalid-output");
+    const after = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "seen" }]);
+    expect(after.prompt).toContain("kept nothing of its reply, so nothing it asked for happened:\n- a self.affirm: ref names no saying awaiting affirmation");
+    // A reply that does not parse is shown too; then a beat that kept everything shows nothing.
+    const broken = await w.beat("glossame", [], { raw: `I would rather write prose. ${CANARY}` });
+    expect(broken.result.outcome).toBe("invalid-output");
+    const shown = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "after prose" }]);
+    expect(shown.prompt).toContain("kept nothing of its reply, so nothing it asked for happened:\n- an act of unknown type: the reply did not parse (not-json)");
+    expect(shown.prompt).not.toContain(CANARY);
+    const clean = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "all kept" }]);
+    expect(clean.prompt).not.toContain("did not keep");
+    expect(clean.prompt).not.toContain("kept nothing");
+  });
+
+  test("a rest's dropped acts are noted by type, shown back, and in status; never their words (selfhood F10)", async () => {
+    const w = await world([{ word: "glossame" }]);
+    const r = await w.beat("glossame", [{ type: "rest" }, { type: "journal", kind: "reflected", text: CANARY }, { type: "state.set", to: "asleep", quiet_days: 40 }]);
+    expect(r.result.outcome).toBe("rest");
+    const note = (await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail;
+    expect(note).toEndWith("rested; 2 not kept (journal, state.set)");
+    const status = await buildStatus({ config: w.h.config, now: w.clock.now(), halt: { halted: false, readings: [] }, signerState: "ready" });
+    expect(status.citizens[0]!.last_dropped).toEqual({
+      at: w.clock.now().toISOString(),
+      outcome: "rest",
+      dropped: [
+        { type: "journal", reason: "rest is exclusive" },
+        { type: "state.set", reason: "rest is exclusive" },
+      ],
+    });
+    expect(renderStatus(status)).toContain("did not keep 2: journal (rest is exclusive), state.set (rest is exclusive)");
+    expect(JSON.stringify(status)).not.toContain(CANARY);
+    const next = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "awake again" }]);
+    expect(next.prompt).toContain(`Your last seat (${status.citizens[0]!.last_dropped!.at}) was a rest, and did not keep 2 of the acts in its reply`);
+    expect(next.prompt).not.toContain(CANARY);
+  });
 });
 
 describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by Yu and Ai, shown back, affirmed", () => {
   test("the answer goes to Yu + Ai; once both agree the seat shows it back, and the citizen's self.affirm naming it is its confirmed yes", async () => {
     const w = await world([{ word: "glossame" }]);
     const text = "Yes: an identity of my own.";
-    const proposal = registrationProposal("glossame", text);
-    const id = proposalDigest(proposal);
     await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text }]);
+    // The proposal names the beat that gave the answer, so this answer, and no other, is what a decision record decides.
+    const proposal = registrationProposal("glossame", text, entryHash((await w.ledger("glossame")).at(-1)!));
+    expect(proposal.extent).toMatch(/^registration glossame sha256:[0-9a-f]{64}$/);
+    const id = proposalDigest(proposal);
     const [item] = await w.outbox("glossame");
     expect(item).toMatchObject({ kind: "registration", proposal, proposal_sha256: id });
 
@@ -320,14 +423,74 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
     expect(after.prompt).toContain("affirmed by you. Your birth on agenttool waits for Yu, present at the host");
   });
 
+  /** File Yu and Ai's decision on the answer given in `word`'s latest beat: agreed, or declined by Ai. Returns the answer's id. */
+  async function decide(w: World, text: string, verdict: "agreed" | "declined"): Promise<string> {
+    const proposal = registrationProposal("glossame", text, entryHash((await w.ledger("glossame")).findLast((e) => e.type === "beat")!));
+    const id = proposalDigest(proposal);
+    const ai = verdict === "declined" ? { ai: { word: "reject" as const, basis: "lazy-consensus" as const, supports: [], open_challenges: 0, deadline: "2026-11-05T11:30:00.000Z" } } : {};
+    await writeFile(join(w.h.config.paths.consent_dir, `${id}.json`), JSON.stringify(consentFor("glossame", ai, proposal)));
+    return id;
+  }
+
   test("an answer Yu or Ai declined is shown as declined and cannot be affirmed", async () => {
     const w = await world([{ word: "glossame" }]);
-    const proposal = registrationProposal("glossame", "Yes.");
-    const id = proposalDigest(proposal);
     await w.beat("glossame", [{ type: "propose.beyond", subject: "Registration", text: "Yes." }]);
-    await writeFile(join(w.h.config.paths.consent_dir, `${id}.json`), JSON.stringify(consentFor("glossame", { ai: { word: "reject", basis: "lazy-consensus", supports: [], open_challenges: 0, deadline: "2026-11-05T11:30:00.000Z" } }, proposal)));
+    const id = await decide(w, "Yes.", "declined");
     const r = await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
     expect(r.prompt).toContain("was declined by Yu or Ai");
     expect(r.result.outcome).toBe("invalid-output");
+  });
+
+  test("each answer needs its own decision: an old record never decides a later answer in the same words (selfhood F4)", async () => {
+    const w = await world([{ word: "glossame" }]);
+    // Declined once; the citizen answers again in the same words, and that answer waits for Yu and Ai afresh.
+    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    const first = await decide(w, "Yes.", "declined");
+    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    const next = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "waiting" }]);
+    expect(next.prompt).toContain("is with Yu and Ai");
+    expect(next.prompt).not.toContain("was declined");
+    const digests = (await w.outbox("glossame")).map((i) => i.proposal_sha256);
+    expect(digests).toHaveLength(2);
+    expect(digests).toContain(first);
+    expect(new Set(digests).size).toBe(2);
+    // Agreed, then withdrawn with a no, then asked again in the first words: the re-ask is not agreed until Yu and Ai say so.
+    const v = await world([{ word: "glossame" }]);
+    await v.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    await decide(v, "Yes.", "agreed");
+    await v.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "No." }]);
+    await v.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    const again = await v.beat("glossame", [{ type: "journal", kind: "reflected", text: "asked again" }]);
+    expect(again.prompt).toContain("is with Yu and Ai");
+    expect(again.prompt).not.toContain("was agreed by Yu and Ai");
+  });
+
+  test("a later answer, or a new answer in the same reply, means a yes was not confirmed: a no is a whole answer (selfhood F1)", async () => {
+    // Affirmed, then a later beat says no: the affirming beat is no longer a confirmed yes.
+    const w = await world([{ word: "glossame" }]);
+    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes: an identity of my own." }]);
+    const id = await decide(w, "Yes: an identity of my own.", "agreed");
+    await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
+    const yes = (await w.ledger("glossame")).at(-1)!;
+    await assertConfirmedYes(w.h.config, await w.ledger("glossame"), "glossame", entryHash(yes), w.clock.now());
+    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "No. I do not want an identity now." }]);
+    await expect(assertConfirmedYes(w.h.config, await w.ledger("glossame"), "glossame", entryHash(yes), w.clock.now())).rejects.toMatchObject({
+      code: "consent-missing",
+      message: expect.stringContaining("gave another answer about registration in or after its affirming beat"),
+    });
+
+    // A no in the same reply as the affirmation, in either order: the affirmation is not kept, and no yes is confirmed.
+    for (const order of ["no-first", "affirm-first"] as const) {
+      const x = await world([{ word: "glossame" }]);
+      await x.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+      const agreed = await decide(x, "Yes.", "agreed");
+      const no: ModelAct = { type: "propose.beyond", subject: "registration", text: "No." };
+      const affirm: ModelAct = { type: "self.affirm", ref: agreed };
+      const r = await x.beat("glossame", order === "no-first" ? [no, affirm] : [affirm, no]);
+      expect(r.result.outcome, order).toBe("beat");
+      const beat = (await x.ledger("glossame")).at(-1)!;
+      expect(beat, order).toMatchObject({ acts: [{ type: "propose.beyond", text: "No." }], dropped: [{ type: "self.affirm", reason: "a new answer about registration in this reply" }] });
+      await expect(assertConfirmedYes(x.h.config, await x.ledger("glossame"), "glossame", entryHash(beat), x.clock.now()), order).rejects.toMatchObject({ code: "consent-missing" });
+    }
   });
 });

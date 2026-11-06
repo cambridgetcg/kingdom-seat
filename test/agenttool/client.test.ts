@@ -441,7 +441,7 @@ describe("[KS-004 5.7, re-review C M3] letters through the inbox", () => {
     const row = { id: "99999999-9999-4999-8999-000000000001", recipient_did: TEST_IDS.did, sender_did: SHEMME.did, sender_signing_key_id: FAKE_OP_KID, ciphertext: "AAAA", nonce: "AAAAAAAAAAAAAAAA", ephemeral_pubkey: "AAAA", signature: "AAAA", created_at: "2026-11-05T13:01:00.000Z" };
     h.at.override((r, url) => url.pathname === "/v1/inbox", { status: 200, json: { messages: [row] } });
     expect(await listInbox(h.deps, WORD)).toEqual([row]);
-    expect(h.signer.sent.at(-1)!.target).toBe(`/v1/inbox?identity_id=${ID}&status=unread`);
+    expect(h.signer.sent.at(-1)!.target).toBe(`/v1/inbox?identity_id=${ID}&status=unread&limit=200`);
     h.at.override((r, url) => url.pathname === "/v1/inbox", { status: 200, json: { messages: [{ ...row, recipient_did: SHEMME.did }] } });
     expect((await agenttoolErrorOf(listInbox(h.deps, WORD))).code).toBe("malformed_response");
   });

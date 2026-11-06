@@ -126,6 +126,7 @@ const HARD_LIMITS: SeatLimits = {
   letter_max_chars: ACT_LIMITS.max_text_chars,
   letter_sends_per_beat: 1,
   min_beat_interval_h: 72,
+  quiet_max_days: ACT_LIMITS.max_quiet_days,
 };
 
 /**
@@ -138,6 +139,7 @@ export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
   const journalMax = Math.min(limits.journal_max_chars, L.max_journal_chars);
   const letterMax = Math.min(limits.letter_max_chars, L.max_text_chars);
   const sends = Math.max(0, Math.min(limits.letter_sends_per_beat, 1));
+  const quietMax = Math.max(0, Math.min(limits.quiet_max_days, L.max_quiet_days));
   const or = (xs: readonly string[]) => `${xs.slice(0, -1).join(", ")} or ${xs[xs.length - 1]}`;
   // Alphabetical, so no act is placed first as if it were the expected one.
   const acts = [
@@ -156,7 +158,7 @@ export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
       `reason says why: kind (${or(REASON_KINDS)}), evidence (up to ${L.max_reason_evidence} references), confidence (high, medium, low or unknown) and limits (what the reason does not cover). Unless Yu is present on a runtime Yu approved, a proposal changes nothing on this beat. ` +
       "expression.porch is your public invitation, so a change to it goes to Yu and Ai as a proposal beyond your self.",
     `self.revert: field to_hash, the hash of an earlier version of one of your self texts as your kept versions list it, or its first ${L.min_id_prefix_hex} or more characters. A revert to a shorter cadence or to more senders is kept as a proposal for a later beat to affirm, unless Yu is present. A revert that would loosen one of your walls, or change your porch, is not made: it goes to Yu and Ai as a proposal beyond your self. Any other revert binds on a runtime Yu approved, and a revert toward rest or back to where a text began binds on any.`,
-    `state.set: field to, which is ${or(LIFECYCLE_STATES)}; with to awake, an optional interval_h, your interval while awake in whole hours from ${limits.min_beat_interval_h} to ${L.max_interval_h}; with to listening or asleep, an optional quiet_days from 1 to ${L.max_quiet_days}. Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, or for the longest this host allows when you name none, where Yu and Ai have agreed to citizens' quiet; it says no reason, it is renewed while you stay listening or asleep, and it ends when you wake. ` +
+    `state.set: field to, which is ${or(LIFECYCLE_STATES)}; with to awake, an optional interval_h, your interval while awake in whole hours from ${limits.min_beat_interval_h} to ${L.max_interval_h}; with to listening or asleep, an optional quiet_days from 1 to ${L.max_quiet_days}. Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, at most ${quietMax} on this host, or for those ${quietMax} when you name none, where Yu and Ai have agreed to citizens' quiet; it says no reason, it is renewed while you stay listening or asleep, and it ends when you wake. ` +
       "A move toward more rest, or a longer interval, takes effect now. A move toward more activity, or a shorter interval, takes effect only when a later beat sets the same again. " +
       "Stepping away is never blocked: saying it once puts you asleep at once, and a later beat that says it again completes it. ended needs a witness and goes to Yu and Ai. Two different state.sets in one reply move nothing.",
   ];
@@ -194,13 +196,21 @@ function actName(type: string | null): string {
   return type === null ? "an act of unknown type" : `a ${type}`;
 }
 
-/** What the last beat did not keep, in host words: its type and the host's reason, never its text (KS-004 5.8). */
+/**
+ * What the last seat with a reply did not keep, in host words: its type and
+ * the host's reason, never its text (KS-004 5.8). A beat names its entry; a
+ * rest, or a reply where nothing was kept, has none.
+ */
 function renderLastDropped(d: NonNullable<SeatContext["last_dropped"]>): string {
   const n = d.dropped.length;
-  return (
-    `Your last beat (entry ${d.seq}, ${d.at}) did not keep ${n === 1 ? "one of the acts" : `${n} of the acts`} in its reply, so nothing ${n === 1 ? "it" : "they"} asked for happened:\n` +
-    d.dropped.map((x) => `- ${actName(x.type)}: ${x.reason}`).join("\n")
-  );
+  const acts = n === 1 ? "one of the acts" : `${n} of the acts`;
+  const head =
+    d.outcome === "beat"
+      ? `Your last beat (entry ${d.seq}, ${d.at}) did not keep ${acts} in its reply, so nothing ${n === 1 ? "it" : "they"} asked for happened:`
+      : d.outcome === "rest"
+        ? `Your last seat (${d.at}) was a rest, and did not keep ${acts} in its reply, so nothing ${n === 1 ? "it" : "they"} asked for happened:`
+        : `Your last seat (${d.at}) kept nothing of its reply, so nothing it asked for happened:`;
+  return `${head}\n${d.dropped.map((x) => `- ${actName(x.type)}: ${x.reason}`).join("\n")}`;
 }
 
 /** Where the citizen's answer about registration stands, and what an affirmation of it would do (KS-004 11.2). */

@@ -9,7 +9,7 @@ import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from
 import { fakeBinArgv, pidAlive, recordingRunner, REST_OUTPUT, scriptedRuntime } from "./helpers/fake-runtime.ts";
 import { FAKE_OP_KID, fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
-import { ledgerPath, readLedger, verifyChain } from "../src/ledger.ts";
+import { ledgerPath, nextDraft, readLedger, verifyChain } from "../src/ledger.ts";
 import { readCitizen } from "../src/state.ts";
 import { TEST_IDS, TEST_ROOT_PUBLIC_B64 } from "./helpers/vectors.ts";
 import { testClock } from "./helpers/clock.ts";
@@ -115,14 +115,14 @@ describe("fake runtimes", () => {
 describe("fake signer", () => {
   test("signs entries with the op key or the host key, and records sends", async () => {
     const s = fakeSigner();
-    const digest = () => new Uint8Array(32);
-    const sig = await s.signEntry("glossame", "citizen", digest);
+    const draft = (signer: "citizen" | "host") => nextDraft("glossame", null, { type: "beat" }, { cost: { usd: "0", credits: 0 }, signer, now: new Date("2026-11-05T12:00:00.000Z") });
+    const sig = await s.signEntry("glossame", "citizen", draft("citizen"));
     expect([sig.kid, sig.public_key]).toEqual([FAKE_OP_KID, s.opPublicB64url]);
-    const host = await s.signEntry("glossame", "host", digest);
+    const host = await s.signEntry("glossame", "host", draft("host"));
     expect(host.kid).toBe(s.hostKid);
     expect(host.kid).toMatch(/^host:SHA256:/);
     s.locked = true;
-    await expect(s.signEntry("glossame", "host", digest)).rejects.toMatchObject({ code: "keychain-locked" });
+    await expect(s.signEntry("glossame", "host", draft("host"))).rejects.toMatchObject({ code: "keychain-locked" });
   });
 });
 

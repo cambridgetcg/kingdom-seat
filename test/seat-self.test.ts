@@ -190,6 +190,26 @@ describe("what binds, and when", () => {
     expect(await pendingProposals(w.h.config, W)).toHaveLength(1);
   });
 
+  test("one saying staged per seat: a held revert and a self.propose in one reply, in either order, stage only the first (selfhood F6)", async () => {
+    for (const order of ["revert-first", "propose-first"] as const) {
+      const w = await world();
+      await w.beat([propose("cadence", { kind: "replace-all", text: '{"interval_h":336}' })]);
+      const [p] = await pendingProposals(w.h.config, W);
+      await w.beat([{ type: "self.affirm", ref: p!.id }]);
+      const old = selfHash(JSON.stringify({ interval_h: 72 }));
+      w.clock.advance(14 * 24 * HOUR_MS);
+      const revert: ModelAct = { type: "self.revert", to_hash: old };
+      const will = propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" });
+      const r = await w.beat(order === "revert-first" ? [revert, will] : [will, revert]);
+      expect(r.outcome, order).toBe("beat");
+      const pending = await pendingProposals(w.h.config, W);
+      expect(pending.map((x) => x.act.target), order).toEqual([order === "revert-first" ? "cadence" : "will"]);
+      // The second is dropped with a fixed reason, recorded on the beat and so shown back.
+      expect((await w.ledger()).at(-1), order).toMatchObject({ type: "beat", dropped: [{ type: order === "revert-first" ? "self.propose" : "self.revert", reason: "one saying staged per seat" }] });
+      await w.h.cleanup();
+    }
+  });
+
   test("a revert toward a shorter cadence is held as a proposal, not bound at once, on any runtime without Yu", async () => {
     const w = await world();
     await w.beat([propose("cadence", { kind: "replace-all", text: '{"interval_h":336}' })]);

@@ -923,6 +923,8 @@ export interface SeatLimits {
   letter_max_chars: number;
   letter_sends_per_beat: number;
   min_beat_interval_h: number;
+  /** The most days of quiet this host declares: the config's cap, never more than 30 (quiet.ts quietCapDays). */
+  quiet_max_days: number;
 }
 
 /** Everything a seat shows the model. Data only; nothing secret, no sibling's words except as a letter. */
@@ -976,10 +978,12 @@ export interface SeatContext {
   /** Whom it may write to: Yu, the gardener desk, and each citizen whose own covenants admit it (letters.ts). */
   recipients: string[];
   /**
-   * The acts its last beat did not keep, shown back so it knows what did not
-   * happen (KS-004 5.8): from the latest beat entry, when it dropped any.
+   * The acts its last seat with a reply did not keep, shown back so it knows
+   * what did not happen (KS-004 5.8): a beat's from its entry (seq), a rest's
+   * or a reply where nothing was kept from the host's last-seat record (seq
+   * null). Null when that seat kept everything.
    */
-  last_dropped: { seq: number; at: IsoTime; dropped: DroppedRecord[] } | null;
+  last_dropped: { seq: number | null; at: IsoTime; outcome: "beat" | "rest" | "invalid-output"; dropped: DroppedRecord[] } | null;
   /** Its answer about registration and where it stands (KS-004 11.2); null when registered or never asked. */
   registration: RegistrationView | null;
 }
@@ -1130,6 +1134,13 @@ export interface CitizenStatus {
    * the model's. Null when none is noted.
    */
   last_refusal: { at: IsoTime; outcome: "refused" | "invalid-output"; refusal: RefusalCode | null; detail: string } | null;
+  /**
+   * The acts its last seat with a reply did not keep, by type and fixed
+   * reason, never their words (KS-004 5.8, 5.10): a rest's and a refused
+   * reply's included, which leave no beat. Null when that seat kept
+   * everything, or no seat has replied.
+   */
+  last_dropped: { at: IsoTime; outcome: "beat" | "rest" | "invalid-output"; dropped: DroppedRecord[] } | null;
   /** Why the record or ledger could not be read, so an unreadable citizen is shown rather than left out. */
   problem: string | null;
 }

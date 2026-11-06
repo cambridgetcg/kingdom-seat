@@ -3,7 +3,7 @@
 // request it is asked to send, and sends nothing anywhere.
 import { Refusal, type LedgerSigner, type RootEvidence, type SignerOp, type Word, type YuPresence } from "../../src/types.ts";
 import { edPublicKey, edSign, fromB64, fromHex, sha256, toB64, toB64url } from "../../src/crypto.ts";
-import { hostKid, type EntrySignature } from "../../src/ledger.ts";
+import { hostKid, signingDigest, type EntrySignature } from "../../src/ledger.ts";
 import { AUTHORITY_HEADERS, AGENTTOOL_ORIGIN, authorityDigest, authorityHeaders, inboxDigest, openInbox, sealInbox } from "../../src/agenttool/wire.ts";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { GIT_NAMESPACE, sshsigArmor, sshsigSignedData } from "../../src/ssh.ts";
@@ -97,13 +97,15 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
     async publicKeys(): Promise<PublicKeys> {
       return { root_b64: toB64(edPublicKey(rootSeed)), op_b64: opPub, op_kid: FAKE_OP_KID, box_b64: null, host_attest_b64: hostPub };
     },
-    async signEntry(word, signer, digestFor): Promise<EntrySignature> {
+    async signEntry(word, signer, draft): Promise<EntrySignature> {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
+      // As the real signer: the draft must be this citizen's, for this signer, and the digest is the ledger's own.
+      if (draft.word !== word || draft.signer !== signer) throw new Refusal("invalid-request", "fake signer: the entry names another citizen or signer");
       s.signed.push({ word, signer });
       const citizen = signer === "citizen";
       const kid = citizen ? FAKE_OP_KID : hostKidOf;
       const seed = citizen ? opSeed : hostSeed;
-      return { kid, sig: toB64url(edSign(digestFor(kid), seed)), public_key: toB64url(edPublicKey(seed)) };
+      return { kid, sig: toB64url(edSign(signingDigest({ ...draft, kid }), seed)), public_key: toB64url(edPublicKey(seed)) };
     },
     async send(req) {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");

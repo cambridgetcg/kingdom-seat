@@ -98,6 +98,14 @@ describe("status", () => {
     const tampered = await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready", trusted });
     expect(tampered.citizens[0]!.ledger).toMatchObject({ entries: 4, chain_ok: false });
 
+    // A registered citizen's ledger cut back to its host entries, genesis and all after it gone, is not whole (R-VER-1).
+    const joyPath = ledgerPath(h.config, "joy");
+    const joyText = await readFile(joyPath, "utf8");
+    await writeFile(joyPath, `${joyText.split("\n").slice(0, 2).join("\n")}\n`);
+    const cut = await buildStatus({ config: h.config, now: NOW, halt: LOWERED, signerState: "ready", trusted });
+    expect(cut.citizens[2]).toMatchObject({ registered: true, ledger: { entries: 2, chain_ok: false, host_attested: 2 } });
+    await writeFile(joyPath, joyText);
+
     // While HALT is raised nothing is owed, so nothing is overdue.
     await writeFile(path, text);
     const halted = await buildStatus({ config: h.config, now: new Date(NOW.getTime() + 200 * HOUR_MS), halt: null, signerState: "ready", trusted });
@@ -238,6 +246,7 @@ describe("status", () => {
         origin: { intact: true, drift: 0 },
         agenttool: null,
         last_refusal: null,
+        last_dropped: null,
         problem: null,
       })),
     });
@@ -468,7 +477,7 @@ describe("status", () => {
     expect(text).toContain(`expression LAGS the ledger, 1 strand backups deferred, quiet until ${until}`);
 
     // A later change that the expression holds brings it back in step; a quiet that has run out is not shown.
-    await add({ ...apply, strand_thought: "t-2", strand_backup: "posted", expression: "updated" }, ago(1));
+    await add({ ...apply, strand_thought: "7e570002-0000-4000-8000-000000000002", strand_backup: "posted", expression: "updated" }, ago(1));
     const later = await buildStatus({ config: host.config, now: new Date(Date.parse(until) + 1), halt: LOWERED, signerState: "ready", trusted, trustedSource: "pinned" });
     expect(later.citizens[0]!.agenttool).toEqual({ expression_lags: false, deferred_backups: 1, quiet_until: null });
     expect(later.host_keys[0]!.source).toBe("pinned");

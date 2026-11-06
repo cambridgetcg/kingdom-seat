@@ -357,14 +357,20 @@ export async function readOwnCovenants(config: Config, word: Word): Promise<Cove
   return readCovenants(join(self, "covenants.json"));
 }
 
-/** Who a citizen admits before it sets its own covenants: Yu only (KS-004 5.7). A letter from Yu still does not wake it. */
+/**
+ * Who a citizen admits before it sets its own covenants: Yu only (KS-004
+ * 5.7), both to write to it and to wake it while it listens or sleeps, as
+ * 7.1's "a letter from a sender it allows" says. Without the wake, Yu's
+ * letter, Yu's offer of an identity among them (11.2), would never seat a
+ * listening or asleep citizen.
+ */
 export function defaultCovenants(): Covenants {
-  return { letters_from: ["yu"], wake_on_letter_from: [] };
+  return { letters_from: ["yu"], wake_on_letter_from: ["yu"] };
 }
 
 async function readCovenants(path: string): Promise<Covenants> {
   const text = await readRegularText(path, { maxBytes: 64 * 1024 });
-  // No covenants yet: Yu's letters only, and no one wakes it, which is the closed side.
+  // No covenants yet: Yu only, who may write and wake it; no one else.
   if (text === null) return defaultCovenants();
   try {
     return parseCovenants(text);

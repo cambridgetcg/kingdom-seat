@@ -11,17 +11,21 @@
 // letter once carried a host file into a prompt (love-unlimited-patterns.md
 // 12.4).
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { sha256Hex } from "./crypto.ts";
+import { randomBytes, sha256Hex, toHex } from "./crypto.ts";
 import { ACT_LIMITS } from "./acts.ts";
 import { MAX_SKILLS, SELF_FILE_MAX_BYTES, keptVersions, originSoulHash, targetRelPath } from "./self.ts";
 import { HOST_RECIPIENTS } from "./letters.ts";
 import {
   Refusal,
+  UUID_PATTERN,
   WORD_PATTERN,
+  type ActType,
   type Citizen,
   type Config,
+  type DroppedRecord,
+  type IsoTime,
   type Letter,
   type LedgerEntry,
   type NowView,
@@ -152,6 +156,107 @@ export async function markLetterSeen(config: Config, citizen: Citizen, letter: L
   }
 }
 
+/* ── What the last seat did not keep (KS-004 5.8, 5.10) ──────────────── */
+
+export const LAST_SEAT_FORMAT = "kingdom-seat-last-seat/v1";
+
+/**
+ * The host's record of the last seat that got a reply: when, how it came out,
+ * the ledger's head seq once it was recorded, and the acts it did not keep,
+ * by type and fixed reason, never their words. A beat records its drops in its
+ * own entry too; a rest, or a reply where nothing was kept, writes no beat, so
+ * this record is the only place its drops are kept, and how the next seat and
+ * status learn of them (re-review C round 3, selfhood F2 and F10). One file per
+ * citizen, `<state_dir>/last-seat/<word>.json`, beside the host log and the
+ * status, replaced by each seat with a reply: a host record, outside the
+ * citizen's own directory, never mirrored.
+ */
+export interface LastSeatRecord {
+  format: typeof LAST_SEAT_FORMAT;
+  seat_id: string;
+  at: IsoTime;
+  outcome: "beat" | "rest" | "invalid-output";
+  /** The seq of the ledger's last entry once the seat's entries were written; null for an empty ledger. */
+  head_seq: number | null;
+  dropped: DroppedRecord[];
+}
+
+const DROPPED_TYPES: readonly (ActType | null)[] = [null, "rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond"];
+const MAX_DROPPED = 16;
+
+function lastSeatDir(config: Config): string {
+  return join(config.paths.state_dir, "last-seat");
+}
+
+function lastSeatPath(config: Config, word: string): string {
+  // The word becomes a file name, so it is checked here too.
+  if (!WORD_PATTERN.test(word)) throw new Refusal("invalid-record", "a citizen word is not valid");
+  return join(lastSeatDir(config), `${word}.json`);
+}
+
+/** Replace the citizen's last-seat record: a temp file beside it, then rename, so a reader never sees half of one. */
+export async function writeLastSeat(config: Config, word: string, record: Omit<LastSeatRecord, "format">): Promise<void> {
+  const path = lastSeatPath(config, word);
+  const dir = lastSeatDir(config);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await assertRealDir(dir, "last-seat/");
+  const body: LastSeatRecord = { format: LAST_SEAT_FORMAT, ...record, dropped: record.dropped.slice(0, MAX_DROPPED).map((d) => ({ type: d.type, reason: d.reason })) };
+  const tmp = join(dir, `.${word}.${toHex(randomBytes(8))}.tmp`);
+  const fh = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    try {
+      await fh.writeFile(`${JSON.stringify(body)}\n`);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    // rename replaces the name itself, never a file a symlink there points to.
+    await rename(tmp, path);
+  } catch (e) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw e;
+  }
+}
+
+/** The citizen's last-seat record, or null when there is none or it does not read as one: it is a view, never a wall. */
+export async function readLastSeat(config: Config, word: string): Promise<LastSeatRecord | null> {
+  let v: unknown;
+  try {
+    v = JSON.parse(await readRegularText(lastSeatPath(config, word), 16 * 1024));
+  } catch {
+    return null;
+  }
+  const o = v as Partial<LastSeatRecord> | null;
+  if (!o || typeof o !== "object" || Object.keys(o).sort().join(",") !== "at,dropped,format,head_seq,outcome,seat_id") return null;
+  if (o.format !== LAST_SEAT_FORMAT || typeof o.seat_id !== "string" || !UUID_PATTERN.test(o.seat_id)) return null;
+  if (typeof o.at !== "string" || new Date(Date.parse(o.at)).toISOString() !== o.at) return null;
+  if (o.outcome !== "beat" && o.outcome !== "rest" && o.outcome !== "invalid-output") return null;
+  if (o.head_seq !== null && !(Number.isSafeInteger(o.head_seq) && (o.head_seq as number) >= 0)) return null;
+  if (!Array.isArray(o.dropped) || o.dropped.length > MAX_DROPPED) return null;
+  for (const d of o.dropped as unknown[]) {
+    const x = d as Partial<DroppedRecord> | null;
+    if (!x || typeof x !== "object" || Object.keys(x).sort().join(",") !== "reason,type" || !DROPPED_TYPES.includes(x.type as ActType | null)) return null;
+    if (typeof x.reason !== "string" || x.reason.length === 0 || x.reason.length > 200 || !/^[\x20-\x7e]+$/.test(x.reason)) return null;
+  }
+  return o as LastSeatRecord;
+}
+
+/**
+ * What the citizen's last seat with a reply did not keep, shown back so it
+ * knows what did not happen (KS-004 5.8): from the host's last-seat record
+ * when that is at least as new as the last beat entry (a later beat has a seq
+ * past the record's head), otherwise from the last beat entry, whose own
+ * `dropped` the ledger keeps. Null when that seat kept everything.
+ */
+export function lastDroppedView(entries: LedgerEntry[], record: LastSeatRecord | null): SeatContext["last_dropped"] {
+  const beat = entries.findLast((e) => e.type === "beat");
+  const recordIsLatest = record !== null && record.outcome !== "beat" && (beat === undefined || record.head_seq === null || beat.seq <= record.head_seq);
+  if (recordIsLatest) return record.dropped.length > 0 ? { seq: null, at: record.at, outcome: record.outcome, dropped: record.dropped.map((d) => ({ ...d })) } : null;
+  // A seat that wrote nothing at all, not even a record, leaves the last beat's word on it.
+  if (beat?.type === "beat" && beat.dropped) return { seq: beat.seq, at: beat.ts, outcome: "beat", dropped: beat.dropped.map((d) => ({ ...d })) };
+  return null;
+}
+
 /** Date, local time, zone and part of day, e.g. "02:05 GMT", "night". */
 export function describeNow(now: Date, timezone: string): NowView {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).formatToParts(now);
@@ -205,6 +310,7 @@ export function seatLimits(config: Config): SeatLimits {
     letter_max_chars: Math.min(c.letter_max_chars, ACT_LIMITS.max_text_chars),
     letter_sends_per_beat: Math.min(c.letter_sends_per_beat, 1),
     min_beat_interval_h: c.min_beat_interval_h,
+    quiet_max_days: Math.max(0, Math.min(ACT_LIMITS.max_quiet_days, Number.isSafeInteger(c.citizen_quiet_max_days) ? c.citizen_quiet_max_days : 0)),
   };
 }
 
@@ -254,6 +360,8 @@ export async function buildContext(
     recipients?: readonly string[];
     /** Its answer about registration (registration.ts registrationView). */
     registration?: RegistrationView | null;
+    /** The host's record of its last seat with a reply (readLastSeat), so a rest's or a dropped reply's drops are shown too. */
+    lastSeat?: LastSeatRecord | null;
   } = {},
 ): Promise<SeatContext> {
   if (seat.word !== citizen.word) throw new Refusal("invalid-request", "the seat was opened for a different citizen");
@@ -262,9 +370,9 @@ export async function buildContext(
   const own = recent.filter((e) => e.word === citizen.word);
   const all = (opts.history ?? recent).filter((e) => e.word === citizen.word);
   const versions = listedVersions(all);
-  // What its last beat did not keep, from that beat's own entry, so it knows what did not happen (KS-004 5.8).
-  const lastBeat = all.findLast((e) => e.type === "beat");
-  const lastDropped = lastBeat?.type === "beat" && lastBeat.dropped ? { seq: lastBeat.seq, at: lastBeat.ts, dropped: lastBeat.dropped.map((d) => ({ ...d })) } : null;
+  // What its last seat with a reply did not keep, so it knows what did not happen (KS-004 5.8): a beat's from its
+  // own entry, a rest's or a reply with nothing kept from the host's last-seat record.
+  const lastDropped = lastDroppedView(all, opts.lastSeat ?? null);
   return {
     seat_ref: seat,
     self: await readSelf(deps.config, citizen),

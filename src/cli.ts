@@ -20,7 +20,7 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join } from "node:path";
-import { toB64 } from "./crypto.ts";
+import { bytesEqual, fromB64, toB64 } from "./crypto.ts";
 import { SSHSIG_MAX_MESSAGE_BYTES, parseSshEd25519 } from "./ssh.ts";
 import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
@@ -545,15 +545,27 @@ async function mirrorAfterSeat(ctx: Ctx, word: Word, outcome: Outcome, before: L
 
 /**
  * The keys a mirror's allowed_signers publishes (KS-004 4.4, 4.5): the host
- * keys host-attested entries verify against (pinned, or the signer's own),
- * and a registered citizen's op key from its record. Public halves only.
+ * keys host-attested entries verify against, and a registered citizen's op
+ * key from its record. Public halves only. When the config pins host keys,
+ * only those are published, the same list `verify` and status trust, so the
+ * mirror never vouches for a key the host itself would refuse; the signer's
+ * own key is added only when nothing is pinned.
  */
 async function mirrorKeys(ctx: Ctx, citizen: Citizen, signing: MirrorSigning | null): Promise<MirrorKeys> {
-  const trusted = pinnedTrust(ctx.config) ?? (await hostTrust(makeSigner(ctx), ctx.config));
-  const host = [...(trusted?.host_attest_b64 ?? [])];
-  // The key that signs an unregistered citizen's commits is published even if no pin names it, so every commit verifies.
-  if (signing && !citizen.identity && !host.includes(signing.public_key_b64)) host.push(signing.public_key_b64);
+  const pinned = pinnedTrust(ctx.config);
+  const host = [...((pinned ?? (await hostTrust(makeSigner(ctx), ctx.config)))?.host_attest_b64 ?? [])];
+  // With nothing pinned, the key that signs an unregistered citizen's commits is published, so every commit verifies.
+  if (!pinned && signing && !citizen.identity && !host.some((k) => sameKey(k, signing.public_key_b64))) host.push(signing.public_key_b64);
   return { host_b64: host, op_b64: citizen.identity?.op_public_key_b64 ?? null };
+}
+
+/** Whether two padded standard base64 spellings name the same 32-byte key; one that does not decode names none. */
+function sameKey(a: string, b: string): boolean {
+  try {
+    return bytesEqual(fromB64(a, 32), fromB64(b, 32));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -579,7 +591,14 @@ async function mirrorAfterBeat(ctx: Ctx, word: Word): Promise<void> {
     if (!citizen.mirror) return;
     const halt = await haltNow(ctx);
     if (!halt || halt.halted) return;
-    const signing = await mirrorSigning(ctx, citizen);
+    let signing = await mirrorSigning(ctx, citizen);
+    const pinned = pinnedTrust(ctx.config);
+    if (signing && !citizen.identity && pinned && !pinned.host_attest_b64.some((k) => sameKey(k, signing!.public_key_b64))) {
+      // The signer's host key is not one the config pins, so verify and status would refuse it: the commit is left
+      // unsigned, which status counts, rather than signed by a key the mirror could only vouch for by publishing it.
+      await note(ctx, "signer", word, "refused", null, "signer host key is not pinned; mirror commit left unsigned");
+      signing = null;
+    }
     const staged = await stageMirror(ctx.config, citizen, ctx.deps.run, await mirrorKeys(ctx, citizen, signing), signing);
     if (!staged.ok) {
       await note(ctx, "push", word, "refused", staged.refused[0]!.code, `mirror stage refused by the seal: ${staged.refused.length} entries`);
@@ -609,7 +628,7 @@ async function verbTick(ctx: Ctx): Promise<ExitCode> {
     // A registered citizen's standing quiet, renewed while it stays quiet and ended once it woke (KS-004 6.4).
     keepQuiet: (citizen) =>
       citizen.identity
-        ? keepQuiet({ config: ctx.config, clock: ctx.deps.clock, keeper: agenttoolQuiet(hostClient(ctx.config, signer, ctx.deps.fetch)), sign: (w, k, d) => signer.signEntry(w, k, d) }, citizen)
+        ? keepQuiet({ config: ctx.config, clock: ctx.deps.clock, keeper: agenttoolQuiet(hostClient(ctx.config, signer, ctx.deps.fetch)), sign: (w, k, draft) => signer.signEntry(w, k, draft) }, citizen)
         : Promise.resolve("none"),
   });
   if (r.word && (await mirrorAfterSeat(ctx, r.word, r.outcome, r.state_before ?? null))) await refreshStatus(ctx, signer).catch(() => {});
@@ -705,7 +724,7 @@ async function verbSeatParent(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>)
     });
     // The child's own note says what happened to the citizen; the watcher knows only how it ended.
     const after = (await readHostNotes(config, new Date(started.getTime() - 1_000))) ?? [];
-    const own = after.filter((n) => n.word === cmd.word && n.kind !== "tick" && isResultNote(n) && (seatIdOf(n) === null || seatIdOf(n) === id)).at(-1) ?? null;
+    const own = after.filter((n) => n.word === cmd.word && n.kind !== "tick" && n.kind !== "signer" && isResultNote(n) && (seatIdOf(n) === null || seatIdOf(n) === id)).at(-1) ?? null;
     exit = sup.exit;
     if (sup.signal !== null) outcome = sup.outcome ?? "error";
     else if (own) outcome = own.outcome;

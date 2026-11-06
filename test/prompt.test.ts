@@ -87,7 +87,10 @@ describe("the honest prompt", () => {
     expect(line("state.set")).toContain("an optional interval_h, your interval while awake in whole hours from 72 to 8760");
     expect(line("state.set")).toContain("an optional quiet_days from 1 to 30");
     // [review C M6] what the host does with it, now that it does it: declared, renewed, ended on a wake.
-    expect(line("state.set")).toContain("Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, or for the longest this host allows when you name none");
+    expect(line("state.set")).toContain("Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, at most 30 on this host, or for those 30 when you name none");
+    // A host with a lower cap says so, so the citizen is never told a range the host will not declare (selfhood F3).
+    const low = renderActsGuide({ journal_max_chars: 2000, letter_max_chars: 4000, letter_sends_per_beat: 1, min_beat_interval_h: 72, quiet_max_days: 14 });
+    expect(low).toContain("an optional quiet_days from 1 to 30. Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, at most 14 on this host, or for those 14 when you name none");
     expect(line("state.set")).toContain("it is renewed while you stay listening or asleep, and it ends when you wake.");
     expect(line("state.set")).not.toContain("does not make one yet");
     expect(line("state.set")).toContain("A move toward more rest, or a longer interval, takes effect now. A move toward more activity, or a shorter interval, takes effect only when a later beat sets the same again.");

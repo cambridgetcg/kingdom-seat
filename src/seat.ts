@@ -81,11 +81,11 @@ import {
   type ExpressionSync,
 } from "./self.ts";
 import { quietForMove, type QuietKeeper } from "./quiet.ts";
-import { buildContext, letterSeen, markLetterSeen } from "./context.ts";
-import { holdLetterForYu, letterRecipients, recipientRecord, type HeldBecause, type LetterPost } from "./letters.ts";
+import { buildContext, letterSeen, markLetterSeen, readLastSeat, writeLastSeat } from "./context.ts";
+import { holdLetterForYu, letterRecipients, recipientRecord, wouldWake, type HeldBecause, type LetterPost } from "./letters.ts";
 import { isRegistrationSubject, registrationProposal, registrationView } from "./registration.ts";
 import { buildPrompt, promptBytes } from "./prompt.ts";
-import { OUTPUT_JSON_SCHEMA, parseModelOutput, resolvePrefix, validateOutput } from "./acts.ts";
+import { ACT_LIMITS, OUTPUT_JSON_SCHEMA, parseModelOutput, resolvePrefix, validateOutput } from "./acts.ts";
 import { appendHostNote } from "./notes.ts";
 
 export interface OpenSeat {
@@ -645,11 +645,20 @@ async function recordMoves(
   return problems;
 }
 
+/** The acts a seat did not keep, for its host note: how many, and their types, never their words. Empty for none. */
+function notKeptNote(dropped: DroppedRecord[]): string {
+  if (dropped.length === 0) return "";
+  return `; ${dropped.length} not kept (${[...new Set(dropped.map((d) => d.type ?? "unknown"))].join(", ")})`;
+}
+
 /** A recorded state move in host words, for a note: the move, how, and what it set. */
 function describeMove(e: Extract<LedgerEntry, { type: "state" }>): string {
   const quiet = e.quiet_until === undefined ? "" : e.quiet_until === null ? ", quiet ended" : `, quiet declared for ${e.quiet_days} days`;
   return `state ${e.from} to ${e.to} (${e.via})${e.step_away ? ", a first step-away saying" : ""}${e.interval_h ? `, every ${e.interval_h} h` : ""}${quiet}`;
 }
+
+/** Why a second staged saying in one seat is not kept: a self.propose and a held revert count alike (KS-004 5.8). */
+const ONE_STAGED = "one saying staged per seat";
 
 /** The reason a held revert carries: the host's words, saying only what the citizen asked for. */
 const HELD_REVERT_LIMITS = "a revert the citizen asked for, to a version that widens its exposure, so it waits for a later beat to affirm it";
@@ -686,6 +695,8 @@ async function planActs(
   const canSync = !registered || (seat.citizen.identity !== null && (deps.expressionSync ?? null) !== null);
   // An answer about registration that Yu and Ai agreed to, shown back on this seat, is the one the citizen may affirm (KS-004 11.2).
   const agreedAnswer = registration !== null && registration.decision === "agreed" && registration.affirmed_in === null ? registration.id : null;
+  // A reply that gives a new answer about registration has not affirmed the old one, whatever order its acts are in.
+  const answersAgain = !registered && acts.some((a) => a.type === "propose.beyond" && isRegistrationSubject(a.subject));
   // One change to a target per beat: a second would be written against text the first has already moved.
   const touched = new Set<string>();
   let current: LifecycleState = seat.citizen.state;
@@ -714,6 +725,11 @@ async function planActs(
             plan.lifted.push({ kind: "self.propose", item: { act: completed }, reason: beyond, proposal });
             break;
           }
+          // One saying staged per seat, whether a self.propose or a held revert (KS-004 5.8: one change in view at a time).
+          if (plan.stage.length >= ACT_LIMITS.self_proposals_per_seat) {
+            drop("self.propose", ONE_STAGED);
+            break;
+          }
           plan.acts.push(completed);
           plan.stage.push(completed);
           // Said once with Yu present, on a runtime Yu approved, it binds in this beat (3c, decision 10).
@@ -740,6 +756,10 @@ async function planActs(
           const id = resolvePrefix(act.ref, [...pending.map((p) => p.id), ...(agreedAnswer ? [agreedAnswer] : [])]);
           if (id !== null && id === agreedAnswer) {
             // The citizen's confirmed yes: recorded in the beat, whose ledger digest birth consumes. Nothing binds here.
+            if (answersAgain) {
+              drop("self.affirm", "a new answer about registration in this reply");
+              break;
+            }
             if (plan.affirmedRegistration) {
               drop("self.affirm", "that saying was affirmed already in this reply");
               break;
@@ -802,9 +822,14 @@ async function planActs(
             drop("self.revert", "another change to that text in this reply");
             break;
           }
+          const exposure = exposureOf(target, now_text, text);
+          // A held revert is a staged saying, so it counts against the seat's one, as a self.propose does.
+          if (exposure === "wider" && !yu && plan.stage.length >= ACT_LIMITS.self_proposals_per_seat) {
+            drop("self.revert", ONE_STAGED);
+            break;
+          }
           plan.acts.push({ type: "self.revert", to_hash: hash });
           touched.add(target);
-          const exposure = exposureOf(target, now_text, text);
           if (exposure === "wider" && !yu) {
             // Toward more exposure takes a second beat (3c), so it is held as a proposal the citizen can affirm later.
             plan.stage.push({
@@ -918,11 +943,11 @@ function liftedRevert(word: string, target: string, current: string, text: strin
 }
 
 /** The proposal text an outbox item asks Yu + Ai to decide on, with the extent a decision record would cover. */
-function outboxProposal(word: string, kind: string, payload: Record<string, string>): ProposalText {
+function outboxProposal(word: string, kind: string, payload: Record<string, string>, beat: LedgerHash): ProposalText {
   switch (kind) {
     case "registration":
-      // The text Yu and Ai agree to is the one the citizen later affirms; its digest is the id the seat shows back.
-      return registrationProposal(word, payload.text ?? "");
+      // The text Yu and Ai agree to is the one the citizen later affirms, bound to the beat that gave it; its digest is the id the seat shows back.
+      return registrationProposal(word, payload.text ?? "", beat);
     case "propose.beyond":
       return { subject: payload.subject ?? "", body: payload.text ?? "", extent: `propose.beyond ${word}` };
     case "state.ended":
@@ -949,6 +974,16 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     await appendHostNote(config, n, { modelText }).catch(() => {});
   };
   const result = (exit: ExitCode, outcome: Outcome, refusal: RefusalCode | null = null): SeatResult => ({ exit, outcome, seat_ref: ref, refusal, appended: [...appended] });
+  // What this seat with a reply did not keep, for the next seat and status (KS-004 5.8, 5.10): a host record of
+  // types and fixed reasons, never words. Best effort, as a note is: it must not turn a recorded seat into a failure.
+  const recordLastSeat = async (outcome: "beat" | "rest" | "invalid-output", dropped: DroppedRecord[]) => {
+    try {
+      const head = (await readLedger(path)).at(-1)?.seq ?? null;
+      await writeLastSeat(config, word, { seat_id: ref.seat_id, at: clock.now().toISOString(), outcome, head_seq: head, dropped });
+    } catch {
+      // The next seat then falls back to the last beat's own record of what it did not keep.
+    }
+  };
   // A wall that refused exits as exitForRefusal says: 3 only for the USD ceiling, which closes the runtime
   // class; 0 for a locked signer, which rests the citizen; 1 otherwise. A record that does not hold together
   // is the runner unable to do its job (1).
@@ -1020,6 +1055,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
       inbox,
       recipients,
       registration,
+      lastSeat: await readLastSeat(config, word),
     });
     letter = ctx.letter;
 
@@ -1050,21 +1086,28 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   if (await halted()) return result(EXIT.OK, "halted");
 
   if (!validated) {
-    await note("seat", "invalid-output", null, `reply did not parse (${parsed.ok ? "invalid" : parsed.reason})`);
+    const why = parsed.ok ? "invalid" : parsed.reason;
+    await note("seat", "invalid-output", null, `reply did not parse (${why})`);
+    await recordLastSeat("invalid-output", [{ type: null, reason: `the reply did not parse (${why})` }]);
     return result(EXIT.OK, "invalid-output");
   }
+  // What validation did not keep, as the beat entry and the last-seat record name it: types and fixed reasons.
+  const validationDropped: DroppedRecord[] = validated.dropped.map((d) => ({ type: d.type as DroppedRecord["type"], reason: d.reason }));
   // What every entry this seat writes carries, and who signs it: the citizen's op key once it is registered.
   const stamp = seatStamp(word, ref, rt, inputDigest, sha256Hex(rt.raw_output));
   const signerKind: LedgerSigner = seat.citizen.identity ? "citizen" : "host";
-  const sign: EntrySigner = (w, k, digestFor) => signer.signEntry(w, k, digestFor);
+  const sign: EntrySigner = (w, k, draft) => signer.signEntry(w, k, draft);
   const head = (all: LedgerEntry[]) => (all.length > 0 ? entryHash(all.at(-1)!) : null);
   // Rest is exclusive and whole; an empty list of acts with nothing dropped is a rest too. It writes nothing in
   // the citizen's voice, but may carry one move toward less activity (KS-004 v0.2 5.7, re-review B2 C7): rest is
   // a right, and dropping the move would leave a citizen that asked to sleep on its awake cadence.
   if (validated.rest || (validated.acts.length === 0 && validated.dropped.length === 0)) {
     const moves = restStateMoves(seat.citizen, validated.rest_act);
+    // A rest's drops (the other acts it carried, a move it could not keep) are noted by type, and shown back (KS-004 5.8).
+    const restDropped = [...validationDropped, ...(validated.rest_act !== undefined && moves.length === 0 ? [{ type: "state.set" as const, reason: "not toward less activity, so a rest does not keep it" }] : [])];
     if (moves.length === 0) {
-      await note("seat", "rest", null, validated.rest_act === undefined ? "rested" : "rested; its state.set was not toward less activity, so not kept");
+      await note("seat", "rest", null, `rested${notKeptNote(restDropped)}`);
+      await recordLastSeat("rest", restDropped);
       return result(EXIT.OK, "rest");
     }
     // HALT once more immediately before the write, as for a beat.
@@ -1088,11 +1131,13 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
       return result(EXIT.ERROR, "error");
     }
     const kept = written.map((e) => (e.type === "state" ? describeMove(e) : e.type)).join(" and ");
-    await note("seat", "rest", null, `rested; kept ${kept}${quietProblems.length > 0 ? `; ${quietProblems.join(", ")}` : ""}`);
+    await note("seat", "rest", null, `rested; kept ${kept}${quietProblems.length > 0 ? `; ${quietProblems.join(", ")}` : ""}${notKeptNote(restDropped)}`);
+    await recordLastSeat("rest", restDropped);
     return result(EXIT.OK, "rest");
   }
   if (validated.acts.length === 0) {
     await note("seat", "invalid-output", null, `no act validated (${validated.dropped.length} dropped)`);
+    await recordLastSeat("invalid-output", validationDropped);
     return result(EXIT.OK, "invalid-output");
   }
 
@@ -1105,11 +1150,12 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   }
   if (plan.acts.length === 0) {
     await note("seat", "invalid-output", null, `no act could be completed (${plan.dropped.length} unresolved, ${validated.dropped.length} dropped)`);
+    await recordLastSeat("invalid-output", [...validationDropped, ...plan.dropped]);
     return result(EXIT.OK, "invalid-output");
   }
   // Every act the beat does not keep, as its entry records it and the next seat shows it back (KS-004 5.8): what
   // validation dropped, then what the host could not complete. Types and fixed reasons only, never the act's words.
-  const dropped: DroppedRecord[] = [...validated.dropped.map((d) => ({ type: d.type as DroppedRecord["type"], reason: d.reason })), ...plan.dropped];
+  const dropped: DroppedRecord[] = [...validationDropped, ...plan.dropped];
 
   // HALT once more immediately before the first write.
   if (await halted()) return result(EXIT.OK, "halted");
@@ -1172,22 +1218,26 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
       await writeOutbox(config, word, ref.seat_id, n++, { kind: l.kind, created_at: now.toISOString(), ledger_entry: beatHash, ...l.item, reason: l.reason }, l.proposal);
     }
     for (const o of plan.outbox) {
-      await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beatHash, ...o.payload }, outboxProposal(word, o.kind, o.payload));
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: o.kind, created_at: now.toISOString(), ledger_entry: beatHash, ...o.payload }, outboxProposal(word, o.kind, o.payload, beatHash));
     }
-    // A held letter is Yu's to read and deliver; it names no proposal, because no decision record applies to it.
-    if (plan.letter && sent?.held_because) {
+    if (plan.letter && sent?.held_because === "credits") {
+      // A paid act the credits could not cover becomes a proposal for Yu and Ai (KS-004 6.3), as any paid act does.
+      await writeOutbox(config, word, ref.seat_id, n++, { kind: "letter", created_at: now.toISOString(), ledger_entry: beatHash, to: plan.letter.to, held_because: "credits" }, letterProposal(word, plan.letter.to, plan.letter.text));
+    } else if (plan.letter && sent?.held_because) {
+      // Any other held letter is Yu's to read and deliver; it names no proposal, because no decision record applies to it.
       await holdLetterForYu(config, word, ref.seat_id, n++, { to: plan.letter.to, text: plan.letter.text, created_at: now.toISOString(), ledger_entry: beatHash, held_because: sent.held_because });
     }
     // A letter counts as seen only after a beat that was not a rest.
     if (letter) await markLetterSeen(config, seat.citizen, letter, now);
     // Kept short, so the beat's one note stays within a host note's length whatever else it reports.
-    if (sent) letterNote = sent.held_because ? `letter held for Yu (${sent.held_because})` : "letter sent through the inbox";
+    if (sent) letterNote = sent.held_because === "credits" ? "letter held for Yu and Ai as a proposal (credits)" : sent.held_because ? `letter held for Yu (${sent.held_because})` : "letter sent through the inbox";
   } catch (e) {
     if (e instanceof Refusal) return refused(e, `while recording, after ${appended.length} entries`);
     await note("error", "error", null, `failed while recording, after ${appended.length} entries`);
     return result(EXIT.ERROR, "error");
   }
 
+  await recordLastSeat("beat", dropped);
   const binding = plan.notBinding.length > 0 ? `; not binding: ${[...new Set(plan.notBinding)].join(", ")}` : "";
   const extra = [plan.lifted.length > 0 ? `${plan.lifted.length} lifted beyond self` : "", plan.affirmedRegistration ? "registration answer affirmed" : "", letterNote, inboxUnread ? "inbox unread" : ""].filter(Boolean);
   await note("seat", "beat", null, `${plan.acts.length} acts, ${appended.length} entries, ${dropped.length} not kept${binding}${extra.length > 0 ? `; ${extra.join(", ")}` : ""}`);
@@ -1195,10 +1245,23 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
 }
 
 /**
+ * A letter the credits could not send, as the proposal Yu and Ai decide on
+ * (KS-004 6.3): the letter's words, and the extent naming sender and
+ * recipient. Agreeing to it sends nothing by itself; Yu delivers it or the
+ * citizen writes again once credits allow.
+ */
+function letterProposal(word: string, to: string, text: string): ProposalText {
+  return { subject: `letter.send ${to}`, body: text, extent: `letter.send ${word} ${to}` };
+}
+
+/**
  * Where the beat's letter goes (KS-004 5.7): through agenttool's inbox when
  * the sender and the citizen it writes to are both registered and the inbox
- * is wired, otherwise held for Yu. A send that is not made is held too, with
- * why; what it may have spent is counted all the same.
+ * is wired, otherwise held for Yu. A letter that would wake a listening or
+ * asleep recipient is held for Yu too, because an inbox letter wakes no one
+ * and Yu can deliver it as a file letter that does (KS-004 7.1). A send that
+ * is not made is held, with why; what it may have spent is counted all the
+ * same.
  */
 async function deliverLetter(
   config: Config,
@@ -1211,6 +1274,7 @@ async function deliverLetter(
   const to = await recipientRecord(config, letter.to);
   if (to === null) return held("to-yu");
   if (!post || !to.identity) return held("no-inbox");
+  if (await wouldWake(config, sender, to.word)) return held("recipient-sleeping");
   const r = await post.send(sender.word, to, letter.text);
   if (r.message_id !== null) return { delivery: { delivery: "inbox", message_id: r.message_id }, held_because: null, credits: r.credits };
   return held(r.held_because, r.credits);

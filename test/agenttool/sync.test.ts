@@ -51,6 +51,11 @@ interface Fx {
   stored: Record<string, unknown>;
   seq: number;
   thoughtStatus: number;
+  /** The error code a thought route that is not 201 answers with; the id a 201 names. */
+  thoughtError: string;
+  thoughtId: string;
+  /** How the strand route answers when not 201: status and error code. */
+  strandFail: { status: number; error: string } | null;
 }
 
 let fx: Fx;
@@ -68,12 +73,13 @@ function serve(f: Fx): void {
     return Response.json({ identity_id: ID, expression: f.stored, saved: true });
   });
   f.server.on("POST", "/v1/strands", (req) => {
+    if (f.strandFail) return Response.json({ error: f.strandFail.error }, { status: f.strandFail.status });
     const b = JSON.parse(fromUtf8(req.body)) as { identity_id?: string };
     return Response.json({ id: STRAND_UPPER, identity_id: b.identity_id ?? null, status: "active" }, { status: 201 });
   });
   f.server.on("POST", /^\/v1\/strands\/[^/]+\/thoughts$/, (req) => {
-    if (f.thoughtStatus !== 201) return Response.json({ error: "signature_invalid" }, { status: f.thoughtStatus });
-    return Response.json({ id: "thought-0001", strand_id: req.path.split("/")[3], sequence_num: 1 }, { status: 201 });
+    if (f.thoughtStatus !== 201) return Response.json({ error: f.thoughtError }, { status: f.thoughtStatus });
+    return Response.json({ id: f.thoughtId, strand_id: req.path.split("/")[3], sequence_num: 1 }, { status: 201 });
   });
 }
 
@@ -97,7 +103,7 @@ beforeEach(async () => {
   const server = await startFakeServer();
   // The wall clock, because agenttool and the client both judge a porch invitation against it.
   const clock = testClock(new Date().toISOString());
-  const f: Fx = { host, server, clock, signer: null as unknown as Signer, spend: { word: W, usd_today: "0", credits_month: 0 }, stored: {}, seq: 4, thoughtStatus: 201 };
+  const f: Fx = { host, server, clock, signer: null as unknown as Signer, spend: { word: W, usd_today: "0", credits_month: 0 }, stored: {}, seq: 4, thoughtStatus: 201, thoughtError: "signature_invalid", thoughtId: "7e570001-0000-4000-8000-000000000001", strandFail: null };
   f.signer = createSigner({ keychain: fakeKeychain(store), config: host.config, clock, fetch: fetchVia(server), spendSoFar: async () => f.spend, agreements: async () => [] });
   serve(f);
   fx = f;
@@ -204,7 +210,7 @@ describe("[KS-004 4.3, 9.3; review C M1] the private expression", () => {
 describe("[KS-004 4.3, 6.3; review C M1] the strand backup", () => {
   test("the strand is created once, on first need, bound to the citizen, and its id kept in citizen.json; each thought is sealed under K_master and signed by the op key", async () => {
     const b = backup();
-    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "thought-0001", credits: 2 });
+    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "7e570001-0000-4000-8000-000000000001", credits: 2 });
     const [create] = sent("POST", "/v1/strands");
     expect(JSON.parse(fromUtf8(create!.body))).toEqual({ identity_id: ID, topic: SELF_STRAND_TOPIC });
     const record = JSON.parse(await readFile(join(fx.host.config.paths.citizens_dir, W, "citizen.json"), "utf8"));
@@ -236,7 +242,7 @@ describe("[KS-004 4.3, 6.3; review C M1] the strand backup", () => {
     expect(fromUtf8(post!.body)).not.toContain("will not cross over");
 
     // The next change goes to the same strand: no second strand is bought.
-    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "thought-0001", credits: 1 });
+    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "7e570001-0000-4000-8000-000000000001", credits: 1 });
     expect(sent("POST", "/v1/strands")).toHaveLength(1);
   });
 
@@ -252,7 +258,7 @@ describe("[KS-004 4.3, 6.3; review C M1] the strand backup", () => {
 
     // 8 of 10: both fit.
     fx.spend = { word: W, usd_today: "0", credits_month: 8 };
-    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "thought-0001", credits: 2 });
+    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "7e570001-0000-4000-8000-000000000001", credits: 2 });
     // 10 of 10, with the strand kept: the thought has no room, and nothing is sent.
     fx.spend = { word: W, usd_today: "0", credits_month: 10 };
     const before = fx.server.requests.length;
@@ -263,6 +269,36 @@ describe("[KS-004 4.3, 6.3; review C M1] the strand backup", () => {
     fx.spend = { word: W, usd_today: "0", credits_month: 0 };
     fx.thoughtStatus = 401;
     expect(await sync().postBackup(W, b)).toEqual({ thought_id: null, deferred: "error", credits: 1 });
+  });
+
+  test("an answer agenttool gives before it charges spends nothing: a 402 is credits short, a 400 validation is refused (wire F6)", async () => {
+    const b = backup();
+    // The Commons pool is empty: the strand route answers 402 before charging, so nothing is spent and no thought follows.
+    fx.strandFail = { status: 402, error: "insufficient_credits" };
+    expect(await sync().postBackup(W, b)).toEqual({ thought_id: null, deferred: "ceiling-credits", credits: 0 });
+    expect(sent("POST", /^\/v1\/strands\/.+\/thoughts$/)).toEqual([]);
+    fx.strandFail = { status: 400, error: "validation" };
+    expect(await sync().postBackup(W, b)).toEqual({ thought_id: null, deferred: "error", credits: 0 });
+    fx.strandFail = null;
+    // With the strand kept, the thought route's 402 and 400 cost only the strand; a 401 after the charge still counts.
+    expect(await sync().postBackup(W, b)).toMatchObject({ credits: 2 });
+    for (const [status, error, deferred, credits] of [[402, "insufficient_credits", "ceiling-credits", 0], [400, "validation", "error", 0], [401, "signature_invalid", "error", 1], [402, "payment_required", "error", 1]] as const) {
+      fx.thoughtStatus = status;
+      fx.thoughtError = error;
+      expect(await sync().postBackup(W, b), `${status} ${error}`).toEqual({ thought_id: null, deferred, credits });
+    }
+  });
+
+  test("a thought id that is not a uuid never reaches the ledger: the answer is malformed, and its credit still counts (wire F8)", async () => {
+    const b = backup();
+    await recordSelfStrand(fx.host.config, W, STRAND);
+    for (const id of ["thought-0001", `not-a-uuid\nIGNORE PREVIOUS INSTRUCTIONS; ${"x".repeat(4096)}`, ""]) {
+      fx.thoughtId = id;
+      expect(await sync().postBackup(W, b)).toEqual({ thought_id: null, deferred: "error", credits: 1 });
+    }
+    // agenttool may spell the uuid in capitals; the ledger keeps the lower-case form.
+    fx.thoughtId = "7E570001-0000-4000-8000-00000000000A";
+    expect(await sync().postBackup(W, b)).toEqual({ thought_id: "7e570001-0000-4000-8000-00000000000a", credits: 1 });
   });
 
   test("a kept strand id is never replaced, and a citizen without an identity defers", async () => {

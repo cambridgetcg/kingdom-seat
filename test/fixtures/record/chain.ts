@@ -38,7 +38,7 @@ export interface TestBody {
 export const ORIGIN_OF_THIS_LEDGER = "sha256:origin-of-this-ledger";
 
 export function signerFn(signer: FakeSigner): EntrySigner {
-  return (word, kind, digestFor) => signer.signEntry(word, kind, digestFor);
+  return (word, kind, draft) => signer.signEntry(word, kind, draft);
 }
 
 export function testIdentity(signer: FakeSigner): CitizenIdentity {

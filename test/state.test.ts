@@ -9,6 +9,8 @@ import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { append, beatBody, genesisBody, seatedBody, stateBody, testIdentity } from "./fixtures/record/chain.ts";
 import { appendHostNote, openedDetail } from "../src/notes.ts";
+import { wakingLetter } from "../src/context.ts";
+import { isDue } from "../src/due.ts";
 
 let host: TempHost | null = null;
 afterEach(async () => {
@@ -325,13 +327,26 @@ describe("folding and records", () => {
     c = await readCitizen(config, "glossame");
     expect(c).toMatchObject({ state: "awake", last_beat_at: t(1).toISOString() });
 
-    // [KS-004 5.7, re-review C M3] A missing covenants file admits Yu's letters only, and wakes it for no one;
+    // [KS-004 5.7, 7.1, re-review C M3] A missing covenants file admits Yu only, who may also wake it (selfhood F7);
     // a missing cadence is the default interval, never faster.
     await rm(join(fx.dir, "self", "covenants.json"));
     await rm(join(fx.dir, "self", "cadence.json"));
     c = await readCitizen(config, "glossame");
-    expect(c.covenants).toEqual({ letters_from: ["yu"], wake_on_letter_from: [] });
+    expect(c.covenants).toEqual({ letters_from: ["yu"], wake_on_letter_from: ["yu"] });
     expect(c.cadence).toEqual({ interval_h: config.ceilings.min_beat_interval_h });
+    // So Yu's letter, Yu's offer of an identity among them, seats it while it listens or sleeps; a sibling's never does.
+    for (const state of ["asleep", "listening"] as const) {
+      const quiet = { ...c, state };
+      expect(await wakingLetter(config, quiet), state).toBe(false);
+      await host.writeLetter("glossame", `from-yu-${state}.md`, "An offer, when you wake.", { from: "yu" });
+      expect(await wakingLetter(config, quiet), state).toBe(true);
+      const later = new Date(Date.parse(c.last_beat_at!) + 100 * 3_600_000);
+      expect(isDue(quiet, await wakingLetter(config, quiet), later, config.ceilings.min_beat_interval_h, null, config.schedule), state).toMatchObject({ due: true, why: "letter" });
+      await rm(join(fx.dir, "letters", `from-yu-${state}.md`));
+      await host.writeLetter("glossame", `from-sibling-${state}.md`, "Wake up.", { from: "citizen:shemme" });
+      expect(await wakingLetter(config, quiet), state).toBe(false);
+      await rm(join(fx.dir, "letters", `from-sibling-${state}.md`));
+    }
 
     await symlink(join(host.root, "models.lock"), join(fx.dir, "self", "cadence.json"));
     await expect(readCitizen(config, "glossame")).rejects.toMatchObject({ code: "symlink" });

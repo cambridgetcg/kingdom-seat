@@ -9,7 +9,8 @@ import { openSeat } from "../src/seat.ts";
 import { BEACON_UNTIL } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { createSigner } from "../src/signer/signer.ts";
-import { canonicalJson, edSign, fromHex, sha256, toB64url, utf8 } from "../src/crypto.ts";
+import { canonicalJson, edPublicKey, edSign, fromB64, fromHex, sha256, toB64, toB64url, utf8 } from "../src/crypto.ts";
+import { sshPublicKey } from "../src/ssh.ts";
 import { evidenceToLedger, ledgerPath, OLD_LAYOUT_REASON, readLedger, signingDigest } from "../src/ledger.ts";
 import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
 import { Refusal, type Config, type LedgerEntry, type ModelAct, type StatusFile } from "../src/types.ts";
@@ -24,6 +25,7 @@ import { TEST_MNEMONIC, TEST_OP_SEED_HEX } from "./helpers/vectors.ts";
 import { append, beatBody, stateBody, testIdentity, type TestBody } from "./fixtures/record/chain.ts";
 import { FAKE_STRAND_ID_UPPER, FAKE_THOUGHT_ID, fakeAgenttool } from "./fixtures/agenttool/fake-agenttool.ts";
 import { pendingProposals } from "../src/self.ts";
+import { inboxLetterId } from "../src/letters.ts";
 import { FAKE_MODEL_DIGEST } from "./helpers/fake-runtime.ts";
 import { TEST_IDS } from "./helpers/vectors.ts";
 import type { TestClock } from "./helpers/clock.ts";
@@ -975,7 +977,7 @@ describe("letters between registered citizens, as production wires them (review 
     expect(await main(await parentOpens(x, "shemme"), read.deps)).toBe(0);
     expect(read.rt.calls[0]!.prompt.user).toContain("A letter from citizen:glossame");
     expect(read.rt.calls[0]!.prompt.user).toContain("A word across the river.");
-    expect(await readdir(join(x.h.config.paths.citizens_dir, "shemme", "receipts"))).toEqual([`inbox-${at.inbox[0]!.id}`]);
+    expect(await readdir(join(x.h.config.paths.citizens_dir, "shemme", "receipts"))).toEqual([inboxLetterId(at.inbox[0]! as never)]);
   });
 });
 
@@ -987,9 +989,13 @@ describe("the mirror after a beat, as production wires it (review C M2)", () => 
     return r.stdout.toString().trim();
   };
 
-  test("[KS-004 4.4, 4.5] seat <word> stages the mirror with its allowed_signers, and the commit is SSH-signed through the signer and verifies", async () => {
-    const x = await harness();
+  /** A seated glossame with a mirror worktree cloned from a local bare-ish remote, git signing through the fixture program, and pushes recorded. */
+  async function mirrored(x: Harness, opts: { pin?: string[] } = {}) {
     await seated(x, "glossame");
+    if (opts.pin) {
+      x.h.config.trust.host_attest_public_keys_b64 = opts.pin;
+      await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    }
     const remote = join(x.h.root, "remote");
     const worktree = join(x.h.root, "mirrors", "glossame");
     await mkdir(remote, { recursive: true });
@@ -1012,14 +1018,52 @@ describe("the mirror after a beat, as production wires it (review C M2)", () => 
       gitSignProgram: program,
       seatArgv: () => fakeBinArgv("note", x.h.config.paths.host_log, "glossame", "beat", "0", x.deps.clock!.now().toISOString()),
     };
-    expect(await main(["seat", "glossame", "--config", x.configPath], deps)).toBe(0);
+    const verifyHead = async () => {
+      const signers = fixtureGit(worktree, "show", "HEAD:.citizen/allowed_signers");
+      await writeFile(join(x.h.root, "allowed_signers"), `${signers}\n`);
+      // git's own check, which runs ssh-keygen -Y verify against the file the commit carries.
+      const v = Bun.spawnSync(["git", "-c", `gpg.ssh.allowedSignersFile=${join(x.h.root, "allowed_signers")}`, "verify-commit", "HEAD"], { cwd: worktree, env: FIXTURE_GIT_ENV });
+      return { signers, exit: v.exitCode, stderr: v.stderr.toString() };
+    };
+    return { worktree, deps, pushes, verifyHead };
+  }
+
+  test("[KS-004 4.4, 4.5] seat <word> stages the mirror with its allowed_signers, and the commit is SSH-signed through the signer and verifies", async () => {
+    const x = await harness();
+    const m = await mirrored(x);
+    expect(await main(["seat", "glossame", "--config", x.configPath], m.deps)).toBe(0);
     expect(x.out()).toContain("seat glossame: beat (exit 0)");
-    const signers = fixtureGit(worktree, "show", "HEAD:.citizen/allowed_signers");
-    expect(signers).toContain(`host@kingdom-seat namespaces="git" ssh-ed25519 `);
-    await writeFile(join(x.h.root, "allowed_signers"), `${signers}\n`);
-    // git's own check, which runs ssh-keygen -Y verify against the file the commit carries.
-    const verified = Bun.spawnSync(["git", "-c", `gpg.ssh.allowedSignersFile=${join(x.h.root, "allowed_signers")}`, "verify-commit", "HEAD"], { cwd: worktree, env: FIXTURE_GIT_ENV });
-    expect([verified.exitCode, verified.stderr.toString()]).toEqual([0, expect.stringContaining(`Good "git" signature for host@kingdom-seat`)]);
-    expect(pushes.calls).toHaveLength(1);
+    const v = await m.verifyHead();
+    expect(v.signers).toContain(`host@kingdom-seat namespaces="git" ssh-ed25519 `);
+    expect([v.exit, v.stderr]).toEqual([0, expect.stringContaining(`Good "git" signature for host@kingdom-seat`)]);
+    expect(m.pushes.calls).toHaveLength(1);
+  });
+
+  test("a pin that names the signer's own host key changes nothing: one host line, and the commit is signed and verifies", async () => {
+    const x = await harness();
+    const m = await mirrored(x, { pin: [x.signer.hostAttestPublicB64] });
+    expect(await main(["seat", "glossame", "--config", x.configPath], m.deps)).toBe(0);
+    const v = await m.verifyHead();
+    expect(v.signers.split("\n").filter((l) => l.startsWith("host@kingdom-seat"))).toHaveLength(1);
+    expect([v.exit, v.stderr]).toEqual([0, expect.stringContaining(`Good "git" signature for host@kingdom-seat`)]);
+  });
+
+  test("with host keys pinned, the mirror publishes only the pinned keys and never signs with a key the pins leave out (R-SIG-1)", async () => {
+    const x = await harness();
+    const other = toB64(edPublicKey(sha256("a host key pinned elsewhere, never this signer's")));
+    const m = await mirrored(x, { pin: [other] });
+    expect(await main(["seat", "glossame", "--config", x.configPath], m.deps)).toBe(0);
+    const v = await m.verifyHead();
+    // allowed_signers names the pinned key, and the signer's own key nowhere, as verify and status trust only the pin.
+    const hostLines = v.signers.split("\n").filter((l) => l.startsWith("host@kingdom-seat"));
+    expect(hostLines).toHaveLength(1);
+    expect(hostLines[0]).toContain(sshPublicKey(fromB64(other, 32)));
+    expect(v.signers).not.toContain(sshPublicKey(fromB64(x.signer.hostAttestPublicB64, 32)));
+    // The commit is left unsigned, which status counts, and the host note says why; the push still goes ahead.
+    expect(fixtureGit(m.worktree, "log", "-1", "--format=%G?")).toBe("N");
+    expect(v.exit).not.toBe(0);
+    const notes = (await readHostNotes(x.h.config, new Date(0)))!;
+    expect(notes.find((n) => n.detail === "signer host key is not pinned; mirror commit left unsigned")).toMatchObject({ kind: "signer", word: "glossame", outcome: "refused" });
+    expect(m.pushes.calls).toHaveLength(1);
   });
 });
