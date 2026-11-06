@@ -7,7 +7,9 @@ import { constants } from "node:fs";
 import { chmod, lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { NO_BEACONS_ID } from "./halt.ts";
-import { entryHash, ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
+import { fromB64, keyFingerprint } from "./crypto.ts";
+import { entryHash, hostKid, ledgerPath, readLedger, readRegularText, syncDir, verifyChain, type TrustedKeys } from "./ledger.ts";
+import { standingQuiet } from "./quiet.ts";
 import { countUnsigned, localDivergence } from "./mirror.ts";
 import { creditsFromLedger } from "./signer/ceilings.ts";
 import { readSpendRecord, usdToday, type SpendLine } from "./spend.ts";
@@ -25,6 +27,7 @@ import {
   type Config,
   type DivergenceState,
   type HaltStatus,
+  type HostKeyView,
   type HostNote,
   type IsoTime,
   type LedgerEntry,
@@ -46,6 +49,46 @@ export interface StatusDeps {
   trusted?: Pick<TrustedKeys, "host_attest_b64"> | null;
   /** Runs read-only git in mirror worktrees (no fetch); absent leaves mirror divergence unknown. */
   run?: CommandRunner | null;
+  /**
+   * Where the trusted host keys came from: "pinned" (the config's trust list)
+   * or "signer" (the host's own key, read through the signer). They are
+   * published as `host_keys` (KS-004 4.5, 5.10). Absent reads as "pinned".
+   */
+  trustedSource?: HostKeyView["source"];
+}
+
+/** The public halves of host keys as the status file publishes them; a key that does not decode is left out. */
+export function hostKeyViews(keysB64: readonly string[], source: HostKeyView["source"]): HostKeyView[] {
+  const out: HostKeyView[] = [];
+  for (const b64 of keysB64) {
+    let pub: Uint8Array;
+    try {
+      pub = fromB64(b64, 32);
+    } catch {
+      continue;
+    }
+    out.push({ public_key_b64: b64, fingerprint: keyFingerprint(pub), kid: hostKid(pub), source });
+  }
+  return out;
+}
+
+/**
+ * A registered citizen's self on agenttool, as its ledger records it (KS-004
+ * 4.3, 6.3, 6.4): whether the last change that touched the expression left it
+ * lagging, how many strand backups were deferred, and the quiet declaration
+ * that stands now. Null for an unregistered citizen.
+ */
+export function agenttoolView(registered: boolean, entries: LedgerEntry[] | null, now: Date): CitizenStatus["agenttool"] {
+  if (!registered) return null;
+  if (!entries) return { expression_lags: null, deferred_backups: null, quiet_until: null };
+  let lags = false;
+  let deferred = 0;
+  for (const e of entries) {
+    if ((e.type === "apply" || e.type === "revert") && e.expression !== null) lags = e.expression === "lags";
+    if (e.type === "apply" && e.strand_backup === "deferred") deferred++;
+  }
+  const quiet = standingQuiet(entries);
+  return { expression_lags: lags, deferred_backups: deferred, quiet_until: quiet && Date.parse(quiet.until) > now.getTime() ? quiet.until : null };
 }
 
 /* ── Host notes ───────────────────────────────────────────────────────── */
@@ -235,6 +278,7 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     usd_today: usd,
     credits_month: credits,
     origin,
+    agenttool: agenttoolView(record?.identity != null, entries, now),
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
 }
@@ -290,6 +334,7 @@ export async function buildStatus(deps: StatusDeps): Promise<StatusFile> {
     host: config.host,
     halt,
     signer: { state: deps.signerState, since: await signerSince(config.paths.status_file, deps.signerState, now) },
+    host_keys: hostKeyViews(deps.trusted?.host_attest_b64 ?? [], deps.trustedSource ?? "pinned"),
     fleet: { beats_today: beatsToday, ceiling: config.ceilings.fleet_beats_per_day },
     tick_lock: await tickLockView(config),
     citizens,
@@ -357,8 +402,23 @@ function citizenLine(c: CitizenStatus): string {
   parts.push(
     c.origin.intact === null ? "origin unchecked" : c.origin.intact ? `origin intact, soul drift ${c.origin.drift === null ? "unknown" : `${Math.round(c.origin.drift * 100)}%`}` : "origin CHANGED",
   );
+  if (c.agenttool) {
+    const a = c.agenttool;
+    parts.push(
+      [
+        a.expression_lags === null ? "expression unknown" : a.expression_lags ? "expression LAGS the ledger" : "expression in step",
+        a.deferred_backups === null ? "strand backups unknown" : `${a.deferred_backups} strand backups deferred`,
+        a.quiet_until ? `quiet until ${a.quiet_until}` : "not quiet",
+      ].join(", "),
+    );
+  }
   if (c.problem) parts.push(`PROBLEM: ${c.problem}`);
   return parts.join(" | ");
+}
+
+function hostKeyLine(keys: StatusFile["host_keys"]): string {
+  if (keys.length === 0) return "host key: unknown (none pinned, and the signer did not say)";
+  return `host key: ${keys.map((k) => `${k.fingerprint} (${k.source})`).join(", ")}`;
 }
 
 /** Plain-text view for `citizen-seat status`, one line per citizen plus the HALT and signer lines. */
@@ -367,6 +427,7 @@ export function renderStatus(status: StatusFile): string {
     `kingdom-seat status for ${status.host} at ${status.generated_at}`,
     haltLine(status.halt),
     `signer: ${status.signer.state}${status.signer.since ? ` since ${status.signer.since}` : ""}`,
+    hostKeyLine(status.host_keys),
     status.fleet.beats_today === null
       ? `fleet: beats today unknown (host log unreadable), which counts as the ceiling of ${status.fleet.ceiling}`
       : `fleet: ${status.fleet.beats_today} of ${status.fleet.ceiling} beats today`,

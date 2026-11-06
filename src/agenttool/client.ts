@@ -291,6 +291,24 @@ export async function listKeys(deps: ClientDeps, word: Word): Promise<KeyRow[]> 
   });
 }
 
+/**
+ * GET /v1/identities/:id/expression: the private expression as stored, for
+ * the read-modify-write every PUT needs, since a PUT replaces the whole object
+ * (routes/identity/expression.ts:25-40). A bearer read, free. The server's
+ * `updated_at` is dropped, because it replaces that field itself and a PUT
+ * that carried it would not be what is kept.
+ */
+export async function readExpression(deps: ClientDeps, word: Word): Promise<Expression> {
+  const what = "expression read";
+  const id = await citizen(deps, word);
+  const res = await send(deps, word, { op: "read", method: "GET", target: identityRoute(id.identity_id, "/expression"), body: EMPTY, credits: 0 }, undefined);
+  if (res.status !== 200) throw refused(what, res);
+  const j = res.json;
+  if (!isObject(j) || j.identity_id !== id.identity_id || !isObject(j.expression)) throw malformed(what, res.status, "names another identity or no expression");
+  const { updated_at: _u, ...expression } = j.expression;
+  return expression as Expression;
+}
+
 /* ── Root-signed acts ─────────────────────────────────────────────────── */
 
 /**
@@ -411,16 +429,25 @@ export async function endCitizenQuiet(deps: ClientDeps, word: Word, auth?: ActAu
 
 /* ── Strands (bearer plus an identity key, not authority) ─────────────── */
 
-/** POST /v1/strands bound to the citizen's identity_id (1 credit); a bound strand accepts only its own identity's keys. */
-export async function createStrand(deps: ClientDeps, word: Word, topic: string): Promise<{ strand_id: string }> {
+/**
+ * POST /v1/strands bound to the citizen's identity_id (1 credit,
+ * routes/strand/strands.ts:74); a bound strand accepts only its own
+ * identity's keys. `then` is the credits the act still spends once the strand
+ * exists (the thought it is made for), checked against the ceiling with it,
+ * so a strand is never bought when the thought it exists for cannot follow:
+ * the ceiling reads the ledger, which records neither until the act's entry.
+ */
+export async function createStrand(deps: ClientDeps, word: Word, topic: string, opts: { then?: number } = {}): Promise<{ strand_id: string }> {
   const what = "strand create";
   // The topic is stored as sent, in plaintext, so callers keep it neutral.
   if (typeof topic !== "string" || topic.length === 0 || topic.length > 2000) throw new Refusal("invalid-request", "topic must be 1..2000 characters");
+  const then = opts.then ?? 0;
+  if (!Number.isSafeInteger(then) || then < 0) throw new Refusal("ceiling-credits", "the credits that follow must be a whole number");
   const id = await citizen(deps, word);
   const res = await send(
     deps,
     word,
-    { op: "strand.create", method: "POST", target: "/v1/strands", body: jsonBody({ identity_id: id.identity_id, topic }), credits: 1 },
+    { op: "strand.create", method: "POST", target: "/v1/strands", body: jsonBody({ identity_id: id.identity_id, topic }), credits: 1 + then },
     undefined,
   );
   if (!ok(res.status)) throw refused(what, res);

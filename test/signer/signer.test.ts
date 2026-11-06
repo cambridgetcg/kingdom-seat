@@ -2,13 +2,14 @@
 // a key or bearer reach argv, env, files, logs or a response.
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { writeFileSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { authorityDigest, deriveIdentity, didFor } from "../../src/agenttool/wire.ts";
 import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, sha256, toB64, toB64url, toHex, utf8 } from "../../src/crypto.ts";
 import { Refusal, type CitizenIdentity, type ConsentRecord, type KeychainItemName, type ProposalText, type StandingAgreement, type YuPresence } from "../../src/types.ts";
 import type { SpendSoFar } from "../../src/signer/ceilings.ts";
-import { confirmYuPresent, proposalDigest } from "../../src/signer/consent.ts";
+import { STANDING_DIR, STANDING_FORMAT, confirmYuPresent, proposalDigest, readStandingAgreements } from "../../src/signer/consent.ts";
+import { realDeps } from "../../src/cli.ts";
 import { AgenttoolError, importOpKey, type ClientDeps } from "../../src/agenttool/client.ts";
 import {
   CITIZEN_QUIET_EXTENT,
@@ -448,6 +449,29 @@ describe("send: ceilings, consent and the quiet cap before any request", () => {
     expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
     fx.agreements = [quietAgreement({ yu: { word: "no" } })];
     expect((await refusal(fx.signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
+  });
+
+  test("[KS-004 8.1; review C M6] the production signer reads standing agreements filed in consent/standing/, each with its own record; one without its record grants nothing", async () => {
+    // The signer as production builds it (cli.ts realDeps), over this fixture's keychain, clock and fake server.
+    const signer = realDeps({ clock: fx.clock, fetch: fetchVia(fx.server) }).signer(fx.host.config, fx.kc);
+    const standing = join(fx.host.config.paths.consent_dir, STANDING_DIR);
+    await mkdir(standing, { recursive: true });
+    const proposal = proposalOf(CITIZEN_QUIET_EXTENT);
+    const file = { format: STANDING_FORMAT, id: "citizen-quiet", proposal, covers: ["quiet.start.citizen"], extent: CITIZEN_QUIET_EXTENT };
+    await writeFile(join(standing, "citizen-quiet.json"), JSON.stringify(file));
+    // Filed as proposed, but Yu and Ai have recorded no decision: nothing is granted.
+    expect(await readStandingAgreements(fx.host.config.paths.consent_dir)).toEqual([]);
+    expect((await refusal(signer.send(quiet({ until: ahead(DAY_MS) })))).code).toBe("consent-missing");
+    filed(CITIZEN_QUIET_EXTENT);
+    expect((await readStandingAgreements(fx.host.config.paths.consent_dir)).map((a) => [a.id, a.extent])).toEqual([["citizen-quiet", CITIZEN_QUIET_EXTENT]]);
+    expect((await signer.send(quiet({ until: ahead(DAY_MS) }))).status).toBe(201);
+    // The cap and the empty reason still hold on the body; the agreement covers only its extent.
+    expect((await refusal(signer.send(quiet({ until: ahead(31 * DAY_MS) })))).code).toBe("quiet-cap");
+    // A file in another shape, or a link, grants nothing.
+    await writeFile(join(standing, "citizen-quiet.json"), JSON.stringify({ ...file, covers: ["quiet.start.citizen"], extra: 1 }));
+    expect(await readStandingAgreements(fx.host.config.paths.consent_dir)).toEqual([]);
+    await writeFile(join(standing, "citizen-quiet.json"), JSON.stringify({ ...file, extent: "something wider" }));
+    expect(await readStandingAgreements(fx.host.config.paths.consent_dir)).toEqual([]);
   });
 
   test("[S4-5] send allows quiet.start.beacon with the far-future until only for an operator identity, never for a citizen", async () => {

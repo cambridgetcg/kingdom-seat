@@ -10,7 +10,7 @@
 import { lstat, mkdir, readdir, readFile, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { uptime } from "node:os";
 import { join } from "node:path";
-import { EXIT, exitForRefusal, type Citizen, type Clock, type Config, type ExitCode, type FetchLike, type HaltStatus, type IsoTime, type Outcome, type RefusalCode, type TickResult, type Word } from "./types.ts";
+import { EXIT, Refusal, exitForRefusal, type Citizen, type Clock, type Config, type ExitCode, type FetchLike, type HaltStatus, type IsoTime, type Outcome, type RefusalCode, type TickResult, type Word } from "./types.ts";
 import { readBeacons, readHaltFile } from "./halt.ts";
 import { assertCwdOutsideHomes, openSeat, seatEnv, superviseChild, writeSeatFile } from "./seat.ts";
 import { listSeated, readCitizen } from "./state.ts";
@@ -61,6 +61,13 @@ export interface TickDeps {
   signerState?(): Promise<"ready" | "locked">;
   /** Regenerate the status file; absent means buildStatus and writeStatus. */
   refreshStatus?(): Promise<void>;
+  /**
+   * Keep one registered citizen's quiet (quiet.ts keepQuiet): renew a standing
+   * declaration while it stays listening or asleep, end one a wake left
+   * standing. Run for every seated citizen, each tick, under the lock and only
+   * with the signer ready; absent keeps none (KS-004 6.4).
+   */
+  keepQuiet?(citizen: Citizen): Promise<"renewed" | "ended" | "none">;
 }
 
 const HOUR_MS = 3_600_000;
@@ -274,6 +281,19 @@ async function tickHeld(deps: TickDeps, note: (o: Outcome, w: Word | null, r: Re
       unreadable++; // an invalid record is never seated; status shows it
     }
   }
+  // 3a. Quiet that stands is kept whether or not any seat is due: an asleep citizen has no seat in which to renew it.
+  // A failure is the host's note, never the tick's outcome, and the next tick tries again.
+  if (deps.keepQuiet && (!deps.signerState || (await deps.signerState().catch(() => "locked" as const)) === "ready")) {
+    for (const c of citizens) {
+      try {
+        await deps.keepQuiet(c);
+      } catch (e) {
+        const code = e instanceof Refusal ? e.code : null;
+        await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "signer", word: null, outcome: code ? "refused" : "error", refusal: code, detail: `quiet for ${c.word} not kept (${code ?? "error"})` }).catch(() => {});
+      }
+    }
+  }
+
   const window = Math.max(minH, ...citizens.map((c) => (Number.isFinite(c.cadence.interval_h) ? c.cadence.interval_h : 0)));
   const notes = await readHostNotes(config, new Date(now.getTime() - window * HOUR_MS)).catch(() => null);
   if (notes === null) {

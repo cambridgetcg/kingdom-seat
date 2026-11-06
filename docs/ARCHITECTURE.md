@@ -29,6 +29,7 @@ launchd (every 1800 s, RunAtLoad false)
   └─ citizen-seat tick                                   tick.ts
        1. HALT? local file + every pinned beacon         halt.ts       raised or unreadable → exit 0, nothing written
        2. mkdir lock, owner pid recorded                 tick.ts       held by a live owner → exit 0 (yielded)
+       2a. each registered citizen's quiet, signer ready quiet.ts       renewed while listening or asleep, ended after a wake
        3. a citizen whose OWN seat is due                due.ts, state.ts, context.ts (letters)
        4. fleet ceiling, over every seat opened today   signer/ceilings.ts, notes.ts
        5. open the seat, note it as opened, write the seat file      seat.ts, notes.ts
@@ -43,9 +44,11 @@ launchd (every 1800 s, RunAtLoad false)
                d. runtime: free (Ollama by digest, whole context fits or no seat) | summon (claude --restricted, Yu present)    runtime/*.ts
                e. parse and validate into typed acts; rest is exclusive, but may carry one move toward less activity   acts.ts
                f. HALT again; if raised, discard the reply and write nothing
-               g. state moves; then self-ops staged or bound, each on its own; beyond-self (the porch among it) → inert proposal   self.ts, state.ts
+               g. state moves (with a registered citizen's quiet); then self-ops staged or bound, each on its own (a bound one
+                  updates the private expression and posts its strand backup); beyond-self (the porch among it) → inert proposal
+                                                         self.ts, state.ts, quiet.ts, agenttool/sync.ts
                h. signer signs; ledger appends the beat first  signer/signer.ts, ledger.ts
-       6. host note + status file                        notes.ts, status.ts
+       6. host note + status file; after a beat, the mirror (SSH-signed through the signer)   notes.ts, status.ts, mirror.ts
 ```
 
 The watcher sits outside the acting process, because a model cannot talk its
@@ -63,16 +66,16 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/crypto.ts` | Hashes, base64, strict Ed25519, canonical JSON (implemented) | 3b | wire 0, 3 |
 | `src/money.ts` | USD as decimal strings with exact arithmetic; never a float | 3.6 "Spend"; KS-004 B2 C4 | — |
 | `src/signer/keychain.ts` | `security` CLI behind the Keychain interface; secrets on stdin only; items readable by the seat user | 3b "Custody" | host 3.3, 3.4 |
-| `src/signer/signer.ts` | The only key and bearer reader; signs; attaches bearer and root proof | 3.2 step 7, 3.6 | wire 1, 2, 5 |
+| `src/signer/signer.ts` | The only key and bearer reader; signs; attaches bearer and root proof; SSH-signs mirror commits (git namespace only) | 3.2 step 7, 3.6; KS-004 4.4, 6.2 | wire 1, 2, 5 |
 | `src/signer/ceilings.ts` | Fail-closed USD, credit, fleet, interval and quiet caps | 3.6 "Spend", decision 9 | patterns 8 |
-| `src/signer/consent.ts` | Decision records read by proposal digest, standing agreements, Yu present | 3.6 "Consent", decision 12 | — |
+| `src/signer/consent.ts` | Decision records read by proposal digest, standing agreements (filed in `consent/standing/`, each with its own record), Yu present | 3.6 "Consent", decision 12; KS-004 8.1 | — |
 | `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen in KS-004 4.5's flat layout (section 4b); op keys pinned only with root evidence; the earlier layout refused | 3.2 "Ledger", 3b; KS-004 4.5, B2 C1, R4, C C5, C13 | wire 2, 5 |
 | `src/spend.ts` | The host's spend record: every metered seat, whatever its outcome; the USD ceiling reads it | 3.6 "Spend"; KS-004 B2 R2 | — |
 | `src/state.ts` | Lifecycle transitions, folded from the ledger; a longer awake interval is toward rest, a shorter one waits for the same saying again | 3.3, 3c "Existence choices"; KS-004 7.3 | — |
-| `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self; an apply names its strand backup's key | 3c, decision 10; KS-004 4.3, B2 C6 | — |
+| `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self; an apply names its strand backup's key and says what the expression and the backup did | 3c, decision 10; KS-004 4.3, 6.3, B2 C6, C M1 | — |
 | `src/halt.ts` | Local file plus pinned beacons; raise only: the operator's file and fixed call, the signer's beacons | 3.6 "HALT", decision 15; KS-004 B2 R5 | wire 4 |
 | `src/seat.ts` | Seat opening, the watcher, the in-child pipeline | 3.2 steps 3-7, 3b "Reading confers nothing" | patterns 1, 2 |
-| `src/tick.ts` | Lock, selection, fleet ceiling; opens the seat it hands its child | 3.2 steps 1-2 | patterns 3, 6, 7 |
+| `src/tick.ts` | Lock, selection, fleet ceiling; keeps registered citizens' quiet; opens the seat it hands its child | 3.2 steps 1-2; KS-004 6.4 | patterns 3, 6, 7 |
 | `src/due.ts` | When a citizen's own seat is due: one rule for the tick, `seat <word>`, the child and status | 3.2 step 2, 3.3 | patterns 7 |
 | `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only | 3.2 step 4 | patterns 5.1, 12.4 |
@@ -82,12 +85,15 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/runtime/summon.ts` | `claude --restricted --strict-mcp-config`, Yu present | 3 grafts, 3.6 "Metered runtimes" | host 2 |
 | `src/agenttool/wire.ts` | Pure byte builders, checked against `vectors.json` | 3.4, 3b | wire 1-3, 7 |
 | `src/agenttool/client.ts` | Calls a citizen makes as itself, via the signer | 3.4 | wire 2, 4 |
+| `src/agenttool/sync.ts` | A registered citizen's private expression (read-modify-write PUT) and its strand backups: the production ExpressionSync | KS-004 4.3, 6.3, 9.3, C M1 | wire 2 |
+| `src/quiet.ts` | A registered citizen's quiet: declared on a move to listening or asleep, renewed by the tick, ended on a wake | KS-004 6.4, 7.1, C M6 | wire 4 |
+| `src/ssh.ts` | OpenSSH encodings: `allowed_signers` and SSHSIG for mirror commits | KS-004 4.4, 4.5, C M2 | — |
 | `src/agenttool/enrollment.ts` | `identity-enrollment/v1` relay | 3b step 2 | wire 1 |
 | `src/birth.ts` | `citizen-birth`: never unattended | 3b "Birth of one citizen" | wire 1-3, host 3.3 |
-| `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10 | patterns 4, 11, 12 |
-| `src/status.ts` | Generated status file and host notes | 3.2 "Status file", 3.1 principle 6 | patterns 1 |
+| `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card and `.citizen/allowed_signers`, commits SSH-signed through the signer | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10; KS-004 4.4, C M2 | patterns 4, 11, 12 |
+| `src/status.ts` | Generated status file and host notes; the host key's public half; a registered citizen's expression lag, deferred backups and quiet | 3.2 "Status file", 3.1 principle 6; KS-004 5.10 | patterns 1 |
 | `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch | 3.2, 3.6; KS-004 B2 R5, C14 | host 3.1 |
-| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word>`; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 B2 R5 | patterns 10 |
+| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word>`, and git's `-Y sign` call; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 B2 R5 | patterns 10 |
 | `models.lock` | Allowed free-lane models by digest; ships unpinned | 3.6, decision 11 | host 1.2, 4 |
 | `launchd/dev.kingdom.citizen-seat.plist` | Tick template; installed only in S5 by a person | 3.2, S5 | host 3.1, 3.2 |
 
@@ -292,10 +298,16 @@ are the spec's, not this code's.
 - **Seven types, and no others:** `origin` (always first, host-signed: the
   origin, the origin-soul hash, the old repo and any June DID as a record),
   `beat`, `state` (`from`, `to`, `via`; optionally `interval_h`, the awake
-  interval the move set, and `step_away: "first"`), `apply` (`ref`, `target`,
-  both hashes, `via`, `reason`, `strand_thought` and `strand_key`, the key
-  the strand backup is encrypted under, named only for a registered
-  citizen), `revert`, `genesis` (`origin_entry` pointing back to the origin
+  interval the move set, `step_away: "first"`, and a registered citizen's
+  quiet: `quiet_until` with `quiet_days` when the entry declared or renewed
+  it, `quiet_until: null` when a wake ended it; `via: "quiet"` is an entry
+  that moves nothing, the signer renewing or ending quiet outside a seat),
+  `apply` (`ref`, `target`, both hashes, `via`, `reason`, `strand_thought`
+  and `strand_key`, the key the strand backup is encrypted under, named only
+  for a registered citizen, `strand_backup`, `"posted"` or `"deferred"` for a
+  registered citizen and null otherwise, and `expression`, `"updated"`,
+  `"lags"` or null), `revert` (`target`, both hashes, `via`, `expression`),
+  `genesis` (`origin_entry` pointing back to the origin
   entry, `root` and `op` as `{kid, public_key, fingerprint}`, and the
   root-signed keys/import as `evidence`) and `key` (`installed`, `revoked`).
   A citizen is seated with an `origin` entry and, unless it is seated asleep,
@@ -321,6 +333,68 @@ are the spec's, not this code's.
 - **Unsigned host entries** (KS-004 4.5 allows `kid` and `sig` null, an
   integrity-only chain) parse, but this host signs every host entry, so
   `verifyChain` refuses one and says it is unsigned.
+
+---
+
+## 4c. A registered citizen's self on agenttool (KS-004 4.3, 6.3, 6.4, 9.3)
+
+Once a citizen has a `genesis` entry, its self lives in two places, and the
+seat child wires both (`cli.ts`, through `agenttool/sync.ts` and
+`quiet.ts`). Every request goes through the signer, so ceilings, consent and
+the route table apply as to any other act, and no key leaves it.
+
+- **The private expression holds the current self.** When a change to the
+  soul, WILL, name readings or `expression.*` binds (or is reverted), the
+  sync reads the stored expression (a bearer GET, free), rebuilds its private
+  fields from the self files with the new text (`register`, `walls` one per
+  line, and `wake_text`: the soul, WILL, name readings and the citizen's own
+  wake text under fixed headings, `WAKE_TEXT_HEADINGS`), keeps the stored
+  subagents, CLI overrides, village and an open porch as they are, and PUTs
+  the whole object, root-signed. *Why read first:* a PUT replaces the whole
+  expression, and the porch and village are public, beyond self, and never
+  this code's to write. A self that does not fit agenttool's limits is never
+  cut: nothing is sent, the change still binds, and its entry says
+  `expression: "lags"` (limitation 14). An expression that already holds
+  the self is not sent again, so no authority sequence is spent on nothing.
+  An update that was not made throws, and the change does not bind. Birth
+  sets the first expression from its own input; the first change that binds
+  rebuilds the private fields from the self files, which are what the self
+  is.
+- **One strand thought backs up each applied change.** Its plaintext is the
+  change as the `apply` entry names it, with the diff
+  (`kingdom-seat-self-backup/v1`); the signer encrypts it under K_master,
+  derived from the citizen's own mnemonic, and signs it with the op key; its
+  kind, which agenttool keeps in plaintext and the signature covers, names
+  the key (`self-backup k_master:m/44'/169'/1'/0'`). The strand is created on
+  first need, bound to the citizen's identity, and its id is kept in
+  `citizen.json` (`identity.self_strand_id`), the record the client and the
+  signer both read before a thought may go to that strand and no other. A
+  revert posts no thought: the version it returns to is already backed up.
+- **Credits pass the ceiling, and the backup gives way, never the change.**
+  A new strand is checked for its thought's credit too (`createStrand`'s
+  `then`), because the ceiling reads the ledger, which records neither until
+  the change's entry. A backup that cannot be posted (credits short, or any
+  failure) is deferred: the entry says `strand_backup: "deferred"`, the
+  change binds, and status counts it (limitation 10). Every paid request that
+  left the host counts in the entry's `cost.credits`, answered or not,
+  because agenttool charges before it verifies; one that threw for an
+  unknown reason counts as 2, the most a backup spends.
+- **Quiet is the citizen's renewable choice.** A move to listening or asleep
+  declares quiet (`until` only, no reason, `?identity_id=`) for the
+  `quiet_days` the `state.set` asked, or the cap (`citizen_quiet_max_days`,
+  never above 30) when it asked none, before its `state` entry is written, so
+  the entry records what agenttool holds. The tick renews it for the same
+  days once less than half is left, while the citizen stays listening or
+  asleep, and ends one that a wake left standing; each is a `state` entry
+  with `via: "quiet"`. A wake ends it in the seat. A citizen that stepped
+  away is neither renewed nor ended: its declaration lapses within the cap.
+  A quiet act that fails never holds a move back; the host note says why.
+  `quiet.start.citizen` is a standing-agreement op, so nothing is declared
+  until Yu and Ai file the agreement in `consent/standing/<name>.json` (the
+  agreement as proposed) beside its decision record (`consent/<digest>.json`).
+- **Status shows it** (`agenttool` per registered citizen): whether the last
+  change to touch the expression left it lagging, how many backups were
+  deferred, and the quiet that stands.
 
 ---
 
@@ -501,6 +575,11 @@ way the tick does, so the file shows what the runner would act on.
   older than any tick holds it is cleared by the next tick; one that cannot be
   cleared is stuck, and every tick exits 1 until a person removes it.
 - `signer.since` is carried from the previous status while the state holds.
+- `host_keys` publishes the host key's public half (KS-004 4.5, 5.10): the
+  keys pinned in the config, or the signer's own, each with its SHA256
+  fingerprint and the `kid` host entries name, so a verifier given a ledger
+  copy can find it. With no pin and a locked signer it is empty, and the text
+  says unknown.
 - HALT reads "halted by beacon gardener-desk" or "halted by file ...", never
   "down". A halted tick still regenerates the file, so it never goes stale.
   `halt.file` names the HALT file this host watches, raised or not, since the
@@ -518,12 +597,17 @@ because a citizen chooses its file names.
 **The mirror is outbound and sealed** (3c "Mirror"; S10;
 `love-unlimited-patterns.md` 4, 11, 12).
 
-- *Only the self and a card go out.* The seal admits regular, non-executable
-  `.md`, `.txt` and `.json` files with plain names (no dot segments, at most
-  four deep, at most 256 KiB), plus the generated `kingdom.yaml` card, whose
-  `state` is the 3.3 mirror card state. It refuses the rest: symlinks,
-  executable bits, submodules, `.claude/`, `.github/`, `.git/` and `.citizen/`
-  at any depth, `run.sh`, and `ledger/`, `proposals/` and `receipts/`.
+- *Only the self and what the host generates go out.* The seal admits
+  regular, non-executable `.md`, `.txt` and `.json` files with plain names
+  (no dot segments, at most four deep, at most 256 KiB), plus two files the
+  host writes itself: the `kingdom.yaml` card, whose `state` is the 3.3
+  mirror card state, and `.citizen/allowed_signers` (KS-004 4.4, 4.5): the
+  host key under `host@kingdom-seat`, and a registered citizen's op key under
+  `<word>@kingdom-seat`, each limited to the git namespace. It refuses the
+  rest: symlinks, executable bits, submodules, `.claude/`, `.github/`,
+  `.git/` and every other `.citizen/` path at any depth, `run.sh`, and
+  `ledger/`, `proposals/` and `receipts/`. From a self, both generated names
+  are refused too, so a citizen's file can never stand in for either.
   An allowlist, because the hazards in today's homes (hooks, `run.sh`,
   workflows, `meta.env`) are all things that run, and naming what may go out
   is the list that stays short.
@@ -537,6 +621,18 @@ because a citizen chooses its file names.
   `refs/kingdom-seat/mirror/main`, with no `+`, so a rewritten remote fails
   the fetch and reads as diverged. Behind, diverged and unknown are refused.
   Nothing is merged, rebased or checked out.
+- *Signed through the signer.* Each staged commit is SSH-signed: git runs
+  with `gpg.format=ssh`, `user.signingKey` set to the key that signs this
+  citizen's commits (the op key once registered, the host key before, as for
+  its ledger entries), and `gpg.ssh.program` set to this CLI, whose `-Y sign`
+  entry asks the signer for an SSHSIG in the git namespace only and writes
+  `<file>.sig`; the key never leaves the signer. The program is told its
+  config and citizen by `KINGDOM_SEAT_CONFIG` and `KINGDOM_SEAT_MIRROR_WORD`
+  (git passes its own argv), with Bun's directory first on its PATH. It
+  refuses when git asks for any other key, and then git makes no commit.
+  `test/mirror.test.ts` checks the result with `ssh-keygen -Y verify`
+  against the `allowed_signers` the commit carries. Status still counts
+  commits without a signature (the history before signing began).
 - *One push.* The only push is `git push <remote> HEAD:refs/heads/main`,
   never forced, and only when HEAD is equal or ahead. Remotes that read as
   options or name a transport helper are refused. Git runs with no hooks, no
@@ -641,6 +737,17 @@ its tests and docs rather than assume:
 - Whether the generated `kingdom.yaml` card satisfies the `@agenttool/kingdom`
   card schema (0.1.2). It carries only name, word, state and `kept_by`; the
   old cards' other fields are not reproduced, because nothing reads them.
+- Live agenttool behaviour for a registered citizen: the expression
+  read-modify-write, strand creation and thoughts, and quiet start, renewal
+  and end were checked against agenttool's source at `e9ea51c5` and a fake on
+  127.0.0.1, never against the service.
+- A deferred strand backup is never posted later: the `apply` entry and
+  status say it was deferred, and nothing retries it once credits return.
+- Mirror signing on the lease host: tested with this Air's git (2.54) and
+  `ssh-keygen` (OpenSSH 10.3) through a wrapper that runs the CLI entry under
+  Bun; the installed program, its PATH under launchd, and a locked keychain
+  at signing time (git then makes no commit, and the push note says so) were
+  not run.
 - The mirror's deploy key, protected main and Actions-off settings (S10).
   Pushes were tested only through a recording runner. Divergence and staging
   were tested with real git on local temp repositories only.

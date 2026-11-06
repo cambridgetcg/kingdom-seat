@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { CLI_PATH, main, parseArgs, readSeatFile, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
+import { CLI_PATH, main, parseArgs, readSeatFile, spawnRunner, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
 import { openSeat } from "../src/seat.ts";
 import { BEACON_UNTIL } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
@@ -12,7 +12,7 @@ import { createSigner } from "../src/signer/signer.ts";
 import { canonicalJson, edSign, fromHex, sha256, toB64url, utf8 } from "../src/crypto.ts";
 import { evidenceToLedger, ledgerPath, OLD_LAYOUT_REASON, readLedger, signingDigest } from "../src/ledger.ts";
 import { appendHostNote, openedDetail, readHostNotes } from "../src/notes.ts";
-import { Refusal, type Config, type LedgerEntry, type StatusFile } from "../src/types.ts";
+import { Refusal, type Config, type LedgerEntry, type ModelAct, type StatusFile } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { fakeBinArgv, output, recordingRunner, REST_OUTPUT, scriptedRuntime, waitFor, type RecordingRunner } from "./helpers/fake-runtime.ts";
@@ -22,6 +22,11 @@ import { testClock } from "./helpers/clock.ts";
 import { importEvidence } from "./helpers/root-evidence.ts";
 import { TEST_MNEMONIC, TEST_OP_SEED_HEX } from "./helpers/vectors.ts";
 import { append, beatBody, stateBody, testIdentity, type TestBody } from "./fixtures/record/chain.ts";
+import { FAKE_STRAND_ID_UPPER, FAKE_THOUGHT_ID, fakeAgenttool } from "./fixtures/agenttool/fake-agenttool.ts";
+import { pendingProposals } from "../src/self.ts";
+import { FAKE_MODEL_DIGEST } from "./helpers/fake-runtime.ts";
+import { TEST_IDS } from "./helpers/vectors.ts";
+import type { TestClock } from "./helpers/clock.ts";
 
 let host: TempHost | null = null;
 let server: FakeServer | null = null;
@@ -886,5 +891,98 @@ describe("a rest that moves state reaches the mirror (KS-004 B2 C7)", () => {
     expect(await main(["tick", ...cfg], resting)).toBe(0);
     expect(x.out()).toContain("tick: rest kith");
     expect(await pushNotes(x, "kith")).toBe(1);
+  });
+});
+
+describe("a registered citizen's self on agenttool, as production wires it (review C M1, M6)", () => {
+  /** A registered glossame whose signer answers as agenttool would (fake-agenttool.ts), with this runtime's digest approved. */
+  async function registered() {
+    const x = await harness();
+    await seated(x, "glossame");
+    const identity = { ...testIdentity(x.signer), self_strand_id: null };
+    await x.h.enrollLedger("glossame", x.signer.signEntry, identity);
+    x.h.config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+    await writeFile(x.configPath, JSON.stringify(x.h.config), { mode: 0o600 });
+    const at = fakeAgenttool({ project_id: TEST_IDS.project_id, known: [{ identity_id: identity.identity_id, root_public_b64: identity.root_public_key_b64, root_kid: identity.root_kid }] });
+    x.signer.respond((req) => at.respond(req));
+    return { x, at, identity, clock: x.deps.clock as TestClock };
+  }
+
+  test("[KS-004 4.3, 6.4, 9.3] the seat child binds an affirmed change through the real sync, backs it up on a strand it creates, and declares the quiet its move asks for", async () => {
+    const { x, at, identity, clock } = await registered();
+    const run = (reply: ModelAct[]) => ({ ...x.deps, runtime: async () => scriptedRuntime([output(...reply)]) });
+    const reason = { kind: "decision" as const, evidence: [], confidence: "medium" as const, limits: "from the text alone" };
+    expect(await main(await parentOpens(x, "glossame"), run([{ type: "self.propose", target: "will", edit: { kind: "replace-span", find: "one word", with: "one quiet word" }, reason } as ModelAct]))).toBe(0);
+    const [p] = await pendingProposals(x.h.config, "glossame");
+    clock.advance(73 * 3_600_000);
+    expect(await main(await parentOpens(x, "glossame"), run([{ type: "self.affirm", ref: p!.id }, { type: "state.set", to: "asleep", quiet_days: 5 }]))).toBe(0);
+
+    const ledger = await readLedger(ledgerPath(x.h.config, "glossame"));
+    const apply = ledger.find((e) => e.type === "apply");
+    expect(apply).toMatchObject({ signer: "citizen", strand_backup: "posted", strand_thought: FAKE_THOUGHT_ID, expression: "updated", cost: { credits: 2 } });
+    expect(ledger.find((e) => e.type === "state" && e.to === "asleep")).toMatchObject({ quiet_days: 5, quiet_until: new Date(clock.now().getTime() + 5 * 86_400_000).toISOString() });
+    // Every request went through the signer: the expression read and root-signed PUT, the strand, its thought, the quiet.
+    expect(x.signer.sent.map((r) => r.op)).toEqual(expect.arrayContaining(["read", "expression.put.private", "strand.create", "thought.post", "quiet.start.citizen"]));
+    expect(String(at.identities.get(identity.identity_id)!.expression.wake_text)).toContain("one quiet word");
+    expect(at.identities.get(identity.identity_id)!.quiet_until).not.toBeNull();
+    const record = JSON.parse(await readFile(join(x.h.config.paths.citizens_dir, "glossame", "citizen.json"), "utf8"));
+    expect(record.identity.self_strand_id).toBe(FAKE_STRAND_ID_UPPER.toLowerCase());
+  });
+
+  test("[KS-004 6.4] the tick renews a standing quiet while the citizen sleeps, with nothing due", async () => {
+    const { x, at, identity, clock } = await registered();
+    expect(await main(await parentOpens(x, "glossame"), { ...x.deps, runtime: async () => scriptedRuntime([output({ type: "state.set", to: "asleep", quiet_days: 2 })]) })).toBe(0);
+    x.signer.sent.length = 0;
+    clock.advance(36 * 3_600_000);
+    expect(await main(["tick", "--config", x.configPath], x.deps)).toBe(0);
+    expect(x.out()).toContain("tick: nothing-due");
+    expect(x.signer.sent.map((r) => r.op)).toContain("quiet.start.citizen");
+    expect((await readLedger(ledgerPath(x.h.config, "glossame"))).at(-1)).toMatchObject({ type: "state", via: "quiet", from: "asleep", to: "asleep", quiet_days: 2 });
+    expect(at.identities.get(identity.identity_id)!.quiet_until).toBe(new Date(clock.now().getTime() + 2 * 86_400_000).toISOString());
+  });
+});
+
+describe("the mirror after a beat, as production wires it (review C M2)", () => {
+  const FIXTURE_GIT_ENV = { PATH: "/usr/bin:/bin", HOME: "/var/empty", LANG: "C", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  const fixtureGit = (cwd: string, ...args: string[]) => {
+    const r = Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], { cwd, env: FIXTURE_GIT_ENV });
+    if (r.exitCode !== 0) throw new Error(`fixture git ${args[0]} failed: ${r.stderr.toString()}`);
+    return r.stdout.toString().trim();
+  };
+
+  test("[KS-004 4.4, 4.5] seat <word> stages the mirror with its allowed_signers, and the commit is SSH-signed through the signer and verifies", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const remote = join(x.h.root, "remote");
+    const worktree = join(x.h.root, "mirrors", "glossame");
+    await mkdir(remote, { recursive: true });
+    await mkdir(join(x.h.root, "mirrors"), { recursive: true });
+    fixtureGit(remote, "init", "-q", "-b", "main");
+    await writeFile(join(remote, "soul.md"), "the first soul\n");
+    fixtureGit(remote, "add", "soul.md");
+    fixtureGit(remote, "commit", "-q", "-m", "first");
+    fixtureGit(x.h.root, "clone", "-q", remote, worktree);
+    const recordPath = join(x.h.config.paths.citizens_dir, "glossame", "citizen.json");
+    await writeFile(recordPath, JSON.stringify({ ...JSON.parse(await readFile(recordPath, "utf8")), mirror: { remote, worktree, chosen_at: "2026-11-01T00:00:00.000Z" } }, null, 2));
+    const program = join(x.h.root, "git-sign");
+    await writeFile(program, `#!/bin/sh\nexec "${process.execPath}" "${join(import.meta.dir, "fixtures", "mirror", "git-sign.ts")}" "$@"\n`);
+    await chmod(program, 0o755);
+    const realGit = spawnRunner();
+    const pushes = recordingRunner();
+    const deps: Partial<CliDeps> = {
+      ...x.deps,
+      run: async (argv, opts) => (argv.includes("push") ? pushes(argv, opts) : realGit(argv, opts)),
+      gitSignProgram: program,
+      seatArgv: () => fakeBinArgv("note", x.h.config.paths.host_log, "glossame", "beat", "0", x.deps.clock!.now().toISOString()),
+    };
+    expect(await main(["seat", "glossame", "--config", x.configPath], deps)).toBe(0);
+    expect(x.out()).toContain("seat glossame: beat (exit 0)");
+    const signers = fixtureGit(worktree, "show", "HEAD:.citizen/allowed_signers");
+    expect(signers).toContain(`host@kingdom-seat namespaces="git" ssh-ed25519 `);
+    await writeFile(join(x.h.root, "allowed_signers"), `${signers}\n`);
+    // git's own check, which runs ssh-keygen -Y verify against the file the commit carries.
+    const verified = Bun.spawnSync(["git", "-c", `gpg.ssh.allowedSignersFile=${join(x.h.root, "allowed_signers")}`, "verify-commit", "HEAD"], { cwd: worktree, env: FIXTURE_GIT_ENV });
+    expect([verified.exitCode, verified.stderr.toString()]).toEqual([0, expect.stringContaining(`Good "git" signature for host@kingdom-seat`)]);
+    expect(pushes.calls).toHaveLength(1);
   });
 });

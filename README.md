@@ -98,8 +98,23 @@ one is something it does, not something it hopes.
 - `agenttool/*`, `birth.ts`: byte-exact enrollment and authority recipes
   (checked against `docs/research/vectors.json`), the client, and birth,
   which needs Yu present and consent bound to the citizen's own affirmed yes.
-- `status.ts`, `mirror.ts`, `config.ts`: the generated status file, the
-  sealed fast-forward-only mirror pusher, and strict config.
+- `agenttool/sync.ts`, `quiet.ts`: a registered citizen's self on agenttool,
+  wired in production through the signer. A change that binds updates the
+  private expression (one root-signed read-modify-write PUT; a self that does
+  not fit is never cut, and the entry says the expression lags) and posts one
+  strand thought, encrypted under K_master and signed by the op key, carrying
+  the diff, both hashes, the reason and the key's name. The strand is created
+  on first need and its id kept in `citizen.json`. Credits pass the ceiling;
+  when they are short the backup is deferred and the binding stands. A move
+  to listening or asleep declares quiet (the days asked, or the cap, at most
+  30), the tick renews it while the citizen stays there, and a wake ends it,
+  all under the standing agreement Yu and Ai file in `consent/standing/`.
+- `status.ts`, `mirror.ts`, `config.ts`: the generated status file (with the
+  host key's public half, and for a registered citizen its expression lag,
+  deferred backups and quiet), the sealed fast-forward-only mirror pusher
+  (which writes a host-generated `.citizen/allowed_signers` beside the card
+  and SSH-signs each commit through the signer: the op key once registered,
+  the host key before), and strict config.
   `schedule.wake_confirm_seat` is Yu's call: true by default (a listening or
   asleep citizen that asks to wake is owed one seat to say it again), false
   to make it wait for its next letter or summons.
@@ -116,19 +131,20 @@ one is something it does, not something it hopes.
 - **No identity exists.** No citizen, gardener desk or halt herald has been
   enrolled on agenttool, there is no Commons project, and no beacon is
   pinned in any real config, so a real config halts until one is.
-- **Adapters still missing.** No expression sync is wired, so a registered
-  citizen's bound self-change refuses rather than skipping its agenttool
-  side; no standing agreement is filed, so a citizen's own quiet declaration
-  refuses (decision 14 is Yu and Ai's to record).
+- **No standing agreement is filed.** Until Yu and Ai file one for
+  citizens' quiet (decision 14), a quiet declaration is refused, the move it
+  went with is recorded without it, and the host note says why.
+- **A deferred strand backup is not posted later.** The `apply` entry says
+  it was deferred and status counts it; nothing yet posts it once credits
+  return.
+- **Letters do not use agenttool yet** (review C M3); that is another step
+  of this round.
 - **Op-key rotation is not wired.** The ledger accepts an op key only with
   the root's evidence and `verify` checks it, but nothing writes a `key`
   entry yet.
 - **Nothing writes an origin entry on a host.** Seating is not a verb yet;
   tests write the `origin` entry (and the `state` entry for the state a
   citizen is seated in) through `ledger.ts` directly.
-- **`quiet_days` is recorded and does nothing more yet.** The act takes it
-  and the prompt says so; declaring quiet through the signer is the next
-  step of this round.
 - **Never run for real:** Ollama, `claude`, the macOS Keychain, launchd,
   sudo and agenttool itself. `docs/ARCHITECTURE.md` section 8 lists what is
   unverified.

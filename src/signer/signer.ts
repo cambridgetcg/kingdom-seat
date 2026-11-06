@@ -52,6 +52,7 @@ import {
   type YuPresence,
 } from "../types.ts";
 import { hostKid, type EntrySignature } from "../ledger.ts";
+import { GIT_NAMESPACE, sshsigArmor, sshsigSignedData } from "../ssh.ts";
 import { checkCitizenQuiet, checkCredits, type SpendSoFar } from "./ceilings.ts";
 import { agreementCovers, classifyOp, presenceConfirmedHere, presenceValid, proposalDigest, readConsentFor, verifyConsent } from "./consent.ts";
 
@@ -89,7 +90,12 @@ export interface SignerRequest {
   target: string;
   /** Exact body bytes; empty for GET and DELETE. Serialised once and never re-serialised. */
   body: Uint8Array;
-  /** Credits the route charges, so the ceiling is checked before sending (charge precedes verification server-side). */
+  /**
+   * Credits the route charges, so the ceiling is checked before sending
+   * (charge precedes verification server-side), plus any paid request the
+   * same act must still make after it (a strand created for the thought it
+   * exists to carry), so the act is checked whole before its first credit.
+   */
   credits: number;
   /**
    * The proposal an act beyond self was agreed as. The signer computes its
@@ -148,6 +154,14 @@ export interface Signer {
   signEnrollment(word: Word, digest: Uint8Array, presence: YuPresence): Promise<string>;
   /** Encrypt a thought under K_master and sign it with the op key, after checking the credit ceiling. */
   sealThought(word: Word, strandId: string, plaintext: string, kind: string): Promise<SealedThought>;
+  /**
+   * An SSHSIG over one mirror commit, in the git namespace only (KS-004 4.4,
+   * 6.2): by the op key once the citizen is registered, by the host key
+   * before, as its ledger entries are; never the root. Returns the armoured
+   * signature and the public key it verifies under, which the mirror's
+   * allowed_signers publishes.
+   */
+  signMirrorCommit(word: Word, message: Uint8Array): Promise<{ armored: string; public_key_b64: string }>;
   /** "locked" after a reboot until the seat user logs in; the tick then rests and status says so. */
   state(): Promise<"ready" | "locked">;
 }
@@ -932,6 +946,21 @@ export function createSigner(deps: SignerDeps): Signer {
       try {
         const digest = thoughtDigestV2(strandId, fromB64(sealed.ciphertext_b64), nonce, kind);
         return { ciphertext: sealed.ciphertext_b64, nonce: sealed.nonce_b64, kind, signature: toB64(edSign(digest, seed)), signing_key_id: identity.op_kid };
+      } finally {
+        wipe(seed);
+      }
+    },
+
+    async signMirrorCommit(word, message) {
+      assertWord(word);
+      if (!(message instanceof Uint8Array)) invalid("a commit to sign is bytes");
+      // The namespace is fixed and the magic prefixed (ssh.ts), so this can never yield a ledger or thought signature.
+      const signed = sshsigSignedData(GIT_NAMESPACE, message);
+      const { identity } = await readCitizen(word);
+      const seed = identity ? await readOpSeed(word, identity) : await readSeed({ kind: "host-attest-seed" });
+      try {
+        const pub = edPublicKey(seed);
+        return { armored: sshsigArmor(pub, GIT_NAMESPACE, edSign(signed, seed)), public_key_b64: toB64(pub) };
       } finally {
         wipe(seed);
       }

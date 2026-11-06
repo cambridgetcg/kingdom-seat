@@ -10,6 +10,7 @@ import {
   postThought,
   putExpression,
   readAuthority,
+  readExpression,
   readPublicAgent,
   registerBoxKey,
   revokeKey,
@@ -249,6 +250,22 @@ describe("requests through the signer", () => {
     const before = h.signer.sent.length;
     expect((await refusalOf(postThought(h.deps, WORD, strand_id, "x", "drift"))).code).toBe("invalid-request");
     expect(h.signer.sent.length).toBe(before);
+  });
+
+  test("[review C M1] readExpression is a bearer read of the citizen's own expression, without the server's updated_at; createStrand checks the thought it is made for with it", async () => {
+    const h = harness();
+    await putExpression(h.deps, WORD, { register: "Plain.", wake_text: "A test wake text." });
+    expect(await readExpression(h.deps, WORD)).toEqual({ register: "Plain.", wake_text: "A test wake text." });
+    const read = h.signer.sent.filter((r) => r.op === "read").at(-1)!;
+    expect([read.method, read.target, read.credits, read.body.length]).toEqual(["GET", `/v1/identities/${ID}/expression`, 0, 0]);
+    // An answer naming another identity is not this citizen's expression.
+    h.at.override((r) => r.op === "read" && r.target.endsWith("/expression"), { status: 200, json: { identity_id: "66666666-6666-4666-8666-666666666666", expression: {} } });
+    expect((await agenttoolErrorOf(readExpression(h.deps, WORD))).code).toBe("malformed_response");
+
+    // A strand made for one thought is checked against the ceiling for both, before its own credit is spent.
+    await createStrand(h.deps, WORD, "self", { then: 1 });
+    expect(h.acts().at(-1)!).toMatchObject({ op: "strand.create", credits: 2 });
+    expect((await refusalOf(createStrand(h.deps, WORD, "self", { then: -1 }))).code).toBe("ceiling-credits");
   });
 
   test("importOpKey and revokeKey return the signer's copy of the root-signed request, and refuse an answer without it", async () => {

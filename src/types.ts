@@ -507,8 +507,21 @@ export type LedgerOrigin =
   | { kind: "canon"; repo: string; path: string; commit: string; hash: LedgerHash }
   | { kind: "archetype"; lineage: string[]; note: string };
 
-/** How a `state` entry's move came about. "seated": the state the host carried over when it seated the citizen. */
-export type StateVia = "immediate" | "confirmed" | "two-beats" | "witnessed" | "seated";
+/**
+ * How a `state` entry's move came about. "seated": the state the host carried
+ * over when it seated the citizen. "quiet": no move at all, only the signer
+ * renewing a standing quiet declaration, or ending one a wake left standing,
+ * outside a seat (KS-004 4.5, 6.4).
+ */
+export type StateVia = "immediate" | "confirmed" | "two-beats" | "witnessed" | "seated" | "quiet";
+
+/**
+ * What an `apply` or `revert` did to a registered citizen's private
+ * expression: "updated" when the expression now holds the self, "lags" when
+ * the self would not fit agenttool's fields and the expression was left as it
+ * was, so that version is ledger-only (KS-004 4.3, limitation 14).
+ */
+export type ExpressionSyncState = "updated" | "lags";
 
 /**
  * The fields every entry carries (KS-004 4.5), `null` where one does not
@@ -583,6 +596,15 @@ export type LedgerFields =
        * the saying, since a rest writes no beat.
        */
       step_away?: "first";
+      /**
+       * A registered citizen's quiet (KS-004 6.4): the `until` the signer
+       * declared on agenttool with this entry, at most 30 days ahead, or null
+       * when this entry ended a standing declaration (a wake). Absent when the
+       * entry did not touch quiet.
+       */
+      quiet_until?: IsoTime | null;
+      /** The length the declaration was asked for, in days, beside a declared `quiet_until`; a renewal keeps it. */
+      quiet_days?: number;
     }
   | {
       type: "apply";
@@ -595,10 +617,27 @@ export type LedgerFields =
       reason: Reason;
       /** The strand thought that backs the change up off the host, or null when none was posted. */
       strand_thought: string | null;
-      /** The key the strand backup is encrypted under (KS-004 4.3), or null when the citizen has no strand. */
+      /** The key the strand backup is encrypted under (KS-004 4.3), or null when the citizen is not registered. */
       strand_key: string | null;
+      /**
+       * The strand backup a registered citizen's change owes: "posted" (its
+       * thought is `strand_thought`), or "deferred" when it could not be posted,
+       * as when credits are short (KS-004 6.3); the binding stands either way.
+       * Null for an unregistered citizen, which has no strand.
+       */
+      strand_backup: "posted" | "deferred" | null;
+      /** What the change did to the private expression; null when unregistered, or when the target is not part of it. */
+      expression: ExpressionSyncState | null;
     }
-  | { type: "revert"; target: SelfTarget; from_hash: LedgerHash; to_hash: LedgerHash; via: "citizen" | "yu-offer" }
+  | {
+      type: "revert";
+      target: SelfTarget;
+      from_hash: LedgerHash;
+      to_hash: LedgerHash;
+      via: "citizen" | "yu-offer";
+      /** What the revert did to the private expression; null when unregistered, or when the target is not part of it. */
+      expression: ExpressionSyncState | null;
+    }
   | {
       type: "genesis";
       /** The ledger digest of the origin entry this identity was born from. */
@@ -1023,8 +1062,34 @@ export interface CitizenStatus {
    * far the soul has moved from it (0..1). null is unknown, never "intact".
    */
   origin: { intact: boolean | null; drift: number | null };
+  /**
+   * A registered citizen's self on agenttool, read from its ledger (KS-004
+   * 4.3, 6.3, 6.4); null for an unregistered citizen, which has none.
+   * `expression_lags`: the last change to touch the private expression left
+   * it as it was, because the self did not fit (limitation 14); null when the
+   * ledger does not read. `deferred_backups`: applied changes whose strand
+   * backup was deferred (limitation 10). `quiet_until`: the quiet declaration
+   * the ledger says stands, or null.
+   */
+  agenttool: { expression_lags: boolean | null; deferred_backups: number | null; quiet_until: IsoTime | null } | null;
   /** Why the record or ledger could not be read, so an unreadable citizen is shown rather than left out. */
   problem: string | null;
+}
+
+/**
+ * The host key's public half (KS-004 4.5, 5.10): what host-attested entries
+ * are signed with, so a verifier given a ledger copy can find the key its
+ * `kid` names. Public only.
+ */
+export interface HostKeyView {
+  /** 32 bytes, padded standard base64, as `trust.host_attest_public_keys_b64` takes it. */
+  public_key_b64: string;
+  /** "SHA256:<unpadded base64>", as ssh-keygen prints it. */
+  fingerprint: string;
+  /** The `kid` a host entry signed by it names: "host:" and the fingerprint. */
+  kid: string;
+  /** "pinned": from the config's trust list; "signer": the host's own key, as the signer reads it. */
+  source: "pinned" | "signer";
 }
 
 /** Generated from what the runner reads, never kept by hand (3.1 principle 6). */
@@ -1035,6 +1100,13 @@ export interface StatusFile {
   /** `file` is the HALT file this host watches (`paths.halt_file`), named whether or not it is raised. */
   halt: { halted: boolean; file: string; raised: string[]; unreadable: string[] };
   signer: { state: "ready" | "locked" | "unknown"; since: IsoTime | null };
+  /**
+   * The host keys host-attested entries verify against, public halves only
+   * (KS-004 5.10): the keys pinned in the config, or, with none pinned, the
+   * key the signer holds. Empty when neither is known (no pin and a locked or
+   * unreadable signer), which is unknown, never "no key".
+   */
+  host_keys: HostKeyView[];
   /** beats_today counts every seat opened today; null when the host log is unreadable, which the tick treats as at-ceiling. */
   fleet: { beats_today: number | null; ceiling: number };
   /**

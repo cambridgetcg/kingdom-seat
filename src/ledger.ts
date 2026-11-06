@@ -639,9 +639,9 @@ const SEAT_KEYS = ["seat_ref", "runtime", "input_digest", "output_digest", "voic
 const TYPE_KEYS: Record<LedgerEntry["type"], { required: readonly string[]; optional: readonly string[] }> = {
   origin: { required: ["origin", "origin_soul_hash", "old_repo", "june_did"], optional: [] },
   beat: { required: [], optional: [] },
-  state: { required: ["from", "to", "via"], optional: ["interval_h", "step_away"] },
-  apply: { required: ["ref", "target", "prior_hash", "new_hash", "via", "reason", "strand_thought", "strand_key"], optional: [] },
-  revert: { required: ["target", "from_hash", "to_hash", "via"], optional: [] },
+  state: { required: ["from", "to", "via"], optional: ["interval_h", "step_away", "quiet_until", "quiet_days"] },
+  apply: { required: ["ref", "target", "prior_hash", "new_hash", "via", "reason", "strand_thought", "strand_key", "strand_backup", "expression"], optional: [] },
+  revert: { required: ["target", "from_hash", "to_hash", "via", "expression"], optional: [] },
   genesis: { required: ["origin_entry", "root", "op", "evidence"], optional: [] },
   key: { required: ["installed", "revoked"], optional: [] },
 };
@@ -738,7 +738,7 @@ function fieldsOf(type: LedgerEntry["type"], e: Record<string, unknown>): void {
     case "state":
       lifecycle(e.from, "from");
       lifecycle(e.to, "to");
-      if (!["immediate", "confirmed", "two-beats", "witnessed", "seated"].includes(e.via as string)) throw new Error("via");
+      if (!["immediate", "confirmed", "two-beats", "witnessed", "seated", "quiet"].includes(e.via as string)) throw new Error("via");
       if (e.to === "ended" && e.via !== "witnessed") throw new Error("ended needs a witness");
       if (e.via === "seated" && (e.signer !== "host" || e.seat_ref !== null)) throw new Error("a seated state is the host's, written outside a seat");
       if (e.interval_h !== undefined && (!Number.isSafeInteger(e.interval_h) || (e.interval_h as number) < 1 || e.to !== "awake")) {
@@ -747,6 +747,7 @@ function fieldsOf(type: LedgerEntry["type"], e: Record<string, unknown>): void {
       if (e.step_away !== undefined && (e.step_away !== "first" || e.to !== "asleep" || e.seat_ref === null)) {
         throw new Error("step_away is \"first\", on a seat's move to asleep");
       }
+      quietFields(e);
       return;
     case "apply":
       ledgerHashField(e.ref, "ref");
@@ -757,12 +758,18 @@ function fieldsOf(type: LedgerEntry["type"], e: Record<string, unknown>): void {
       reasonField(e.reason, "reason");
       if (e.strand_thought !== null) str(e.strand_thought, "strand_thought");
       if (e.strand_key !== null) str(e.strand_key, "strand_key");
+      // A registered citizen's change owes a backup, posted or deferred; an unregistered one's owes none (KS-004 4.3, 6.3).
+      if (e.strand_backup !== null && e.strand_backup !== "posted" && e.strand_backup !== "deferred") throw new Error("strand_backup");
+      if ((e.strand_backup === null) !== (e.strand_key === null)) throw new Error("strand_backup and strand_key are both set or both null");
+      if ((e.strand_backup === "posted") !== (e.strand_thought !== null)) throw new Error("strand_thought is set exactly when the backup was posted");
+      expressionField(e);
       return;
     case "revert":
       selfTargetSpelling(e.target, "target");
       ledgerHashField(e.from_hash, "from_hash");
       ledgerHashField(e.to_hash, "to_hash");
       if (e.via !== "citizen" && e.via !== "yu-offer") throw new Error("via");
+      expressionField(e);
       return;
     case "genesis":
       ledgerHashField(e.origin_entry, "origin_entry");
@@ -888,6 +895,37 @@ function reasonField(value: unknown, what: string): void {
   for (const ref of c.evidence) str(ref, `${what}.evidence[]`);
   if (!["high", "medium", "low", "unknown"].includes(c.confidence as string)) throw new Error(`${what}.confidence`);
   str(c.limits, `${what}.limits`, true);
+}
+
+/** What an apply or revert did to the private expression: "updated", "lags", or null; only a registered citizen has one. */
+function expressionField(e: Record<string, unknown>): void {
+  if (e.expression !== null && e.expression !== "updated" && e.expression !== "lags") throw new Error("expression");
+  if (e.expression !== null && e.signer !== "citizen") throw new Error("only a registered citizen has an expression");
+}
+
+/**
+ * A state entry's quiet (KS-004 6.4): a declaration names its `until` and
+ * the days asked for, on a move to listening or asleep or a renewal there; an
+ * end (null `until`) goes with a move to awake, or a "quiet" entry that is
+ * awake. Only a registered citizen has a quiet declaration. A "quiet" entry
+ * moves nothing: it is the signer's, outside a seat, and carries the quiet.
+ */
+function quietFields(e: Record<string, unknown>): void {
+  const hasUntil = Object.hasOwn(e, "quiet_until");
+  const hasDays = Object.hasOwn(e, "quiet_days");
+  if (e.via === "quiet" && (e.from !== e.to || e.seat_ref !== null || !hasUntil)) throw new Error("a quiet entry moves nothing, outside a seat, and carries its quiet");
+  if (!hasUntil) {
+    if (hasDays) throw new Error("quiet_days goes with a declared quiet_until");
+    return;
+  }
+  if (e.signer !== "citizen") throw new Error("only a registered citizen has a quiet declaration");
+  if (e.quiet_until === null) {
+    if (hasDays || e.to !== "awake") throw new Error("a quiet end goes with a move to awake");
+    return;
+  }
+  isoTime(e.quiet_until, "quiet_until");
+  if (e.to !== "listening" && e.to !== "asleep") throw new Error("a quiet declaration goes with listening or asleep");
+  if (!Number.isSafeInteger(e.quiet_days) || (e.quiet_days as number) < 1 || (e.quiet_days as number) > 30) throw new Error("quiet_days is whole days from 1 to 30");
 }
 
 function runtimeField(value: unknown): void {

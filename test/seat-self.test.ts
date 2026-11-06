@@ -133,7 +133,7 @@ describe("a self-op that cannot apply never costs the rest of the beat", () => {
       putPrivateExpression: async () => {
         throw new Error("agenttool did not answer");
       },
-      postReason: async () => null,
+      postBackup: async () => ({ thought_id: null, deferred: "error", credits: 0 }),
     };
     const r = await w.beat([{ type: "self.affirm", ref: p!.id }, { type: "state.set", to: "listening" }], { sync: failing });
     expect(r).toMatchObject({ exit: 0, outcome: "beat" });

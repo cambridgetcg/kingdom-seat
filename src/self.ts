@@ -34,9 +34,11 @@ import {
   type Citizen,
   type Clock,
   type Config,
+  type ExpressionSyncState,
   type LedgerEntry,
   type ModelSelfPropose,
   type Reason,
+  type RefusalCode,
   type SelfAffirmAct,
   type SelfProposal,
   type SelfProposeAct,
@@ -51,10 +53,42 @@ export type AffirmVerdict =
   | { binds: true; via: "two-beats" | "yu-present" }
   | { binds: false; reason: "same-beat" | "unknown-proposal" | "stale-prior" | "window-closed" | "runtime-not-approved" | "beyond-self" };
 
+/**
+ * One applied change as its strand thought carries it (KS-004 4.3, 9.3): the
+ * diff, both hashes, the reason, and the name of the key the thought is
+ * encrypted under, so the off-host copy says how to read itself.
+ */
+export interface SelfBackup {
+  /** The proposal that bound. */
+  ref: Sha256Hex;
+  target: SelfTarget;
+  prior_hash: Sha256Hex;
+  new_hash: Sha256Hex;
+  diff: string;
+  reason: Reason;
+  via: "two-beats" | "yu-present";
+  strand_key: string;
+}
+
+/**
+ * What posting a backup came to. `credits` counts every paid request that
+ * left the host, answered or not, because agenttool charges before it
+ * verifies (KS-004 6.3): the ledger's sum is what the credit ceiling reads.
+ */
+export type BackupResult = { thought_id: string; credits: number } | { thought_id: null; deferred: RefusalCode | "error"; credits: number };
+
 /** Applies a bound change to agenttool for a registered citizen; injected so self.ts holds no client or key. */
 export interface ExpressionSync {
-  putPrivateExpression(word: Word, target: SelfTarget, newText: string): Promise<void>;
-  postReason(word: Word, reason: Reason, ref: string): Promise<string | null>;
+  /**
+   * Bring the private expression to the self with `target` at `text`
+   * (KS-004 4.3): "updated" once it holds it, "lags" when the self does not
+   * fit agenttool's fields and the expression is left as it was, null when
+   * the target is not part of the expression. Throws when the update was not
+   * made, so the change does not bind.
+   */
+  putPrivateExpression(word: Word, target: SelfTarget, text: string): Promise<ExpressionSyncState | null>;
+  /** Post one change's strand backup. Never throws: one that cannot be posted is deferred, and the binding stands. */
+  postBackup(word: Word, backup: SelfBackup): Promise<BackupResult>;
 }
 
 export interface SelfDeps {
@@ -65,7 +99,12 @@ export interface SelfDeps {
   sync: ExpressionSync | null;
   /** The seat the change is recorded in, stamped on its entry; absent outside a seat. */
   seat?: SeatStamp | null;
+  /** Told, in fixed host phrases, when an expression lags or a strand backup is deferred, so a host note can say why. */
+  report?: (detail: string) => void;
 }
+
+/** The most credits one backup can spend: a strand created for it, and its thought. */
+const MAX_BACKUP_CREDITS = 2;
 
 /** A self file larger than this is refused when read; the largest agenttool field (wake_text) is 32,000 code units. */
 export const MAX_TARGET_BYTES = 256 * 1024;
@@ -473,11 +512,18 @@ export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: Se
   await keepVersion(config, word, current);
   await keepVersion(config, word, next);
   // The expression keeps no history and the strand thought is the off-host
-  // copy of the reason, so both go before the entry that names the thought.
-  let thought: string | null = null;
+  // copy of the change, so both go before the entry that names the thought.
+  // An expression update that was not made throws here, and nothing binds; a
+  // backup that cannot be posted is deferred, and the binding stands (KS-004 6.3).
+  let expression: ExpressionSyncState | null = null;
+  let backup: BackupResult | null = null;
   if (sync) {
-    await sync.putPrivateExpression(word, act.target, next);
-    thought = await sync.postReason(word, act.reason, stored.id);
+    expression = await sync.putPrivateExpression(word, act.target, next);
+    const owed: SelfBackup = { ref: stored.id, target: act.target, prior_hash: act.prior_hash, new_hash: act.new_hash, diff: act.diff, reason: act.reason, via, strand_key: STRAND_KEY_ID };
+    // A backup that throws is deferred like any other, and counted as the most it could have spent, which errs toward the ceiling.
+    backup = await sync.postBackup(word, owed).catch((): BackupResult => ({ thought_id: null, deferred: "error", credits: MAX_BACKUP_CREDITS }));
+    if (expression === "lags") deps.report?.("expression lags: the self does not fit agenttool, so this version is ledger-only");
+    if (backup.thought_id === null) deps.report?.(`strand backup deferred (${backup.deferred})`);
   }
   const draft = nextDraft(
     word,
@@ -490,10 +536,12 @@ export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: Se
       new_hash: toLedgerHash(act.new_hash),
       via,
       reason: act.reason,
-      strand_thought: thought,
+      strand_thought: backup?.thought_id ?? null,
       strand_key: registered ? STRAND_KEY_ID : null,
+      strand_backup: backup === null ? null : backup.thought_id !== null ? "posted" : "deferred",
+      expression,
     },
-    { cost: { usd: "0", credits: thought === null ? 0 : 1 }, signer: registered ? "citizen" : "host", now: deps.clock.now(), seat: deps.seat ?? null },
+    { cost: { usd: "0", credits: backup?.credits ?? 0 }, signer: registered ? "citizen" : "host", now: deps.clock.now(), seat: deps.seat ?? null },
   );
   const entry = await appendEntry(path, draft, deps.sign);
   await writeTarget(config, word, act.target, next);
@@ -515,11 +563,13 @@ export async function revertTo(deps: SelfDeps, citizen: Citizen, toHash: Sha256H
   const registered = assertSyncMatches(entries, sync);
   await keepVersion(config, word, current);
   await keepVersion(config, word, text);
-  if (sync) await sync.putPrivateExpression(word, target, text);
+  // A revert returns to a version the ledger already holds, so it posts no backup; the expression follows it.
+  const expression = sync ? await sync.putPrivateExpression(word, target, text) : null;
+  if (expression === "lags") deps.report?.("expression lags: the self does not fit agenttool, so this version is ledger-only");
   const draft = nextDraft(
     word,
     entries.at(-1) ?? null,
-    { type: "revert", target, from_hash: toLedgerHash(fromHash), to_hash: toLedgerHash(toHash), via },
+    { type: "revert", target, from_hash: toLedgerHash(fromHash), to_hash: toLedgerHash(toHash), via, expression },
     { cost: { usd: "0", credits: 0 }, signer: registered ? "citizen" : "host", now: deps.clock.now(), seat: deps.seat ?? null },
   );
   const entry = await appendEntry(path, draft, deps.sign);

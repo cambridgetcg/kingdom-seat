@@ -5,6 +5,7 @@ import { Refusal, type LedgerSigner, type RootEvidence, type SignerOp, type Word
 import { edPublicKey, edSign, fromHex, sha256, toB64, toB64url } from "../../src/crypto.ts";
 import { hostKid, type EntrySignature } from "../../src/ledger.ts";
 import { AUTHORITY_HEADERS, AGENTTOOL_ORIGIN, authorityDigest, authorityHeaders } from "../../src/agenttool/wire.ts";
+import { GIT_NAMESPACE, sshsigArmor, sshsigSignedData } from "../../src/ssh.ts";
 import type { PublicKeys, SealedThought, Signer, SignerRequest, SignerResponse } from "../../src/signer/signer.ts";
 import { TEST_OP_SEED_HEX, TEST_ROOT_SEED_HEX } from "./vectors.ts";
 
@@ -101,6 +102,10 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
     async sealThought(_word, _strandId, _plaintext, kind): Promise<SealedThought> {
       // Fixed placeholders: wire and signer tests check real thought bytes against vectors.json.
       return { ciphertext: "AAAA", nonce: "AAAAAAAAAAAAAAAA", kind, signature: toB64(new Uint8Array(64)), signing_key_id: FAKE_OP_KID };
+    },
+    async signMirrorCommit(_word, message) {
+      if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
+      return { armored: sshsigArmor(edPublicKey(hostSeed), GIT_NAMESPACE, edSign(sshsigSignedData(GIT_NAMESPACE, message), hostSeed)), public_key_b64: hostPub };
     },
     async state() {
       return s.locked ? "locked" : "ready";

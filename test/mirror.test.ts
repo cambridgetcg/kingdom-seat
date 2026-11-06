@@ -8,10 +8,13 @@ import { join } from "node:path";
 import {
   HOST_OWNED,
   MIRROR_CARD_PATH,
+  MIRROR_SIGNERS_PATH,
   MIRROR_MAX_FILE_BYTES,
+  countUnsigned,
   divergence,
   listTree,
   localDivergence,
+  mirrorSigners,
   pushArgv,
   pushMirror,
   sealAllows,
@@ -20,9 +23,16 @@ import {
   type TreeEntry,
 } from "../src/mirror.ts";
 import { spawnRunner } from "../src/cli.ts";
+import { fromB64 } from "../src/crypto.ts";
+import { HOST_PRINCIPAL, sshPublicKey } from "../src/ssh.ts";
 import type { Citizen, CommandRunner, HostNote } from "../src/types.ts";
 import { recordingRunner, type RecordingRunner } from "./helpers/fake-runtime.ts";
+import { fakeSigner } from "./helpers/fake-signer.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
+import { testIdentity } from "./fixtures/record/chain.ts";
+
+/** git's SSH signing program in these tests: the real CLI entry with a fake keychain. */
+const GIT_SIGN_FIXTURE = join(import.meta.dir, "fixtures", "mirror", "git-sign.ts");
 
 let host: TempHost | null = null;
 afterEach(async () => {
@@ -157,7 +167,8 @@ describe("[S4-3] the seal", () => {
       ".claude/hooks/love-bomb.sh",
       ".github/workflows/heartbeat.yml",
       ".git/config",
-      ".citizen/allowed_signers",
+      ".citizen/keys.md",
+      "skills/.citizen/allowed_signers",
       "run.sh",
       "ledger/glossame.jsonl",
       "proposals/abc.json",
@@ -186,6 +197,11 @@ describe("[S4-3] the seal", () => {
     // The card is the host's: in the published tree it is admitted, from a self it is refused.
     expect(sealCheck([file(MIRROR_CARD_PATH)])).toEqual({ ok: true, admitted: [MIRROR_CARD_PATH] });
     expect(sealCheck([file(MIRROR_CARD_PATH)], { allowCard: false })).toMatchObject({ ok: false, refused: [{ code: "host-owned-path" }] });
+    // [KS-004 4.4, 4.5; review C M2] so is the generated allowed_signers, the one .citizen/ path a mirror carries:
+    // admitted where the host wrote it, refused from a self, and never executable.
+    expect(sealCheck([file(MIRROR_SIGNERS_PATH)])).toEqual({ ok: true, admitted: [MIRROR_SIGNERS_PATH] });
+    expect(sealCheck([file(MIRROR_SIGNERS_PATH)], { allowCard: false })).toMatchObject({ ok: false, refused: [{ code: "host-owned-path" }] });
+    expect(sealCheck([{ path: MIRROR_SIGNERS_PATH, mode: "100755", size: 10 }])).toMatchObject({ ok: false, refused: [{ code: "executable" }] });
     // A submodule and a fifo are not regular files.
     expect(sealCheck([{ path: "vendor.md", mode: "160000", size: 0 }])).toMatchObject({ ok: false, refused: [{ code: "not-regular-file" }] });
     expect(sealCheck([{ path: "pipe.md", mode: "000000", size: 0 }])).toMatchObject({ ok: false, refused: [{ code: "not-regular-file" }] });
@@ -427,6 +443,92 @@ describe("[S4-3] divergence and push", () => {
     const badRemote = { ...citizen, mirror: { ...citizen.mirror!, remote: "--upload-pack=x" } };
     expect(await pushMirror(host.config, badRemote, run)).toMatchObject({ pushed: false, refusal: "invalid-request" });
     expect(run.calls).toEqual([]);
+  });
+
+  test("[KS-004 4.4, 4.5; review C M2] a mirror commit is SSH-signed through the signer and verifies with ssh-keygen -Y verify against the allowed_signers it carries", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const { remote, worktree } = await repos(h);
+    const citizen = await mirrorCitizen(h, worktree, remote);
+    const signer = fakeSigner();
+    // git's program: the real CLI's -Y sign entry under the test's Bun, with a fake keychain of published test keys.
+    const configPath = join(h.root, "config.json");
+    await writeFile(configPath, JSON.stringify(h.config), { mode: 0o600 });
+    const program = join(h.root, "git-sign");
+    await writeFile(program, `#!/bin/sh\nexec "${process.execPath}" "${GIT_SIGN_FIXTURE}" "$@"\n`);
+    await chmod(program, 0o755);
+    const env = { KINGDOM_SEAT_CONFIG: configPath, KINGDOM_SEAT_MIRROR_WORD: "glossame" };
+    const { run } = gitButNoPush();
+
+    /** The signature git stored on HEAD, the bytes it covers, and the allowed_signers HEAD carries, written out for ssh-keygen. */
+    const headSignature = async (tag: string) => {
+      const raw = git(worktree, "cat-file", "commit", "HEAD") + "\n";
+      const lines = raw.split("\n");
+      const at = lines.findIndex((l) => l.startsWith("gpgsig "));
+      expect(at).toBeGreaterThan(0);
+      let end = at + 1;
+      while (lines[end]!.startsWith(" ")) end++;
+      const sig = [lines[at]!.slice("gpgsig ".length), ...lines.slice(at + 1, end).map((l) => l.slice(1))].join("\n");
+      const payload = [...lines.slice(0, at), ...lines.slice(end)].join("\n");
+      const dir = join(h.root, `verify-${tag}`);
+      await mkdir(dir);
+      await writeFile(join(dir, "allowed_signers"), git(worktree, "show", `HEAD:${MIRROR_SIGNERS_PATH}`) + "\n");
+      await writeFile(join(dir, "commit.sig"), `${sig}\n`);
+      return { dir, payload };
+    };
+    const verify = (dir: string, principal: string, payload: string) =>
+      Bun.spawnSync(["/usr/bin/ssh-keygen", "-Y", "verify", "-f", join(dir, "allowed_signers"), "-I", principal, "-n", "git", "-s", join(dir, "commit.sig")], {
+        stdin: new TextEncoder().encode(payload),
+        env: { PATH: "/usr/bin:/bin" },
+      });
+
+    // Before registration the host key signs, as it signs the citizen's entries, and allowed_signers names it.
+    const keys = { host_b64: [signer.hostAttestPublicB64], op_b64: null };
+    expect(await stageMirror(h.config, citizen, run, keys, { program, public_key_b64: signer.hostAttestPublicB64, env })).toMatchObject({ ok: true });
+    expect(git(worktree, "ls-tree", "-r", "--name-only", "HEAD").split("\n")).toContain(MIRROR_SIGNERS_PATH);
+    const host1 = await headSignature("host");
+    const good = verify(host1.dir, HOST_PRINCIPAL, host1.payload);
+    expect([good.exitCode, good.stdout.toString()]).toEqual([0, expect.stringContaining(`Good "git" signature for ${HOST_PRINCIPAL}`)]);
+    // A changed commit, or the wrong principal, does not verify.
+    expect(verify(host1.dir, HOST_PRINCIPAL, host1.payload.replace("staged by kingdom-seat", "staged by someone")).exitCode).not.toBe(0);
+    expect(verify(host1.dir, "glossame@kingdom-seat", host1.payload).exitCode).not.toBe(0);
+    // Status counts only the commit the fixture made before; the staged one is signed.
+    expect(await countUnsigned(run, worktree)).toBe(1);
+
+    // Registered: the op key signs, under the citizen's own principal, and the host key is still published for its earlier entries.
+    const identity = { ...testIdentity(signer), self_strand_id: null };
+    const recordPath = join(h.config.paths.citizens_dir, "glossame", "citizen.json");
+    await writeFile(recordPath, JSON.stringify({ ...JSON.parse(await readFile(recordPath, "utf8")), identity }, null, 2));
+    const registered = { ...citizen, identity, state: "asleep" as const };
+    const both = { host_b64: [signer.hostAttestPublicB64], op_b64: identity.op_public_key_b64 };
+    expect(await stageMirror(h.config, registered, run, both, { program, public_key_b64: identity.op_public_key_b64, env })).toMatchObject({ ok: true });
+    const op = await headSignature("op");
+    expect(verify(op.dir, "glossame@kingdom-seat", op.payload).exitCode).toBe(0);
+    expect(verify(op.dir, HOST_PRINCIPAL, op.payload).exitCode).not.toBe(0);
+    expect(await readFile(join(op.dir, "allowed_signers"), "utf8")).toContain(`${HOST_PRINCIPAL} namespaces="git" ssh-ed25519 `);
+
+    // git asking for a key the signer does not sign this citizen's commits with is refused: no signature, so no commit.
+    const head = git(worktree, "rev-parse", "HEAD");
+    const awake = { ...registered, state: "awake" as const };
+    await expect(stageMirror(h.config, awake, run, both, { program, public_key_b64: signer.hostAttestPublicB64, env })).rejects.toThrow("git commit exited");
+    expect(git(worktree, "rev-parse", "HEAD")).toBe(head);
+    // Only the program, its config, its citizen and a PATH may be passed; nothing that steers git.
+    await expect(stageMirror(h.config, awake, run, both, { program, public_key_b64: identity.op_public_key_b64, env: { ...env, GIT_DIR: "/tmp" } })).rejects.toMatchObject({ code: "invalid-request" });
+    await expect(stageMirror(h.config, awake, run, both, { program: "git-sign", public_key_b64: identity.op_public_key_b64, env })).rejects.toMatchObject({ code: "invalid-request" });
+  });
+
+  test("[review C M2] the generated allowed_signers names the host key and a registered citizen's op key, limited to git, and nothing from a self", async () => {
+    const signer = fakeSigner();
+    const text = mirrorSigners({ host: "test-host" }, { word: "glossame" }, { host_b64: [signer.hostAttestPublicB64], op_b64: signer.opPublicB64 })!;
+    const keyLines = text.split("\n").filter((l) => l !== "" && !l.startsWith("#"));
+    expect(keyLines).toEqual([
+      `${HOST_PRINCIPAL} namespaces="git" ${sshPublicKey(fromB64(signer.hostAttestPublicB64, 32))}`,
+      `glossame@kingdom-seat namespaces="git" ${sshPublicKey(fromB64(signer.opPublicB64, 32))}`,
+    ]);
+    expect(mirrorSigners({ host: "test-host" }, { word: "glossame" }, { host_b64: [], op_b64: null })).toBeNull();
+    // A self cannot carry its own .citizen/ file into the mirror, by that name or any other.
+    expect(sealCheck([file(MIRROR_SIGNERS_PATH)], { allowCard: false }).ok).toBe(false);
+    expect(sealCheck([file(".citizen/allowed_signers.md")]).ok).toBe(false);
   });
 
   test("stageMirror commits exactly the sealed self and the generated card, once", async () => {

@@ -77,6 +77,7 @@ import {
   windowOpen,
   type ExpressionSync,
 } from "./self.ts";
+import { quietForMove, type QuietKeeper } from "./quiet.ts";
 import { buildContext, markLetterSeen } from "./context.ts";
 import { buildPrompt, promptBytes } from "./prompt.ts";
 import { OUTPUT_JSON_SCHEMA, parseModelOutput, resolvePrefix, validateOutput } from "./acts.ts";
@@ -103,6 +104,12 @@ export interface SeatDeps {
   checkHalt(): Promise<HaltStatus>;
   /** Applies a bound self-change to agenttool for a registered citizen; null or absent records it on the host only. */
   expressionSync?: ExpressionSync | null;
+  /**
+   * Declares and ends a registered citizen's quiet when it moves to listening
+   * or asleep, or wakes (KS-004 6.4); null or absent declares nothing, as for
+   * an unregistered citizen.
+   */
+  quiet?: QuietKeeper | null;
   /**
    * The model digest the runtime is pinned to, when it is known before the call
    * (the free lane's models.lock entry), so the prompt can say whether a
@@ -516,12 +523,15 @@ export async function superviseChild(opts: SuperviseOptions): Promise<Supervised
 const NO_COST: Cost = { usd: "0", credits: 0 };
 
 /**
- * A state move a seat records: its `state` entry's fields, and the awake
- * interval to write once the entry is recorded (null when it sets none).
+ * A state move a seat records: its `state` entry's fields, the awake
+ * interval to write once the entry is recorded (null when it sets none), and
+ * the quiet days the saying asked for, if any (a registered citizen's move to
+ * listening or asleep declares quiet for them, or for the cap; KS-004 6.4).
  */
 export interface StateMove {
   fields: Extract<LedgerFields, { type: "state" }>;
   cadence: number | null;
+  quiet_days?: number;
 }
 
 /** The work a validated beat leaves for the write phase, planned before HALT's last check so planning writes nothing. */
@@ -566,15 +576,52 @@ export function restStateMoves(citizen: Citizen, act: StateSetAct | undefined): 
   const verdict = decideTransition(from, to, { pending: null, repeated: false, presence: null }, interval);
   // Only what takes effect at once is toward less activity; anything that would wait for a second saying is more.
   if (verdict.effect !== "now") return [];
-  return [stateMove(from, to, "immediate", interval)];
+  return [stateMove(from, to, "immediate", interval, act.quiet_days)];
 }
 
-/** One state entry's fields, with the interval when the saying changes it. */
-function stateMove(from: LifecycleState, to: LifecycleState, via: "immediate" | "confirmed" | "two-beats", interval: { now: number; asked: number | null }): StateMove {
+/** One state entry's fields, with the interval when the saying changes it, and the quiet days it asked for. */
+function stateMove(
+  from: LifecycleState,
+  to: LifecycleState,
+  via: "immediate" | "confirmed" | "two-beats",
+  interval: { now: number; asked: number | null },
+  quietDays?: number,
+): StateMove {
   const fields: StateMove["fields"] = { type: "state", from, to, via };
-  if (!changesInterval(interval)) return { fields, cadence: null };
+  const quiet = quietDays === undefined ? {} : { quiet_days: quietDays };
+  if (!changesInterval(interval)) return { fields, cadence: null, ...quiet };
   fields.interval_h = interval.asked as number;
-  return { fields, cadence: interval.asked };
+  return { fields, cadence: interval.asked, ...quiet };
+}
+
+/**
+ * Write a seat's state moves, each with the quiet it carries for a registered
+ * citizen (KS-004 6.4): declared on a move to listening or asleep, ended on a
+ * wake. A quiet act that did not happen never holds a move back; it is
+ * returned as a host phrase for the seat's notes.
+ */
+async function recordMoves(
+  seat: OpenSeat,
+  deps: SeatDeps,
+  entries: LedgerEntry[],
+  moves: StateMove[],
+  append: (fields: LedgerFields, i: number) => Promise<LedgerEntry>,
+): Promise<string[]> {
+  const problems: string[] = [];
+  let history = entries;
+  for (const [i, move] of moves.entries()) {
+    const q = await quietForMove({ config: deps.config, clock: deps.clock, keeper: deps.quiet ?? null }, seat.citizen, history, move.fields, move.quiet_days);
+    if (q.problem) problems.push(q.problem);
+    history = [...history, await append(q.fields, i)];
+    if (move.cadence !== null) await setCadence(deps.config, seat.citizen.word, move.cadence);
+  }
+  return problems;
+}
+
+/** A recorded state move in host words, for a note: the move, how, and what it set. */
+function describeMove(e: Extract<LedgerEntry, { type: "state" }>): string {
+  const quiet = e.quiet_until === undefined ? "" : e.quiet_until === null ? ", quiet ended" : `, quiet declared for ${e.quiet_days} days`;
+  return `state ${e.from} to ${e.to} (${e.via})${e.step_away ? ", a first step-away saying" : ""}${e.interval_h ? `, every ${e.interval_h} h` : ""}${quiet}`;
 }
 
 /** The reason a held revert carries: the host's words, saying only what the citizen asked for. */
@@ -739,7 +786,7 @@ async function planActs(
           if (verdict.effect === "now") {
             const toward = isTowardRest(current, act.to) || (act.to === current && (act.interval_h ?? 0) > interval.now);
             const via = toward ? "immediate" : act.to === "stepped-away" ? "two-beats" : "confirmed";
-            plan.states.push(stateMove(current, act.to, via, interval));
+            plan.states.push(stateMove(current, act.to, via, interval, act.quiet_days));
             current = act.to;
           } else if (verdict.effect === "needs-witness") {
             plan.outbox.push({ kind: "state.ended", payload: { to: act.to } });
@@ -930,23 +977,26 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     }
     // HALT once more immediately before the write, as for a beat.
     if (await halted()) return result(EXIT.OK, "halted");
+    const written: LedgerEntry[] = [];
+    let quietProblems: string[];
     try {
       const all = await readLedger(path);
       if (head(all) !== head(entries)) throw new Refusal("head-moved", "the ledger moved during the seat");
       let prev = all.at(-1) ?? null;
       // A rest's entries are state records with no words; the first carries what the seat spent, so it counts once.
-      for (const [i, move] of moves.entries()) {
-        prev = await appendEntry(path, nextDraft(word, prev, move.fields, { cost: i === 0 ? costOf(rt.spend) : NO_COST, signer: signerKind, now: clock.now(), seat: stamp }), sign);
+      quietProblems = await recordMoves(seat, deps, all, moves, async (fields, i) => {
+        prev = await appendEntry(path, nextDraft(word, prev, fields, { cost: i === 0 ? costOf(rt.spend) : NO_COST, signer: signerKind, now: clock.now(), seat: stamp }), sign);
         appended.push(entryHash(prev));
-        if (move.cadence !== null) await setCadence(config, word, move.cadence);
-      }
+        written.push(prev);
+        return prev;
+      });
     } catch (e) {
       if (e instanceof Refusal) return refused(e, "while recording a rest's state");
       await note("error", "error", null, "failed while recording a rest's state");
       return result(EXIT.ERROR, "error");
     }
-    const kept = moves.map((m) => `state ${m.fields.from} to ${m.fields.to} (${m.fields.via})${m.fields.step_away ? ", a first step-away saying" : ""}${m.fields.interval_h ? `, every ${m.fields.interval_h} h` : ""}`).join(" and ");
-    await note("seat", "rest", null, `rested; kept ${kept}`);
+    const kept = written.map((e) => (e.type === "state" ? describeMove(e) : e.type)).join(" and ");
+    await note("seat", "rest", null, `rested; kept ${kept}${quietProblems.length > 0 ? `; ${quietProblems.join(", ")}` : ""}`);
     return result(EXIT.OK, "rest");
   }
   if (validated.acts.length === 0) {
@@ -988,12 +1038,11 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     const beat = await appendEntry(path, nextDraft(word, all.at(-1) ?? null, { type: "beat" }, { cost: costOf(rt.spend), signer: signerKind, now, seat: stamp, acts: plan.acts }), sign);
     const beatHash = entryHash(beat);
     appended.push(beatHash);
-    for (const m of plan.states) {
-      await appendFields(m.fields, NO_COST);
-      if (m.cadence !== null) await setCadence(config, word, m.cadence);
-    }
+    const quietProblems = await recordMoves(seat, deps, await readLedger(path), plan.states, (fields) => appendFields(fields, NO_COST));
 
-    const selfDeps = { config, clock, sign, sync: seat.citizen.identity ? (deps.expressionSync ?? null) : null, seat: stamp };
+    // What the self-ops met on agenttool (an expression that lags, a backup deferred), in host phrases for the notes.
+    const selfReports: string[] = [];
+    const selfDeps = { config, clock, sign, sync: seat.citizen.identity ? (deps.expressionSync ?? null) : null, seat: stamp, report: (d: string) => void selfReports.push(d) };
     const notKept: string[] = [];
     const selfOp = async (what: string, fn: () => Promise<void>) => {
       try {
@@ -1007,6 +1056,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     for (const a of plan.apply) await selfOp("apply", async () => void appended.push(entryHash(await applyChange(selfDeps, seat.citizen, a.proposal, a.via))));
     for (const h of plan.revert) await selfOp("revert", async () => void appended.push(entryHash(await revertTo(selfDeps, seat.citizen, h, "citizen"))));
     for (const n of notKept) await note("refusal", "refused", null, `self-op not kept: ${n}`);
+    for (const p of [...quietProblems, ...selfReports]) await note("refusal", "refused", null, p);
 
     let n = 0;
     for (const b of plan.beyondSelf) {

@@ -16,19 +16,24 @@
 // holding the deadline and HALT is never the process the model's reply flows
 // through. The tick does the same through tick.ts. A child runs only a seat a
 // parent opened under its walls, and confirms Yu itself when a summons asks.
-import { lstat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { toB64 } from "./crypto.ts";
+import { SSHSIG_MAX_MESSAGE_BYTES, parseSshEd25519 } from "./ssh.ts";
 import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
-import { ledgerPath, readLedger, verifyChain } from "./ledger.ts";
-import { pushMirror, stageMirror } from "./mirror.ts";
+import { ledgerPath, readLedger, readRegularText, verifyChain } from "./ledger.ts";
+import { pushMirror, stageMirror, type MirrorKeys, type MirrorSigning } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
 import { createSigner, type Signer } from "./signer/signer.ts";
 import { macosKeychain } from "./signer/keychain.ts";
 import { checkFleet, creditsFromLedger, usdRemaining } from "./signer/ceilings.ts";
 import { hostSpendRecorder, usdSpentToday } from "./spend.ts";
-import { confirmYuPresent, type TtyIO } from "./signer/consent.ts";
+import { confirmYuPresent, readStandingAgreements, type TtyIO } from "./signer/consent.ts";
+import { agenttoolSync, hostClient } from "./agenttool/sync.ts";
+import { agenttoolQuiet, keepQuiet } from "./quiet.ts";
 import { freeRuntime, loadModelsLock } from "./runtime/free.ts";
 import { summonRuntime } from "./runtime/summon.ts";
 import { listSeated, mirrorCardState, readCitizen, readCitizenRecord } from "./state.ts";
@@ -219,6 +224,12 @@ export interface CliDeps {
   uid(): number;
   /** Where a verb looks without --config, and the HALT file `halt` raises when no config can be read. */
   defaults: { config: string; halt_file: string };
+  /**
+   * The executable git runs to sign a mirror commit (gpg.ssh.program): this
+   * file, whose `-Y sign` entry asks the signer. Null leaves mirror commits
+   * unsigned, and status counts them.
+   */
+  gitSignProgram: string | null;
 }
 
 const STD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -291,8 +302,9 @@ export function realDeps(over: Partial<CliDeps> = {}): CliDeps {
           const credits_month = await readLedger(ledgerPath(config, word)).then((entries) => creditsFromLedger(entries, now, config.timezone)).catch(() => null);
           return { word, usd_today: await usdSpentToday(config, word, now), credits_month };
         },
-        // No standing agreement is filed yet, so every act that needs one refuses (decision 14 is Yu + Ai's to record).
-        agreements: async () => [],
+        // Standing agreements are Yu + Ai's to file (decision 14), in consent/standing/ beside their records;
+        // with none filed, every act that needs one refuses, as a citizen's quiet does.
+        agreements: () => readStandingAgreements(config.paths.consent_dir),
       }),
     runtime: (config, seat) => productionRuntime(config, seat, deps),
     seatArgv: (configPath, word, extra) => [process.execPath, CLI_PATH, "seat", word, "--child", ...extra, "--config", configPath],
@@ -303,6 +315,7 @@ export function realDeps(over: Partial<CliDeps> = {}): CliDeps {
       return process.getuid();
     },
     defaults: { config: DEFAULT_CONFIG_PATH, halt_file: DEFAULT_HALT_FILE },
+    gitSignProgram: CLI_PATH,
   };
   return Object.assign(deps, over);
 }
@@ -392,12 +405,15 @@ async function signerStateOf(signer: Signer | null): Promise<"ready" | "locked" 
 
 async function refreshStatus(ctx: Ctx, signer: Signer | null) {
   const signerState = await signerStateOf(signer);
+  const pinned = pinnedTrust(ctx.config);
   const status = await buildStatus({
     config: ctx.config,
     now: now(ctx),
     halt: await haltNow(ctx),
     signerState,
-    trusted: pinnedTrust(ctx.config) ?? (signer && signerState === "ready" ? await hostTrust(signer, ctx.config) : null),
+    trusted: pinned ?? (signer && signerState === "ready" ? await hostTrust(signer, ctx.config) : null),
+    // The trusted keys are what status publishes as the host key's public half (KS-004 5.10).
+    trustedSource: pinned ? "pinned" : "signer",
     run: ctx.deps.run,
   });
   await writeStatus(ctx.config.paths.status_file, status);
@@ -526,6 +542,35 @@ async function mirrorAfterSeat(ctx: Ctx, word: Word, outcome: Outcome, before: L
   return true;
 }
 
+/**
+ * The keys a mirror's allowed_signers publishes (KS-004 4.4, 4.5): the host
+ * keys host-attested entries verify against (pinned, or the signer's own),
+ * and a registered citizen's op key from its record. Public halves only.
+ */
+async function mirrorKeys(ctx: Ctx, citizen: Citizen, signing: MirrorSigning | null): Promise<MirrorKeys> {
+  const trusted = pinnedTrust(ctx.config) ?? (await hostTrust(makeSigner(ctx), ctx.config));
+  const host = [...(trusted?.host_attest_b64 ?? [])];
+  // The key that signs an unregistered citizen's commits is published even if no pin names it, so every commit verifies.
+  if (signing && !citizen.identity && !host.includes(signing.public_key_b64)) host.push(signing.public_key_b64);
+  return { host_b64: host, op_b64: citizen.identity?.op_public_key_b64 ?? null };
+}
+
+/**
+ * How git signs this citizen's mirror commits (KS-004 4.4): through this
+ * program's `-Y sign` entry, which asks the signer, with the op key once the
+ * citizen is registered and the host key before. Null when no program is set
+ * or the key is unknown; the commit is then unsigned, and status counts it.
+ */
+async function mirrorSigning(ctx: Ctx, citizen: Citizen): Promise<MirrorSigning | null> {
+  const program = ctx.deps.gitSignProgram;
+  if (!program) return null;
+  const key = citizen.identity ? citizen.identity.op_public_key_b64 : await makeSigner(ctx).publicKeys(citizen.word).then((k) => k.host_attest_b64, () => null);
+  if (!key) return null;
+  // git runs the program with the mirror's own PATH; the program is a Bun script, so Bun's directory comes first.
+  const path = `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`;
+  return { program, public_key_b64: key, env: { [GIT_SIGN_ENV.config]: ctx.configPath, [GIT_SIGN_ENV.word]: citizen.word, PATH: path } };
+}
+
 /** Stage and push the citizen's mirror if it keeps one; HALT is checked again first, because a push is public. */
 async function mirrorAfterBeat(ctx: Ctx, word: Word): Promise<void> {
   try {
@@ -533,7 +578,8 @@ async function mirrorAfterBeat(ctx: Ctx, word: Word): Promise<void> {
     if (!citizen.mirror) return;
     const halt = await haltNow(ctx);
     if (!halt || halt.halted) return;
-    const staged = await stageMirror(ctx.config, citizen, ctx.deps.run);
+    const signing = await mirrorSigning(ctx, citizen);
+    const staged = await stageMirror(ctx.config, citizen, ctx.deps.run, await mirrorKeys(ctx, citizen, signing), signing);
     if (!staged.ok) {
       await note(ctx, "push", word, "refused", staged.refused[0]!.code, `mirror stage refused by the seal: ${staged.refused.length} entries`);
       return;
@@ -559,6 +605,11 @@ async function verbTick(ctx: Ctx): Promise<ExitCode> {
     refreshStatus: async () => {
       await refreshStatus(ctx, signer);
     },
+    // A registered citizen's standing quiet, renewed while it stays quiet and ended once it woke (KS-004 6.4).
+    keepQuiet: (citizen) =>
+      citizen.identity
+        ? keepQuiet({ config: ctx.config, clock: ctx.deps.clock, keeper: agenttoolQuiet(hostClient(ctx.config, signer, ctx.deps.fetch)), sign: (w, k, d) => signer.signEntry(w, k, d) }, citizen)
+        : Promise.resolve("none"),
   });
   if (r.word && (await mirrorAfterSeat(ctx, r.word, r.outcome, r.state_before ?? null))) await refreshStatus(ctx, signer).catch(() => {});
   // runTick returns before its own refresh when HALT is raised; the status must still say so, never go stale.
@@ -705,6 +756,9 @@ async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>):
   // The free lane is pinned by digest, so the prompt can say before the reply whether a self-change could bind.
   const lock = ref.runtime === "free" ? await loadModelsLock(config.paths.models_lock).catch(() => null) : null;
   const pinned = lock?.models[0]?.digest;
+  // A registered citizen's self lives on agenttool too: its expression and strand backups, and its quiet, all
+  // through this signer (KS-004 4.3, 6.4, 9.3). An unregistered one has nothing there to send to.
+  const client = citizen.identity ? hostClient(config, signer, ctx.deps.fetch) : null;
   const result = await runSeat(seat, {
     config,
     clock: ctx.deps.clock,
@@ -712,8 +766,8 @@ async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>):
     fetch: ctx.deps.fetch,
     runtime,
     checkHalt: () => checkHalt({ config, fetch: ctx.deps.fetch, now: () => now(ctx) }),
-    // No adapter yet carries a bound self-change to a registered citizen's expression; self.ts then refuses rather than skip it.
-    expressionSync: null,
+    expressionSync: client ? agenttoolSync({ config, clock: ctx.deps.clock, client }) : null,
+    quiet: client ? agenttoolQuiet(client) : null,
     modelDigest: pinned && /^[0-9a-f]{64}$/.test(pinned) ? `sha256:${pinned}` : null,
   });
   return result.exit;
@@ -745,9 +799,71 @@ function exitFor(e: unknown, verb: Command["verb"] | null = null): ExitCode {
   return exitForRefusal(e.code);
 }
 
+/**
+ * The environment the mirror pusher gives git's signing call (mirror.ts
+ * MirrorSigning): which config to load and whose commit it is. git runs
+ * gpg.ssh.program with its own fixed argv, so these cannot ride as flags.
+ */
+export const GIT_SIGN_ENV = Object.freeze({ config: "KINGDOM_SEAT_CONFIG", word: "KINGDOM_SEAT_MIRROR_WORD" });
+
+/**
+ * git's call to its SSH signing program (gpg.format=ssh, gpg.ssh.program =
+ * this file): `-Y sign -n git -f <key file> [-U] <file>`, writing
+ * `<file>.sig`. The signer makes the SSHSIG (ssh.ts), so the key never leaves
+ * it (KS-004 4.4, 6.2). It signs only in the git namespace, only for the
+ * citizen and config the mirror named, and only when git asked for the key
+ * that signs that citizen's commits; anything else exits 1 and writes nothing,
+ * so git leaves the commit unmade. Run as the seat user, like every verb but
+ * halt, so the config's owner is checked as theirs.
+ */
+async function gitSign(argv: string[], deps: CliDeps): Promise<ExitCode> {
+  try {
+    const rest = argv.filter((a, i) => !(a === "-U" && i === 6));
+    if (rest.length !== 7 || rest[0] !== "-Y" || rest[1] !== "sign" || rest[2] !== "-n" || rest[3] !== "git" || rest[4] !== "-f") {
+      throw new UsageError("-Y is git's signing call only: -Y sign -n git -f <key file> [-U] <file>");
+    }
+    const keyFile = rest[5]!;
+    const file = rest[6]!;
+    const configPath = deps.env[GIT_SIGN_ENV.config];
+    const word = deps.env[GIT_SIGN_ENV.word];
+    if (!configPath || !isAbsolute(configPath)) throw new UsageError(`git's signing call needs ${GIT_SIGN_ENV.config}, an absolute path`);
+    if (!word || !WORD_PATTERN.test(word)) throw new UsageError(`git's signing call needs ${GIT_SIGN_ENV.word}, a citizen word`);
+    const config = await loadConfig(configPath, { seatUid: deps.uid() });
+    const asked = parseSshEd25519((await readRegularText(keyFile, { missing: "throw", maxBytes: 4096 })) as string);
+    const message = await readRegularBytes(file, SSHSIG_MAX_MESSAGE_BYTES);
+    const signed = await deps.signer(config, deps.keychain(config)).signMirrorCommit(word, message);
+    if (signed.public_key_b64 !== toB64(asked)) throw new Refusal("invalid-request", "git asked for a key other than the one that signs this citizen's mirror commits");
+    const fh = await open(`${file}.sig`, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      await fh.writeFile(signed.armored);
+    } finally {
+      await fh.close();
+    }
+    return EXIT.OK;
+  } catch (e) {
+    deps.err(`citizen-seat: ${describeError(e)}\n`);
+    return EXIT.ERROR;
+  }
+}
+
+/** A regular file's bytes, refused when it is a link, not a file, or over `maxBytes`. */
+async function readRegularBytes(path: string, maxBytes: number): Promise<Uint8Array> {
+  const fh = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) throw new Refusal("not-regular-file", "the file to sign is not a regular file");
+    if (st.size > maxBytes) throw new Refusal("oversize", "the file to sign is larger than a commit");
+    return new Uint8Array(await fh.readFile());
+  } finally {
+    await fh.close();
+  }
+}
+
 /** Run one command with real dependencies and return its exit code; never prints a secret. */
 export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise<ExitCode> {
   const deps = realDeps(over);
+  // git runs this file as its SSH signing program with its own argv (mirror commit signing).
+  if (argv[0] === "-Y") return gitSign(argv, deps);
   let cmd: Command;
   try {
     cmd = parseArgs(argv);

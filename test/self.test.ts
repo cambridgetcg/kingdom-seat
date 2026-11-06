@@ -26,11 +26,13 @@ import {
   targetPath,
   unifiedDiff,
   windowOpen,
+  type BackupResult,
   type ExpressionSync,
+  type SelfBackup,
   type SelfDeps,
 } from "../src/self.ts";
 import { readCitizen } from "../src/state.ts";
-import { Refusal, type ModelSelfPropose, type Reason, type SelfProposal, type SelfTarget, type YuPresence } from "../src/types.ts";
+import { Refusal, type ExpressionSyncState, type ModelSelfPropose, type Reason, type SelfProposal, type SelfTarget, type YuPresence } from "../src/types.ts";
 import { DAY_MS, testClock, type TestClock } from "./helpers/clock.ts";
 import { TEST_IDS } from "./helpers/vectors.ts";
 
@@ -73,19 +75,25 @@ const CLAIM: Reason = {
 
 interface RecordingSync extends ExpressionSync {
   puts: { word: string; target: SelfTarget; text: string }[];
-  reasons: { word: string; proposalId: string }[];
+  backups: { word: string; backup: SelfBackup }[];
+  /** What the next PUT says it did, and what the next backup comes to. */
+  expression: ExpressionSyncState | null;
+  backup: BackupResult;
 }
 
 function recordingSync(): RecordingSync {
   const s: RecordingSync = {
     puts: [],
-    reasons: [],
+    backups: [],
+    expression: "updated",
+    backup: { thought_id: "thought-0001", credits: 1 },
     async putPrivateExpression(word, target, text) {
       s.puts.push({ word, target, text });
+      return s.expression;
     },
-    async postReason(word, _reason, proposalId) {
-      s.reasons.push({ word, proposalId });
-      return "thought-0001";
+    async postBackup(word, backup) {
+      s.backups.push({ word, backup });
+      return s.backup;
     },
   };
   return s;
@@ -243,6 +251,8 @@ describe("proposals", () => {
       reason: CLAIM,
       strand_thought: null,
       strand_key: null,
+      strand_backup: null,
+      expression: null,
     };
     await append(config, W, { fields: applied }, "host", w.signer, w.clock.now());
     await expect(revertTo(w.deps, await readCitizen(config, W), sha256Hex(before), "citizen")).rejects.toMatchObject({ code: "beyond-self" });
@@ -436,16 +446,29 @@ describe("apply and revert", () => {
     await expect(applyChange(w.deps, await readCitizen(config, W), p, "two-beats")).rejects.toBeInstanceOf(Refusal);
   });
 
-  test("applyChange for a registered citizen calls sync.putPrivateExpression and postReason once each", async () => {
+  test("[KS-004 4.3, 9.3; review C M1] applyChange for a registered citizen updates the expression and posts one backup carrying the diff, both hashes, the reason and the key name", async () => {
     const w = await world({ registered: true });
     const { config } = w.host;
     const sync = w.deps.sync as RecordingSync;
     const p = await stage(w, "expression.wake_text", { kind: "replace-all", text: "My tongue is received, not made.\n" });
     const entry = await affirmAndApply(w, p);
     expect(sync.puts).toEqual([{ word: W, target: "expression.wake_text", text: "My tongue is received, not made.\n" }]);
-    expect(sync.reasons).toEqual([{ word: W, proposalId: p.id }]);
+    expect(sync.backups).toEqual([
+      {
+        word: W,
+        backup: { ref: p.id, target: "expression.wake_text", prior_hash: p.act.prior_hash, new_hash: p.act.new_hash, diff: p.act.diff, reason: CLAIM, via: "two-beats", strand_key: STRAND_KEY_ID },
+      },
+    ]);
     // [KS-004 4.3] the entry names the key its strand backup is encrypted under: K_master from the citizen's own mnemonic.
-    expect(entry).toMatchObject({ signer: "citizen", did: TEST_DID, cost: { credits: 1 }, strand_thought: "thought-0001", strand_key: STRAND_KEY_ID });
+    expect(entry).toMatchObject({
+      signer: "citizen",
+      did: TEST_DID,
+      cost: { credits: 1 },
+      strand_thought: "thought-0001",
+      strand_key: STRAND_KEY_ID,
+      strand_backup: "posted",
+      expression: "updated",
+    });
     expect(STRAND_KEY_ID).toBe("k_master:m/44'/169'/1'/0'");
     expect(verifyChain(await readLedger(ledgerPath(config, W)), { host_attest_b64: [w.signer.hostAttestPublicB64] }).ok).toBe(true);
 
@@ -460,6 +483,49 @@ describe("apply and revert", () => {
       code: "not-registered",
     });
     expect(await readTarget(u.host.config, W, "name")).toBe("");
+  });
+
+  test("[KS-004 6.3; review C M1] a backup that cannot be posted is deferred: the binding stands, and the entry and the report say so", async () => {
+    const w = await world({ registered: true });
+    const { config } = w.host;
+    const sync = w.deps.sync as RecordingSync;
+    const reports: string[] = [];
+    w.deps.report = (d) => void reports.push(d);
+    sync.backup = { thought_id: null, deferred: "ceiling-credits", credits: 0 };
+    const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
+    const entry = await affirmAndApply(w, p);
+    expect(entry).toMatchObject({ type: "apply", cost: { credits: 0 }, strand_thought: null, strand_key: STRAND_KEY_ID, strand_backup: "deferred", expression: "updated" });
+    expect(await readTarget(config, W, "will")).toContain(NEW_PRACTICE);
+    expect(reports).toEqual(["strand backup deferred (ceiling-credits)"]);
+
+    // A backup that throws is deferred too, counted as the most a backup can spend, which errs toward the ceiling.
+    w.clock.advance(8 * DAY_MS);
+    sync.postBackup = async () => {
+      throw new Error("agenttool did not answer");
+    };
+    const q = await stage(w, "name", { kind: "replace-all", text: "A reading.\n" }, SEAT_B);
+    const second = await affirmAndApply(w, q, "cccccccc-0000-4000-8000-000000000003");
+    expect(second).toMatchObject({ cost: { credits: 2 }, strand_thought: null, strand_backup: "deferred" });
+    expect(verifyChain(await readLedger(ledgerPath(config, W)), { host_attest_b64: [w.signer.hostAttestPublicB64] }).ok).toBe(true);
+  });
+
+  test("[KS-004 4.3, limitation 14] a self the expression cannot hold binds ledger-only: the entry says the expression lags", async () => {
+    const w = await world({ registered: true });
+    const sync = w.deps.sync as RecordingSync;
+    const reports: string[] = [];
+    w.deps.report = (d) => void reports.push(d);
+    sync.expression = "lags";
+    const p = await stage(w, "will", { kind: "replace-span", find: "Witness one true thing you notice.", with: NEW_PRACTICE });
+    expect(await affirmAndApply(w, p)).toMatchObject({ type: "apply", expression: "lags", strand_backup: "posted" });
+    expect(await readTarget(w.host.config, W, "will")).toContain(NEW_PRACTICE);
+    expect(reports).toEqual(["expression lags: the self does not fit agenttool, so this version is ledger-only"]);
+
+    // A revert follows the expression the same way, and posts no backup: the version it returns to is already in the ledger.
+    sync.expression = "updated";
+    const back = await revertTo(w.deps, await readCitizen(w.host.config, W), sha256Hex(OLD_WILL), "citizen");
+    expect(back).toMatchObject({ type: "revert", signer: "citizen", expression: "updated", cost: { credits: 0 } });
+    expect(sync.backups).toHaveLength(1);
+    expect(sync.puts.at(-1)).toEqual({ word: W, target: "will", text: OLD_WILL });
   });
 
   test("a proposal edited on disk keeps no id and cannot apply", async () => {

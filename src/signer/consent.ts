@@ -172,6 +172,63 @@ export async function readConsentFor(dir: string, proposal: ProposalText): Promi
   return readRecord(join(dir, `${digest}.json`), `${digest}.json`);
 }
 
+/** Where standing agreements are filed, under the consent dir: one `<name>.json` each. */
+export const STANDING_DIR = "standing";
+export const STANDING_FORMAT = "kingdom-seat-standing/v1";
+const STANDING_KEYS = ["covers", "extent", "format", "id", "proposal"];
+const STANDING_NAME = /^[a-z0-9][a-z0-9-]{0,62}\.json$/;
+
+/**
+ * The standing Yu + Ai agreements filed on this host (KS-004 8.1), each with
+ * the decision record filed for its own proposal text, as the signer needs
+ * them: `<consent_dir>/standing/<name>.json` holds the agreement as proposed
+ * (`{format, id, proposal, covers, extent}`), and the record is the one
+ * filed under that proposal's digest. A file that is not a regular file, not
+ * strict JSON in exactly that shape, or has no record filed for it, grants
+ * nothing and is skipped. Nothing here makes an agreement: Yu and Ai file
+ * both, and the signer still checks the record against the proposal's digest
+ * and the request's exact extent itself.
+ */
+export async function readStandingAgreements(consentDir: string): Promise<StandingAgreement[]> {
+  const dir = join(consentDir, STANDING_DIR);
+  try {
+    const st = await lstat(dir);
+    if (!st.isDirectory()) return [];
+  } catch {
+    return [];
+  }
+  const out: StandingAgreement[] = [];
+  for (const name of (await readdir(dir)).sort()) {
+    if (!STANDING_NAME.test(name)) continue;
+    let value: unknown;
+    let handle;
+    try {
+      handle = await open(join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch {
+      continue;
+    }
+    try {
+      const st = await handle.stat();
+      if (!st.isFile() || st.size > 65_536) continue;
+      value = parseStrictJson(new Uint8Array(await handle.readFile()));
+    } catch {
+      continue;
+    } finally {
+      await handle.close();
+    }
+    if (!isPlainObject(value) || !hasExactKeys(value, STANDING_KEYS) || value.format !== STANDING_FORMAT || !nonEmptyText(value.id)) continue;
+    const p = value.proposal;
+    if (!isPlainObject(p) || !hasExactKeys(p, ["body", "extent", "subject"]) || typeof p.subject !== "string" || typeof p.body !== "string" || typeof p.extent !== "string") continue;
+    if (!nonEmptyText(value.extent) || p.extent !== value.extent) continue;
+    if (!Array.isArray(value.covers) || value.covers.length === 0 || !value.covers.every((op) => typeof op === "string" && Object.hasOwn(OP_CLASS, op))) continue;
+    const proposal: ProposalText = { subject: p.subject, body: p.body, extent: p.extent };
+    const record = await readConsentFor(consentDir, proposal);
+    if (!record) continue;
+    out.push({ id: value.id, proposal, consent: record, covers: value.covers as SignerOp[], extent: value.extent });
+  }
+  return out;
+}
+
 /** Load decision records from the consent dir: regular files only, strict JSON, invalid ones skipped and reported. */
 export async function loadConsentRecords(dir: string): Promise<{ records: ConsentRecord[]; invalid: string[] }> {
   try {

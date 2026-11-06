@@ -231,7 +231,7 @@ describe("enrollment", () => {
 
     // When the request did land, the read says so.
     const h4 = harness();
-    h4.at.identities.set(h4.prepared.fields.identity_id, { root: TEST_ROOT_PUBLIC_B64, sequence: 0, keys: [] });
+    h4.at.identities.set(h4.prepared.fields.identity_id, { root: TEST_ROOT_PUBLIC_B64, sequence: 0, keys: [], expression: {}, quiet_until: null });
     expect(await resolveAmbiguous(h4.deps, h4.prepared.fields.identity_id, h4.prepared)).toBe("exists");
     expect(h4.signer.sent.every((r) => r.op === "read")).toBe(true);
   });

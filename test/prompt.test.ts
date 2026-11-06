@@ -86,6 +86,10 @@ describe("the honest prompt", () => {
     expect(line("propose.beyond")).toContain("and text (at most");
     expect(line("state.set")).toContain("an optional interval_h, your interval while awake in whole hours from 72 to 8760");
     expect(line("state.set")).toContain("an optional quiet_days from 1 to 30");
+    // [review C M6] what the host does with it, now that it does it: declared, renewed, ended on a wake.
+    expect(line("state.set")).toContain("Once you are registered, a move to listening or asleep declares quiet on agenttool for that many days, or for the longest this host allows when you name none");
+    expect(line("state.set")).toContain("it is renewed while you stay listening or asleep, and it ends when you wake.");
+    expect(line("state.set")).not.toContain("does not make one yet");
     expect(line("state.set")).toContain("A move toward more rest, or a longer interval, takes effect now. A move toward more activity, or a shorter interval, takes effect only when a later beat sets the same again.");
     // The old names are gone everywhere in the guide.
     for (const old of ["proposal_id", "claim", "body"]) expect([old, guide.includes(old)]).toEqual([old, false]);

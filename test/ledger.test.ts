@@ -289,6 +289,49 @@ describe("ledger", () => {
     expect(parseEntry({ ...beat, type: "state", acts: null, from: "awake", to: "awake", via: "immediate", interval_h: 96 }).type).toBe("state");
   });
 
+  test("[KS-004 4.3, 6.3, 6.4; review C M1, M6] apply and revert say what the expression did, apply what its backup did, state what its quiet did", async () => {
+    const { host, signer } = await setup();
+    const all = await seatedThenBorn(host.config, WORD, "soul", signer);
+    const beat = all[1] as LedgerEntry; // host-signed, in a seat
+    const mine = all[3] as LedgerEntry; // citizen-signed, in a seat
+    const h = `sha256:${"a".repeat(64)}`;
+    const reason = { kind: "decision", evidence: [], confidence: "low", limits: "" };
+    const apply = { ...mine, type: "apply", acts: null, ref: h, target: "will", prior_hash: h, new_hash: h, via: "two-beats", reason, strand_thought: "t-1", strand_key: "k", strand_backup: "posted", expression: "updated" };
+    const ok = (v: Record<string, unknown>) => expect(parseEntry(v).type).toBe(v.type as LedgerEntry["type"]);
+    const throws = (v: Record<string, unknown>) => expect(() => parseEntry(v)).toThrow();
+    ok(apply);
+    ok({ ...apply, strand_thought: null, strand_backup: "deferred", expression: "lags" });
+    ok({ ...beat, ...apply, signer: "host", kid: beat.kid, sig: beat.sig, did: null, strand_thought: null, strand_key: null, strand_backup: null, expression: null });
+    throws({ ...apply, strand_backup: undefined }); // the backup is always said
+    throws({ ...apply, expression: undefined });
+    throws({ ...apply, strand_backup: "posted", strand_thought: null }); // posted names its thought
+    throws({ ...apply, strand_backup: "deferred" }); // and a deferred one names none
+    throws({ ...apply, strand_backup: null }); // a backup is owed exactly when the key is named
+    throws({ ...apply, expression: "synced" });
+    throws({ ...beat, ...apply, signer: "host", kid: beat.kid, sig: beat.sig, did: null, strand_thought: null, strand_key: null, strand_backup: null }); // no expression before registration
+
+    const revert = { ...mine, type: "revert", acts: null, target: "will", from_hash: h, to_hash: h, via: "citizen", expression: "lags" };
+    ok(revert);
+    throws({ ...revert, expression: undefined });
+
+    const state = { ...mine, type: "state", acts: null, from: "awake", to: "asleep", via: "immediate" };
+    const until = "2026-12-05T02:05:00.000Z";
+    ok({ ...state, quiet_until: until, quiet_days: 30 });
+    ok({ ...state, from: "asleep", to: "awake", quiet_until: null }); // a wake ends it
+    const renewal = { ...state, from: "asleep", via: "quiet", seat_ref: null, runtime: null, input_digest: null, output_digest: null, voiced: null, quiet_until: until, quiet_days: 30 };
+    ok(renewal);
+    throws({ ...state, quiet_until: until }); // a declaration names its days
+    throws({ ...state, quiet_days: 30 });
+    throws({ ...state, quiet_until: until, quiet_days: 31 }); // never past 30 days
+    throws({ ...state, quiet_until: "2026-12-05", quiet_days: 30 });
+    throws({ ...state, to: "awake", quiet_until: until, quiet_days: 3 }); // declared only for listening or asleep
+    throws({ ...state, quiet_until: null }); // ended only on a wake
+    throws({ ...beat, type: "state", acts: null, from: "awake", to: "asleep", via: "immediate", quiet_until: until, quiet_days: 3 }); // only a registered citizen is quiet
+    throws({ ...renewal, to: "listening" }); // a quiet entry moves nothing
+    throws({ ...renewal, seat_ref: mine.seat_ref, runtime: mine.runtime, input_digest: mine.input_digest, output_digest: mine.output_digest, voiced: mine.voiced }); // and is the signer's, outside a seat
+    throws({ ...renewal, quiet_until: undefined, quiet_days: undefined }); // and carries the quiet
+  });
+
   test("verifyChain accepts an origin → beat → genesis → beat chain and counts host entries", async () => {
     const { host, signer } = await setup();
     const entries = await seatedThenBorn(host.config, WORD, "soul", signer);

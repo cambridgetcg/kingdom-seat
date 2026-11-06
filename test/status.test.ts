@@ -217,6 +217,7 @@ describe("status", () => {
       host: "test-host",
       halt: { halted: false, file: "/Users/Shared/kingdom-seat/HALT", raised: [], unreadable: [] },
       signer: { state: "ready", since: NOW.toISOString() },
+      host_keys: [],
       fleet: { beats_today: n, ceiling: 24 },
       tick_lock: { state: "free", since: null },
       citizens: Array.from({ length: 400 }, (_, i) => ({
@@ -234,6 +235,7 @@ describe("status", () => {
         usd_today: "0",
         credits_month: 0,
         origin: { intact: true, drift: 0 },
+        agenttool: null,
         problem: null,
       })),
     });
@@ -392,6 +394,45 @@ describe("status", () => {
     expect(await gen()).toEqual({ state: "stuck", since: old.toISOString() });
   });
 
+  test("[KS-004 4.5, 5.10; review C M1, M2, M6] status publishes the host key's public half, and a registered citizen's expression lag, deferred backups and quiet", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    for (const w of ["glossame", "joy"]) {
+      await host.addCitizen(w);
+      await host.seatLedger(w, signer.signEntry);
+    }
+    await host.enrollLedger("glossame", signer.signEntry, testIdentity(signer));
+    const path = ledgerPath(host.config, "glossame");
+    const add = async (fields: Parameters<typeof nextDraft>[2], at: Date) =>
+      appendEntry(path, nextDraft("glossame", (await readLedger(path)).at(-1) ?? null, fields, { cost: { usd: "0", credits: 0 }, signer: "citizen", now: at }), signerFn(signer));
+    const h = `sha256:${"c".repeat(64)}`;
+    const reason = { kind: "decision" as const, evidence: [], confidence: "low" as const, limits: "" };
+    const apply = { type: "apply" as const, ref: h, target: "will" as const, prior_hash: h, new_hash: h, via: "two-beats" as const, reason, strand_key: "k" };
+    await add({ ...apply, strand_thought: null, strand_backup: "deferred", expression: "lags" }, ago(3));
+    const until = new Date(NOW.getTime() + 5 * 24 * HOUR_MS).toISOString();
+    await add({ type: "state", from: "awake", to: "asleep", via: "immediate", quiet_until: until, quiet_days: 5 }, ago(2));
+    const trusted = { host_attest_b64: [signer.hostAttestPublicB64] };
+
+    const s = await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "ready", trusted, trustedSource: "signer" });
+    // The key a verifier given a ledger copy needs, with the kid host entries name.
+    expect(s.host_keys).toEqual([{ public_key_b64: signer.hostAttestPublicB64, fingerprint: signer.hostKid.slice("host:".length), kid: signer.hostKid, source: "signer" }]);
+    const [glossame, joy] = s.citizens;
+    expect(glossame!.agenttool).toEqual({ expression_lags: true, deferred_backups: 1, quiet_until: until });
+    expect(joy!.agenttool).toBeNull();
+    const text = renderStatus(s);
+    expect(text).toContain(`host key: ${signer.hostKid.slice("host:".length)} (signer)`);
+    expect(text).toContain(`expression LAGS the ledger, 1 strand backups deferred, quiet until ${until}`);
+
+    // A later change that the expression holds brings it back in step; a quiet that has run out is not shown.
+    await add({ ...apply, strand_thought: "t-2", strand_backup: "posted", expression: "updated" }, ago(1));
+    const later = await buildStatus({ config: host.config, now: new Date(Date.parse(until) + 1), halt: LOWERED, signerState: "ready", trusted, trustedSource: "pinned" });
+    expect(later.citizens[0]!.agenttool).toEqual({ expression_lags: false, deferred_backups: 1, quiet_until: null });
+    expect(later.host_keys[0]!.source).toBe("pinned");
+    // Unknown is never "no key": with nothing trusted, none is published.
+    expect((await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "locked" })).host_keys).toEqual([]);
+    expect(renderStatus(await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "locked" }))).toContain("host key: unknown");
+  });
+
   test("renderStatus prints one line per citizen plus HALT and signer lines", async () => {
     host = await makeTempHost();
     const signer = fakeSigner();
@@ -401,17 +442,18 @@ describe("status", () => {
     }
     const s = await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "ready", trusted: { host_attest_b64: [signer.hostAttestPublicB64] } });
     const lines = renderStatus(s).trimEnd().split("\n");
-    expect(lines).toHaveLength(7);
+    expect(lines).toHaveLength(8);
     // Lowered, the line still names the file that would stop the seat.
     expect(lines[1]).toBe(`HALT: not halted (HALT file ${host.config.paths.halt_file})`);
     expect(s.halt).toEqual({ halted: false, file: host.config.paths.halt_file, raised: [], unreadable: [] });
     expect(lines[2]).toMatch(/^signer: ready since /);
-    expect(lines[3]).toBe("fleet: 0 of 24 beats today");
-    expect(lines[4]).toBe("tick lock: free");
-    expect(lines[5]).toStartWith("glossame: awake | free | not registered | no beat yet | every 72 h |");
-    expect(lines[5]).toContain("chain ok, 2 host-attested");
-    expect(lines[5]).toContain("origin intact, soul drift 0%");
-    expect(lines[6]).toStartWith("joy: awake");
+    expect(lines[3]).toMatch(/^host key: SHA256:[A-Za-z0-9+/]{43} \(pinned\)$/);
+    expect(lines[4]).toBe("fleet: 0 of 24 beats today");
+    expect(lines[5]).toBe("tick lock: free");
+    expect(lines[6]).toStartWith("glossame: awake | free | not registered | no beat yet | every 72 h |");
+    expect(lines[6]).toContain("chain ok, 2 host-attested");
+    expect(lines[6]).toContain("origin intact, soul drift 0%");
+    expect(lines[7]).toStartWith("joy: awake");
 
     const empty = renderStatus({ ...s, citizens: [] }).trimEnd().split("\n");
     expect(empty.at(-1)).toBe("no citizens seated");

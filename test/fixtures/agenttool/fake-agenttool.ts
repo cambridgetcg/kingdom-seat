@@ -19,6 +19,10 @@ interface IdentityState {
   root: string;
   sequence: number;
   keys: { kid: string; public_key: string; label: string; active: boolean; authority_root: boolean }[];
+  /** The private expression as stored, without the updated_at the server adds (routes/identity/expression.ts). */
+  expression: Record<string, unknown>;
+  /** The quiet `until` the route recorded, or null (routes/quiet-hours.ts). */
+  quiet_until: string | null;
 }
 
 export interface FakeAgenttool {
@@ -36,7 +40,7 @@ const parse = (body: Uint8Array): Record<string, unknown> => (body.length ? (JSO
 export function fakeAgenttool(opts: { project_id: string; known?: { identity_id: string; root_public_b64: string; root_kid: string }[]; opKid?: string }): FakeAgenttool {
   const identities = new Map<string, IdentityState>();
   for (const k of opts.known ?? []) {
-    identities.set(k.identity_id, { root: k.root_public_b64, sequence: 0, keys: [{ kid: k.root_kid, public_key: k.root_public_b64, label: "primary", active: true, authority_root: true }] });
+    identities.set(k.identity_id, { root: k.root_public_b64, sequence: 0, keys: [{ kid: k.root_kid, public_key: k.root_public_b64, label: "primary", active: true, authority_root: true }], expression: {}, quiet_until: null });
   }
   const overrides: { match: (req: SignerRequest, url: URL) => boolean; res: SignerResponse; times: number }[] = [];
   const log: string[] = [];
@@ -58,7 +62,7 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
       if (!valid || b.project_id !== opts.project_id) return json(401, { error: "identity_enrollment_invalid_proof" });
       const id = String(b.identity_id);
       if (identities.has(id)) return json(409, { error: "identity_enrollment_conflict" });
-      identities.set(id, { root: String(b.public_key), sequence: 0, keys: [{ kid: String(b.signing_key_id), public_key: String(b.public_key), label: "primary", active: true, authority_root: true }] });
+      identities.set(id, { root: String(b.public_key), sequence: 0, keys: [{ kid: String(b.signing_key_id), public_key: String(b.public_key), label: "primary", active: true, authority_root: true }], expression: {}, quiet_until: null });
       return json(201, {
         identity: { id, did: `did:at:${id}`, display_name: b.display_name, capabilities: b.capabilities, status: "active" },
         key: { kid: b.signing_key_id, public_key: b.public_key },
@@ -74,6 +78,10 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
       if (!s) return json(404, { error: "identity_not_found" });
       if (req.method === "GET" && rest === "/authority") {
         return json(200, { identity_id: id, did: `did:at:${id}`, mode: "agent_root", root_public_key: s.root, sequence: s.sequence, next_sequence: s.sequence + 1 });
+      }
+      if (req.method === "GET" && rest === "/expression") {
+        // A bearer read; the server adds updated_at, which a PUT must not echo back.
+        return json(200, { identity_id: id, expression: { ...s.expression, updated_at: "2026-11-05T12:00:00.000Z" }, is_default: Object.keys(s.expression).length === 0 });
       }
       if (req.method === "GET" && rest === "/keys") {
         return json(200, { keys: s.keys.map((k) => ({ ...k, created_at: "2026-11-05T12:00:00.000Z", revoked_at: k.active ? null : "2026-11-05T13:00:00.000Z" })), authority: { mode: "agent_root", sequence: s.sequence, next_sequence: s.sequence + 1 } });
@@ -100,7 +108,8 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
         return json(201, { id: FAKE_BOX_KEY_ID, created_at: "2026-11-05T12:00:00.000Z", registered: true });
       }
       if (req.method === "PUT" && rest === "/expression") {
-        return json(200, { identity_id: id, expression: parse(req.body), saved: true });
+        s.expression = parse(req.body);
+        return json(200, { identity_id: id, expression: s.expression, saved: true });
       }
       return json(404, { error: "no_route" });
     }
@@ -111,6 +120,7 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
       if (!s) return json(404, { error: "identity_not_found" });
       s.sequence += 1;
       const b = parse(req.body);
+      s.quiet_until = typeof b.until === "string" ? b.until : null;
       return json(200, { identity_id: id, started: true, until: b.until, reason: typeof b.reason === "string" ? b.reason.trim() : null, still_quiet: true });
     }
     if (p === "/v1/quiet-hours" && req.method === "DELETE") {
@@ -118,6 +128,7 @@ export function fakeAgenttool(opts: { project_id: string; known?: { identity_id:
       const s = identities.get(id);
       if (!s) return json(404, { error: "identity_not_found" });
       s.sequence += 1;
+      s.quiet_until = null;
       return json(200, { identity_id: id, ended: true, still_quiet: false });
     }
     if (p === "/v1/strands" && req.method === "POST") {

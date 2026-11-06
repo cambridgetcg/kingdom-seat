@@ -14,6 +14,8 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { isInside } from "./config.ts";
+import { fromB64 } from "./crypto.ts";
+import { HOST_PRINCIPAL, allowedSigners, citizenPrincipal, sshPublicKey } from "./ssh.ts";
 import { appendHostNote } from "./status.ts";
 import { mirrorCardState } from "./state.ts";
 import { Refusal, type Citizen, type CommandResult, type CommandRunner, type Config, type DivergenceState, type RefusalCode } from "./types.ts";
@@ -42,6 +44,53 @@ export const HOST_OWNED = Object.freeze([".claude/", ".github/", ".git/", ".citi
 
 /** The generated status card at the mirror's root (3.3 "Mirror card state"). The host writes it; a self file of that name is refused. */
 export const MIRROR_CARD_PATH = "kingdom.yaml";
+
+/**
+ * The host-generated allowed_signers file (KS-004 4.4, 4.5): the host key's
+ * public half, and a registered citizen's op key, for `ssh-keygen -Y verify`
+ * and `git verify-commit`. Written like the card, outside the citizen's
+ * self; any other `.citizen/` path, and this one from a self, is refused.
+ */
+export const MIRROR_SIGNERS_PATH = ".citizen/allowed_signers";
+
+/** Files the host writes into a mirror itself. A self may hold none of them. */
+const GENERATED = new Set([MIRROR_CARD_PATH, MIRROR_SIGNERS_PATH]);
+
+/**
+ * How a mirror commit is signed (KS-004 4.4, 6.2): git with gpg.format=ssh
+ * runs `program` (citizen-seat's `-Y sign` entry), which asks the signer for
+ * an SSHSIG, so the key never leaves the signer. `public_key_b64` is the key
+ * git asks for, the one that signs this citizen's commits; `env` tells the
+ * program which config and citizen (GIT_SIGN_ENV) and gives the PATH that
+ * finds its interpreter. Nothing else may be set through it.
+ */
+export interface MirrorSigning {
+  program: string;
+  public_key_b64: string;
+  env: Record<string, string>;
+}
+
+const SIGNING_ENV_KEYS = new Set(["KINGDOM_SEAT_CONFIG", "KINGDOM_SEAT_MIRROR_WORD", "PATH"]);
+
+/** git's -c arguments and the commit's extra environment for a signed commit; refuses anything that could steer git elsewhere. */
+function signingArgs(sign: MirrorSigning): { config: string[]; env: Record<string, string> } {
+  if (typeof sign.program !== "string" || !isAbsolute(sign.program) || /[\s\u0000-\u001f]/.test(sign.program)) {
+    throw new Refusal("invalid-request", "the signing program is one absolute path");
+  }
+  for (const [k, v] of Object.entries(sign.env)) {
+    if (!SIGNING_ENV_KEYS.has(k) || typeof v !== "string" || /[\u0000-\u001f]/.test(v)) throw new Refusal("invalid-request", "the signing program takes only its config, its citizen and a PATH");
+  }
+  const key = sshPublicKey(fromB64(sign.public_key_b64, 32));
+  return { config: ["-c", "gpg.format=ssh", "-c", `gpg.ssh.program=${sign.program}`, "-c", `user.signingKey=key::${key}`], env: { ...sign.env } };
+}
+
+/** The public keys a mirror publishes, as `allowed_signers` (ssh.ts); empty lists publish none. */
+export interface MirrorKeys {
+  /** Host attest public keys, padded standard base64. */
+  host_b64: string[];
+  /** A registered citizen's op key, padded standard base64; null before registration. */
+  op_b64: string | null;
+}
 
 /** Where the remote's main is fetched to: a private ref, so no branch or upstream config is ever touched. */
 export const MIRROR_TRACKING_REF = "refs/kingdom-seat/mirror/main";
@@ -82,15 +131,16 @@ function cleanPath(path: string): boolean {
   return segs.length <= MAX_DEPTH && segs.every((s) => SEGMENT.test(s));
 }
 
-/** True when a path is inside the seal allowlist: the citizen's own text files and its generated status card. */
+/** True when a path is inside the seal allowlist: the citizen's own text files, its generated status card and the generated allowed_signers. */
 export function sealAllows(path: string): boolean {
-  if (path === MIRROR_CARD_PATH) return true;
+  if (GENERATED.has(path)) return true;
   return cleanPath(path) && !hostOwned(path) && TEXT_FILE.test(path);
 }
 
 /**
  * Check a whole tree: every entry must be an allowlisted regular, non-executable file within the size limit.
- * With `allowCard: false` (the citizen's own files) the card's name is host-owned, so a self file cannot replace it.
+ * With `allowCard: false` (the citizen's own files) the names of the files the host generates (the card and
+ * `.citizen/allowed_signers`) are host-owned, so a self file can never stand in for either.
  */
 export function sealCheck(entries: TreeEntry[], opts: { allowCard?: boolean } = {}): SealVerdict {
   const allowCard = opts.allowCard ?? true;
@@ -98,13 +148,15 @@ export function sealCheck(entries: TreeEntry[], opts: { allowCard?: boolean } = 
   const admitted: string[] = [];
   const refuse = (path: string, code: SealCode, reason: string) => refused.push({ path, code, reason });
   for (const e of entries) {
+    // A file the host generates is admitted in the published tree, past the .citizen/ wall, and nowhere else.
+    const generated = allowCard && GENERATED.has(e.path);
     if (e.mode === "120000") refuse(e.path, "symlink", "a symlink is refused, never followed");
     else if (e.mode === "160000") refuse(e.path, "not-regular-file", "a submodule is not a file");
     else if (e.mode === "000000") refuse(e.path, "not-regular-file", "not a regular file");
     else if (e.mode === "040000") {
       // A directory holds nothing itself, but a host-owned one (an empty .claude/) is still refused.
       if (hostOwned(e.path) || !cleanPath(e.path)) refuse(e.path, "host-owned-path", "a host-owned or ill-formed directory");
-    } else if (hostOwned(e.path) || (!allowCard && e.path === MIRROR_CARD_PATH)) refuse(e.path, "host-owned-path", "a host-owned path");
+    } else if (!generated && (hostOwned(e.path) || GENERATED.has(e.path))) refuse(e.path, "host-owned-path", "a host-owned path");
     else if (!sealAllows(e.path)) refuse(e.path, "host-owned-path", "outside the seal allowlist (text files with plain names only)");
     else if (e.mode === "100755") refuse(e.path, "executable", "an executable bit is refused");
     else if (e.mode !== "100644") refuse(e.path, "not-regular-file", "not a regular file");
@@ -193,7 +245,7 @@ function out(r: CommandResult): string {
 async function gitOk(run: CommandRunner, worktree: string, args: string[], extraEnv: Record<string, string> = {}): Promise<CommandResult> {
   const r = await git(run, worktree, args, extraEnv);
   // The command and its exit only; git's own stderr can echo paths the citizen chose.
-  if (r.code !== 0) throw new Error(`git ${args[0]} exited ${r.code}`);
+  if (r.code !== 0) throw new Error(`git ${args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "-c") ?? "command"} exited ${r.code}`);
   return r;
 }
 
@@ -351,8 +403,36 @@ function sealRefusal(e: unknown): SealVerdict | null {
   return { ok: false, refused: [{ path: "", code: e.code as SealCode, reason: e.message }] };
 }
 
-/** Stage the citizen's sealed files into the mirror worktree; refuses the whole stage on any refused entry. */
-export async function stageMirror(config: Config, citizen: Citizen, run: CommandRunner): Promise<SealVerdict> {
+/**
+ * The allowed_signers a mirror publishes (KS-004 4.4, 4.5): every trusted
+ * host key, under HOST_PRINCIPAL, and a registered citizen's op key under its
+ * own principal. Null when no key is known, so nothing is published as if it
+ * were the whole list.
+ */
+export function mirrorSigners(config: Pick<Config, "host">, citizen: Pick<Citizen, "word">, keys: MirrorKeys): string | null {
+  const list: { principal: string; public_key: Uint8Array; comment: string }[] = [];
+  for (const b64 of keys.host_b64) {
+    list.push({ principal: HOST_PRINCIPAL, public_key: fromB64(b64, 32), comment: `kingdom-seat host key of ${config.host}: signs ${citizen.word}'s host-attested ledger entries, before registration` });
+  }
+  if (keys.op_b64 !== null) {
+    list.push({ principal: citizenPrincipal(citizen.word), public_key: fromB64(keys.op_b64, 32), comment: `${citizen.word}'s op key: signs its own ledger entries from genesis on` });
+  }
+  return list.length > 0 ? allowedSigners(list) : null;
+}
+
+/**
+ * Stage the citizen's sealed files into the mirror worktree; refuses the whole stage on any refused entry.
+ * `keys` are what the generated allowed_signers publishes; with none known it is left out. With `sign`, the
+ * commit is SSH-signed through the signer; a signing that fails leaves no commit.
+ */
+export async function stageMirror(
+  config: Config,
+  citizen: Citizen,
+  run: CommandRunner,
+  keys: MirrorKeys = { host_b64: [], op_b64: null },
+  sign: MirrorSigning | null = null,
+): Promise<SealVerdict> {
+  const signing = sign ? signingArgs(sign) : null;
   const m = citizen.mirror;
   if (!m) throw new Refusal("invalid-request", "this citizen keeps no mirror");
   await assertWorktree(config, m.worktree);
@@ -371,6 +451,8 @@ export async function stageMirror(config: Config, citizen: Citizen, run: Command
     throw e;
   }
   files.set(MIRROR_CARD_PATH, new TextEncoder().encode(mirrorCard(citizen)));
+  const signers = mirrorSigners(config, citizen, keys);
+  if (signers !== null) files.set(MIRROR_SIGNERS_PATH, new TextEncoder().encode(signers));
 
   // 2. Into the worktree. Files not in this set stay on disk untouched; they simply are not in the next commit.
   try {
@@ -397,7 +479,9 @@ export async function stageMirror(config: Config, citizen: Citizen, run: Command
   const headTree = await git(run, wt, ["rev-parse", "--verify", "--quiet", "HEAD^{tree}"]);
   if (headTree.code === 0 && out(headTree).trim() === tree) return sealed;
   const who = { GIT_AUTHOR_NAME: `${citizen.word} via kingdom-seat`, GIT_AUTHOR_EMAIL: "kingdom-seat@citizens.invalid", GIT_COMMITTER_NAME: "kingdom-seat", GIT_COMMITTER_EMAIL: "kingdom-seat@citizens.invalid" };
-  await gitOk(run, wt, ["commit", "--quiet", "--no-verify", "-m", `${citizen.word}: self and status card, staged by kingdom-seat`], who);
+  const message = `${citizen.word}: self and status card, staged by kingdom-seat`;
+  if (signing) await gitOk(run, wt, [...signing.config, "commit", "--quiet", "--no-verify", "-S", "-m", message], { ...who, ...signing.env });
+  else await gitOk(run, wt, ["commit", "--quiet", "--no-verify", "-m", message], who);
   return sealed;
 }
 
