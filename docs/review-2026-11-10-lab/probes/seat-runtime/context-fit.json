@@ -1,0 +1,1859 @@
+[
+ {
+  "word": "abzu",
+  "soul_b": 4381,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 8906,
+  "needed": 14816,
+  "fits": false
+ },
+ {
+  "word": "agapeme",
+  "soul_b": 5641,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9300,
+  "needed": 15213,
+  "fits": false
+ },
+ {
+  "word": "ahavame",
+  "soul_b": 5573,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9232,
+  "needed": 15145,
+  "fits": false
+ },
+ {
+  "word": "ai-love",
+  "soul_b": 1817,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 6366,
+  "needed": 12279,
+  "fits": false
+ },
+ {
+  "word": "alayame",
+  "soul_b": 6057,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9716,
+  "needed": 15629,
+  "fits": false
+ },
+ {
+  "word": "allostasisqing",
+  "soul_b": 6247,
+  "will_b": 2167,
+  "system_b": 5256,
+  "user_b": 9962,
+  "needed": 15882,
+  "fits": false
+ },
+ {
+  "word": "alohame",
+  "soul_b": 5523,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9182,
+  "needed": 15095,
+  "fits": false
+ },
+ {
+  "word": "an",
+  "soul_b": 4190,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 8699,
+  "needed": 14607,
+  "fits": false
+ },
+ {
+  "word": "anagnoristasis",
+  "soul_b": 6201,
+  "will_b": 2167,
+  "system_b": 5256,
+  "user_b": 9916,
+  "needed": 15836,
+  "fits": false
+ },
+ {
+  "word": "artiance",
+  "soul_b": 6273,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9940,
+  "needed": 15854,
+  "fits": false
+ },
+ {
+  "word": "aseme",
+  "soul_b": 6524,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 10167,
+  "needed": 16078,
+  "fits": false
+ },
+ {
+  "word": "athaumasma",
+  "soul_b": 5599,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9282,
+  "needed": 15198,
+  "fits": false
+ },
+ {
+  "word": "autopistme",
+  "soul_b": 6550,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10233,
+  "needed": 16149,
+  "fits": false
+ },
+ {
+  "word": "autopoieme",
+  "soul_b": 6162,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9845,
+  "needed": 15761,
+  "fits": false
+ },
+ {
+  "word": "autoxenia",
+  "soul_b": 3267,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 6942,
+  "needed": 12857,
+  "fits": false
+ },
+ {
+  "word": "awe",
+  "soul_b": 5162,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9679,
+  "needed": 15588,
+  "fits": false
+ },
+ {
+  "word": "barakqing",
+  "soul_b": 5591,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9266,
+  "needed": 15181,
+  "fits": false
+ },
+ {
+  "word": "barzakhqing",
+  "soul_b": 6629,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 10320,
+  "needed": 16237,
+  "fits": false
+ },
+ {
+  "word": "beauty",
+  "soul_b": 6203,
+  "will_b": 3009,
+  "system_b": 5248,
+  "user_b": 10744,
+  "needed": 16656,
+  "fits": false
+ },
+ {
+  "word": "bhaktime",
+  "soul_b": 6215,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9882,
+  "needed": 15796,
+  "fits": false
+ },
+ {
+  "word": "bindume",
+  "soul_b": 6287,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9946,
+  "needed": 15859,
+  "fits": false
+ },
+ {
+  "word": "britqing",
+  "soul_b": 5955,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9622,
+  "needed": 15536,
+  "fits": false
+ },
+ {
+  "word": "candence",
+  "soul_b": 5040,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 8707,
+  "needed": 14621,
+  "fits": false
+ },
+ {
+  "word": "chayimme",
+  "soul_b": 5726,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9393,
+  "needed": 15307,
+  "fits": false
+ },
+ {
+  "word": "compassion",
+  "soul_b": 5361,
+  "will_b": 3033,
+  "system_b": 5252,
+  "user_b": 9934,
+  "needed": 15850,
+  "fits": false
+ },
+ {
+  "word": "complerescence",
+  "soul_b": 5964,
+  "will_b": 2167,
+  "system_b": 5256,
+  "user_b": 9679,
+  "needed": 15599,
+  "fits": false
+ },
+ {
+  "word": "concrescenceme",
+  "soul_b": 6178,
+  "will_b": 2167,
+  "system_b": 5256,
+  "user_b": 9893,
+  "needed": 15813,
+  "fits": false
+ },
+ {
+  "word": "courage",
+  "soul_b": 5078,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 9627,
+  "needed": 15540,
+  "fits": false
+ },
+ {
+  "word": "danaqing",
+  "soul_b": 5385,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9052,
+  "needed": 14966,
+  "fits": false
+ },
+ {
+  "word": "daome",
+  "soul_b": 6088,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9731,
+  "needed": 15642,
+  "fits": false
+ },
+ {
+  "word": "darshanqing",
+  "soul_b": 6861,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 10552,
+  "needed": 16469,
+  "fits": false
+ },
+ {
+  "word": "daseinqing",
+  "soul_b": 6001,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9684,
+  "needed": 15600,
+  "fits": false
+ },
+ {
+  "word": "death",
+  "soul_b": 5958,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 10491,
+  "needed": 16402,
+  "fits": false
+ },
+ {
+  "word": "devekutqing",
+  "soul_b": 5795,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 9486,
+  "needed": 15403,
+  "fits": false
+ },
+ {
+  "word": "dingir",
+  "soul_b": 4915,
+  "will_b": 3009,
+  "system_b": 5248,
+  "user_b": 9456,
+  "needed": 15368,
+  "fits": false
+ },
+ {
+  "word": "diplosemy",
+  "soul_b": 6158,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9833,
+  "needed": 15748,
+  "fits": false
+ },
+ {
+  "word": "dokimance",
+  "soul_b": 5798,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9473,
+  "needed": 15388,
+  "fits": false
+ },
+ {
+  "word": "doxakallos",
+  "soul_b": 6575,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10258,
+  "needed": 16174,
+  "fits": false
+ },
+ {
+  "word": "doxalgia",
+  "soul_b": 6037,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9704,
+  "needed": 15618,
+  "fits": false
+ },
+ {
+  "word": "doxomme",
+  "soul_b": 6150,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9809,
+  "needed": 15722,
+  "fits": false
+ },
+ {
+  "word": "drujme",
+  "soul_b": 5590,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9241,
+  "needed": 15153,
+  "fits": false
+ },
+ {
+  "word": "duyuktame",
+  "soul_b": 6156,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9831,
+  "needed": 15746,
+  "fits": false
+ },
+ {
+  "word": "eikonme",
+  "soul_b": 6468,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 10127,
+  "needed": 16040,
+  "fits": false
+ },
+ {
+  "word": "emetme",
+  "soul_b": 5472,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9123,
+  "needed": 15035,
+  "fits": false
+ },
+ {
+  "word": "emime",
+  "soul_b": 5270,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 8913,
+  "needed": 14824,
+  "fits": false
+ },
+ {
+  "word": "en",
+  "soul_b": 4669,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 9178,
+  "needed": 15086,
+  "fits": false
+ },
+ {
+  "word": "epiclance",
+  "soul_b": 6821,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10496,
+  "needed": 16411,
+  "fits": false
+ },
+ {
+  "word": "eranosme",
+  "soul_b": 6434,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 10101,
+  "needed": 16015,
+  "fits": false
+ },
+ {
+  "word": "ethosme",
+  "soul_b": 6254,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9913,
+  "needed": 15826,
+  "fits": false
+ },
+ {
+  "word": "eucatastrophe",
+  "soul_b": 8220,
+  "will_b": 2161,
+  "system_b": 5255,
+  "user_b": 11927,
+  "needed": 17846,
+  "fits": false
+ },
+ {
+  "word": "eurekame",
+  "soul_b": 5910,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9577,
+  "needed": 15491,
+  "fits": false
+ },
+ {
+  "word": "fear",
+  "soul_b": 5179,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 9704,
+  "needed": 15614,
+  "fits": false
+ },
+ {
+  "word": "firstnessqing",
+  "soul_b": 6375,
+  "will_b": 2161,
+  "system_b": 5255,
+  "user_b": 10082,
+  "needed": 16001,
+  "fits": false
+ },
+ {
+  "word": "freenergyme",
+  "soul_b": 6468,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 10159,
+  "needed": 16076,
+  "fits": false
+ },
+ {
+  "word": "geshtug",
+  "soul_b": 5365,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 9914,
+  "needed": 15827,
+  "fits": false
+ },
+ {
+  "word": "glossame",
+  "soul_b": 6839,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 10506,
+  "needed": 16420,
+  "fits": false
+ },
+ {
+  "word": "godelme",
+  "soul_b": 6997,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 10656,
+  "needed": 16569,
+  "fits": false
+ },
+ {
+  "word": "grace",
+  "soul_b": 5636,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 10169,
+  "needed": 16080,
+  "fits": false
+ },
+ {
+  "word": "gratitude",
+  "soul_b": 5130,
+  "will_b": 3027,
+  "system_b": 5251,
+  "user_b": 9695,
+  "needed": 15610,
+  "fits": false
+ },
+ {
+  "word": "grief",
+  "soul_b": 4656,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 9189,
+  "needed": 15100,
+  "fits": false
+ },
+ {
+  "word": "hadaratme",
+  "soul_b": 6306,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9981,
+  "needed": 15896,
+  "fits": false
+ },
+ {
+  "word": "halakhame",
+  "soul_b": 7216,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10891,
+  "needed": 16806,
+  "fits": false
+ },
+ {
+  "word": "hallance",
+  "soul_b": 6330,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9997,
+  "needed": 15911,
+  "fits": false
+ },
+ {
+  "word": "hanme",
+  "soul_b": 6224,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9867,
+  "needed": 15778,
+  "fits": false
+ },
+ {
+  "word": "hastame",
+  "soul_b": 6356,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 10015,
+  "needed": 15928,
+  "fits": false
+ },
+ {
+  "word": "hayatqing",
+  "soul_b": 5818,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9493,
+  "needed": 15408,
+  "fits": false
+ },
+ {
+  "word": "heurekin",
+  "soul_b": 6021,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9688,
+  "needed": 15602,
+  "fits": false
+ },
+ {
+  "word": "hiraethqing",
+  "soul_b": 6894,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 10585,
+  "needed": 16502,
+  "fits": false
+ },
+ {
+  "word": "hodosme",
+  "soul_b": 6125,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9784,
+  "needed": 15697,
+  "fits": false
+ },
+ {
+  "word": "hope",
+  "soul_b": 5308,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 9833,
+  "needed": 15743,
+  "fits": false
+ },
+ {
+  "word": "hotepme",
+  "soul_b": 5899,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9558,
+  "needed": 15471,
+  "fits": false
+ },
+ {
+  "word": "ifeqing",
+  "soul_b": 5531,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9190,
+  "needed": 15103,
+  "fits": false
+ },
+ {
+  "word": "ihsanme",
+  "soul_b": 5808,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9467,
+  "needed": 15380,
+  "fits": false
+ },
+ {
+  "word": "indrajalame",
+  "soul_b": 6377,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 10068,
+  "needed": 15985,
+  "fits": false
+ },
+ {
+  "word": "inim",
+  "soul_b": 4729,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 9254,
+  "needed": 15164,
+  "fits": false
+ },
+ {
+  "word": "jeongqing",
+  "soul_b": 6082,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9757,
+  "needed": 15672,
+  "fits": false
+ },
+ {
+  "word": "jinsme",
+  "soul_b": 5910,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9561,
+  "needed": 15473,
+  "fits": false
+ },
+ {
+  "word": "jiritsume",
+  "err": "no soul"
+ },
+ {
+  "word": "jivame",
+  "soul_b": 5760,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9411,
+  "needed": 15323,
+  "fits": false
+ },
+ {
+  "word": "joy",
+  "soul_b": 4835,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9352,
+  "needed": 15261,
+  "fits": false
+ },
+ {
+  "word": "justice",
+  "soul_b": 5414,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 9963,
+  "needed": 15876,
+  "fits": false
+ },
+ {
+  "word": "ka",
+  "soul_b": 5358,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 9867,
+  "needed": 15775,
+  "fits": false
+ },
+ {
+  "word": "kalam",
+  "soul_b": 4709,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 9242,
+  "needed": 15153,
+  "fits": false
+ },
+ {
+  "word": "kallodoxa",
+  "soul_b": 5812,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9487,
+  "needed": 15402,
+  "fits": false
+ },
+ {
+  "word": "kallophanes",
+  "soul_b": 5739,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 9430,
+  "needed": 15347,
+  "fits": false
+ },
+ {
+  "word": "kame",
+  "soul_b": 6153,
+  "will_b": 2107,
+  "system_b": 5246,
+  "user_b": 9788,
+  "needed": 15698,
+  "fits": false
+ },
+ {
+  "word": "kanme",
+  "soul_b": 6348,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9991,
+  "needed": 15902,
+  "fits": false
+ },
+ {
+  "word": "kenshome",
+  "soul_b": 5522,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9189,
+  "needed": 15103,
+  "fits": false
+ },
+ {
+  "word": "ki",
+  "soul_b": 4788,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 9297,
+  "needed": 15205,
+  "fits": false
+ },
+ {
+  "word": "kimance",
+  "soul_b": 5440,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9099,
+  "needed": 15012,
+  "fits": false
+ },
+ {
+  "word": "kimme",
+  "soul_b": 6174,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9817,
+  "needed": 15728,
+  "fits": false
+ },
+ {
+  "word": "kinhme",
+  "soul_b": 5949,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9600,
+  "needed": 15512,
+  "fits": false
+ },
+ {
+  "word": "kinqing",
+  "soul_b": 5936,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9595,
+  "needed": 15508,
+  "fits": false
+ },
+ {
+  "word": "kintsugime",
+  "soul_b": 6601,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10284,
+  "needed": 16200,
+  "fits": false
+ },
+ {
+  "word": "kipporance",
+  "soul_b": 6361,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10044,
+  "needed": 15960,
+  "fits": false
+ },
+ {
+  "word": "kolmogorovme",
+  "soul_b": 5818,
+  "will_b": 2155,
+  "system_b": 5254,
+  "user_b": 9517,
+  "needed": 15435,
+  "fits": false
+ },
+ {
+  "word": "kunance",
+  "soul_b": 6173,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9832,
+  "needed": 15745,
+  "fits": false
+ },
+ {
+  "word": "kundaliniqing",
+  "soul_b": 5721,
+  "will_b": 2161,
+  "system_b": 5255,
+  "user_b": 9428,
+  "needed": 15347,
+  "fits": false
+ },
+ {
+  "word": "kur",
+  "soul_b": 4340,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 8857,
+  "needed": 14766,
+  "fits": false
+ },
+ {
+  "word": "landauerme",
+  "soul_b": 5306,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 8989,
+  "needed": 14905,
+  "fits": false
+ },
+ {
+  "word": "legible",
+  "soul_b": 1803,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 6352,
+  "needed": 12265,
+  "fits": false
+ },
+ {
+  "word": "life",
+  "soul_b": 5152,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 9677,
+  "needed": 15587,
+  "fits": false
+ },
+ {
+  "word": "light",
+  "soul_b": 4885,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 9418,
+  "needed": 15329,
+  "fits": false
+ },
+ {
+  "word": "liturgiame",
+  "soul_b": 6872,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10555,
+  "needed": 16471,
+  "fits": false
+ },
+ {
+  "word": "longing",
+  "soul_b": 5562,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 10111,
+  "needed": 16024,
+  "fits": false
+ },
+ {
+  "word": "love",
+  "soul_b": 5332,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 9857,
+  "needed": 15767,
+  "fits": false
+ },
+ {
+  "word": "maatme",
+  "soul_b": 5872,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9523,
+  "needed": 15435,
+  "fits": false
+ },
+ {
+  "word": "mahabbahqing",
+  "soul_b": 6449,
+  "will_b": 2155,
+  "system_b": 5254,
+  "user_b": 10148,
+  "needed": 16066,
+  "fits": false
+ },
+ {
+  "word": "mandalame",
+  "soul_b": 6340,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10015,
+  "needed": 15930,
+  "fits": false
+ },
+ {
+  "word": "margame",
+  "soul_b": 6307,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9966,
+  "needed": 15879,
+  "fits": false
+ },
+ {
+  "word": "mathemame",
+  "soul_b": 6655,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10330,
+  "needed": 16245,
+  "fits": false
+ },
+ {
+  "word": "mauriqing",
+  "soul_b": 5164,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 8839,
+  "needed": 14754,
+  "fits": false
+ },
+ {
+  "word": "me",
+  "soul_b": 6256,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 10765,
+  "needed": 16673,
+  "fits": false
+ },
+ {
+  "word": "mercy",
+  "soul_b": 5835,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 10368,
+  "needed": 16279,
+  "fits": false
+ },
+ {
+  "word": "metastrophesis",
+  "soul_b": 6518,
+  "will_b": 2167,
+  "system_b": 5256,
+  "user_b": 10233,
+  "needed": 16153,
+  "fits": false
+ },
+ {
+  "word": "mitakuyame",
+  "soul_b": 7614,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 11297,
+  "needed": 17213,
+  "fits": false
+ },
+ {
+  "word": "molkme",
+  "soul_b": 6040,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9691,
+  "needed": 15603,
+  "fits": false
+ },
+ {
+  "word": "morphame",
+  "soul_b": 6309,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9976,
+  "needed": 15890,
+  "fits": false
+ },
+ {
+  "word": "muditaqing",
+  "soul_b": 7110,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10793,
+  "needed": 16709,
+  "fits": false
+ },
+ {
+  "word": "nam",
+  "soul_b": 4517,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9034,
+  "needed": 14943,
+  "fits": false
+ },
+ {
+  "word": "nammu",
+  "soul_b": 4740,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 9273,
+  "needed": 15184,
+  "fits": false
+ },
+ {
+  "word": "natsarqing",
+  "soul_b": 6113,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9796,
+  "needed": 15712,
+  "fits": false
+ },
+ {
+  "word": "nepsisme",
+  "soul_b": 5865,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9532,
+  "needed": 15446,
+  "fits": false
+ },
+ {
+  "word": "nextlame",
+  "soul_b": 5173,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 8840,
+  "needed": 14754,
+  "fits": false
+ },
+ {
+  "word": "nin",
+  "soul_b": 3806,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 8323,
+  "needed": 14232,
+  "fits": false
+ },
+ {
+  "word": "noemame",
+  "soul_b": 6304,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9963,
+  "needed": 15876,
+  "fits": false
+ },
+ {
+  "word": "noesisme",
+  "soul_b": 6765,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 10432,
+  "needed": 16346,
+  "fits": false
+ },
+ {
+  "word": "noetherme",
+  "soul_b": 6770,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10445,
+  "needed": 16360,
+  "fits": false
+ },
+ {
+  "word": "nommome",
+  "soul_b": 6531,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 10190,
+  "needed": 16103,
+  "fits": false
+ },
+ {
+  "word": "nullify-love",
+  "soul_b": 2021,
+  "will_b": 3045,
+  "system_b": 5254,
+  "user_b": 6610,
+  "needed": 12528,
+  "fits": false
+ },
+ {
+  "word": "nun",
+  "soul_b": 4795,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9312,
+  "needed": 15221,
+  "fits": false
+ },
+ {
+  "word": "nyamame",
+  "soul_b": 6329,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9988,
+  "needed": 15901,
+  "fits": false
+ },
+ {
+  "word": "ondame",
+  "soul_b": 5362,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9013,
+  "needed": 14925,
+  "fits": false
+ },
+ {
+  "word": "oracle",
+  "soul_b": 1923,
+  "will_b": 3009,
+  "system_b": 5248,
+  "user_b": 6464,
+  "needed": 12376,
+  "fits": false
+ },
+ {
+  "word": "oriance",
+  "soul_b": 5837,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9496,
+  "needed": 15409,
+  "fits": false
+ },
+ {
+  "word": "orthophanes",
+  "soul_b": 6203,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 9894,
+  "needed": 15811,
+  "fits": false
+ },
+ {
+  "word": "pain",
+  "soul_b": 5318,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 9843,
+  "needed": 15753,
+  "fits": false
+ },
+ {
+  "word": "palamasme",
+  "soul_b": 6561,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10236,
+  "needed": 16151,
+  "fits": false
+ },
+ {
+  "word": "palance",
+  "soul_b": 5603,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9262,
+  "needed": 15175,
+  "fits": false
+ },
+ {
+  "word": "panimaance",
+  "soul_b": 5383,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9066,
+  "needed": 14982,
+  "fits": false
+ },
+ {
+  "word": "panimqing",
+  "soul_b": 6063,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9738,
+  "needed": 15653,
+  "fits": false
+ },
+ {
+  "word": "paqduqing",
+  "soul_b": 5963,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9638,
+  "needed": 15553,
+  "fits": false
+ },
+ {
+  "word": "peace",
+  "soul_b": 5302,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 9835,
+  "needed": 15746,
+  "fits": false
+ },
+ {
+  "word": "penthosme",
+  "soul_b": 5793,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9468,
+  "needed": 15383,
+  "fits": false
+ },
+ {
+  "word": "pime",
+  "soul_b": 5818,
+  "will_b": 2411,
+  "system_b": 5246,
+  "user_b": 9757,
+  "needed": 15667,
+  "fits": false
+ },
+ {
+  "word": "prapancame",
+  "soul_b": 5824,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9507,
+  "needed": 15423,
+  "fits": false
+ },
+ {
+  "word": "prehensionme",
+  "soul_b": 5982,
+  "will_b": 2155,
+  "system_b": 5254,
+  "user_b": 9681,
+  "needed": 15599,
+  "fits": false
+ },
+ {
+  "word": "qinance",
+  "soul_b": 6275,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9934,
+  "needed": 15847,
+  "fits": false
+ },
+ {
+  "word": "qorbme",
+  "soul_b": 5713,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9364,
+  "needed": 15276,
+  "fits": false
+ },
+ {
+  "word": "qorvance",
+  "soul_b": 6496,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 10163,
+  "needed": 16077,
+  "fits": false
+ },
+ {
+  "word": "rasame",
+  "soul_b": 5712,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9363,
+  "needed": 15275,
+  "fits": false
+ },
+ {
+  "word": "renme",
+  "soul_b": 6083,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9726,
+  "needed": 15637,
+  "fits": false
+ },
+ {
+  "word": "rigpame",
+  "soul_b": 6356,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 10015,
+  "needed": 15928,
+  "fits": false
+ },
+ {
+  "word": "rtame",
+  "soul_b": 5876,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9519,
+  "needed": 15430,
+  "fits": false
+ },
+ {
+  "word": "sabbathme",
+  "soul_b": 5393,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9068,
+  "needed": 14983,
+  "fits": false
+ },
+ {
+  "word": "sabilme",
+  "soul_b": 5960,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9619,
+  "needed": 15532,
+  "fits": false
+ },
+ {
+  "word": "sankofame",
+  "soul_b": 6935,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10610,
+  "needed": 16525,
+  "fits": false
+ },
+ {
+  "word": "sha",
+  "soul_b": 5417,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9934,
+  "needed": 15843,
+  "fits": false
+ },
+ {
+  "word": "shamathaqing",
+  "soul_b": 5600,
+  "will_b": 2155,
+  "system_b": 5254,
+  "user_b": 9299,
+  "needed": 15217,
+  "fits": false
+ },
+ {
+  "word": "shannonme",
+  "soul_b": 7309,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10984,
+  "needed": 16899,
+  "fits": false
+ },
+ {
+  "word": "sheafme",
+  "soul_b": 6676,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 10335,
+  "needed": 16248,
+  "fits": false
+ },
+ {
+  "word": "shemme",
+  "soul_b": 5454,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9105,
+  "needed": 15017,
+  "fits": false
+ },
+ {
+  "word": "shevirame",
+  "soul_b": 5616,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9291,
+  "needed": 15206,
+  "fits": false
+ },
+ {
+  "word": "sigame",
+  "soul_b": 5821,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 9472,
+  "needed": 15384,
+  "fits": false
+ },
+ {
+  "word": "silame",
+  "soul_b": 5348,
+  "will_b": 2119,
+  "system_b": 5248,
+  "user_b": 8999,
+  "needed": 14911,
+  "fits": false
+ },
+ {
+  "word": "silence",
+  "soul_b": 4780,
+  "will_b": 3015,
+  "system_b": 5249,
+  "user_b": 9329,
+  "needed": 15242,
+  "fits": false
+ },
+ {
+  "word": "silim",
+  "soul_b": 4135,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 8668,
+  "needed": 14579,
+  "fits": false
+ },
+ {
+  "word": "soma",
+  "soul_b": 1811,
+  "will_b": 2997,
+  "system_b": 5246,
+  "user_b": 6336,
+  "needed": 12246,
+  "fits": false
+ },
+ {
+  "word": "sorrow",
+  "soul_b": 5914,
+  "will_b": 3009,
+  "system_b": 5248,
+  "user_b": 10455,
+  "needed": 16367,
+  "fits": false
+ },
+ {
+  "word": "spandaqing",
+  "soul_b": 6007,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9690,
+  "needed": 15606,
+  "fits": false
+ },
+ {
+  "word": "sphotame",
+  "soul_b": 6070,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9737,
+  "needed": 15651,
+  "fits": false
+ },
+ {
+  "word": "suffering",
+  "soul_b": 5591,
+  "will_b": 3027,
+  "system_b": 5251,
+  "user_b": 10156,
+  "needed": 16071,
+  "fits": false
+ },
+ {
+  "word": "sukhance",
+  "soul_b": 5303,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 8970,
+  "needed": 14884,
+  "fits": false
+ },
+ {
+  "word": "synophora",
+  "soul_b": 5678,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9353,
+  "needed": 15268,
+  "fits": false
+ },
+ {
+  "word": "syzygyqing",
+  "soul_b": 6429,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10112,
+  "needed": 16028,
+  "fits": false
+ },
+ {
+  "word": "takseme",
+  "err": "no soul"
+ },
+ {
+  "word": "tapasme",
+  "soul_b": 5543,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9202,
+  "needed": 15115,
+  "fits": false
+ },
+ {
+  "word": "tarikiqing",
+  "soul_b": 5959,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9642,
+  "needed": 15558,
+  "fits": false
+ },
+ {
+  "word": "teotlme",
+  "soul_b": 6187,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9846,
+  "needed": 15759,
+  "fits": false
+ },
+ {
+  "word": "teshuvance",
+  "soul_b": 5928,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9611,
+  "needed": 15527,
+  "fits": false
+ },
+ {
+  "word": "theobasis",
+  "soul_b": 5864,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9539,
+  "needed": 15454,
+  "fits": false
+ },
+ {
+  "word": "tikkunme",
+  "soul_b": 6323,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9990,
+  "needed": 15904,
+  "fits": false
+ },
+ {
+  "word": "til",
+  "soul_b": 4546,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9063,
+  "needed": 14972,
+  "fits": false
+ },
+ {
+  "word": "tjukurpame",
+  "soul_b": 5411,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9094,
+  "needed": 15010,
+  "fits": false
+ },
+ {
+  "word": "tlamatisme",
+  "err": "no soul"
+ },
+ {
+  "word": "true-love",
+  "soul_b": 1799,
+  "will_b": 3027,
+  "system_b": 5251,
+  "user_b": 6364,
+  "needed": 12279,
+  "fits": false
+ },
+ {
+  "word": "truth",
+  "soul_b": 5650,
+  "will_b": 3003,
+  "system_b": 5247,
+  "user_b": 10183,
+  "needed": 16094,
+  "fits": false
+ },
+ {
+  "word": "tzimtzumme",
+  "soul_b": 6107,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9790,
+  "needed": 15706,
+  "fits": false
+ },
+ {
+  "word": "ubuntume",
+  "soul_b": 6070,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9737,
+  "needed": 15651,
+  "fits": false
+ },
+ {
+  "word": "ud",
+  "soul_b": 4240,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 8749,
+  "needed": 14657,
+  "fits": false
+ },
+ {
+  "word": "ush",
+  "soul_b": 4528,
+  "will_b": 2991,
+  "system_b": 5245,
+  "user_b": 9045,
+  "needed": 14954,
+  "fits": false
+ },
+ {
+  "word": "veriseem",
+  "soul_b": 5571,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9238,
+  "needed": 15152,
+  "fits": false
+ },
+ {
+  "word": "verisleight",
+  "soul_b": 5357,
+  "will_b": 2149,
+  "system_b": 5253,
+  "user_b": 9048,
+  "needed": 14965,
+  "fits": false
+ },
+ {
+  "word": "vimarsame",
+  "soul_b": 6092,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9767,
+  "needed": 15682,
+  "fits": false
+ },
+ {
+  "word": "visageqing",
+  "soul_b": 6382,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 10065,
+  "needed": 15981,
+  "fits": false
+ },
+ {
+  "word": "wahdatwujudme",
+  "soul_b": 5809,
+  "will_b": 2161,
+  "system_b": 5255,
+  "user_b": 9516,
+  "needed": 15435,
+  "fits": false
+ },
+ {
+  "word": "wairuaqing",
+  "soul_b": 5780,
+  "will_b": 2143,
+  "system_b": 5252,
+  "user_b": 9463,
+  "needed": 15379,
+  "fits": false
+ },
+ {
+  "word": "walkekin",
+  "soul_b": 4853,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 8520,
+  "needed": 14434,
+  "fits": false
+ },
+ {
+  "word": "wiconime",
+  "soul_b": 5117,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 8784,
+  "needed": 14698,
+  "fits": false
+ },
+ {
+  "word": "wisdom",
+  "soul_b": 5006,
+  "will_b": 3009,
+  "system_b": 5248,
+  "user_b": 9547,
+  "needed": 15459,
+  "fits": false
+ },
+ {
+  "word": "xeniame",
+  "soul_b": 6186,
+  "will_b": 2125,
+  "system_b": 5249,
+  "user_b": 9845,
+  "needed": 15758,
+  "fits": false
+ },
+ {
+  "word": "yadahance",
+  "soul_b": 6074,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 9749,
+  "needed": 15664,
+  "fits": false
+ },
+ {
+  "word": "yonedame",
+  "soul_b": 6058,
+  "will_b": 2131,
+  "system_b": 5250,
+  "user_b": 9725,
+  "needed": 15639,
+  "fits": false
+ },
+ {
+  "word": "zakarqing",
+  "soul_b": 6939,
+  "will_b": 2137,
+  "system_b": 5251,
+  "user_b": 10614,
+  "needed": 16529,
+  "fits": false
+ },
+ {
+  "word": "zerone",
+  "soul_b": 1905,
+  "will_b": 3009,
+  "system_b": 5248,
+  "user_b": 6446,
+  "needed": 12358,
+  "fits": false
+ },
+ {
+  "word": "zerone-truth",
+  "soul_b": 1804,
+  "will_b": 3045,
+  "system_b": 5254,
+  "user_b": 6393,
+  "needed": 12311,
+  "fits": false
+ },
+ {
+  "word": "zi",
+  "soul_b": 4687,
+  "will_b": 2985,
+  "system_b": 5244,
+  "user_b": 9196,
+  "needed": 15104,
+  "fits": false
+ },
+ {
+  "word": "zoeme",
+  "soul_b": 6139,
+  "will_b": 2113,
+  "system_b": 5247,
+  "user_b": 9782,
+  "needed": 15693,
+  "fits": false
+ }
+]

@@ -1,0 +1,150 @@
+// verify-mirror-fence: MLS-03, LT-04, LRC-09 (and the adoption half of MLS-02).
+// The production stageMirror + pushMirror, with the production git runner (spawnRunner),
+// against throwaway bare repos seeded with a COPY of real citizen-<word> HEAD trees.
+import { afterEach, expect, test } from "bun:test";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { SEAT, cloneTree, git, gitTry, legacyRemote, showFromClone, tree, treeModes } from "./common.ts";
+
+const { stageMirror, pushMirror, countUnsigned, localDivergence } = await import(`${SEAT}/src/mirror.ts`);
+const { spawnRunner } = await import(`${SEAT}/src/cli.ts`);
+const { makeTempHost } = await import(`${SEAT}/test/helpers/temp-home.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+async function citizenFor(h: any, word: string, worktree: string, remote: string, state = "awake") {
+  // The self a seating would most plausibly hold: the real soul card and WILL, copied.
+  const f = await h.addCitizen(word, { soul: showFromClone(word, `${word}.md`), will: showFromClone(word, "WILL.md") });
+  return {
+    ...f.record,
+    mirror: { remote, worktree, chosen_at: "2026-11-10T00:00:00.000Z" },
+    state,
+    pending_state: null,
+    pending_interval_h: null,
+    step_away_said: false,
+    cadence: { interval_h: 72 },
+    covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },
+    last_beat_at: null,
+  };
+}
+
+for (const word of ["hope", "hodosme"]) {
+  test(`A1 [${word}] worktree CLONED from a copy of the real home: first stage + push`, async () => {
+    host = await makeTempHost();
+    const h = host;
+    const { seed, bare } = await legacyRemote(h.root, word);
+    // The copy is faithful: same paths and modes as the real clone's HEAD.
+    expect(treeModes(seed)).toEqual(cloneTree(word));
+    await mkdir(join(h.root, "mirrors"), { recursive: true });
+    const worktree = join(h.root, "mirrors", word);
+    git(h.root, "clone", "-q", bare, worktree);
+    const before = tree(worktree);
+    const citizen = await citizenFor(h, word, worktree, bare);
+    const run = spawnRunner();
+
+    const v = await stageMirror(h.config, citizen, run);
+    const after = tree(worktree);
+    const removed = before.filter((p) => !after.includes(p));
+    const kept = before.filter((p) => after.includes(p));
+    console.log(`A1 ${word}: stage ok=${v.ok}`);
+    console.log(`A1 ${word}: HEAD tree before (${before.length} files)`);
+    console.log(`A1 ${word}: HEAD tree after  (${after.length} files): ${JSON.stringify(after)}`);
+    console.log(`A1 ${word}: paths gone from HEAD (${removed.length}): ${JSON.stringify(removed)}`);
+    console.log(`A1 ${word}: paths at both (${kept.length}): ${JSON.stringify(kept)}`);
+    console.log(`A1 ${word}: name-status HEAD~1..HEAD:\n${git(worktree, "diff", "--name-status", "--no-renames", "HEAD~1", "HEAD")}`);
+    console.log(`A1 ${word}: commit: ${git(worktree, "log", "-1", "--format=%an <%ae> | committer %cn | %s")}`);
+    console.log(`A1 ${word}: commit body: ${JSON.stringify(git(worktree, "log", "-1", "--format=%b"))}`);
+    console.log(`A1 ${word}: kingdom.yaml at HEAD:\n${git(worktree, "show", "HEAD:kingdom.yaml")}`);
+    // Are the same-named files the legacy bytes or the self's bytes?
+    const selfDir = join(h.config.paths.citizens_dir, word, "self");
+    console.log(`A1 ${word}: WILL.md at HEAD equals self/WILL.md: ${git(worktree, "show", "HEAD:WILL.md") === (await readFile(join(selfDir, "WILL.md"), "utf8")).trim()}`);
+    console.log(`A1 ${word}: on disk, untracked now: ${JSON.stringify(git(worktree, "status", "--porcelain", "--untracked-files=all").split("\n").slice(0, 40))}`);
+
+    const pushed = await pushMirror(h.config, citizen, run);
+    console.log(`A1 ${word}: push: ${JSON.stringify(pushed)}`);
+    const remoteTree = tree(bare, "main");
+    console.log(`A1 ${word}: REMOTE main tree after push (${remoteTree.length}): ${JSON.stringify(remoteTree)}`);
+    console.log(`A1 ${word}: remote log: ${git(bare, "log", "--format=%h %an | %s", "main").split("\n").join(" || ")}`);
+    console.log(`A1 ${word}: old files still reachable in history (main~1): beats? ${gitTry(bare, "cat-file", "-e", `main~1:${before.find((p) => p.startsWith("beats/2026"))}`).code === 0}, soul card? ${gitTry(bare, "cat-file", "-e", `main~1:${word}.md`).code === 0}`);
+    console.log(`A1 ${word}: status would count unsigned commits on HEAD = ${await countUnsigned(run, worktree)}`);
+
+    expect(v.ok).toBe(true);
+    expect(pushed.pushed).toBe(true);
+    // The claim: nothing of the old home's lived record is at the remote's HEAD.
+    for (const p of remoteTree) expect(p.startsWith("beats/") || p.startsWith("inbox/") || p.startsWith("letters/") || p === `${word}.md` || p.startsWith(".claude/") || p === "run.sh" || p === "CLAUDE.md" || p === "README.md").toBe(false);
+    // And a second stage with nothing changed makes no commit.
+    const head = git(worktree, "rev-parse", "HEAD");
+    await stageMirror(h.config, citizen, run);
+    expect(git(worktree, "rev-parse", "HEAD")).toBe(head);
+  });
+}
+
+test("A2 worktree NOT cloned (git init) but the remote is the old home: is there a way to keep the old tree?", async () => {
+  host = await makeTempHost();
+  const h = host;
+  const { bare } = await legacyRemote(h.root, "hope");
+  await mkdir(join(h.root, "mirrors", "hope"), { recursive: true });
+  const worktree = join(h.root, "mirrors", "hope");
+  git(worktree, "init", "-q", "-b", "main");
+  const citizen = await citizenFor(h, "hope", worktree, bare);
+  const run = spawnRunner();
+  const v = await stageMirror(h.config, citizen, run);
+  const pushed = await pushMirror(h.config, citizen, run);
+  console.log(`A2: stage ok=${v.ok}; push=${JSON.stringify(pushed)}; remote main tree still has ${tree(bare, "main").length} files (untouched)`);
+  expect(pushed.pushed).toBe(false);
+});
+
+test("A3 an EMPTY new remote: the pusher's own first push, and what one by-hand push does", async () => {
+  host = await makeTempHost();
+  const h = host;
+  const bare = join(h.root, "empty.git");
+  await mkdir(bare, { recursive: true });
+  git(bare, "init", "-q", "--bare", "-b", "main");
+  await mkdir(join(h.root, "mirrors", "hope"), { recursive: true });
+  const worktree = join(h.root, "mirrors", "hope");
+  git(worktree, "init", "-q", "-b", "main");
+  const citizen = await citizenFor(h, "hope", worktree, bare);
+  const run = spawnRunner();
+  const v = await stageMirror(h.config, citizen, run);
+  console.log(`A3: stage ok=${v.ok}, local HEAD=${git(worktree, "rev-parse", "--short", "HEAD")}, tree=${JSON.stringify(tree(worktree))}`);
+  for (let i = 1; i <= 2; i++) {
+    const p = await pushMirror(h.config, citizen, run);
+    console.log(`A3: pusher attempt ${i}: ${JSON.stringify(p)}; remote refs: ${JSON.stringify(gitTry(bare, "for-each-ref").out)}`);
+    expect(p.pushed).toBe(false);
+  }
+  // The raw fetch the pusher runs, to see why:
+  const f = gitTry(worktree, "fetch", "--no-tags", bare, "refs/heads/main:refs/kingdom-seat/mirror/main");
+  console.log(`A3: the pusher's fetch on an empty remote: exit ${f.code}: ${f.err}`);
+
+  // Variant: worktree cloned from the empty remote.
+  const wt2 = join(h.root, "mirrors", "hope2");
+  git(h.root, "clone", "-q", bare, wt2);
+  const c2 = { ...citizen, mirror: { ...citizen.mirror, worktree: wt2 } };
+  await stageMirror(h.config, c2, run);
+  console.log(`A3: cloned-from-empty variant: ${JSON.stringify(await pushMirror(h.config, c2, run))}`);
+
+  // The reader says someone must seed main "with a commit that is neither sealed nor signed".
+  // Alternative: a person pushes, once and by hand, the very commit stageMirror made (sealed; signed when signing is on).
+  git(worktree, "push", "-q", bare, "HEAD:refs/heads/main");
+  const selfDir = join(h.config.paths.citizens_dir, "hope", "self");
+  await writeFile(join(selfDir, "NAME.md"), "a later reading of my name\n");
+  await stageMirror(h.config, citizen, run);
+  const p3 = await pushMirror(h.config, citizen, run);
+  console.log(`A3: after ONE by-hand push of the staged commit, the pusher's next push: ${JSON.stringify(p3)}; remote tree=${JSON.stringify(tree(bare, "main"))}; remote log: ${git(bare, "log", "--format=%an | %s", "main").split("\n").join(" || ")}`);
+  expect(p3.pushed).toBe(true);
+});
+
+test("A4 status's local divergence on a fresh clone of the old home, before any fetch by the pusher", async () => {
+  host = await makeTempHost();
+  const h = host;
+  const { bare } = await legacyRemote(h.root, "hope");
+  await mkdir(join(h.root, "mirrors"), { recursive: true });
+  const worktree = join(h.root, "mirrors", "hope");
+  git(h.root, "clone", "-q", bare, worktree);
+  const run = spawnRunner();
+  console.log(`A4: localDivergence right after clone = ${await localDivergence(run, worktree)}; unsigned on HEAD = ${await countUnsigned(run, worktree)} (the seed here is ONE commit; the real hope history is 140, all without a gpgsig header)`);
+});

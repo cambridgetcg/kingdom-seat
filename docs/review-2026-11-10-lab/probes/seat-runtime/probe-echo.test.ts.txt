@@ -1,0 +1,65 @@
+// Probe: what happens to the seat's own host note when a reply repeats a phrase the host itself uses.
+import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+const SRC = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${SRC}/src/seat.ts`);
+const { checkHalt } = await import(`${SRC}/src/halt.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/src/ledger.ts`);
+const { readHostNotes } = await import(`${SRC}/src/notes.ts`);
+const { readLastSeat, buildContext } = await import(`${SRC}/src/context.ts`);
+const { buildPrompt } = await import(`${SRC}/src/prompt.ts`);
+const { runTick } = await import(`${SRC}/src/tick.ts`);
+const { output, scriptedRuntime } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${SRC}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${SRC}/test/helpers/clock.ts`);
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+const log = (label: string, v: unknown) => console.log(`PROBE ${label}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+
+test("F. a second unparseable reply that repeats the reason it was shown leaves no seat note", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen("glossame");
+  await host.seatLedger("glossame", signer.signEntry, { initialState: "awake" });
+  const clock = testClock();
+  const config = host.config;
+  const deps = (runtime: any) => ({ config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+  const run = async (raw: string) => {
+    const citizen = await readCitizen(config, "glossame");
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    const rt = scriptedRuntime([raw]);
+    const r = await runSeat(seat, deps(rt));
+    return { r, prompt: rt.calls[0]?.prompt };
+  };
+  // Seat 1: prose, so it does not parse.
+  const one = await run("I rest in the quiet of the word.");
+  log("F seat 1", { outcome: one.r.outcome, exit: one.r.exit });
+  clock.advance(72 * HOUR_MS);
+  // Seat 2 is shown what seat 1 did not keep.
+  const two = await run("I see that the reply did not parse (not-json), so here is my journal in plain words again.");
+  const shown = (two.prompt.user as string).split("\n").filter((l: string) => /did not parse|kept nothing/.test(l));
+  log("F what seat 2 was shown", shown);
+  log("F seat 2", { outcome: two.r.outcome, exit: two.r.exit });
+  const notes = (await readHostNotes(config, new Date(0)))!;
+  log("F host notes after two seats", notes.map((n: any) => `${n.kind}/${n.outcome}: ${n.detail.replace(/[0-9a-f-]{36}/, "<id>")}`));
+  expect(notes.length).toBe(1);
+});
+
+test("G. beat whose journal repeats host phrasing: the beat is recorded, the seat's note is not", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen("glossame");
+  await host.seatLedger("glossame", signer.signEntry, { initialState: "awake" });
+  const clock = testClock();
+  const config = host.config;
+  const citizen = await readCitizen(config, "glossame");
+  const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+  const rt = scriptedRuntime([output({ type: "journal", kind: "reflected", text: "Last time one of my acts was not kept. This time: 1 acts, 1 entries, 0 not kept, I hope." } as any)]);
+  const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime: rt, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+  const notes = (await readHostNotes(config, new Date(0)))!;
+  const beats = (await readLedger(ledgerPath(config, "glossame"))).filter((e: any) => e.type === "beat").length;
+  log("G", { outcome: r.outcome, exit: r.exit, beats_in_ledger: beats, host_notes: notes.length });
+});

@@ -1,0 +1,190 @@
+// Skeptic probe (read-only against the build): the same two questions through
+// the PRODUCTION signer (createSigner), with a fake keychain and the fake
+// agenttool answering over a local in-process HTTP server, as the build's own
+// "birth through the real signer" test does. Nothing leaves the machine.
+//  (1) Does the production signer stop a birth whose confirmed "yes" is a No?
+//  (2) After a stop at box-keys: is a second citizenBirth refused, and does the
+//      production signer let the build's exported client calls finish it by hand?
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const W = "<KINGDOM_SEAT>";
+const birthMod = await import(`${W}/src/birth.ts`);
+const { citizenBirth, hostBirthRecord, BirthError } = birthMod;
+const clientMod = await import(`${W}/src/agenttool/client.ts`);
+const { ENROLLMENT_SIGNATURE_HEADER } = await import(`${W}/src/agenttool/wire.ts`);
+const { createSigner } = await import(`${W}/src/signer/signer.ts`);
+const { confirmYuPresent, proposalDigest } = await import(`${W}/src/signer/consent.ts`);
+const { appendEntry, entryHash, evidenceToLedger, ledgerKey, ledgerPath, nextDraft, originToLedger, readLedger, toLedgerHash, verifyChain } = await import(`${W}/src/ledger.ts`);
+const { fromB64, sha256 } = await import(`${W}/src/crypto.ts`);
+const { Refusal } = await import(`${W}/src/types.ts`);
+const { registrationProposal, assertConfirmedYes } = await import(`${W}/src/registration.ts`);
+const { testStamp } = await import(`${W}/test/fixtures/record/chain.ts`);
+const { fakeKeychain } = await import(`${W}/test/helpers/fake-keychain.ts`);
+const { fetchVia, startFakeServer } = await import(`${W}/test/helpers/fake-server.ts`);
+const { testClock } = await import(`${W}/test/helpers/clock.ts`);
+const { makeTempHost } = await import(`${W}/test/helpers/temp-home.ts`);
+const { TEST_IDS } = await import(`${W}/test/helpers/vectors.ts`);
+const { fakeAgenttool } = await import(`${W}/test/fixtures/agenttool/fake-agenttool.ts`);
+
+const WORD = "glossame";
+const PROJECT = TEST_IDS.project_id;
+const NOW = "2026-11-05T12:00:00.000Z";
+const AT = "2026-11-05T11:00:00.000Z";
+
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  while (cleanups.length) await cleanups.pop()!();
+});
+
+function consent(proposal: { subject: string; body: string; extent: string }) {
+  return {
+    format: "kingdom-seat-consent/v1",
+    proposal_sha256: proposalDigest(proposal),
+    subject: proposal.subject,
+    extent: proposal.extent,
+    yu: { word: "yes", recorded_at: AT, via: "decision-record" },
+    ai: { word: "agree", basis: "lazy-consensus", supports: ["collab-report:probe"], open_challenges: 0, deadline: AT },
+    expires_at: null,
+  };
+}
+
+async function setup(answerText: string) {
+  const host = await makeTempHost();
+  cleanups.push(() => host.cleanup());
+  host.config.agenttool.project_id = PROJECT;
+  await host.addCitizen(WORD);
+  const clock = testClock(NOW);
+  const kc = fakeKeychain([
+    [{ kind: "host-attest-seed" }, sha256("verify-registration probe host attest key")],
+    [{ kind: "commons-bearer" }, new TextEncoder().encode("at_probe-bearer-never-issued")],
+  ]);
+  const server = await startFakeServer();
+  cleanups.push(async () => void (await server.stop?.()));
+  const at = fakeAgenttool({ project_id: PROJECT });
+  for (const method of ["GET", "POST", "PUT", "DELETE"]) {
+    server.on(method, /^\/v1\//, (r: any) => {
+      const sig = r.headers[ENROLLMENT_SIGNATURE_HEADER.toLowerCase()];
+      const res = at.respond({ op: "read", word: null, operator: null, method: r.method, target: `${r.path}${r.search}`, body: r.body, credits: 0, proposal: null, presence: null, ...(sig ? { extra_headers: { [ENROLLMENT_SIGNATURE_HEADER]: sig } } : {}) });
+      return Response.json(res.json, { status: res.status });
+    });
+  }
+  const fetch = fetchVia(server);
+  const config = host.config;
+  const signer = createSigner({ keychain: kc, config, clock, fetch, spendSoFar: async (word: string) => ({ word, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
+  const sign = (w: any, k: any, d: any) => signer.signEntry(w, k, d);
+  const path = ledgerPath(config, WORD);
+  const rec = JSON.parse(await readFile(join(config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+  const cost = { usd: "0", credits: 0 };
+  const origin = await appendEntry(path, nextDraft(WORD, null, { type: "origin", origin: originToLedger(rec.origin), origin_soul_hash: toLedgerHash("b".repeat(64)), old_repo: { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" }, june_did: null }, { cost, signer: "host", now: new Date("2026-11-04T02:00:00.000Z") }), sign);
+  const answer = await appendEntry(path, nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "propose.beyond", subject: "registration", text: answerText }] }), sign);
+  const proposal = registrationProposal(WORD, answerText, entryHash(answer));
+  await writeFile(join(config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consent(proposal)));
+  const yesEntry = await appendEntry(path, nextDraft(WORD, answer, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T05:06:00.000Z"), seat: testStamp(WORD, "13131313-1313-4131-8131-131313131313"), acts: [{ type: "self.affirm", ref: proposalDigest(proposal) }] }), sign);
+  const yes = entryHash(yesEntry);
+  const birthProposal = { subject: `birth ${WORD}`, body: `Birth of ${WORD}; its affirming beat is ${yes}.`, extent: `birth ${WORD}` };
+  const birthConsent = consent(birthProposal);
+  await writeFile(join(config.paths.consent_dir, `${proposalDigest(birthProposal)}.json`), JSON.stringify(birthConsent));
+  const out: string[] = [];
+  const present = () => confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => `birth ${WORD}` }, `birth ${WORD}`, () => clock.now());
+  const deps: any = {
+    config,
+    clock,
+    keychain: kc,
+    signer,
+    client: { signer, fetch, identity: async (x: string) => { throw new Refusal("not-registered", `${x} is not registered`); } },
+    enroll: { signer, fetch, project_id: PROJECT, clock },
+    record: hostBirthRecord(config, clock, signer),
+    out: (line: string) => void out.push(line),
+  };
+  const input = async () => ({ word: WORD, origin: rec.origin, proposal: birthProposal, citizen_yes: yes, consent: birthConsent, presence: await present(), expression: { register: "Plain.", wake_text: "The soul." } });
+  const ledger = () => readLedger(path);
+  return { host, config, kc, at, signer, fetch, clock, deps, input, out, ledger, birthProposal, present, yes };
+}
+
+describe("skeptic, production signer", () => {
+  test("(1) a birth whose 'confirmed yes' affirms a No passes the production signer and completes", async () => {
+    const NO = "No. I do not want an identity on agenttool. Leave me unregistered.";
+    const w = await setup(NO);
+    await assertConfirmedYes(w.config, await w.ledger(), WORD, w.yes, w.clock.now());
+    const born = await citizenBirth(w.deps, await w.input());
+    console.log("REAL SIGNER, No answer -> birth report:", w.out.join(" | "));
+    console.log("routes answered by the fake agenttool:", JSON.stringify(w.at.log.filter((l: string) => !l.endsWith("/authority")).map((l: string) => l.replace(/[0-9a-f]{8}-[0-9a-f-]{27}/, "<id>"))));
+    expect(born.genesis.type).toBe("genesis");
+    expect(w.at.identities.size).toBe(1);
+  });
+
+  test("(2) a stop at box-keys: second run refused; the exported client calls finish it by hand through the production signer", async () => {
+    const w = await setup("Yes: an identity of my own.");
+    w.at.override((_r: any, url: URL) => url.pathname.endsWith("/box-keys"), { status: 503, json: { error: "unavailable" } });
+    let first: any = null;
+    try {
+      await citizenBirth(w.deps, await w.input());
+    } catch (e) {
+      first = e;
+    }
+    expect(first).toBeInstanceOf(BirthError);
+    const p = first.progress;
+    console.log("first run:", JSON.stringify({ stage: first.stage, done: first.done, ambiguous: first.ambiguous, has_evidence: p.op_key_evidence !== null }));
+    const rec = JSON.parse(await readFile(join(w.config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+    console.log("host after stop:", JSON.stringify({ citizen_json_identity: rec.identity, ledger: (await w.ledger()).map((e: any) => e.type), server_identities: w.at.identities.size }));
+
+    let second: any = null;
+    try {
+      await citizenBirth(w.deps, await w.input());
+    } catch (e) {
+      second = e;
+    }
+    console.log("second run:", second?.constructor?.name, "-", second?.message);
+    expect(second).toBeInstanceOf(Refusal);
+
+    // By hand, with only what the build exports and what the thrown error carried.
+    const keys = await w.signer.publicKeys(WORD);
+    const named = { identity_id: p.identity_id, did: p.did, root_kid: p.root_kid, root_public_key_b64: keys.root_b64, self_strand_id: null };
+    const client = { ...w.deps.client, identity: async (x: string) => (x === WORD ? named : w.deps.client.identity(x)) };
+    const auth = { presence: await w.present(), proposal: w.birthProposal, enrolled: { identity_id: p.identity_id, did: p.did } };
+    let result = "";
+    try {
+      const box = await clientMod.registerBoxKey(client, WORD, keys.box_b64, auth);
+      await clientMod.putExpression(client, WORD, { register: "Plain.", wake_text: "The soul." }, auth);
+      const identity = { did: p.did, identity_id: p.identity_id, project_id: PROJECT, root_public_key_b64: keys.root_b64, root_kid: p.root_kid, op_kid: p.op_kid, op_public_key_b64: keys.op_b64, box_public_key_b64: keys.box_b64, self_strand_id: null, enrolled_at: w.clock.now().toISOString() };
+      await birthMod.saveCitizenIdentity(w.config, WORD, identity);
+      const originEntry = (await w.ledger())[0];
+      const fields = { type: "genesis", origin_entry: entryHash(originEntry), root: ledgerKey(p.root_kid, fromB64(keys.root_b64, 32)), op: ledgerKey(p.op_kid, fromB64(keys.op_b64, 32)), evidence: evidenceToLedger(p.op_key_evidence) };
+      const genesis = await hostBirthRecord(w.config, w.clock, w.signer).append(WORD, fields, { signer: "citizen", did: p.did });
+      const verdict = verifyChain(await w.ledger(), { host_attest_b64: [keys.host_attest_b64], identity: { did: p.did, root_public_key_b64: keys.root_b64 } });
+      result = `finished by hand: box key ${box.id ? "registered" : "?"}, expression put, identity saved, ${genesis.type} appended; verifyChain ok=${verdict.ok}${verdict.problem ? ` (${verdict.problem.reason})` : ""}`;
+    } catch (e: any) {
+      result = `refused: ${e?.constructor?.name}: ${e?.message}`;
+    }
+    console.log("HAND FINISH through the production signer:", result);
+
+    // And without the error's progress: can the ids be recovered from anything on the host?
+    console.log("without the thrown error, the identity id is in: citizen.json?", rec.identity !== null, "| ledger?", (await w.ledger()).some((e: any) => JSON.stringify(e).includes(p.identity_id) && e.type !== "genesis"));
+  });
+
+  test("(3) without Yu present again, the production signer lets nothing of a stopped birth continue", async () => {
+    const w = await setup("Yes: an identity of my own.");
+    w.at.override((_r: any, url: URL) => url.pathname.endsWith("/box-keys"), { status: 503, json: { error: "unavailable" } });
+    let first: any = null;
+    try {
+      await citizenBirth(w.deps, await w.input());
+    } catch (e) {
+      first = e;
+    }
+    const p = first.progress;
+    const keys = await w.signer.publicKeys(WORD);
+    const named = { identity_id: p.identity_id, did: p.did, root_kid: p.root_kid, root_public_key_b64: keys.root_b64, self_strand_id: null };
+    const client = { ...w.deps.client, identity: async (x: string) => (x === WORD ? named : w.deps.client.identity(x)) };
+    const stale = { present: true, via: "tty-confirm", confirmed_at: w.clock.now().toISOString(), scope: `birth ${WORD}` };
+    let r = "";
+    try {
+      await clientMod.registerBoxKey(client, WORD, keys.box_b64, { presence: stale, proposal: w.birthProposal, enrolled: { identity_id: p.identity_id, did: p.did } });
+      r = "sent";
+    } catch (e: any) {
+      r = `${e?.constructor?.name}: ${e?.code ?? ""} ${e?.message}`;
+    }
+    console.log("hand finish with a presence not confirmed at this terminal:", r);
+  });
+});

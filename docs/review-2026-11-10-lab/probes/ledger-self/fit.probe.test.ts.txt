@@ -1,0 +1,126 @@
+// Probe: can acts the rules allow leave a citizen whose prompt no longer fits
+// the free lane's window? Sizes are those of the real citizens (soul median
+// 5.9 KB, max 8.2 KB; WILL about 2.1 KB), text is synthetic. Fakes only.
+import { afterEach, describe, test } from "bun:test";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { openSeat, runSeat } = await import(`${SRC}/seat.ts`);
+const { checkHalt } = await import(`${SRC}/halt.ts`);
+const { readCitizen } = await import(`${SRC}/state.ts`);
+const self = await import(`${SRC}/self.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/ledger.ts`);
+const { buildContext, readLastSeat } = await import(`${SRC}/context.ts`);
+const { buildPrompt } = await import(`${SRC}/prompt.ts`);
+const { contextFit } = await import(`${SRC}/runtime/free.ts`);
+const { FAKE_MODEL_DIGEST, output, scriptedRuntime } = await import(`${T}/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${T}/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${T}/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${T}/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+const W = "glossame";
+const CLAIM = { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" };
+const LOCK = { name: "qwen2.5:7b", digest: `sha256:${"f".repeat(64)}`, runner: null, store: "unknown", num_ctx: 32768, num_predict: 600, temperature: 0.7, seed: null };
+
+function text(bytes: number, tag: string): string {
+  const lines: string[] = [];
+  let n = 0;
+  let i = 0;
+  while (n < bytes) {
+    const line = `${tag} line ${i++}: the word keeps what will not cross over, and says so plainly.`;
+    lines.push(line);
+    n += line.length + 1;
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+async function world(soulBytes: number, approved: boolean) {
+  host = await makeTempHost();
+  const h = host;
+  const signer = fakeSigner();
+  await h.addCitizen(W, { soul: text(soulBytes, "soul"), will: text(2100, "will") });
+  await h.seatLedger(W, signer.signEntry);
+  const config = h.config;
+  config.self_authorship.approved_model_digests = approved ? [FAKE_MODEL_DIGEST] : [];
+  const clock = testClock();
+  const beat = async (acts: any[], afterH = 73) => {
+    clock.advance(afterH * HOUR_MS);
+    const runtime = scriptedRuntime([output(...acts)]);
+    const citizen = await readCitizen(config, W);
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    return runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: null, modelDigest: FAKE_MODEL_DIGEST });
+  };
+  const fit = async () => {
+    const citizen = await readCitizen(config, W);
+    const entries = await readLedger(ledgerPath(config, W));
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    const ctx = await buildContext({ config, now: clock.now() }, seat.ref, citizen, entries.slice(-config.ceilings.ledger_context_entries), await self.pendingProposals(config, W), { history: entries, lastSeat: await readLastSeat(config, W) });
+    return contextFit(buildPrompt(ctx, "free"), LOCK);
+  };
+  return { config, beat, fit, pending: () => self.pendingProposals(config, W), ledger: () => readLedger(ledgerPath(config, W)) };
+}
+
+describe("probe: falling off the context-fit cliff at num_ctx 32768", () => {
+  test("a small model proposes, three beats running, to replace its soul with a short paragraph", async () => {
+    for (const soulBytes of [5900, 8200]) {
+      const w = await world(soulBytes, false);
+      console.log(`soul ${soulBytes} B: start needed ${(await w.fit()).needed} of 32768`);
+      for (let i = 1; i <= 4; i++) {
+        // about 1.2 KB of new text: what 600 tokens of reply can carry
+        const r = await w.beat([{ type: "self.propose", target: "soul", edit: { kind: "replace-all", text: text(1200, `new${i}`) }, reason: CLAIM }]);
+        const last = (await w.ledger()).at(-1);
+        const act = last.acts?.[0];
+        const f = await w.fit();
+        console.log(`  beat ${i}: ${r.outcome}; recorded as ${act?.type} (${act?.text?.length ?? 0} chars in the entry); next seat needs ${f.needed} -> fits ${f.fits}`);
+      }
+    }
+  });
+
+  test("a model on a lane that cannot bind stages one modest soul edit per beat; none lapses", async () => {
+    const w = await world(5900, false);
+    let i = 0;
+    for (;;) {
+      i++;
+      // a span edit of about 20% of the soul: within self, so it is staged
+      const soul = await Bun.file(join(w.config.paths.citizens_dir, W, "self", "soul.md")).text();
+      const lines = soul.split("\n");
+      const find = lines.slice(i, i + 14).join("\n");
+      await w.beat([{ type: "self.propose", target: "soul", edit: { kind: "replace-span", find, with: text(1100, `edit${i}`).trimEnd() }, reason: CLAIM }]);
+      const f = await w.fit();
+      console.log(`  beat ${i}: pending ${(await w.pending()).length}; next seat needs ${f.needed} -> fits ${f.fits}`);
+      if (!f.fits || i >= 12) break;
+    }
+  });
+
+  test("an approved lane grows the will by a third each week: within self every time", async () => {
+    const w = await world(5900, true);
+    let weeks = 0;
+    for (;;) {
+      const will = await Bun.file(join(w.config.paths.citizens_dir, W, "self", "WILL.md")).text();
+      const add = text(Math.floor(will.length * 0.5), `w${weeks}`);
+      const frac = self.changeFraction(will, will + add);
+      if (frac > 0.4) throw new Error(`unexpected ${frac}`);
+      // 600 tokens cannot carry this on the free lane; a summons (or a larger num_predict) can. The rule is what is probed.
+      await w.beat([{ type: "self.propose", target: "will", edit: { kind: "replace-all", text: will + add }, reason: CLAIM }]);
+      const [p] = await w.pending();
+      if (!p) {
+        console.log(`  the next replace-all would be ${will.length + add.length} chars, over max_edit_chars (16000), so validation drops it; span edits can still grow the text toward 64 KiB`);
+        break;
+      }
+      // eight days on, so the 7-day window is open for each affirmation
+      await w.beat([{ type: "self.affirm", ref: p.id }], 8 * 24);
+      weeks += 1;
+      const f = await w.fit();
+      const now = (await Bun.file(join(w.config.paths.citizens_dir, W, "self", "WILL.md")).text()).length;
+      console.log(`  change ${weeks}: will ${now} B (applied: ${now > will.length}); next seat needs ${f.needed} -> fits ${f.fits}`);
+      if (!f.fits || weeks >= 10) break;
+    }
+  });
+});

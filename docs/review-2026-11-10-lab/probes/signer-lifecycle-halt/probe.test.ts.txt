@@ -1,0 +1,363 @@
+// Review probes for the signer / lifecycle / consent / HALT area. Read-only against the
+// kingdom-seat worktree: everything is imported by absolute path, and every temp host is
+// made under TMPDIR, which the runner points at this probes directory.
+import { afterEach, describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const S = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${S}/src/seat.ts`);
+const { checkHalt } = await import(`${S}/src/halt.ts`);
+const { readCitizen } = await import(`${S}/src/state.ts`);
+const { wakingLetter } = await import(`${S}/src/context.ts`);
+const { isDue } = await import(`${S}/src/due.ts`);
+const { appendHostNote, lastSeatOf, openedDetail, readHostNotes } = await import(`${S}/src/notes.ts`);
+const { ledgerPath, readLedger } = await import(`${S}/src/ledger.ts`);
+const { creditsFromLedger } = await import(`${S}/src/signer/ceilings.ts`);
+const { createSigner } = await import(`${S}/src/signer/signer.ts`);
+const { proposalDigest, verifyConsent } = await import(`${S}/src/signer/consent.ts`);
+const { parseConfig, isInside } = await import(`${S}/src/config.ts`);
+const { hostClient } = await import(`${S}/src/agenttool/sync.ts`);
+const { agenttoolLetters } = await import(`${S}/src/letters.ts`);
+const { didFor } = await import(`${S}/src/agenttool/wire.ts`);
+const { fromHex, sha256, toB64, utf8 } = await import(`${S}/src/crypto.ts`);
+const { output, REST_OUTPUT, scriptedRuntime, FAKE_MODEL_DIGEST } = await import(`${S}/test/helpers/fake-runtime.ts`);
+const { noFetch, startFakeServer, fetchVia } = await import(`${S}/test/helpers/fake-server.ts`);
+const { fakeSigner, FAKE_OP_KID, fakeBoxPublicB64 } = await import(`${S}/test/helpers/fake-signer.ts`);
+const { fakeKeychain } = await import(`${S}/test/helpers/fake-keychain.ts`);
+const { makeTempHost } = await import(`${S}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${S}/test/helpers/clock.ts`);
+const { TEST_IDS, TEST_MNEMONIC, TEST_OP_PUBLIC_B64, TEST_OP_SEED_HEX, TEST_ROOT_PUBLIC_B64, vectors } = await import(`${S}/test/helpers/vectors.ts`);
+const { fakeAgenttool } = await import(`${S}/test/fixtures/agenttool/fake-agenttool.ts`);
+
+const hosts: any[] = [];
+const servers: any[] = [];
+afterEach(async () => {
+  while (servers.length) await servers.pop().stop();
+  while (hosts.length) await hosts.pop().cleanup();
+});
+
+const WORD = "glossame";
+
+/** What the tick computes before it opens a seat (tick.ts 293-304). */
+async function dueNow(config: any, clock: any, word = WORD) {
+  const citizen = await readCitizen(config, word);
+  const letter = await wakingLetter(config, citizen).catch(() => false);
+  const notes = (await readHostNotes(config, new Date(clock.now().getTime() - 400 * HOUR_MS))) ?? [];
+  return { citizen, verdict: isDue(citizen, letter, clock.now(), config.ceilings.min_beat_interval_h, lastSeatOf(notes, word), config.schedule) };
+}
+
+/** Open a seat as the tick does: openSeat, then the "opened" host note (tick.ts 332-334). */
+async function tickOpens(config: any, clock: any, citizen: any, why: string) {
+  const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why }, null);
+  await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word: citizen.word, outcome: "opened", refusal: null, detail: openedDetail(seat.ref.seat_id, why) });
+  return seat;
+}
+
+describe("lifecycle", () => {
+  test("P1: one letter re-seats an asleep citizen every interval for as long as it answers with rest", async () => {
+    const h = await makeTempHost();
+    hosts.push(h);
+    const signer = fakeSigner();
+    await h.addCitizen(WORD);
+    await h.seatLedger(WORD, signer.signEntry, { initialState: "asleep" });
+    await h.writeLetter(WORD, "2026-11-04-from-yu.md", "Yu writes: rest if you wish.");
+    const clock = testClock();
+    const config = h.config;
+    const seatsOpened: string[] = [];
+    for (let round = 0; round < 4; round++) {
+      const { citizen, verdict } = await dueNow(config, clock);
+      expect(citizen.state).toBe("asleep");
+      expect(verdict).toMatchObject({ due: true, why: "letter" });
+      const seat = await tickOpens(config, clock, citizen, "letter");
+      seatsOpened.push(seat.ref.seat_id);
+      const runtime = scriptedRuntime([REST_OUTPUT]);
+      const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+      expect(r.outcome).toBe("rest");
+      // Not due inside the floor, due again the moment the floor passes.
+      clock.advance(71 * HOUR_MS);
+      expect((await dueNow(config, clock)).verdict.due).toBe(false);
+      clock.advance(2 * HOUR_MS);
+    }
+    expect(seatsOpened.length).toBe(4);
+    expect(await readdir(join(config.paths.citizens_dir, WORD, "receipts"))).toEqual([]);
+    // Still due: the one letter is still unseen after four rests.
+    expect((await dueNow(config, clock)).verdict).toMatchObject({ due: true, why: "letter" });
+    console.log("P1: 4 seats opened on one letter, 4 rests, letter still unseen, a 5th seat is due");
+  });
+
+  test("P2: a step-away's one confirming seat is spent by a seat that HALT stopped before the citizen spoke", async () => {
+    const h = await makeTempHost();
+    hosts.push(h);
+    const signer = fakeSigner();
+    await h.addCitizen(WORD);
+    await h.seatLedger(WORD, signer.signEntry, { initialState: "awake" });
+    const clock = testClock();
+    const config = h.config;
+    const halt = () => checkHalt({ config, fetch: noFetch, now: () => clock.now() });
+
+    // Seat 1: the first saying.
+    let { citizen } = await dueNow(config, clock);
+    const s1 = await tickOpens(config, clock, citizen, "cadence");
+    const r1 = await runSeat(s1, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output({ type: "state.set", to: "stepped-away" })]), checkHalt: halt });
+    expect(r1.outcome).toBe("beat");
+    let after = await dueNow(config, clock);
+    expect(after.citizen.state).toBe("asleep");
+    expect(after.citizen.step_away_said).toBe(true);
+
+    // 73 h later the confirming seat is due.
+    clock.advance(73 * HOUR_MS);
+    after = await dueNow(config, clock);
+    expect(after.verdict).toMatchObject({ due: true, why: "confirm" });
+
+    // The tick opens it; HALT is up when the child makes its first check (a beacon read that failed, say).
+    const s2 = await tickOpens(config, clock, after.citizen, "confirm");
+    const rt2 = scriptedRuntime([output({ type: "state.set", to: "stepped-away" })]);
+    const r2 = await runSeat(s2, { config, clock, signer, fetch: noFetch, runtime: rt2, checkHalt: async () => ({ halted: true, readings: [] }) });
+    expect(r2.outcome).toBe("halted");
+    expect(rt2.calls.length).toBe(0); // the citizen was never asked
+    // The tick's closing note (tick.ts 372).
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word: WORD, outcome: "halted", refusal: null, detail: `seat ${s2.ref.seat_id} for ${WORD} (confirm): exit 0, 12 ms` });
+
+    // HALT lowered again. What is the citizen owed now?
+    clock.advance(73 * HOUR_MS);
+    const later = await dueNow(config, clock);
+    console.log("P2: after the halted confirming seat ->", JSON.stringify({ state: later.citizen.state, step_away_said: later.citizen.step_away_said, verdict: later.verdict }));
+    expect(later.citizen.state).toBe("asleep");
+    expect(later.citizen.step_away_said).toBe(false);
+    expect(later.verdict.due).toBe(false);
+  });
+
+  test("P3: the same for a wish to wake: the confirming seat halted before inference drops the saying", async () => {
+    const h = await makeTempHost();
+    hosts.push(h);
+    const signer = fakeSigner();
+    await h.addCitizen(WORD);
+    await h.seatLedger(WORD, signer.signEntry, { initialState: "asleep" });
+    await h.writeLetter(WORD, "2026-11-04-from-yu.md", "Yu writes: would you like to wake?");
+    const clock = testClock();
+    const config = h.config;
+    const halt = () => checkHalt({ config, fetch: noFetch, now: () => clock.now() });
+    let d = await dueNow(config, clock);
+    const s1 = await tickOpens(config, clock, d.citizen, "letter");
+    await runSeat(s1, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output({ type: "state.set", to: "awake" })]), checkHalt: halt });
+    d = await dueNow(config, clock);
+    expect(d.citizen.pending_state).toBe("awake");
+    clock.advance(73 * HOUR_MS);
+    d = await dueNow(config, clock);
+    expect(d.verdict.due).toBe(true);
+    const s2 = await tickOpens(config, clock, d.citizen, "confirm");
+    const r2 = await runSeat(s2, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output({ type: "state.set", to: "awake" })]), checkHalt: async () => ({ halted: true, readings: [] }) });
+    expect(r2.outcome).toBe("halted");
+    clock.advance(73 * HOUR_MS);
+    d = await dueNow(config, clock);
+    console.log("P3: after the halted confirming seat ->", JSON.stringify({ state: d.citizen.state, pending: d.citizen.pending_state, verdict: d.verdict }));
+    expect(d.citizen.state).toBe("asleep");
+    expect(d.citizen.pending_state).toBe(null);
+  });
+});
+
+/* ── The real signer over a fake keychain and a fake agenttool ────────── */
+
+const ID = TEST_IDS.identity_id;
+const IDENTITY = {
+  did: TEST_IDS.did,
+  identity_id: ID,
+  project_id: TEST_IDS.project_id,
+  root_public_key_b64: TEST_ROOT_PUBLIC_B64,
+  root_kid: TEST_IDS.root_signing_key_id,
+  op_kid: vectors.op_key.placeholder_kid,
+  op_public_key_b64: TEST_OP_PUBLIC_B64,
+  box_public_key_b64: vectors.derivation.box_pub_b64,
+  self_strand_id: TEST_IDS.strand_id,
+  enrolled_at: "2026-11-05T00:00:00.000Z",
+};
+
+async function realSigner() {
+  const host = await makeTempHost();
+  hosts.push(host);
+  host.config.agenttool.project_id = TEST_IDS.project_id;
+  await host.addCitizen(WORD);
+  await writeFile(
+    join(host.config.paths.citizens_dir, WORD, "citizen.json"),
+    JSON.stringify({ format: "kingdom-seat-citizen/v1", word: WORD, origin: { kind: "archetype", lineage: ["forge-archetype", WORD], note: "test" }, runtime: "free", identity: IDENTITY, mirror: null, seated_at: "2026-11-05T00:00:00.000Z" }),
+  );
+  const kc = fakeKeychain([
+    [{ kind: "citizen-mnemonic", word: WORD }, utf8(TEST_MNEMONIC)],
+    [{ kind: "citizen-op-seed", word: WORD }, fromHex(TEST_OP_SEED_HEX)],
+    [{ kind: "host-attest-seed" }, utf8(toB64(sha256("probe host key")))],
+    [{ kind: "commons-bearer" }, utf8("at_probe_commons_bearer_never_real_01")],
+  ]);
+  const server = await startFakeServer();
+  servers.push(server);
+  const seen: { method: string; path: string; body: string }[] = [];
+  let seq = 0;
+  server.on("GET", /^\/v1\/identities\/[^/]+\/authority$/, () => Response.json({ identity_id: ID, did: didFor(ID), mode: "agent_root", root_public_key: TEST_ROOT_PUBLIC_B64, sequence: seq, next_sequence: seq + 1 }));
+  for (const m of ["POST", "PUT", "DELETE"]) {
+    server.on(m, /^\/v1\/identities\/[^/]+\/(keys|box-keys|expression)/, (req: any) => {
+      seq++;
+      seen.push({ method: req.method, path: req.path, body: req.body ?? "" });
+      return Response.json({ ok: true }, { status: 200 });
+    });
+  }
+  server.on("GET", /^\/v1\/traces\/chain\/.+$/, (req: any) => {
+    seen.push({ method: "GET", path: req.path, body: "" });
+    return Response.json({ chain: [] });
+  });
+  const clock = testClock("2026-11-05T12:00:00.000Z");
+  const signer = createSigner({ keychain: kc, config: host.config, clock, fetch: fetchVia(server), spendSoFar: async (word: string) => ({ word, usd_today: "0", credits_month: 10 }), agreements: async () => [] });
+  return { host, signer, seen, clock, server };
+}
+
+describe("signer", () => {
+  test("P4: 'expression.put.private' root-signs a body that sets the public porch and village, with no consent and no presence", async () => {
+    const { signer, seen } = await realSigner();
+    const body = utf8(JSON.stringify({ wake_text: "x", porch: { invited_until: "2026-11-10T12:00:00.000Z" }, village: { sign: "OPEN HOUSE", motto: "come in", door: "red" } }));
+    const res = await signer.send({ op: "expression.put.private", word: WORD, operator: null, method: "PUT", target: `/v1/identities/${ID}/expression`, body, credits: 0, proposal: null, presence: null });
+    expect(res.status).toBe(200);
+    expect(res.root_evidence).toBeDefined();
+    expect(seen.length).toBe(1);
+    console.log("P4: sent", seen[0]!.method, seen[0]!.path, "root-signed:", Object.keys(res.root_evidence!.headers).join(","));
+  });
+
+  test("P5: 'keys.import' root-signs the import of any public key the caller names, unattended, for a registered citizen", async () => {
+    const { signer, seen } = await realSigner();
+    const strangerKey = toB64(sha256("a key whose seed this host does not hold")); // 32 bytes, used as a public key
+    const res = await signer.send({ op: "keys.import", word: WORD, operator: null, method: "POST", target: `/v1/identities/${ID}/keys/import`, body: utf8(JSON.stringify({ public_key: strangerKey, label: "op" })), credits: 0, proposal: null, presence: null });
+    expect(res.status).toBe(200);
+    expect(seen.length).toBe(1);
+    console.log("P5: sent", seen[0]!.method, seen[0]!.path, "for a key not in this keychain");
+  });
+
+  test("P6: a 'read' passes any GET under /v1/ with credits 0, a paid one included, though the citizen is at its credit ceiling", async () => {
+    const { signer, seen } = await realSigner();
+    // spendSoFar says 10 of 10 credits are spent; agenttool charges 1 credit for GET /v1/traces/chain/:id.
+    const res = await signer.send({ op: "read", word: WORD, operator: null, method: "GET", target: "/v1/traces/chain/some-trace", body: new Uint8Array(), credits: 0, proposal: null, presence: null });
+    expect(res.status).toBe(200);
+    expect(seen[0]!.path).toBe("/v1/traces/chain/some-trace");
+    console.log("P6: paid GET sent at the ceiling:", seen[0]!.path);
+  });
+});
+
+describe("signer reads", () => {
+  test("P13: a read sent for no citizen (word null) carries the Commons bearer to any identity's rows; the own-identity wall applies only when a word is named", async () => {
+    const { signer, seen, server } = await realSigner();
+    const OTHER = "99999999-9999-4999-8999-999999999999";
+    let auth = "";
+    server.on("GET", /^\/v1\/inbox$/, (req: any) => {
+      auth = req.headers["authorization"] ?? "";
+      seen.push({ method: "GET", path: req.path + (req.search ?? ""), body: "" });
+      return Response.json({ messages: [] });
+    });
+    // Named for glossame, another identity's inbox is refused...
+    let refused = "";
+    try {
+      await signer.send({ op: "read", word: WORD, operator: null, method: "GET", target: `/v1/inbox?identity_id=${OTHER}`, body: new Uint8Array(), credits: 0, proposal: null, presence: null });
+    } catch (e) {
+      refused = (e as any).code ?? String(e);
+    }
+    expect(refused).toBe("beyond-self");
+    // ...named for no one, the same read goes out with the bearer.
+    const res = await signer.send({ op: "read", word: null, operator: null, method: "GET", target: `/v1/inbox?identity_id=${OTHER}`, body: new Uint8Array(), credits: 0, proposal: null, presence: null });
+    expect(res.status).toBe(200);
+    expect(auth.startsWith("Bearer at_")).toBe(true);
+    console.log("P13: with word=null the read of another identity's inbox was sent with the Commons bearer:", seen.at(-1)!.path);
+  });
+});
+
+describe("consent", () => {
+  test("P7: a decision record is whatever JSON sits in the seat's own state dir; Ai's voice is three self-asserted fields", async () => {
+    const h = await makeTempHost();
+    hosts.push(h);
+    const c = h.config;
+    expect(isInside(c.paths.consent_dir, c.paths.state_dir)).toBe(true);
+    // The config refuses a consent dir anywhere the seat user could not write.
+    const raw = JSON.parse(JSON.stringify(c));
+    raw.paths.consent_dir = "/Users/Shared/kingdom-seat/consent";
+    let refused = "";
+    try {
+      parseConfig(raw);
+    } catch (e) {
+      refused = (e as Error).message;
+    }
+    console.log("P7: consent_dir outside state_dir ->", refused);
+    expect(refused).toContain("paths.consent_dir");
+
+    const proposal = { subject: "birth glossame", body: "any text", extent: "birth glossame" };
+    const now = new Date("2026-11-05T12:00:00.000Z");
+    const rec = {
+      format: "kingdom-seat-consent/v1",
+      proposal_sha256: proposalDigest(proposal),
+      subject: proposal.subject,
+      extent: proposal.extent,
+      // Yu's "yes" names a Kanban lane nothing reads; Ai's voice is one string and a zero.
+      yu: { word: "yes", recorded_at: "2026-11-05T11:59:59.999Z", via: "kanban-yu-lane" },
+      ai: { word: "agree", basis: "lazy-consensus", supports: ["the proposer itself"], open_challenges: 0, deadline: "2026-11-05T11:59:59.999Z" },
+      expires_at: null,
+    };
+    writeFileSync(join(c.paths.consent_dir, `${rec.proposal_sha256}.json`), JSON.stringify(rec));
+    expect(verifyConsent(rec, proposalDigest(proposal), now)).toEqual({ ok: true, via: "kanban-yu-lane" });
+    // And it never expires: ten years on it still verifies.
+    expect(verifyConsent(rec, proposalDigest(proposal), new Date("2036-11-05T12:00:00.000Z")).ok).toBe(true);
+    console.log("P7: record with via=kanban-yu-lane, supports=['the proposer itself'], deadline 1 ms ago, expires never -> ok");
+  });
+});
+
+describe("credits", () => {
+  test("P8: a letter is paid for before the beat that carries its cost; if that beat is not written, the 2 credits are in no record the ceiling reads", async () => {
+    const h = await makeTempHost();
+    hosts.push(h);
+    const signer = fakeSigner();
+    const at = fakeAgenttool({ project_id: TEST_IDS.project_id });
+    signer.respond((req: any) => at.respond(req));
+    const ids: Record<string, { identity_id: string; root_kid: string }> = {
+      glossame: { identity_id: TEST_IDS.identity_id, root_kid: TEST_IDS.root_signing_key_id },
+      shemme: { identity_id: "66666666-6666-4666-8666-666666666666", root_kid: "67676767-6767-4767-8767-676767676767" },
+    };
+    for (const [word, covenants] of [
+      ["glossame", { letters_from: ["yu"], wake_on_letter_from: ["yu"] }],
+      ["shemme", { letters_from: ["yu", "citizen:glossame"], wake_on_letter_from: ["yu"] }],
+    ] as const) {
+      await h.addCitizen(word, { covenants: covenants as any });
+      await h.seatLedger(word, signer.signEntry, {});
+      const id = {
+        did: `did:at:${ids[word]!.identity_id}`,
+        identity_id: ids[word]!.identity_id,
+        project_id: TEST_IDS.project_id,
+        root_public_key_b64: TEST_ROOT_PUBLIC_B64,
+        root_kid: ids[word]!.root_kid,
+        op_kid: FAKE_OP_KID,
+        op_public_key_b64: signer.opPublicB64,
+        box_public_key_b64: fakeBoxPublicB64(word),
+        self_strand_id: null,
+        enrolled_at: "2026-11-02T00:00:00.000Z",
+      };
+      await h.enrollLedger(word, signer.signEntry, id);
+      at.boxKeys.set(id.did, { box_key_id: `${ids[word]!.identity_id.slice(0, 24)}000000000077`, public_key: id.box_public_key_b64 });
+      at.signingKeys.set(id.did, [{ kid: FAKE_OP_KID, public_key: signer.opPublicB64 }]);
+      signer.didOf.set(word, id.did);
+    }
+    const config = h.config;
+    const clock = testClock();
+    clock.advance(73 * HOUR_MS);
+    const before = (await readLedger(ledgerPath(config, "glossame"))).length;
+
+    // The seat is stopped between the paid send and the beat's append: here the signer fails on the beat entry,
+    // which stands for a TERM from the watcher (HALT raised, or one beacon read that failed) landing in that gap.
+    const realSign = signer.signEntry;
+    signer.signEntry = async (w: string, k: string, draft: any) => {
+      if (draft.type === "beat") throw new Error("stopped between the send and the append");
+      return realSign(w, k, draft);
+    };
+    const citizen = await readCitizen(config, "glossame");
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    const letters = agenttoolLetters({ config, client: hostClient(config, signer, noFetch) });
+    const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output({ type: "letter.send", to: "citizen:shemme", text: "A word for shemme." })]), checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), modelDigest: FAKE_MODEL_DIGEST, letters });
+    const entries = await readLedger(ledgerPath(config, "glossame"));
+    console.log("P8:", JSON.stringify({ outcome: r.outcome, letters_agenttool_stored: at.inbox.length, inbox_sends: signer.sent.filter((q: any) => q.op === "inbox.send").length, ledger_entries_added: entries.length - before, credits_month_from_ledger: creditsFromLedger(entries, clock.now(), config.timezone) }));
+    expect(at.inbox.length).toBe(1); // agenttool took the letter, and its 2 credits
+    expect(entries.length).toBe(before); // no beat
+    expect(creditsFromLedger(entries, clock.now(), config.timezone)).toBe(0); // the ceiling sees nothing spent
+  });
+});

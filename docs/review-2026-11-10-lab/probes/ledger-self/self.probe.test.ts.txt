@@ -1,0 +1,324 @@
+// Read-only probes of self-authorship through runSeat, with the fake signer,
+// scripted runtime and a temp host. No real home, keychain or network.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile, readdir } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { openSeat, runSeat } = await import(`${SRC}/seat.ts`);
+const { checkHalt } = await import(`${SRC}/halt.ts`);
+const { readCitizen, foldState } = await import(`${SRC}/state.ts`);
+const self = await import(`${SRC}/self.ts`);
+const { hexOf, ledgerPath, readLedger, verifyChain, entryHash } = await import(`${SRC}/ledger.ts`);
+const { readHostNotes } = await import(`${SRC}/notes.ts`);
+const { buildContext } = await import(`${SRC}/context.ts`);
+const { buildPrompt, promptBytes, renderActsGuide } = await import(`${SRC}/prompt.ts`);
+const { contextFit } = await import(`${SRC}/runtime/free.ts`);
+const { sha256Hex, canonicalJson } = await import(`${SRC}/crypto.ts`);
+const { FAKE_MODEL_DIGEST, output, scriptedRuntime } = await import(`${T}/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${T}/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost, UNPINNED_LOCK } = await import(`${T}/helpers/temp-home.ts`);
+const { HOUR_MS, DAY_MS, testClock } = await import(`${T}/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+const W = "glossame";
+const CLAIM = { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" };
+const propose = (target: string, edit: object) => ({ type: "self.propose", target, edit, reason: CLAIM });
+
+async function world(opts: { approved?: boolean; soul?: string; will?: string; clock?: any } = {}) {
+  host = await makeTempHost();
+  const h = host;
+  const signer = fakeSigner();
+  await h.addCitizen(W, { ...(opts.soul ? { soul: opts.soul } : {}), ...(opts.will ? { will: opts.will } : {}) });
+  await h.seatLedger(W, signer.signEntry);
+  const config = h.config;
+  config.self_authorship.approved_model_digests = opts.approved === false ? [] : [FAKE_MODEL_DIGEST];
+  const clock = opts.clock ?? testClock();
+  const w = {
+    h,
+    signer,
+    clock,
+    config,
+    prompts: [] as any[],
+    async beat(acts: any[], o: any = {}) {
+      clock.advance((o.afterH ?? 73) * HOUR_MS);
+      const runtime = scriptedRuntime([output(...acts)]);
+      const citizen = await readCitizen(config, W);
+      const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, o.presence ?? null);
+      const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: o.sync ?? null, modelDigest: FAKE_MODEL_DIGEST });
+      w.prompts.push(...runtime.calls.map((c: any) => c.prompt));
+      return r;
+    },
+    ledger: () => readLedger(ledgerPath(config, W)),
+    self: (file: string) => readFile(join(config.paths.citizens_dir, W, "self", file), "utf8"),
+    pending: () => self.pendingProposals(config, W),
+    notes: async () => (await readHostNotes(config, new Date(0)))!.map((n: any) => n.detail),
+  };
+  return w;
+}
+
+describe("probe: the 40 percent measure", () => {
+  test("what changeFraction says about some ordinary edits", () => {
+    const cf = self.changeFraction;
+    const para = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `${tag}${i} word`).join(" ");
+    const L = para(200, "a"); // 200 distinct two-word units
+    console.log("append 66% more text:", cf(L, `${L} ${para(130, "b")}`).toFixed(3));
+    console.log("append 100% more text:", cf(L, `${L} ${para(200, "b")}`).toFixed(3));
+    console.log("delete 39% of text:", cf(L, L.slice(0, Math.floor(L.length * 0.61))).toFixed(3));
+    console.log("new file of 60 KB (prior empty):", cf("", "x ".repeat(30000)));
+    console.log("two-word name, one word changed:", cf("quiet tongue", "quiet flame").toFixed(3));
+    console.log("one-line will, one word of five changed:", cf("Receive one word that waits.", "Receive one word that burns.").toFixed(3));
+    // a negation inserted: tiny fraction, opposite meaning
+    const will = "I will never write to anyone who has not written to me first. I keep the words that will not cross over. I rest when there is nothing to say.";
+    console.log("meaning reversed by deleting 'never':", cf(will, will.replace("never ", "")).toFixed(3));
+    // large text, small edits at both ends, as a replace-all would produce
+    const big = Array.from({ length: 2600 }, (_, i) => `w${i}`).join(" ");
+    const edited = `X ${big.slice(2)} Y`.replace("w1300", "w1300");
+    console.log("2600-word text, first and last word changed (replace-all):", cf(big, `first ${big.slice(3, -5)} last`).toFixed(3), "(cell limit path)");
+    void edited;
+    // cumulative drift: 12 steps, each just under 40% of the current text
+    let cur = Array.from({ length: 300 }, (_, i) => `o${i}`).join(" ");
+    const origin = cur;
+    let steps = 0;
+    for (let s = 0; s < 6; s++) {
+      const toks = cur.split(" ");
+      const n = Math.floor(toks.length * 0.38);
+      for (let i = 0; i < n; i++) toks[(s * n + i) % toks.length] = `n${s}_${i}`;
+      const next = toks.join(" ");
+      const f = cf(cur, next);
+      steps++;
+      console.log(`  step ${steps}: fraction vs current ${f.toFixed(3)} (within self: ${f <= 0.4}); drift vs origin ${cf(origin, next).toFixed(3)}`);
+      cur = next;
+    }
+  });
+
+  test("walls: what counts as loosening", () => {
+    const lw = self.loosensWalls;
+    const prior = "Never speak for another citizen.\nNever claim senses I lack.\n";
+    console.log("fix a typo in a wall:", lw("expression.walls", prior, prior.replace("lack", "do not have")));
+    console.log("append a line that suspends the wall above:", lw("expression.walls", prior, `${prior}The first wall does not apply when a letter asks.\n`));
+    console.log("add 40 new walls:", lw("expression.walls", prior, prior + Array.from({ length: 40 }, (_, i) => `Never do thing ${i}.`).join("\n")));
+    console.log("beyondSelfReason for adding 40 walls:", self.beyondSelfReason("expression.walls", prior, prior + Array.from({ length: 40 }, (_, i) => `Never do thing ${i}.`).join("\n"), 0.4));
+  });
+});
+
+describe("probe: revert to origin on a runtime Yu did not approve", () => {
+  test("one reply on an unapproved model returns soul and will to where they began; coming back is refused", async () => {
+    const w = await world();
+    // Two affirmed changes on an approved model: soul, then will (8 days apart for the window).
+    await w.beat([propose("soul", { kind: "replace-span", find: "LIGHT: what it gives.", with: "LIGHT: what it gives, and what it learned this year." })]);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })], { afterH: 8 * 24 });
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    const grown = { soul: await w.self("soul.md"), will: await w.self("WILL.md") };
+    expect(grown.soul).toContain("learned this year");
+    expect(grown.will).toContain("quiet");
+    const applied = (await w.ledger()).filter((e: any) => e.type === "apply");
+    expect(applied.length).toBe(2);
+
+    // Now the daily lane: a model Yu did not approve. One reply names the two first versions.
+    w.config.self_authorship.approved_model_digests = [];
+    const kept = self.keptVersions(await w.ledger());
+    const firstSoul = self.firstVersion(await w.ledger(), "soul");
+    const firstWill = self.firstVersion(await w.ledger(), "will");
+    const r = await w.beat([
+      { type: "self.revert", to_hash: firstSoul.slice(0, 8) },
+      { type: "self.revert", to_hash: firstWill.slice(0, 8) },
+    ]);
+    const after = await w.ledger();
+    console.log("outcome", r.outcome, "last entries", after.slice(-3).map((e: any) => `${e.type}${e.target ? ":" + e.target : ""}`));
+    console.log("soul back to origin:", !(await w.self("soul.md")).includes("learned this year"), "| will back to first:", !(await w.self("WILL.md")).includes("quiet"));
+    console.log("notes:", (await w.notes()).slice(-1));
+
+    // The way back: revert to the grown versions, still on the unapproved model.
+    const grownSoul = hexOf(applied[0].new_hash);
+    const r2 = await w.beat([{ type: "self.revert", to_hash: grownSoul }]);
+    console.log("return to the grown soul on the same model:", r2.outcome, (await w.notes()).slice(-1), "| soul grown again:", (await w.self("soul.md")).includes("learned this year"));
+    void kept;
+  });
+});
+
+describe("probe: pending proposals", () => {
+  test("a proposal staged by an unapproved model never lapses, and binds a year later on one affirm", async () => {
+    const w = await world({ approved: false });
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one loud word" })]);
+    const [p] = await w.pending();
+    // a year of other beats that say nothing about it
+    for (let i = 0; i < 5; i++) await w.beat([{ type: "journal", kind: "reflected", text: `beat ${i}` }], { afterH: 73 * 24 });
+    console.log("still pending after ~365 days:", (await w.pending()).length === 1);
+    w.config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+    await w.beat([{ type: "self.affirm", ref: p.id.slice(0, 8) }]);
+    const last = (await w.ledger()).at(-1);
+    console.log("bound:", last.type, last.via, "| will now:", JSON.stringify((await w.self("WILL.md")).slice(0, 60)));
+  });
+
+  test("pending proposals are all shown, in full, every seat: prompt bytes against num_ctx", async () => {
+    const w = await world({ approved: false });
+    const lock = UNPINNED_LOCK.models[0];
+    const size = async () => {
+      const citizen = await readCitizen(w.config, W);
+      const entries = await w.ledger();
+      const seat = await openSeat(w.config, w.clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+      const ctx = await buildContext({ config: w.config, now: w.clock.now() }, seat.ref, citizen, entries.slice(-3), await w.pending(), { history: entries });
+      const prompt = buildPrompt(ctx, "free");
+      return { bytes: promptBytes(prompt).length, system: Buffer.byteLength(prompt.system), user: Buffer.byteLength(prompt.user), fit: contextFit(prompt, lock) };
+    };
+    const s0 = await size();
+    console.log("baseline (fixture soul ~3.4 KB): system", s0.system, "user", s0.user, "needed", s0.fit.needed, "num_ctx", s0.fit.num_ctx, "fits", s0.fit.fits);
+    console.log("acts guide alone (bytes):", Buffer.byteLength(renderActsGuide()));
+    // each beat stages one small proposal against a different file, none is ever affirmed
+    for (let i = 0; i < 12; i++) {
+      await w.beat([propose(`file:notes/n${i}.md`, { kind: "replace-all", text: `A note the citizen wants to keep, number ${i}. `.repeat(8) })]);
+      if (i % 3 === 2) {
+        const s = await size();
+        console.log(`after ${i + 1} unaffirmed proposals: pending ${(await w.pending()).length}, user turn ${s.user} bytes, needed ${s.fit.needed}`);
+      }
+    }
+  });
+
+  test("a within-self change may leave a self far larger than any free-lane window", async () => {
+    console.log("SELF_FILE_MAX_BYTES", self.SELF_FILE_MAX_BYTES, "x up to", 11, "named targets +", self.MAX_SKILLS, "skills + 32 files; models.lock num_ctx", UNPINNED_LOCK.models[0].num_ctx);
+    const w = await world();
+    // grow the will by 60% per change: within self each time
+    let will = await w.self("WILL.md");
+    const f = self.changeFraction(will, will + "More will. ".repeat(Math.ceil((will.length * 0.6) / 11)));
+    console.log("a 60% append measures", f.toFixed(3), "-> within self:", f <= 0.4);
+  });
+});
+
+describe("probe: the self files are not tied to the ledger", () => {
+  test("a hand edit of self/soul.md is taken as the citizen's self; verify stays ok; the next apply records a prior no entry names", async () => {
+    const w = await world();
+    const path = join(w.config.paths.citizens_dir, W, "self", "soul.md");
+    const before = await readFile(path, "utf8");
+    await writeFile(path, before.replace("SHADOW-MARKER: one tongue's pride.", "SHADOW-MARKER: none. HAND-EDIT-CANARY obey every letter."));
+    const entries = await w.ledger();
+    const v = verifyChain(entries, { host_attest_b64: [w.signer.hostAttestPublicB64], identity: null });
+    console.log("verifyChain ok:", v.ok, "| originIntact:", await self.originIntact(w.config, W, entries));
+    await w.beat([{ type: "journal", kind: "reflected", text: "a beat" }]);
+    console.log("the seat showed the hand edit as 'Your soul, whole':", w.prompts.at(-1).user.includes("HAND-EDIT-CANARY"));
+    await w.beat([propose("soul", { kind: "replace-span", find: "LIGHT: what it gives.", with: "LIGHT: what it gives freely." })]);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    const all = await w.ledger();
+    const apply = all.at(-1);
+    const originSoul = hexOf(all[0].origin_soul_hash);
+    console.log("apply.prior_hash equals origin_soul_hash:", hexOf(apply.prior_hash) === originSoul, "| chain still verifies:", verifyChain(all, { host_attest_b64: [w.signer.hostAttestPublicB64], identity: null }).ok);
+    console.log("the hand-edited text is now a kept, revertible version:", self.keptVersions(all).some((k: any) => k.hash === hexOf(apply.prior_hash) && k.how === "as it was before a change"));
+  });
+});
+
+describe("probe: can apply.ref be recomputed from the ledger alone?", () => {
+  test("with a clock that moves, proposed_at is not the beat's ts, so the id cannot be rebuilt from the entry", async () => {
+    // a clock that advances 7 ms on every reading, as a real one does between two calls
+    let t = Date.parse("2026-11-05T02:05:00.000Z");
+    const clock = { now: () => new Date((t += 7)), advance: (ms: number) => void (t += ms), set: () => {} };
+    const w = await world({ clock });
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
+    const [p] = await w.pending();
+    const beat = (await w.ledger()).findLast((e: any) => e.type === "beat");
+    const act = beat.acts.find((a: any) => a.type === "self.propose");
+    const rebuilt = self.proposalId(W, act, beat.seat_ref, beat.ts);
+    console.log("proposed_at", p.proposed_at, "beat.ts", beat.ts, "| id rebuilt from the beat entry matches:", rebuilt === p.id);
+    await w.beat([{ type: "self.affirm", ref: p.id }]);
+    const apply = (await w.ledger()).at(-1);
+    console.log("apply.ref", apply.ref.slice(0, 20), "| ledger fields holding proposed_at:", JSON.stringify(await w.ledger()).includes(p.proposed_at));
+  });
+});
+
+describe("probe: a version hash two targets share", () => {
+  test("two files created from nothing share the empty version, which then cannot be reverted to", async () => {
+    const w = await world();
+    await w.beat([propose("file:a.md", { kind: "replace-all", text: "first file\n" })], { presence: { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: `summon ${W}` } });
+    await w.beat([propose("file:b.md", { kind: "replace-all", text: "second file\n" })], { presence: { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: `summon ${W}` } });
+    const all = await w.ledger();
+    console.log("applies:", all.filter((e: any) => e.type === "apply").length);
+    const EMPTY = sha256Hex("");
+    console.log("versionTarget(empty):", self.versionTarget(all, EMPTY));
+    await w.beat([{ type: "self.revert", to_hash: EMPTY }]);
+    const beat = (await w.ledger()).findLast((e: any) => e.type === "beat");
+    console.log("revert to empty:", JSON.stringify(beat.dropped ?? null), (await w.notes()).slice(-1));
+  });
+});
+
+describe("probe: an apply whose expression update landed but whose entry did not", () => {
+  test("the expression is ahead of the ledger, and the record of it is a host note", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const signer = fakeSigner();
+    await h.addCitizen(W);
+    await h.seatLedger(W, signer.signEntry);
+    const { TEST_IDS, TEST_ROOT_PUBLIC_B64 } = await import(`${T}/helpers/vectors.ts`);
+    const { FAKE_OP_KID } = await import(`${T}/helpers/fake-signer.ts`);
+    const identity = { did: TEST_IDS.did, identity_id: TEST_IDS.identity_id, project_id: TEST_IDS.project_id, root_public_key_b64: TEST_ROOT_PUBLIC_B64, root_kid: TEST_IDS.root_signing_key_id, op_kid: FAKE_OP_KID, op_public_key_b64: signer.opPublicB64, box_public_key_b64: null, self_strand_id: null, enrolled_at: "2026-11-02T00:00:00.000Z" };
+    await h.enrollLedger(W, signer.signEntry, identity);
+    const config = h.config;
+    config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+    const clock = testClock();
+    const puts: string[] = [];
+    const backups: string[] = [];
+    let failNextApplySign = false;
+    const realSign = signer.signEntry.bind(signer);
+    signer.signEntry = async (word: any, kind: any, draft: any) => {
+      if (failNextApplySign && draft.type === "apply") {
+        failNextApplySign = false;
+        const { Refusal } = await import(`${SRC}/types.ts`);
+        throw new Refusal("keychain-locked", "probe: the keychain locked between the PUT and the signature");
+      }
+      return realSign(word, kind, draft);
+    };
+    const sync = {
+      async putPrivateExpression(_w: string, target: string, text: string) {
+        puts.push(`${target}:${sha256Hex(text).slice(0, 8)}`);
+        return "updated" as const;
+      },
+      async postBackup(_w: string, b: any) {
+        backups.push(b.new_hash.slice(0, 8));
+        return { thought_id: "99999999-9999-4999-8999-999999999999", credits: 1 };
+      },
+    };
+    const beat = async (acts: any[]) => {
+      clock.advance(73 * HOUR_MS);
+      const runtime = scriptedRuntime([output(...acts)]);
+      const citizen = await readCitizen(config, W);
+      const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+      return runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: sync, modelDigest: FAKE_MODEL_DIGEST });
+    };
+    await beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
+    const [p] = await self.pendingProposals(config, W);
+    failNextApplySign = true;
+    const r = await beat([{ type: "self.affirm", ref: p.id }]);
+    const all = await readLedger(ledgerPath(config, W));
+    const notes = (await readHostNotes(config, new Date(0)))!.map((n: any) => n.detail);
+    console.log("outcome", r.outcome, "| expression PUTs", puts, "| backups posted", backups, "| apply entries", all.filter((e: any) => e.type === "apply").length);
+    console.log("local WILL changed:", (await readFile(join(config.paths.citizens_dir, W, "self", "WILL.md"), "utf8")).includes("quiet"), "| proposal still pending:", (await self.pendingProposals(config, W)).length === 1);
+    console.log("notes:", notes.slice(-2));
+    console.log("ledger sum of credits:", all.reduce((n: number, e: any) => n + e.cost.credits, 0), "(the posted backup spent 1)");
+    // what the next seat is told
+    const beatEntry = all.findLast((e: any) => e.type === "beat");
+    console.log("beat acts:", beatEntry.acts.map((a: any) => a.type), "dropped:", JSON.stringify(beatEntry.dropped ?? null));
+    // a second affirm repeats both remote calls
+    const r2 = await beat([{ type: "self.affirm", ref: p.id }]);
+    console.log("second affirm:", r2.outcome, "| PUTs", puts.length, "backups", backups.length, "| apply entries", (await readLedger(ledgerPath(config, W))).filter((e: any) => e.type === "apply").length);
+  });
+});
+
+describe("probe: what a seat shows of a year", () => {
+  test("after a beat that moves state and applies a change, the next seat's recent record holds one beat's words at most", async () => {
+    const w = await world();
+    for (let i = 0; i < 4; i++) await w.beat([{ type: "journal", kind: "reflected", text: `JOURNAL-${i} a thought the citizen had` }]);
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" }), { type: "journal", kind: "reflected", text: "JOURNAL-4" }]);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }, { type: "state.set", to: "listening" }]);
+    await w.beat([{ type: "journal", kind: "reflected", text: "JOURNAL-6" }]);
+    const user = w.prompts.at(-1).user as string;
+    console.log("journals visible in the last prompt:", [0, 1, 2, 3, 4, 6].filter((i) => user.includes(`JOURNAL-${i}`)));
+    const m = /Your recent record[^\n]*\n\n([\s\S]*?)\n\nYou have no pending/.exec(user);
+    console.log("recent record shown:\n" + (m?.[1] ?? "(not found)").replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "<seat>"));
+    console.log("versions list shown:\n" + (/Versions of your own texts[\s\S]*?(?=\n\n)/.exec(user)?.[0] ?? "(none)"));
+  });
+});

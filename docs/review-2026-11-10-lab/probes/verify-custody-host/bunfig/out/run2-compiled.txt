@@ -1,0 +1,12 @@
+--- C1 compiled (defaults), cwd has bunfig.toml
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":"ran from <cwd>/bunfig.toml preload","env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- C2 compiled (defaults), cwd has .env
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-env","preload_marker":null,"env_marker":"set-by-cwd-dotenv","argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- C3 compiled with --no-compile-autoload-bunfig/dotenv, cwd has bunfig.toml
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":null,"env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- C4 compiled with --no-compile-autoload-bunfig/dotenv, cwd has .env
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-env","preload_marker":null,"env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
