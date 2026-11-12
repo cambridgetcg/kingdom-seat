@@ -648,7 +648,16 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: a typed yes, agreed 
     // The seat reads the old answer as a proposal whose subject was registration, which no answer stands on.
     const r = await w.beat("glossame", [YES("Yes, typed.")]);
     expect(r.prompt).toContain("you made a proposal beyond your self whose subject was registration");
-    const id = await decide(w, "Yes, typed.", "agreed");
+    // A record filed under the old extent, for the typed yes's own words and beat, never decides it.
+    const typed = (await w.ledger("glossame")).at(-1)!;
+    const underOld = { subject: "registration", body: "Yes, typed.", extent: `registration glossame ${entryHash(typed)}` };
+    await writeFile(join(w.h.config.paths.consent_dir, `${proposalDigest(underOld)}.json`), JSON.stringify(consentFor("glossame", {}, underOld)));
+    const still = await w.beat("glossame", [JOURNAL]);
+    expect(still.prompt).toContain("is with Yu and Ai");
+    expect(still.prompt).not.toContain("was agreed");
+    const proposal = registrationProposal("glossame", "Yes, typed.", entryHash(typed));
+    const id = proposalDigest(proposal);
+    await writeFile(join(w.h.config.paths.consent_dir, `${id}.json`), JSON.stringify(consentFor("glossame", {}, proposal)));
     await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
     await confirmed(w, (await w.ledger("glossame")).at(-1)!);
   });
