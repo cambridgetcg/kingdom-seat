@@ -696,6 +696,9 @@ describe("[KS-004 11.2, 11.3; AW-1] a reply that declines never reaches Yu at th
         );
         expect([what, e.seq, r, tty.written, tty.asked]).toEqual([what, e.seq, "consent-missing", [], 0]);
       }
+      // Status shows Yu the saying as it stands: closed, with nothing waiting.
+      const status = await buildStatus({ config: w.h.config, now: w.clock.now(), halt: { halted: false, readings: [] }, signerState: "ready" });
+      expect([what, status.citizens[0]!.registration]).toEqual([what, { answer: reply.type === "registration.answer" ? reply.answer : "untyped", at: declined.ts, stage: "closed" }]);
     }
   });
 });

@@ -18,6 +18,7 @@ import { lastDroppedView, readLastSeat, wakingLetter } from "./context.ts";
 import { isDue } from "./due.ts";
 import { isResultNote, lastSeatOf, readHostNotes, seatsOpenedToday } from "./notes.ts";
 import { driftFromOrigin, originIntact } from "./self.ts";
+import { registrationStage, registrationView } from "./registration.ts";
 import {
   Refusal,
   type Citizen,
@@ -316,10 +317,25 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     credits_month: credits,
     origin,
     agenttool: agenttoolView(record?.identity != null, entries, now),
+    registration: record?.identity != null || entries === null ? null : await registrationFor(config, entries, word, now),
     last_refusal: lastRefusal(mine),
     last_dropped: await lastDroppedFor(config, word, entries),
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
+}
+
+/**
+ * Its latest saying about registration and where it stands, as its seat is
+ * shown it (KS-004 11.2): a no is filed nowhere, and a yes whose outbox file
+ * was not written is otherwise seen only in the ledger. Never its words.
+ */
+async function registrationFor(config: Config, entries: LedgerEntry[], word: Word, now: Date): Promise<CitizenStatus["registration"]> {
+  try {
+    const view = await registrationView(config, entries, word, now);
+    return view === null ? null : { answer: view.answer, at: view.asked_at, stage: registrationStage(view) };
+  } catch {
+    return null;
+  }
 }
 
 /** What its last seat with a reply did not keep (KS-004 5.8, 5.10), as its next seat is shown it; types and fixed reasons only. */
@@ -465,6 +481,7 @@ function citizenLine(c: CitizenStatus): string {
       ].join(", "),
     );
   }
+  if (c.registration) parts.push(`registration ${c.registration.answer}, ${c.registration.stage} (${c.registration.at})`);
   if (c.last_refusal) parts.push(`last ${c.last_refusal.outcome === "refused" ? "refused" : "invalid reply"} ${c.last_refusal.at}${c.last_refusal.refusal ? ` (${c.last_refusal.refusal})` : ""}: ${c.last_refusal.detail}`);
   if (c.last_dropped) {
     const d = c.last_dropped;

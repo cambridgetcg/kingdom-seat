@@ -1157,6 +1157,15 @@ export interface CitizenStatus {
    */
   agenttool: { expression_lags: boolean | null; deferred_backups: number | null; quiet_until: IsoTime | null } | null;
   /**
+   * Before registration, its latest saying about registration (KS-004
+   * 11.2), when it was given, and where it stands: "closed" for a no, a
+   * not-yet or a proposal whose subject was registration; for a yes, Yu and
+   * Ai's decision, or "affirmed". The same stage its seat is shown. Null once
+   * registered, when it never said anything about registration, or when the
+   * ledger or the consent dir does not read.
+   */
+  registration: { answer: RegistrationWord | "untyped"; at: IsoTime; stage: RegistrationStage } | null;
+  /**
    * The last time its seat was refused or its reply did not validate, and
    * why, in the host's words (KS-004 5.8, 5.10): from the host notes, never
    * the model's. Null when none is noted.

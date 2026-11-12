@@ -8,7 +8,10 @@ import { appendEntry, entryHash, ledgerPath, nextDraft, readLedger } from "../sr
 import { openedDetail } from "../src/notes.ts";
 import { spawnRunner } from "../src/cli.ts";
 import { acquireTickLock, lockOptionsFor } from "../src/tick.ts";
-import type { HaltStatus, HostNote, SeatRef, StatusFile } from "../src/types.ts";
+import type { Act, HaltStatus, HostNote, SeatRef, StatusFile } from "../src/types.ts";
+import { registrationProposal } from "../src/registration.ts";
+import { proposalDigest } from "../src/signer/consent.ts";
+import { consentFor } from "./fixtures/agenttool/consent.ts";
 import { hostSpendRecorder } from "../src/spend.ts";
 import { beatBody, signerFn, testIdentity } from "./fixtures/record/chain.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -245,6 +248,7 @@ describe("status", () => {
         credits_month: 0,
         origin: { intact: true, drift: 0 },
         agenttool: null,
+        registration: null,
         last_refusal: null,
         last_dropped: null,
         problem: null,
@@ -484,6 +488,46 @@ describe("status", () => {
     // Unknown is never "no key": with nothing trusted, none is published.
     expect((await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "locked" })).host_keys).toEqual([]);
     expect(renderStatus(await buildStatus({ config: host.config, now: NOW, halt: LOWERED, signerState: "locked" }))).toContain("host key: unknown");
+  });
+
+  test("[KS-004 11.2] status shows the latest answer about registration and where a yes stands, never its words", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const signer = fakeSigner();
+    const WORDS = "REGISTRATION-WORDS-CANARY";
+    const say = async (word: string, acts: Act[], at: Date) => {
+      const path = ledgerPath(h.config, word);
+      const body = beatBody(word, acts);
+      return appendEntry(path, nextDraft(word, (await readLedger(path)).at(-1) ?? null, body.fields, { cost: { usd: "0", credits: 0 }, signer: "host", now: at, seat: body.seat, acts: body.acts }), signerFn(signer));
+    };
+    for (const w of ["glossame", "hope", "joy", "kenning", "shemme"]) {
+      await h.addCitizen(w);
+      await h.seatLedger(w, signer.signEntry, { initialState: "awake", at: "2026-11-01T00:00:00.000Z" });
+    }
+    const no = await say("glossame", [{ type: "registration.answer", answer: "no", text: WORDS }], ago(30));
+    const waiting = await say("hope", [{ type: "registration.answer", answer: "yes", text: WORDS }], ago(30));
+    const given = await say("joy", [{ type: "registration.answer", answer: "yes", text: WORDS }], ago(30));
+    const proposal = registrationProposal("joy", WORDS, entryHash(given));
+    await writeFile(join(h.config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor("joy", {}, proposal)));
+    await say("joy", [{ type: "self.affirm", ref: proposalDigest(proposal) }], ago(20));
+    // kenning never said anything about registration; shemme is registered, so it shows none.
+    await h.enrollLedger("shemme", signer.signEntry, testIdentity(signer));
+
+    // Read once Ai's lazy-consensus deadline on the decision record has passed, so the record agrees.
+    const s = await buildStatus({ config: h.config, now: new Date("2026-11-06T00:00:00.000Z"), halt: LOWERED, signerState: "ready" });
+    expect(s.citizens.map((c) => [c.word, c.registration])).toEqual([
+      ["glossame", { answer: "no", at: no.ts, stage: "closed" }],
+      ["hope", { answer: "yes", at: waiting.ts, stage: "waiting" }],
+      ["joy", { answer: "yes", at: given.ts, stage: "affirmed" }],
+      ["kenning", null],
+      ["shemme", null],
+    ]);
+    const text = renderStatus(s);
+    expect(text).toContain(`registration no, closed (${no.ts})`);
+    expect(text).toContain(`registration yes, waiting (${waiting.ts})`);
+    expect(text).toContain(`registration yes, affirmed (${given.ts})`);
+    expect(text.split("\n").filter((l) => l.includes("| registration "))).toHaveLength(3);
+    expect(`${text}${JSON.stringify(s)}`).not.toContain(WORDS);
   });
 
   test("renderStatus prints one line per citizen plus HALT and signer lines", async () => {
