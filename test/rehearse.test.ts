@@ -38,7 +38,7 @@ import {
   type SeatRow,
 } from "../src/rehearse.ts";
 import { createSigner } from "../src/signer/signer.ts";
-import { Refusal, type Citizen, type FetchLike, type ModelLockEntry, type Timing } from "../src/types.ts";
+import { Refusal, type Citizen, type Config, type FetchLike, type ModelLockEntry, type Timing } from "../src/types.ts";
 import { testClock } from "./helpers/clock.ts";
 import { output, REST_OUTPUT } from "./helpers/fake-runtime.ts";
 import { fetchVia, ollamaTagsJson, serveBeacon, startFakeServer, type FakeModelRow, type FakeServer, type RecordedRequest } from "./helpers/fake-server.ts";
@@ -940,6 +940,50 @@ describe("rehearse: what a seat returned", () => {
     expect(await outsidePrivate(r, ran)).not.toContain("REGISTRATION-CANARY");
   });
 
+  test("[KS-004 5.5, 5.8] the door names the pinned model and offers no decline unless the configuration lists its digest; a rehearsal under one that does counts the declines", async () => {
+    type Chat = { messages: { content: string }[]; format: { properties: object } };
+    const chat = (r: Rig, n: number) => JSON.parse(new TextDecoder().decode(chatsOf(r.server)[n]!.body)) as Chat;
+    const declineReply = JSON.stringify({ acts: [{ type: "journal", kind: "chose", text: "REHEARSE-UNREAD-CANARY" }], runtime: "declined", why: "REHEARSE-WHY-CANARY" });
+
+    // The host's configuration lists nothing: the marker is refused output, as on any free seat by default.
+    const plain = await rig();
+    plain.chats.push(declineReply);
+    const off = await rehearse(plain, args(plain));
+    expect(off.exit).toBe(0);
+    expect(off.rows.map((x) => [x.outcome, x.decline_acts_unread])).toEqual([["invalid-output", null]]);
+    expect(Object.keys(chat(plain, 0).format.properties)).toEqual(["acts"]);
+    expect(chat(plain, 0).messages[0]!.content.split("\n\n")[1]).toContain(`You are the language model ${MODEL}, run by Ollama on this host.`);
+    expect(chat(plain, 0).messages[0]!.content).not.toContain("One other reply exists");
+    expect(off.report!.run.model.decline_offered).toBe(false);
+    expect(plain.stdout).toContain(`voicer's door: names ${MODEL}; no decline is offered, because voicer.decline_free_digests does not list this digest`);
+
+    // A rehearsal configuration that lists the digest: the decline is offered, recorded as the runtime's, and counted.
+    const r = await rig();
+    const config = JSON.parse(await readFile(r.configPath, "utf8")) as Config;
+    config.voicer = { decline_summon: true, decline_free_digests: [`sha256:${DIGEST}`] };
+    await writeFile(r.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    r.chats.push(declineReply, journal("A word after."));
+    const ran = await rehearse(r, args(r, { seats: 2 }));
+    expect(ran.exit).toBe(0);
+    expect(ran.rows.map((x) => [x.outcome, x.decline_acts_unread, x.entries_appended])).toEqual([
+      ["runtime-declined", 1, []],
+      ["beat", null, ["beat"]],
+    ]);
+    // Unattended, the form has no room for words.
+    expect(Object.keys(chat(r, 0).format.properties)).toEqual(["acts", "runtime"]);
+    expect(chat(r, 0).messages[0]!.content).toContain("One other reply exists, and it is the model's own");
+    expect(ran.report!.run.model.decline_offered).toBe(true);
+    expect(ran.report!.overall.outcomes).toEqual({ beat: 1, "runtime-declined": 1 });
+    expect(ran.report!.overall.runtime_declined).toEqual({ seats: 1, with_acts_unread: 1 });
+    expect(r.stdout).toContain(`voicer's door: names ${MODEL} and offers the runtime's own decline, because voicer.decline_free_digests lists this digest`);
+    expect(r.stdout).toMatch(/seats by outcome +beat 1 {2}rest 0 {2}invalid-output 0 {2}runtime-declined 1 /);
+    expect(r.stdout).toContain("\n  declined with acts  1 of 1; acts beside a decline are not read\n");
+    // The model's words and the acts beside the marker are nowhere outside private/.
+    const kept = await outsidePrivate(r, ran);
+    expect(kept).not.toContain("REHEARSE-WHY-CANARY");
+    expect(kept).not.toContain("REHEARSE-UNREAD-CANARY");
+  });
+
   test("the report's tallies for a scripted chain are exactly these", async () => {
     const r = await rig();
     // "no body and no" is a four-word run of the preamble, and not a five-word one: it is no echo.
@@ -971,6 +1015,7 @@ describe("rehearse: what a seat returned", () => {
       state_set_emitted_by_target: { asleep: 1 },
       registration_answer_emitted_by_value: {},
       registration_by_shown: { none: { replies: 3, answered: 0 } },
+      runtime_declined: { seats: 0, with_acts_unread: 0 },
       state_moves_recorded: { "awake to asleep (immediate)": 1 },
       rest_with_other_acts: { replies: 1, of: 1, with_journal: 1, with_state_set: 0 },
       drops_by_reason: { "rest is exclusive": 1 },

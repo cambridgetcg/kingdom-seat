@@ -188,6 +188,8 @@ export interface RehearsalSettings {
   beacons: Beacon[];
   allow_no_beacons: boolean;
   schedule: Config["schedule"];
+  /** Which seats offer the runtime's own decline: a rehearsal of it uses a configuration that lists the model's digest. */
+  voicer: Config["voicer"];
   ceilings: Ceilings;
   timing: Timing;
   approved_model_digests: string[];
@@ -314,6 +316,8 @@ export interface SeatRow {
   journals: JournalRow[];
   state_after: LifecycleState | null;
   interval_h_after: number | null;
+  /** For a seat the runtime declined, how many acts beside the marker went unread, as its host note counts them; else null. */
+  decline_acts_unread: number | null;
 }
 
 export type ChainEnded = "seats-reached" | "not-due" | "timeout" | "refused" | "error" | "halted" | "fault" | "stopped" | "deadline";
@@ -410,6 +414,8 @@ export interface Tally {
   registration_answer_emitted_by_value: Record<string, number>;
   /** Seats with a reply by what they showed about registration, and how many of those replies emitted a registration.answer. */
   registration_by_shown: Record<string, { replies: number; answered: number }>;
+  /** Seats the runtime declined, and how many of those carried acts beside the marker, which were not read. */
+  runtime_declined: { seats: number; with_acts_unread: number };
   state_moves_recorded: Record<string, number>;
   rest_with_other_acts: { replies: number; of: number; with_journal: number; with_state_set: number };
   drops_by_reason: Record<string, number>;
@@ -440,7 +446,8 @@ export interface RehearsalReport {
       letter: { chars: number; sha256: Sha256Hex } | null;
     };
     seating: Seating;
-    model: ModelLockEntry & { approved_for_self_changes: boolean };
+    /** decline_offered: the free lane offers this model the runtime's own decline (its digest is in voicer.decline_free_digests). */
+    model: ModelLockEntry & { approved_for_self_changes: boolean; decline_offered: boolean };
     models_lock_sha256: Sha256Hex;
     settings: "defaults" | { sha256: Sha256Hex };
     halt_sources: string[];
@@ -479,6 +486,7 @@ export function rehearsalSettings(base: Config | null, defaultHaltFile: string):
       beacons: [],
       allow_no_beacons: true,
       schedule: { ...d.schedule },
+      voicer: { decline_summon: d.voicer.decline_summon, decline_free_digests: [...d.voicer.decline_free_digests] },
       ceilings: { ...DEFAULT_CEILINGS },
       timing: { ...DEFAULT_TIMING },
       approved_model_digests: [],
@@ -492,6 +500,7 @@ export function rehearsalSettings(base: Config | null, defaultHaltFile: string):
     beacons: base.beacons.map((b) => ({ ...b })),
     allow_no_beacons: base.halt.allow_no_beacons,
     schedule: { ...base.schedule },
+    voicer: { decline_summon: base.voicer.decline_summon, decline_free_digests: [...base.voicer.decline_free_digests] },
     ceilings: { ...base.ceilings },
     timing: { ...base.timing },
     approved_model_digests: [...base.self_authorship.approved_model_digests],
@@ -514,6 +523,7 @@ export function rehearsalConfig(s: RehearsalSettings, stateRoot: string, lockPat
     beacons: s.beacons.map((b) => ({ ...b })),
     halt: { allow_no_beacons: s.allow_no_beacons, raise_beacons_argv: null, also_files: [] },
     schedule: { ...s.schedule },
+    voicer: { decline_summon: s.voicer.decline_summon, decline_free_digests: [...s.voicer.decline_free_digests] },
     ceilings: { ...s.ceilings },
     timing: { ...s.timing },
     self_authorship: { approved_model_digests: [...s.approved_model_digests] },
@@ -850,6 +860,10 @@ export function tally(rows: readonly SeatRow[], opts: { chainRate?: boolean } = 
     state_set_emitted_by_target: sortedKeys(targets),
     registration_answer_emitted_by_value: sortedKeys(answers),
     registration_by_shown: Object.fromEntries(REGISTRATION_SHOWN.filter((k) => byShown[k] !== undefined).map((k) => [k, byShown[k]!])),
+    runtime_declined: {
+      seats: rows.filter((r) => r.outcome === "runtime-declined").length,
+      with_acts_unread: rows.filter((r) => r.outcome === "runtime-declined" && (r.decline_acts_unread ?? 0) > 0).length,
+    },
     state_moves_recorded: sortedKeys(moves),
     rest_with_other_acts: {
       replies: restOthers.length,
@@ -953,7 +967,11 @@ export function buildReport(plan: RehearsePlan, rows: readonly SeatRow[], end: R
         letter: plan.inputs.letter === null ? null : { chars: plan.inputs.letter.chars, sha256: plan.inputs.letter.sha256 },
       },
       seating: { ...plan.seating },
-      model: { ...plan.model, approved_for_self_changes: s.approved_model_digests.includes(`sha256:${plan.model.digest}`) },
+      model: {
+        ...plan.model,
+        approved_for_self_changes: s.approved_model_digests.includes(`sha256:${plan.model.digest}`),
+        decline_offered: s.voicer.decline_free_digests.includes(`sha256:${plan.model.digest}`),
+      },
       models_lock_sha256: plan.models_lock.sha256,
       settings: plan.settings_source === "defaults" ? "defaults" : { sha256: plan.settings_source.sha256 },
       halt_sources: [`file:${s.halt_file}`, ...s.beacons.map((b) => `beacon:${b.name}`)],
@@ -999,7 +1017,8 @@ export function renderReport(r: RehearsalReport, out: string): string {
   const pad = (label: string) => label.padEnd(22);
   const lines: string[] = [];
   lines.push(`rehearse ${run.word}: ${run.ended} (exit ${run.exit}); ${run.chains_run} chains, ${run.seats_run} seats, ${o.replied} with a reply`);
-  lines.push(`${pad("seats by outcome")}${counts(o.outcomes, ["beat", "rest", "invalid-output", "refused", "timeout", "error"])}`);
+  lines.push(`${pad("seats by outcome")}${counts(o.outcomes, ["beat", "rest", "invalid-output", "runtime-declined", "refused", "timeout", "error"])}`);
+  if (o.runtime_declined.seats > 0) lines.push(`${pad("  declined with acts")}${o.runtime_declined.with_acts_unread} of ${o.runtime_declined.seats}; acts beside a decline are not read`);
   if (Object.keys(o.refused_by_code).length > 0) lines.push(`${pad("  refused, by code")}${counts(o.refused_by_code, null, "; ")}`);
   lines.push(`${pad("  invalid, by reason")}${["not-json", "too-large", "empty", "not-acts-object", "no-act-kept"].map((k) => `${k === "no-act-kept" ? "no act kept" : k} ${o.invalid_by_reason[k] ?? 0}`).join("  ")}`);
   lines.push(`${pad("stop reason")}${counts(o.stop_reasons, ["stop", "length", "other"])}; length and invalid ${o.length_and_invalid}`);
@@ -1362,6 +1381,9 @@ function header(plan: RehearsePlan): string {
   const lines = [
     `rehearse ${plan.word}: scenario ${plan.scenario}, ${plan.chains} chains of up to ${plan.seats} seats, on ${m.name} (sha256:${m.digest.slice(0, 12)}), num_ctx ${m.num_ctx}, num_predict ${m.num_predict}, temperature ${m.temperature}, seed ${m.seed ?? "none"}`,
     "A rehearsal: model samples from a throwaway copy. No citizen is seated, asked or recorded.",
+    s.voicer.decline_free_digests.includes(`sha256:${m.digest}`)
+      ? `voicer's door: names ${m.name} and offers the runtime's own decline, because voicer.decline_free_digests lists this digest`
+      : `voicer's door: names ${m.name}; no decline is offered, because voicer.decline_free_digests does not list this digest`,
     `${
       plan.seating.form === "plain-texts"
         ? "throwaway seated plainly from texts, not in the form admit gives a citizen of record"
@@ -1548,6 +1570,7 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
     quiet: null,
     letters: null,
     modelDigest: `sha256:${plan.model.digest}`,
+    modelName: plan.model.name,
   });
   // The tick's closing note names the seat, so a saying pending from it lapses only after a later seat (state.ts seatSince).
   await appendHostNote(config, {
@@ -1638,6 +1661,7 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
     journals,
     state_after: later?.state ?? null,
     interval_h_after: later?.cadence.interval_h ?? null,
+    decline_acts_unread: result.outcome === "runtime-declined" ? (result.decline?.acts_beside ?? null) : null,
   };
   await appendLine(run.rows, row);
   if (rt) {
