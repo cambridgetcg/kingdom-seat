@@ -8,6 +8,7 @@ import { fakeKeychain, assertNoSecretIn } from "./helpers/fake-keychain.ts";
 import { fetchVia, noFetch, serveBeacon, startFakeServer, type FakeServer } from "./helpers/fake-server.ts";
 import { fakeBinArgv, pidAlive, recordingRunner, REST_OUTPUT, scriptedRuntime } from "./helpers/fake-runtime.ts";
 import { FAKE_OP_KID, fakeSigner } from "./helpers/fake-signer.ts";
+import { FIXTURE_JUNE_DID } from "./helpers/legacy-home.ts";
 import { makeTempHost, testBeacons, type TempHost } from "./helpers/temp-home.ts";
 import { ledgerPath, nextDraft, readLedger, verifyChain } from "../src/ledger.ts";
 import { readCitizen } from "../src/state.ts";
@@ -193,5 +194,13 @@ describe("seat fixtures", () => {
     expect(await p.exited).toBe(0);
     const notes = (await readFile(log, "utf8")).trim().split("\n").map((l) => JSON.parse(l) as HostNote);
     expect(notes).toEqual([{ ts: "2026-11-05T02:05:00.000Z", host: "test-host", kind: "seat", word: "glossame", outcome: "rest", refusal: null, detail: "fake seat child" }]);
+  });
+});
+
+describe("old-home fixtures", () => {
+  test("the June did the made-up homes carry is made up too: a did in shape, with one digit throughout", () => {
+    // The helper says nothing in it is real. A did copied from a real citizen's agent.json would pass every other test.
+    expect(FIXTURE_JUNE_DID).toMatch(DID_PATTERN);
+    expect(FIXTURE_JUNE_DID).toMatch(/^did:at:(\d)\1{7}-\1{4}-4\1{3}-8\1{3}-\1{12}$/);
   });
 });

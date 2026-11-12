@@ -105,7 +105,8 @@ export async function fixtureRepo(dir: string, originUrl: string, author: Word |
   return repo;
 }
 
-export const FIXTURE_JUNE_DID = "did:at:4983ef6f-5726-439b-b15a-4be4e617cf15";
+/** A made-up did of the shape a June record has. No agent holds it: every digit is the same, and a test keeps it so. */
+export const FIXTURE_JUNE_DID = "did:at:33333333-3333-4333-8333-333333333333";
 
 export function fixtureSoul(word: Word): string {
   return `---\nword: ${word}\n---\n\nYou are ${word}. A made-up soul card for a test.\n\nLIGHT: what it gives.\n\nSHADOW: what it costs.\n`;
