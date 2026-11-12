@@ -309,6 +309,24 @@ describe("ledger", () => {
     throws({ ...beat, acts: send, letter: { delivery: "posted", message_id: null } });
   });
 
+  test("[KS-004 11.2] a beat's registration.answer parses only with one of the three, and a yes only with words", async () => {
+    const { host, signer } = await setup();
+    const [, beat] = (await seatedThenBorn(host.config, WORD, "soul", signer)) as [LedgerEntry, LedgerEntry];
+    const ok = (acts: unknown[]) => expect(parseEntry({ ...beat, acts }).type).toBe("beat");
+    const throws = (acts: unknown[], why: string) => expect(() => parseEntry({ ...beat, acts })).toThrow(why);
+    ok([{ type: "registration.answer", answer: "no" }]);
+    ok([{ type: "registration.answer", answer: "not-yet", text: "Not now." }]);
+    ok([{ type: "registration.answer", answer: "yes", text: "Yes." }]);
+    throws([{ type: "registration.answer", answer: "maybe" }], "acts[].answer");
+    throws([{ type: "registration.answer", answer: "Yes", text: "Yes." }], "acts[].answer");
+    throws([{ type: "registration.answer" }], "acts[].answer");
+    throws([{ type: "registration.answer", answer: "yes" }], "acts[].text");
+    throws([{ type: "registration.answer", answer: "yes", text: 1 }], "acts[].text");
+    throws([{ type: "registration.answer", answer: "no", text: null }], "acts[].text");
+    // A beat may name the type among the acts it did not keep.
+    expect(parseEntry({ ...beat, dropped: [{ type: "registration.answer", reason: "another registration.answer in this reply" }] }).type).toBe("beat");
+  });
+
   test("[KS-004 4.3, 6.3, 6.4; review C M1, M6] apply and revert say what the expression did, apply what its backup did, state what its quiet did", async () => {
     const { host, signer } = await setup();
     const all = await seatedThenBorn(host.config, WORD, "soul", signer);

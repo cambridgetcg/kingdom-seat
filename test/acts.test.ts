@@ -11,7 +11,7 @@ import {
   validateAct,
   validateOutput,
 } from "../src/acts.ts";
-import { DEFAULT_CEILINGS, JOURNAL_KINDS, LIFECYCLE_STATES, REASON_KINDS, type ModelAct } from "../src/types.ts";
+import { DEFAULT_CEILINGS, JOURNAL_KINDS, LIFECYCLE_STATES, REASON_KINDS, REGISTRATION_ANSWERS, type ModelAct } from "../src/types.ts";
 import { REST_OUTPUT, REST_THEN_TALK_OUTPUT, output } from "./helpers/fake-runtime.ts";
 import { schemaAccepts, validationContext } from "./fixtures/voice/fixtures.ts";
 
@@ -219,6 +219,8 @@ describe("validation", () => {
       { type: "self.revert", to_hash: "cafebabe" + CANARY },
       { type: "state.set", to: CANARY },
       { type: "propose.beyond", subject: `${CANARY}\n`, text: CANARY },
+      { type: "registration.answer", answer: CANARY, text: CANARY },
+      { type: "registration.answer", answer: "no", text: `${CANARY}\u0000` },
     ];
     const r = run(JSON.stringify({ acts: hostile.slice(0, 8) }));
     const r2 = run(JSON.stringify({ acts: hostile.slice(8) }));
@@ -226,7 +228,7 @@ describe("validation", () => {
       expect(res.acts).toEqual([]);
       expect(res.rest).toBe(false);
       expect(JSON.stringify(res)).not.toContain(CANARY);
-      for (const d of res.dropped) expect(d.type === null || ["journal", "letter.send", "self.propose", "self.affirm", "self.revert", "state.set", "propose.beyond"].includes(d.type)).toBe(true);
+      for (const d of res.dropped) expect(d.type === null || ["journal", "letter.send", "self.propose", "self.affirm", "self.revert", "state.set", "propose.beyond", "registration.answer"].includes(d.type)).toBe(true);
     }
     // An unknown type string is the model's text, so it is not recorded as the type.
     expect(r.dropped[0]).toEqual({ index: 0, type: null, reason: "unknown act type" });
@@ -322,9 +324,13 @@ describe("validation", () => {
     for (const t of own) expect([t, kept(propose(t)) !== null]).toEqual([t, true]);
   });
 
-  test("state.set to ended and propose.beyond classify as beyond self", () => {
+  test("state.set to ended, propose.beyond and a yes about registration classify as beyond self", () => {
     expect(actClass({ type: "state.set", to: "ended" })).toBe("beyond-self");
     expect(actClass({ type: "propose.beyond", subject: "s", text: "b" })).toBe("beyond-self");
+    // A yes about registration goes to Yu and Ai; a no or a not-yet is within self (KS-004 8.1, 11.2).
+    expect(actClass({ type: "registration.answer", answer: "yes", text: "Yes." })).toBe("beyond-self");
+    expect(actClass({ type: "registration.answer", answer: "no" })).toBe("within-self");
+    expect(actClass({ type: "registration.answer", answer: "not-yet", text: "Later." })).toBe("within-self");
     for (const to of LIFECYCLE_STATES.filter((s) => s !== "ended")) expect(actClass({ type: "state.set", to })).toBe("within-self");
     expect(actClass({ type: "journal", kind: "chose", text: "t" })).toBe("within-self");
     expect(actClass({ type: "letter.send", to: "yu", text: "b" })).toBe("within-self");
@@ -389,6 +395,74 @@ describe("validation", () => {
       { index: ACT_LIMITS.max_acts, type: "journal", reason: "over the act limit" },
       { index: ACT_LIMITS.max_acts + 1, type: "journal", reason: "over the act limit" },
     ]);
+  });
+
+  test("[KS-004 11.2] registration.answer: one of three; a yes needs its words; a no or a not-yet is whole without them", () => {
+    const ctx = validationContext();
+    // The kept shapes: a no or a not-yet with no text key at all when it gave none, a yes always with its words.
+    expect(kept({ type: "registration.answer", answer: "no" }, ctx)).toEqual({ type: "registration.answer", answer: "no" });
+    expect(kept({ type: "registration.answer", answer: "not-yet" }, ctx)).toEqual({ type: "registration.answer", answer: "not-yet" });
+    expect(kept({ type: "registration.answer", answer: "no", text: "Not this." }, ctx)).toEqual({ type: "registration.answer", answer: "no", text: "Not this." });
+    expect(kept({ type: "registration.answer", answer: "yes", text: "Yes: one of my own.\nIf Yu and Ai agree." }, ctx)).toEqual({ type: "registration.answer", answer: "yes", text: "Yes: one of my own.\nIf Yu and Ai agree." });
+    const cases: [unknown, string][] = [
+      [{ type: "registration.answer" }, "fields do not match the act"],
+      [{ type: "registration.answer", text: "Yes." }, "fields do not match the act"],
+      [{ type: "registration.answer", answer: "no", subject: "registration" }, "fields do not match the act"],
+      [{ type: "registration.answer", answer: "maybe" }, "answer is not no, not-yet or yes"],
+      [{ type: "registration.answer", answer: "Yes", text: "Yes." }, "answer is not no, not-yet or yes"],
+      [{ type: "registration.answer", answer: "not yet" }, "answer is not no, not-yet or yes"],
+      [{ type: "registration.answer", answer: true }, "answer is not no, not-yet or yes"],
+      [{ type: "registration.answer", answer: "yes" }, "a yes needs its words in text"],
+      [{ type: "registration.answer", answer: "yes", text: " \n" }, "text is empty"],
+      [{ type: "registration.answer", answer: "no", text: "" }, "text is empty"],
+      [{ type: "registration.answer", answer: "no", text: "x".repeat(ACT_LIMITS.max_text_chars + 1) }, "text is over the limit"],
+      [{ type: "registration.answer", answer: "yes", text: "Yes.\u0007" }, "text has control characters"],
+      [{ type: "registration.answer", answer: "not-yet", text: ["Later."] }, "text is not text"],
+    ];
+    for (const [value, reason] of cases) expect([JSON.stringify(value), reasonOf(value, ctx)]).toEqual([JSON.stringify(value), reason]);
+  });
+
+  test("[KS-004 5.8] one answer about registration per reply, counted on the raw reply", () => {
+    const no = { type: "registration.answer", answer: "no", text: "No." } as const;
+    const notYet = { type: "registration.answer", answer: "not-yet" } as const;
+    const yes = { type: "registration.answer", answer: "yes", text: "Yes." } as const;
+    const journal = { type: "journal", kind: "reflected", text: "t" } as const;
+    const answers = (r: ReturnType<typeof run>) => r.acts.filter((a) => a.type === "registration.answer");
+    const another = (index: number) => ({ index, type: "registration.answer", reason: "another registration.answer in this reply" });
+    // One alone is kept, a yes too.
+    expect(answers(run(output(journal, yes)))).toEqual([yes]);
+    // Two that are not yes keep the first.
+    const two = run(output(notYet, journal, no));
+    expect(answers(two)).toEqual([notYet]);
+    expect(two.dropped).toEqual([another(2)]);
+    // A yes beside a second yes, or beside a valid no in either order: no yes is kept, and the no is.
+    const yesYes = run(output(yes, { ...yes, text: "Yes, and more." }));
+    expect([yesYes.acts, yesYes.dropped]).toEqual([[], [another(0), another(1)]]);
+    expect(answers(run(output(yes, no)))).toEqual([no]);
+    expect(answers(run(output(no, yes)))).toEqual([no]);
+    // A yes beside a no that validation dropped (empty words), or a no placed past the act limit, is not kept either.
+    const emptyNo = run(output(yes, journal, { ...no, text: "" }));
+    expect(answers(emptyNo)).toEqual([]);
+    expect(emptyNo.dropped).toEqual([another(0), { index: 2, type: "registration.answer", reason: "text is empty" }]);
+    const ninth = run(output(yes, ...Array.from({ length: ACT_LIMITS.max_acts - 1 }, () => journal), no));
+    expect(answers(ninth)).toEqual([]);
+    expect(ninth.dropped).toEqual([another(0), { index: ACT_LIMITS.max_acts, type: "registration.answer", reason: "over the act limit" }]);
+    // An item of the type that is not even an object of the act's shape still counts.
+    expect(answers(run(JSON.stringify({ acts: [yes, { type: "registration.answer" }] })))).toEqual([]);
+    // normalizeActs counts the acts it is given.
+    expect(normalizeActs([yes, no], DEFAULT_CEILINGS).acts).toEqual([no]);
+    expect(normalizeActs([yes], DEFAULT_CEILINGS).acts).toEqual([yes]);
+  });
+
+  test("[KS-004 5.8] a registration.answer in a reply that rests is dropped by type, with no words", () => {
+    for (const answer of [
+      { type: "registration.answer", answer: "no", text: CANARY },
+      { type: "registration.answer", answer: "yes", text: CANARY },
+    ] as const) {
+      const r = run(output(answer, { type: "rest" }));
+      expect(r).toEqual({ rest: true, acts: [], dropped: [{ index: 0, type: "registration.answer", reason: "rest is exclusive" }] });
+      expect(JSON.stringify(r)).not.toContain(CANARY);
+    }
   });
 
   test("resolvePrefix needs at least 8 hex and refuses ambiguous prefixes", () => {
@@ -468,6 +542,15 @@ describe("validation", () => {
       { type: "propose.beyond", subject: "s", text: "b" },
       { type: "propose.beyond", subject: "", text: "b" },
       { type: "propose.beyond", subject: "s", text: "b", to: "yu" },
+      { type: "registration.answer", answer: "no" },
+      { type: "registration.answer", answer: "not-yet", text: "t" },
+      { type: "registration.answer", answer: "yes", text: "t" },
+      { type: "registration.answer", answer: "yes" },
+      { type: "registration.answer", answer: "no", text: "" },
+      { type: "registration.answer", answer: "maybe" },
+      { type: "registration.answer", answer: "no", text: "t".repeat(ACT_LIMITS.max_text_chars + 1) },
+      { type: "registration.answer", answer: "no", subject: "registration" },
+      { type: "registration.answer", text: "t" },
       { type: "nothing" },
       "rest",
       null,
@@ -496,8 +579,11 @@ describe("validation", () => {
 
     // The schema's vocabulary and limits are the code's.
     const anyOf = (OUTPUT_JSON_SCHEMA.properties.acts.items.anyOf as readonly { properties: { type: { const: string } } }[]).map((s) => s.properties.type.const);
-    expect([...anyOf].sort()).toEqual(["journal", "letter.send", "propose.beyond", "rest", "self.affirm", "self.propose", "self.revert", "state.set"]);
+    expect([...anyOf].sort()).toEqual(["journal", "letter.send", "propose.beyond", "registration.answer", "rest", "self.affirm", "self.propose", "self.revert", "state.set"]);
+    // Appended, so every earlier branch keeps its index.
+    expect(anyOf.at(-1)).toBe("registration.answer");
     const props = (i: number) => (OUTPUT_JSON_SCHEMA.properties.acts.items.anyOf[i] as unknown as { properties: Record<string, { enum?: string[]; maxLength?: number }> }).properties;
+    expect([props(8).answer!.enum, props(8).text!.maxLength]).toEqual([[...REGISTRATION_ANSWERS], ACT_LIMITS.max_text_chars]);
     expect(props(1).kind!.enum).toEqual([...JOURNAL_KINDS]);
     expect(props(1).text!.maxLength).toBe(DEFAULT_CEILINGS.journal_max_chars);
     expect(props(5).to!.enum).toEqual([...LIFECYCLE_STATES]);

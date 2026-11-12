@@ -44,6 +44,7 @@ import {
   LEDGER_HASH_PATTERN,
   LEDGER_TYPES,
   LIFECYCLE_STATES,
+  REGISTRATION_ANSWERS,
   Refusal,
   SHA256_HEX_PATTERN,
   UUID_PATTERN,
@@ -662,7 +663,8 @@ const TYPE_KEYS: Record<LedgerEntry["type"], { required: readonly string[]; opti
 const OLD_LAYOUT_KEYS = ["body", "hash", "signature", "attestation", "spend"];
 const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const HOST_KID_PATTERN = /^host:SHA256:[A-Za-z0-9+/]{43}$/;
-const ACT_TYPES = new Set(["journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond"]);
+const ACT_TYPES = new Set(["journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond", "registration.answer"]);
+const REGISTRATION_WORDS = new Set<unknown>(REGISTRATION_ANSWERS);
 const SELF_TARGET_NAMES = new Set([
   "soul",
   "will",
@@ -901,6 +903,11 @@ function actsField(value: unknown): void {
     if (typeof a.type !== "string" || !ACT_TYPES.has(a.type)) throw new Error("acts[].type");
     if (a.type === "state.set") lifecycle(a.to, "acts[].to");
     if (a.type === "self.propose") reasonField(a.reason, "acts[].reason");
+    if (a.type === "registration.answer") {
+      // A typed answer reads only as one of the three, and a yes only with its words (KS-004 11.2).
+      if (!REGISTRATION_WORDS.has(a.answer)) throw new Error("acts[].answer");
+      if (a.answer === "yes" ? typeof a.text !== "string" : Object.hasOwn(a, "text") && typeof a.text !== "string") throw new Error("acts[].text");
+    }
   }
 }
 

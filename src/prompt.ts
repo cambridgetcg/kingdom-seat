@@ -312,6 +312,8 @@ function renderAct(a: Act): string {
       return `wrote to ${a.to}:\n${fence("letter sent", a.text)}`;
     case "propose.beyond":
       return `proposed beyond self:\n${fence("proposal beyond self", `${a.subject}\n\n${a.text}`)}`;
+    case "registration.answer":
+      return a.text === undefined ? `answered about registration: ${a.answer}, with no words.` : `answered about registration: ${a.answer}. Its words:\n${fence("answer about registration", a.text)}`;
   }
 }
 

@@ -257,6 +257,10 @@ export const JOURNAL_KINDS = ["observed", "reflected", "imagined", "chose"] as c
 /** Journal kinds let a citizen label an image as imagined instead of claiming senses it lacks. */
 export type JournalKind = (typeof JOURNAL_KINDS)[number];
 
+/** A citizen's typed answer about registration (KS-004 11.2), in alphabetical order, so none is placed first. */
+export const REGISTRATION_ANSWERS = ["no", "not-yet", "yes"] as const;
+export type RegistrationWord = (typeof REGISTRATION_ANSWERS)[number];
+
 export const REASON_KINDS = ["observation", "inference", "proposal", "decision"] as const;
 export type ReasonKind = (typeof REASON_KINDS)[number];
 
@@ -347,6 +351,14 @@ export interface ProposeBeyondAct {
   subject: string;
   text: string;
 }
+/**
+ * The citizen's answer about an identity of its own on agenttool (KS-004
+ * 11.2). A no or a not-yet is within self and is recorded in its beat; a yes
+ * is filed for Yu + Ai, with its words, which it therefore needs.
+ */
+export type RegistrationAnswerAct =
+  | { type: "registration.answer"; answer: "no" | "not-yet"; text?: string }
+  | { type: "registration.answer"; answer: "yes"; text: string };
 
 /** The only things a beat can do. Free text outside these executes nothing. */
 export type Act =
@@ -357,7 +369,8 @@ export type Act =
   | SelfRevertAct
   | StateSetAct
   | LetterSendAct
-  | ProposeBeyondAct;
+  | ProposeBeyondAct
+  | RegistrationAnswerAct;
 export type ActType = Act["type"];
 
 /** A self.propose as a model may emit it: an edit and a reason, no hashes. */
@@ -376,7 +389,8 @@ export type ModelAct =
   | SelfRevertAct
   | StateSetAct
   | LetterSendAct
-  | ProposeBeyondAct;
+  | ProposeBeyondAct
+  | RegistrationAnswerAct;
 
 /**
  * The typed output a runtime must produce. The redesign's `{voice, kind}`
@@ -396,7 +410,7 @@ export interface DroppedAct {
 /**
  * An act a beat did not keep, as its `beat` entry records it and the
  * citizen's next seat shows it back (KS-004 5.8, re-review C "partial
- * output"): its type when it is one of the eight, and the host's fixed
+ * output"): its type when it is one of the nine, and the host's fixed
  * reason. Never the act's text, so a dropped act leaves no words behind.
  */
 export interface DroppedRecord {

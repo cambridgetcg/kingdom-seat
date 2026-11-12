@@ -181,7 +181,7 @@ export interface LastSeatRecord {
   dropped: DroppedRecord[];
 }
 
-const DROPPED_TYPES: readonly (ActType | null)[] = [null, "rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond"];
+const DROPPED_TYPES: readonly (ActType | null)[] = [null, "rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond", "registration.answer"];
 const MAX_DROPPED = 16;
 
 function lastSeatDir(config: Config): string {

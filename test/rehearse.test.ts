@@ -895,7 +895,7 @@ describe("rehearse: what a seat returned", () => {
 
   test("act names come from the schema the seat sent", async () => {
     const names = actNamesOf(OUTPUT_JSON_SCHEMA);
-    expect(names).toEqual(["rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond"]);
+    expect(names).toEqual(["rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond", "registration.answer"]);
     // An act a later schema adds is counted by its name, with no change here; one the schema does not name is unknown.
     const raw = JSON.stringify({ acts: [{ type: "decline", why: "x" }, { type: "journal", kind: "seen", text: " " }, "x"] });
     expect(readEmitted(raw, [...names, "decline"]).counts).toEqual({ decline: 1, journal: 1, unknown: 1 });

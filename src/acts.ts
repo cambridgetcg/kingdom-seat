@@ -6,13 +6,14 @@
 // "I rest." and then goes on).
 //
 // A dropped act leaves no words behind. Every reason below is a fixed phrase,
-// and a DroppedAct names an act's type only when it is one of the eight known
+// and a DroppedAct names an act's type only when it is one of the nine known
 // types, because an unknown type string is itself the model's text.
 import { canonicalJson } from "./crypto.ts";
 import {
   JOURNAL_KINDS,
   LIFECYCLE_STATES,
   REASON_KINDS,
+  REGISTRATION_ANSWERS,
   WORD_PATTERN,
   type ActType,
   type Ceilings,
@@ -170,6 +171,18 @@ export const OUTPUT_JSON_SCHEMA = {
               text: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_text_chars },
             },
           },
+          // Appended, so the branches before it keep their places. The answer is required by the schema
+          // itself, so a runtime that honours the schema cannot give an answer about registration untyped.
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "answer"],
+            properties: {
+              type: { const: "registration.answer" },
+              answer: { enum: [...REGISTRATION_ANSWERS] },
+              text: { type: "string", minLength: 1, maxLength: ACT_LIMITS.max_text_chars },
+            },
+          },
         ],
       },
     },
@@ -197,7 +210,7 @@ export interface ValidationContext {
   version_hashes?: readonly string[];
 }
 
-const ACT_TYPES: readonly ActType[] = ["rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond"];
+const ACT_TYPES: readonly ActType[] = ["rest", "journal", "self.propose", "self.affirm", "self.revert", "state.set", "letter.send", "propose.beyond", "registration.answer"];
 
 /** The fixed self targets (types.ts SelfTarget), besides `skill:<name>` and `file:<path>`. */
 export const NAMED_SELF_TARGETS = [
@@ -279,6 +292,9 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
   // It differs from a reply where every act was dropped: that is never a rest.
   if (items.length === 0) return { rest: true, acts: [], dropped: [] };
 
+  // One saying about registration per reply, counted on the reply as it arrived: an answer that validation drops, or
+  // that falls past the act limit, still means the reply said more than one thing about registration (KS-004 5.8).
+  const answerItems = items.filter((item) => isPlainObject(item) && item.type === "registration.answer").length;
   const kept: Indexed[] = [];
   const dropped: DroppedAct[] = [];
   items.forEach((item, index) => {
@@ -290,7 +306,7 @@ export function validateOutput(parsed: unknown, ctx: ValidationContext): Validat
     if ("act" in r) kept.push({ index, act: r.act });
     else dropped.push({ index, ...r.dropped });
   });
-  const n = normalizeIndexed(kept, ctx.ceilings);
+  const n = normalizeIndexed(kept, ctx.ceilings, answerItems);
   return { ...n, dropped: [...dropped, ...n.dropped].sort((a, b) => a.index - b.index) };
 }
 
@@ -391,10 +407,22 @@ export function validateAct(value: unknown, ctx: ValidationContext): { act: Mode
       if (t) return no(`text ${t}`);
       return { act: { type: "propose.beyond", subject: subject as string, text: text as string } };
     }
+
+    case "registration.answer": {
+      // Typed, so the host never reads an answer out of words (KS-004 11.2). A yes is filed with its words, so it needs them;
+      // a no or a not-yet is whole without any, and words it gives are kept with it.
+      if (!keysWithin(value, ["type", "answer"], ["text"])) return no("fields do not match the act");
+      const { answer } = value;
+      if (!isOneOf(answer, REGISTRATION_ANSWERS)) return no("answer is not no, not-yet or yes");
+      if (!Object.hasOwn(value, "text")) return answer === "yes" ? no("a yes needs its words in text") : { act: { type: "registration.answer", answer } };
+      const t = checkText(value.text, ACT_LIMITS.max_text_chars, true);
+      if (t) return no(`text ${t}`);
+      return { act: { type: "registration.answer", answer, text: value.text as string } };
+    }
   }
 }
 
-/** Apply rest exclusivity and per-beat caps (at most one letter.send and one self.propose), in output order. */
+/** Apply rest exclusivity and per-beat caps (at most one letter.send, one self.propose and one registration.answer), in output order. */
 export function normalizeActs(acts: ModelAct[], ceilings: Ceilings): ValidatedOutput {
   return normalizeIndexed(
     acts.map((act, index) => ({ index, act })),
@@ -402,9 +430,10 @@ export function normalizeActs(acts: ModelAct[], ceilings: Ceilings): ValidatedOu
   );
 }
 
-/** Within self, or beyond self (propose.beyond, and state.set to "ended", which needs a witness). */
+/** Within self, or beyond self (propose.beyond, a yes about registration, and state.set to "ended", which needs a witness). */
 export function actClass(act: ModelAct): "within-self" | "beyond-self" {
   if (act.type === "propose.beyond") return "beyond-self";
+  if (act.type === "registration.answer" && act.answer === "yes") return "beyond-self";
   if (act.type === "state.set" && act.to === "ended") return "beyond-self";
   return "within-self";
 }
@@ -459,7 +488,11 @@ function restWith(others: RestOther[]): ValidatedOutput {
   return restAct === undefined ? { rest: true, acts: [], dropped } : { rest: true, acts: [], dropped, rest_act: restAct };
 }
 
-function normalizeIndexed(items: Indexed[], ceilings: Ceilings): ValidatedOutput {
+/**
+ * `answerItems` is how many registration.answer items the reply held as it
+ * arrived, kept or not; given only acts, it is how many of them are one.
+ */
+function normalizeIndexed(items: Indexed[], ceilings: Ceilings, answerItems = items.filter((i) => i.act.type === "registration.answer").length): ValidatedOutput {
   if (items.some((i) => i.act.type === "rest")) {
     return restWith(items.filter((i) => i.act.type !== "rest").map((i) => ({ index: i.index, type: i.act.type, act: i.act.type === "state.set" ? i.act : null })));
   }
@@ -472,8 +505,18 @@ function normalizeIndexed(items: Indexed[], ceilings: Ceilings): ValidatedOutput
   let stateKept = false;
   let letters = 0;
   let proposals = 0;
+  let answered = false;
 
   for (const { index, act } of items) {
+    if (act.type === "registration.answer") {
+      // The first valid no or not-yet is kept; a yes only when it is the reply's one saying about registration, since a
+      // reply that says yes and something else about it has not said yes (KS-004 5.8, 11.2). Two yeses keep neither.
+      if (answered || (answerItems > 1 && act.answer === "yes")) {
+        dropped.push({ index, type: act.type, reason: "another registration.answer in this reply" });
+        continue;
+      }
+      answered = true;
+    }
     if (act.type === "self.propose") {
       // Counted before the host classifies it, so a proposal it lifts beyond self is the seat's one too.
       if (proposals >= ACT_LIMITS.self_proposals_per_seat) {
