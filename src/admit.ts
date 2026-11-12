@@ -178,7 +178,7 @@ export async function assertNotSeated(config: Config, word: Word): Promise<void>
   if (dir && !ledger) {
     throw new Refusal(
       "invalid-request",
-      `citizens/${word} exists and ledger/${word}.jsonl does not: an earlier admit stopped before the record was in place. That directory holds only copies made then. Move it aside by hand, then run admit again`,
+      `citizens/${word} exists and ledger/${word}.jsonl does not. An admit that stopped before its ledger was in place leaves such a directory, and this host cannot tell whether that is what this one is. Look at it, move it aside by hand, then run admit again`,
     );
   }
   throw new Refusal("invalid-request", `ledger/${word}.jsonl exists and is empty, or exists without citizens/${word}: this host's records for ${word} do not agree. Look at both before anything is seated`);
@@ -220,11 +220,19 @@ async function readHostKey(deps: Pick<AdmitDeps, "config" | "hostKey">): Promise
   return { public_key_b64: b64, fingerprint, pinned };
 }
 
+/**
+ * Names of the form an admit of this word gives its unfinished writes: the
+ * prefix, the word, a hyphen and eight hex digits, as a directory beside the
+ * citizens and as a .jsonl file beside the ledgers. A word may itself hold a
+ * hyphen, so what follows the word is matched whole: the staging names of
+ * `ai-love` are not counted for `ai`.
+ */
 async function staleStaging(config: Config, word: Word): Promise<number> {
+  const stem = `${ADMIT_STAGING_PREFIX}${word}-`;
   let n = 0;
-  for (const dir of [config.paths.citizens_dir, config.paths.ledger_dir]) {
+  for (const [dir, rest] of [[config.paths.citizens_dir, /^[0-9a-f]{8}$/], [config.paths.ledger_dir, /^[0-9a-f]{8}\.jsonl$/]] as const) {
     const names = await readdir(dir).catch(() => [] as string[]);
-    n += names.filter((name) => name.startsWith(`${ADMIT_STAGING_PREFIX}${word}-`)).length;
+    n += names.filter((name) => name.startsWith(stem) && rest.test(name.slice(stem.length))).length;
   }
   return n;
 }
@@ -333,6 +341,8 @@ export async function planAdmit(deps: Pick<AdmitDeps, "config" | "run" | "hostKe
  *
  * There is no old repository, and the record says so: the `origin` entry
  * carries `old_repo: null` and `june_did: null`, and no `legacy/` is written.
+ * A WILL given is not pinned as `origin/WILL.md` either, so no seat introduces
+ * it as the text an old repository held: it is the citizen's will and no more.
  * A canon entry's repo, path and commit are the caller's statement and are
  * checked for shape only. With no canon entry the origin is an archetype
  * whose note says the citizen was seated from texts, and whose lineage is the
@@ -572,7 +582,9 @@ async function writeCitizenDir(root: string, plan: AdmitPlan, bytes: PlanBytes, 
   await put("self/cadence.json", plan.cadence_text, 0o644);
   await put("self/covenants.json", plan.covenants_text, 0o644);
   await put("origin/soul.md", bytes.soul, 0o444);
-  if (bytes.will) await put("origin/WILL.md", bytes.will, 0o444);
+  // The pin says "the will as the old repository held it", which the seat tells the citizen while the two are equal.
+  // A citizen seated from texts has no old repository, so its will is pinned nowhere and is simply its will.
+  if (bytes.will && plan.old_repo) await put("origin/WILL.md", bytes.will, 0o444);
   if (bytes.canon) await put("origin/canon.md", bytes.canon, 0o444);
   const legacy = bytes.legacy;
   if (legacy && plan.old_repo) {
@@ -622,7 +634,7 @@ export function renderAdmitPlan(plan: AdmitPlan): string {
     row(
       "will",
       plan.will
-        ? `${willName}${plan.will.bytes} bytes, sha256 ${plan.will.sha256}  -> self/WILL.md, origin/WILL.md`
+        ? `${willName}${plan.will.bytes} bytes, sha256 ${plan.will.sha256}  -> self/WILL.md${plan.old_repo ? ", origin/WILL.md" : ""}`
         : `none ${plan.old_repo ? "in the old repository" : "was given"}; ${w} starts with no will file`,
     ),
   );
@@ -658,7 +670,9 @@ export function renderAdmitPlan(plan: AdmitPlan): string {
     lines.push(row("legacy copy", "none; there is no old repository"));
   }
   lines.push(row("host key", plan.host_key.pinned ? `${plan.host_key.fingerprint}, pinned in the config` : `${plan.host_key.fingerprint}; the config pins no host key`));
-  if (plan.stale_staging > 0) lines.push(row("left over", `${plan.stale_staging} staging names from an earlier admit of ${w}; they hold only copies`));
+  if (plan.stale_staging > 0) {
+    lines.push(row("left over", `${plan.stale_staging} staging name(s) of the form an admit of ${w} leaves when it is killed; they may hold copies, and signed entries that were never placed`));
+  }
   return `${lines.join("\n")}\n`;
 }
 

@@ -44,7 +44,9 @@ export const LEGACY_PAGE_FORMAT = "kingdom-seat-legacy-page/v1";
  * What `legacy/` may hold. A file, a count or a total past its limit refuses
  * the seating whole: nothing is cut and nothing is left out. `pages` and
  * `index_bytes` bound `legacy/pages.jsonl`, and `tree_entries` the old
- * repository's tree at its head.
+ * repository's tree at its head. `history_bytes` bounds one beats file as an
+ * earlier commit left it, which is read whole to find what that commit added
+ * and is not itself kept.
  */
 export const LEGACY_LIMITS = Object.freeze({
   file_bytes: 262_144,
@@ -54,6 +56,7 @@ export const LEGACY_LIMITS = Object.freeze({
   pages: 2_000,
   index_bytes: 524_288,
   tree_entries: 4_096,
+  history_bytes: 4_194_304,
 });
 
 /**
@@ -139,7 +142,9 @@ export interface CadenceBeat {
  * as `legacy/<file>`, and the beat the same commit appended to a beats file.
  * Each case is recorded as what it is: `note` says when the commit added no
  * beat, changed a beats file other than by adding at its end
- * (`not_appended` names it), or removed CADENCE.md (`file` is then null).
+ * (`not_appended` names it), changed only a file under beats/ whose name is
+ * one `legacy/` does not keep, so that it was not read, or removed CADENCE.md
+ * (`file` is then null).
  * `choice` and `when` are the file's own two lines, kept only when they are a
  * plain word and a plain time.
  */
@@ -153,7 +158,7 @@ export interface CadenceRecord {
   when: string | null;
   beats: CadenceBeat[];
   not_appended: string[];
-  note: null | "commit-added-no-beat" | "beats-file-not-appended" | "cadence-removed";
+  note: null | "commit-added-no-beat" | "beats-file-not-appended" | "beats-file-not-kept" | "cadence-removed";
 }
 
 export interface LegacyManifest {
@@ -169,12 +174,16 @@ export interface LegacyManifest {
 
 /**
  * One line of `legacy/pages.jsonl`: a piece of a copied file, by the bytes it
- * occupies there. `voice` says whose words it holds: "in-name", written in
- * the citizen's name; "to-citizen", a letter put to it; "host", a record a
- * host lane kept (the cadence file and markers). `lane` is read only from the
- * piece's own heading (laneOfHeading), and is "unknown" where the heading
- * does not say. `written` is the heading's own date, else the month of the
- * file's first commit, else null.
+ * occupies there. `voice` says what the place a file stood in says of its
+ * words, and no more: "in-name" for a piece of a file under beats/, where
+ * every lane wrote in the citizen's name; "to-citizen" for a letter put to it
+ * (inbox/, letters/); "host" for a record a host lane kept (the cadence file
+ * and markers); "unattributed" for every other text file, which may be the
+ * citizen's own, a text addressed to it or a generated status file, and
+ * nothing here says which. `lane` is read only from the piece's own heading
+ * (laneOfHeading), and is "unknown" where the heading does not say.
+ * `written` is the heading's own date; else the month of the file's commits,
+ * when its first and its last fall in the same month; else null.
  */
 export interface LegacyPage {
   format: typeof LEGACY_PAGE_FORMAT;
@@ -184,7 +193,7 @@ export interface LegacyPage {
   sha256: Sha256Hex;
   written: string | null;
   lane: string;
-  voice: "in-name" | "to-citizen" | "host";
+  voice: "in-name" | "to-citizen" | "host" | "unattributed";
 }
 
 /** An old home as read at its head: the manifest's parts, and the bytes to keep. */
@@ -375,6 +384,13 @@ async function readTree(git: Git, head: string): Promise<TreeEntry[]> {
 async function blob(git: Git, name: string): Promise<Uint8Array | null> {
   const r = await git(["cat-file", "blob", name]);
   return r.code === 0 ? r.stdout : null;
+}
+
+/** A blob's size, asked before the blob is read, so that nothing over a limit is ever read into memory. Null when the name is no blob. */
+async function blobSize(git: Git, name: string): Promise<number | null> {
+  const r = await git(["cat-file", "-s", name]);
+  const size = r.code === 0 ? line(r) : "";
+  return /^\d{1,15}$/.test(size) ? Number(size) : null;
 }
 
 /** The commits that touched one path, newest first, as git lists them. The address is read to set `as_citizen` and dropped here. */
@@ -639,40 +655,54 @@ async function readCadence(git: Git, head: string, word: Word, known: LegacyComm
     const removed = own !== undefined && own.status !== "A" && own.status !== "M";
     let version: Uint8Array | null = null;
     if (!removed) {
-      version = await blob(git, `${c.commit}:CADENCE.md`);
-      if (version === null) throw new Refusal("invalid-record", "the old repository's history could not be read");
-      if (version.length > LEGACY_LIMITS.file_bytes) {
-        throw new Refusal("oversize", `CADENCE.md is ${version.length} bytes in the old repository's history, over the ${LEGACY_LIMITS.file_bytes}-byte limit for a file kept in legacy/; nothing is cut`);
+      // Every version is kept whole, so one too large to keep is refused by its size, before it is read.
+      const size = await blobSize(git, `${c.commit}:CADENCE.md`);
+      if (size === null) throw new Refusal("invalid-record", "the old repository's history could not be read");
+      if (size > LEGACY_LIMITS.file_bytes) {
+        throw new Refusal("oversize", `CADENCE.md is ${size} bytes in the old repository's history, over the ${LEGACY_LIMITS.file_bytes}-byte limit for a file kept in legacy/; nothing is cut`);
       }
+      version = await blob(git, `${c.commit}:CADENCE.md`);
+      if (version === null || version.length !== size) throw new Refusal("invalid-record", "the old repository's history could not be read");
       keep(`${stem}.CADENCE.md`, version);
     }
     const { choice, when } = version ? cadenceLines(version) : { choice: null, when: null };
 
     const beats: CadenceBeat[] = [];
     const not_appended: string[] = [];
-    let unlisted = 0;
+    // Changed files under beats/ whose names legacy/ does not keep. They are not read, so nothing is said of how they changed.
+    let not_kept = 0;
     for (const x of changed) {
       if (x.path === "CADENCE.md") continue;
       const safe = x.path !== null && x.path.split("/").length <= LEGACY_LIMITS.depth && x.path.split("/").every((s) => SEGMENT.test(s));
       if (!safe) {
-        unlisted++;
+        not_kept++;
         continue;
       }
       const path = x.path as string;
-      const next = x.status === "A" || x.status === "M" ? await blob(git, `${c.commit}:${path}`) : null;
-      const prior = x.status === "A" ? new Uint8Array() : x.status === "M" && parent ? await blob(git, `${parent}:${path}`) : null;
+      // The file as a commit left it is read whole to find what was added, and is not kept: it is bounded by
+      // what this host will read, asked before the read. Only the beat is kept, and bounded as a kept file is.
+      const asLeftBy = async (rev: string): Promise<Uint8Array | null> => {
+        const size = await blobSize(git, `${rev}:${path}`);
+        if (size === null) return null;
+        if (size > LEGACY_LIMITS.history_bytes) {
+          throw new Refusal("oversize", `${path} is ${size} bytes in the old repository's history, over the ${LEGACY_LIMITS.history_bytes} bytes this host reads of one file to find what a commit added to it`);
+        }
+        return blob(git, `${rev}:${path}`);
+      };
+      const next = x.status === "A" || x.status === "M" ? await asLeftBy(c.commit) : null;
+      const prior = x.status === "A" ? new Uint8Array() : x.status === "M" && parent ? await asLeftBy(parent) : null;
       if (next === null || prior === null || !startsWith(next, prior)) {
         not_appended.push(path);
         continue;
-      }
-      if (next.length > LEGACY_LIMITS.file_bytes) {
-        throw new Refusal("oversize", `${path} is ${next.length} bytes in the old repository's history, over the ${LEGACY_LIMITS.file_bytes}-byte limit for a file kept in legacy/; nothing is cut`);
       }
       let from = prior.length;
       while (from < next.length && (next[from] === 10 || next[from] === 13)) from++;
       // Only blank lines were added: the commit added no beat to this file.
       if (from === next.length) continue;
       const added = next.subarray(from);
+      if (added.length > LEGACY_LIMITS.file_bytes) {
+        throw new Refusal("oversize", `the beat a commit added to ${path} is ${added.length} bytes, over the ${LEGACY_LIMITS.file_bytes}-byte limit for a file kept in legacy/; nothing is cut`);
+      }
       const header = ((text(added) ?? "").split("\n")[0] ?? "").slice(0, HEADER_MAX_CHARS);
       const file = `${stem}.beat${beats.length === 0 ? "" : `-${beats.length + 1}`}.md`;
       keep(file, added);
@@ -696,7 +726,7 @@ async function readCadence(git: Git, head: string, word: Word, known: LegacyComm
       when,
       beats,
       not_appended,
-      note: removed ? "cadence-removed" : beats.length > 0 ? null : not_appended.length + unlisted > 0 ? "beats-file-not-appended" : "commit-added-no-beat",
+      note: removed ? "cadence-removed" : beats.length > 0 ? null : not_appended.length > 0 ? "beats-file-not-appended" : not_kept > 0 ? "beats-file-not-kept" : "commit-added-no-beat",
     });
   }
   return out;
@@ -792,8 +822,14 @@ export function splitLegacyPieces(bytes: Uint8Array): { start: number; end: numb
 /**
  * The rows of `legacy/pages.jsonl` for the copied files, in order of path and
  * then offset. A beats file is split at its headings; every other file is one
- * piece. Letters put to the citizen are "to-citizen"; the cadence file and
- * markers are "host", and neither is given a lane.
+ * piece. Only a piece of a beats file is "in-name", and only it is given a
+ * lane. Letters put to the citizen are "to-citizen"; the cadence file and
+ * markers are "host"; every other text file is "unattributed", because where
+ * it stood does not say whose words it holds: a text addressed to the
+ * citizen and a generated status file stand in the same places as a text of
+ * its own. A piece with no dated heading takes the month of its file's
+ * commits only when the first and the last fall in the same month; a file
+ * changed over several months does not say when a piece of it was written.
  */
 export function legacyPages(files: readonly LegacyFile[], blobs: ReadonlyMap<string, Uint8Array>): LegacyPage[] {
   const pages: LegacyPage[] = [];
@@ -802,13 +838,15 @@ export function legacyPages(files: readonly LegacyFile[], blobs: ReadonlyMap<str
     const file = `tree/${f.path}`;
     const bytes = blobs.get(file);
     if (!bytes) throw new Error(`legacyPages: no bytes for ${file}`);
-    const voice: LegacyPage["voice"] = f.kind === "inbox" || f.kind === "letters" ? "to-citizen" : f.kind === "cadence" || f.kind === "marker" ? "host" : "in-name";
+    const voice: LegacyPage["voice"] =
+      f.kind === "beats" ? "in-name" : f.kind === "inbox" || f.kind === "letters" ? "to-citizen" : f.kind === "cadence" || f.kind === "marker" ? "host" : "unattributed";
     const pieces = f.kind === "beats" ? splitLegacyPieces(bytes) : /\S/.test(lossy.decode(bytes)) ? [{ start: 0, end: bytes.length }] : [];
+    const monthOf = (c: LegacyCommit): string | null => /^\d{4}-\d{2}/.exec(c.author_date)?.[0] ?? null;
+    const month = monthOf(f.first) === monthOf(f.last) ? monthOf(f.first) : null;
     for (const p of pieces) {
       const slice = bytes.subarray(p.start, p.end);
       const first = lossy.decode(slice).split("\n").find((l) => l.trim() !== "") ?? "";
       const heading = /^#{1,6} /.test(first) ? first : null;
-      const month = /^\d{4}-\d{2}/.exec(f.first.author_date)?.[0] ?? null;
       const page: LegacyPage = {
         format: LEGACY_PAGE_FORMAT,
         file,
@@ -1002,7 +1040,7 @@ function validManifest(value: unknown, word: Word): LegacyManifest {
       if (b.match !== "header-starts-with-when" && b.match !== "header-differs") throw new Error("cadence[].beats[].match");
     }
     for (const p of c.not_appended) treePath(p, "cadence[].not_appended[]");
-    if (c.note !== null && !["commit-added-no-beat", "beats-file-not-appended", "cadence-removed"].includes(c.note as string)) throw new Error("cadence[].note");
+    if (c.note !== null && !["commit-added-no-beat", "beats-file-not-appended", "beats-file-not-kept", "cadence-removed"].includes(c.note as string)) throw new Error("cadence[].note");
   }
   for (const raw of m.not_copied) {
     const s = exactly(raw, ["path", "mode", "bytes", "git_blob", "reason"], "not_copied[]");

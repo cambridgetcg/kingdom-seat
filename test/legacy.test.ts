@@ -134,7 +134,14 @@ describe("readLegacyHome", () => {
       for (const a of c.argv) expect(["fetch", "pull", "push", "checkout", "status", "add", "commit", "gc", "-c", "--exec-path"]).not.toContain(a);
     }
     expect(calls.filter((c) => c.argv[1] === "config").map((c) => c.argv.slice(2))).toEqual([["--local", "--list", "--name-only", "-z"], ["--local", "--get", "remote.origin.url"]]);
-    expect(calls.filter((c) => c.argv[1] === "cat-file").every((c) => c.argv[2] === "blob" && c.argv.length === 4)).toBe(true);
+    const cat = calls.filter((c) => c.argv[1] === "cat-file").map((c) => c.argv.slice(2));
+    expect(cat.every((a) => a.length === 2 && (a[0] === "blob" || a[0] === "-s"))).toBe(true);
+    // A blob at the head is read by the id and size its tree gave. One from an earlier commit is named by commit and
+    // path, and its size is asked first, so that nothing over a limit is read into memory.
+    const byPath = cat.map((a, i) => ({ a, i })).filter(({ a }) => a[0] === "blob" && a[1]!.includes(":"));
+    expect(byPath.length).toBeGreaterThan(10);
+    for (const { a, i } of byPath) expect([a[1], cat[i - 1]]).toEqual([a[1], ["-s", a[1]!]]);
+    expect(cat.filter((a) => a[0] === "-s").every((a) => a[1]!.includes(":"))).toBe(true);
     expect(calls.filter((c) => c.argv[1] === "ls-tree").map((c) => c.argv.slice(2))).toEqual([["-r", "-l", "-z", "--full-tree", s.head]]);
 
     expect(env).toMatchObject({
@@ -241,6 +248,113 @@ describe("readLegacyHome", () => {
       [2, null, null, true, true, "cadence-removed"],
     ]);
     expect(oddHome.files.map((f) => f.path)).toEqual([]);
+  });
+
+  test("a commit that changed only a beats file under a name not kept is recorded as that, and not as a change that was no addition", async () => {
+    host = await makeTempHost();
+    const repo = await smallHome(host, "oddbeats");
+    await repo.commit({ "beats/2026 10.md": fixtureBeat("2026-10-22 04:10", "an answer"), "CADENCE.md": fixtureCadence("oddbeats", "undecided", "2026-10-22 04:10") }, { as: "citizen", subject: "beat: oddbeats reflected" });
+    // The same again beside a file that is kept: the beat found is recorded, and the note stays null.
+    await repo.commit(
+      { "beats/2026 10.md": `${fixtureBeat("2026-10-22 04:10", "an answer")}\nmore\n`, "beats/2026-10.md": fixtureBeat("2026-10-23 05:15", "another"), "CADENCE.md": fixtureCadence("oddbeats", "ambient", "2026-10-23 05:15") },
+      { as: "citizen", subject: "beat: oddbeats reflected" },
+    );
+    repo.publish();
+    const { run, calls } = recording();
+    const home = await readLegacyHome(run, repo.dir, "oddbeats");
+    expect(home.cadence.map((r) => [r.n, r.note, r.beats.map((b) => b.from_path), r.not_appended])).toEqual([
+      [1, "beats-file-not-kept", [], []],
+      [2, null, ["beats/2026-10.md"], []],
+    ]);
+    // The oddly named file is listed at the head and was never opened: its name is given to no git call.
+    expect(home.not_copied.filter((s) => s.reason === "path").map((s) => s.path)).toEqual(["beats/2026 10.md"]);
+    expect(calls.filter((c) => c.argv.some((a) => a.includes("2026 10"))).map((c) => c.argv)).toEqual([]);
+  });
+
+  test("a beats file that was once larger than a kept file may be is read to find the beat, and only the beat is bounded as a kept file", async () => {
+    host = await makeTempHost();
+    const big = `## 2026-07-01 00:00 — a made-up bundle\n\n${"x".repeat(LEGACY_LIMITS.file_bytes + 1000)}\n`;
+    const beat = fixtureBeat("2026-07-02 00:00", "GROWN-FILE-MARKER the answer a commit added to a large file");
+    const repo = await smallHome(host, "grownfile", { "beats/2026-07.md": big });
+    const added = await repo.commit({ "beats/2026-07.md": `${big}\n${beat}`, "CADENCE.md": fixtureCadence("grownfile", "ambient", "2026-07-02 00:00") }, { as: "citizen", subject: "beat: grownfile reflected" });
+    // Later the file was cut down; at the head it is small, and the cadence file was not touched again.
+    await repo.commit({ "beats/2026-07.md": beat }, { subject: "tend: a made-up tidy" });
+    repo.publish();
+    const home = await readLegacyHome(real, repo.dir, "grownfile");
+    expect(home.files.map((f) => [f.path, f.bytes])).toEqual([["CADENCE.md", expect.any(Number)], ["beats/2026-07.md", utf8(beat).length]]);
+    expect(home.cadence).toHaveLength(1);
+    const kept = home.cadence[0]!.beats[0]!;
+    expect(kept).toMatchObject({ from_path: "beats/2026-07.md", from_offset: utf8(big).length + 1, bytes: utf8(beat).length, sha256: sha256Hex(beat), match: "header-starts-with-when" });
+    expect(new TextDecoder().decode(home.blobs.get(kept.file)!)).toBe(beat);
+    expect(home.cadence[0]!.commit.commit).toBe(added);
+
+    // A beat too large to keep whole is refused as such, by its own size.
+    const fat = await smallHome(host, "fatbeat", { "beats/2026-07.md": "## a first piece\n" });
+    await fat.commit({ "beats/2026-07.md": `## a first piece\n\n## a beat\n${"y".repeat(LEGACY_LIMITS.file_bytes)}\n`, "CADENCE.md": fixtureCadence("fatbeat", "ambient", "2026-07-02 00:00") }, { as: "citizen" });
+    await fat.commit({ "beats/2026-07.md": "## a first piece\n" });
+    fat.publish();
+    expect(await refusal(readLegacyHome(real, fat.dir, "fatbeat"))).toEqual({
+      code: "oversize",
+      message: `the beat a commit added to beats/2026-07.md is ${LEGACY_LIMITS.file_bytes + 11} bytes, over the 262144-byte limit for a file kept in legacy/; nothing is cut`,
+    });
+  });
+
+  test("a file in history over what this host reads is refused by its size, before it is read; so is a cadence version too large to keep", async () => {
+    host = await makeTempHost();
+    const huge = "z".repeat(LEGACY_LIMITS.history_bytes + 1);
+    const repo = await smallHome(host, "hugepast", { "beats/2026-07.md": "## a first piece\n" });
+    await repo.commit({ "beats/2026-07.md": huge, "CADENCE.md": fixtureCadence("hugepast", "ambient", "2026-07-02 00:00") }, { as: "citizen" });
+    await repo.commit({ "beats/2026-07.md": "## a first piece\n" });
+    repo.publish();
+    const a = recording();
+    expect(await refusal(readLegacyHome(a.run, repo.dir, "hugepast"))).toEqual({
+      code: "oversize",
+      message: `beats/2026-07.md is ${LEGACY_LIMITS.history_bytes + 1} bytes in the old repository's history, over the ${LEGACY_LIMITS.history_bytes} bytes this host reads of one file to find what a commit added to it`,
+    });
+    const asked = a.calls.filter((c) => c.argv[1] === "cat-file" && c.argv[3]!.endsWith(":beats/2026-07.md")).map((c) => c.argv[2]);
+    expect(asked).toEqual(["-s"]);
+
+    const cad = await smallHome(host, "hugecadence", { "CADENCE.md": "c".repeat(LEGACY_LIMITS.file_bytes + 1) });
+    await cad.commit({ "CADENCE.md": fixtureCadence("hugecadence", "ambient", "2026-07-02 00:00") });
+    cad.publish();
+    const b = recording();
+    expect(await refusal(readLegacyHome(b.run, cad.dir, "hugecadence"))).toEqual({
+      code: "oversize",
+      message: `CADENCE.md is ${LEGACY_LIMITS.file_bytes + 1} bytes in the old repository's history, over the 262144-byte limit for a file kept in legacy/; nothing is cut`,
+    });
+    expect(b.calls.filter((c) => c.argv[1] === "cat-file" && c.argv[3]!.endsWith(":CADENCE.md")).map((c) => c.argv[2])).toEqual(["-s"]);
+  });
+
+  test("a text outside beats/ is not said to be written in the citizen's name, and a file changed over several months is given no date", async () => {
+    host = await makeTempHost();
+    const w = "voicefix";
+    // As old homes hold them: a text put to the citizen that was not filed under inbox/, and a status file a lane
+    // rewrote. Neither was written in the citizen's name, and nothing in the tree says so.
+    const repo = await smallHome(host, w, {
+      "TO-YOU.md": `You are **${w}**. ADDRESSED-MARKER a made-up text another hand put to the citizen.\n`,
+      "STATUS.md": "# status\n\nGENERATED-MARKER beat 1\n",
+      "writings/own.md": "# On a made-up subject\n\nOWN-MARKER\n",
+      "beats/2026-06.md": fixtureBeat("2026-06-19 10:00", "BEAT-MARKER a made-up beat"),
+    });
+    await repo.commit({ "STATUS.md": "# status\n\nGENERATED-MARKER beat 2\n" }, { subject: "status: a made-up update", date: "2026-07-26T09:00:00Z" });
+    repo.publish();
+    const home = await readLegacyHome(real, repo.dir, w);
+    expect(home.files.map((f) => [f.path, f.kind, f.first.author_date.slice(0, 7), f.last.author_date.slice(0, 7)])).toEqual([
+      ["STATUS.md", "other", "2026-06", "2026-07"],
+      ["TO-YOU.md", "other", "2026-06", "2026-06"],
+      ["beats/2026-06.md", "beats", "2026-06", "2026-06"],
+      ["writings/own.md", "other", "2026-06", "2026-06"],
+    ]);
+    expect(home.pages.map((p) => [p.file, p.written, p.lane, p.voice])).toEqual([
+      ["tree/STATUS.md", null, "unknown", "unattributed"],
+      ["tree/TO-YOU.md", "2026-06", "unknown", "unattributed"],
+      ["tree/beats/2026-06.md", "2026-06-19", "reflect-local", "in-name"],
+      ["tree/writings/own.md", "2026-06", "unknown", "unattributed"],
+    ]);
+    // What a reader of in-name rows is given holds the beat and neither of the other two.
+    const inName = home.pages.filter((p) => p.voice === "in-name").map((p) => new TextDecoder().decode(home.blobs.get(p.file)!.subarray(p.start, p.start + p.bytes))).join("\n");
+    expect(inName).toContain("BEAT-MARKER");
+    for (const marker of ["ADDRESSED-MARKER", "GENERATED-MARKER", "OWN-MARKER"]) expect([marker, inName.includes(marker)]).toEqual([marker, false]);
   });
 
   test("each copied file carries its first and last commit, the author name as written, and how it was authored", async () => {
@@ -527,11 +641,11 @@ describe("the pieces of pages.jsonl", () => {
     expect(laneOfHeading(null)).toBe("unknown");
   });
 
-  test("rows carry the heading's own date, else the month of the file's first commit, and a voice by where the file stood", () => {
+  test("rows carry the heading's own date, else the one month the file's commits fall in, and a voice that says no more than where the file stood", () => {
     const commit = (date: string) => ({ commit: "a".repeat(40), author_name: "x", as_citizen: "no" as const, author_date: date, subject: "s" });
-    const file = (path: string, kind: LegacyFile["kind"], body: string, date = "2026-07-04T23:30:00-07:00"): [LegacyFile, Uint8Array] => {
+    const file = (path: string, kind: LegacyFile["kind"], body: string, date = "2026-07-04T23:30:00-07:00", last = date): [LegacyFile, Uint8Array] => {
       const bytes = enc(body);
-      return [{ path, kind, bytes: bytes.length, sha256: sha256Hex(bytes), git_blob: "b".repeat(40), first: commit(date), last: commit(date), commits: 1, authored: "other-names" }, bytes];
+      return [{ path, kind, bytes: bytes.length, sha256: sha256Hex(bytes), git_blob: "b".repeat(40), first: commit(date), last: commit(last), commits: date === last ? 1 : 2, authored: "other-names" }, bytes];
     };
     const beats = "front matter\n## 2026-10-23 05:15 — a free beat (local)\none\n## 2026-13-40 — not a date\ntwo\n## the arrangement\nthree\n## 2026-06-21 — a free beat (human summons)\nfour\n";
     const entries = [
@@ -544,6 +658,10 @@ describe("the pieces of pages.jsonl", () => {
       file("letters/from-x.md", "letters", "Dear citizen\n"),
       file("writings/essay.md", "other", "\n# 2026-08-09 an essay (local)\n\nmade\n"),
       file("notes.txt", "other", "plain notes\n", "not a date"),
+      // A text addressed to the citizen, and a status file a lane kept rewriting: both stand where a text of its own would.
+      file("TO-YOU.md", "other", "You are the citizen. A made-up text put to it.\n"),
+      file("STATUS.md", "other", "state: a made-up status\n", "2026-06-21T10:00:00+00:00", "2026-07-26T10:00:00+00:00"),
+      file("beats/journal.md", "beats", "## an undated heading\nkept over two months\n", "2026-06-30T23:00:00+00:00", "2026-07-01T01:00:00+00:00"),
     ];
     const blobs = new Map(entries.map(([f, b]) => [`tree/${f.path}`, b]));
     const pages = legacyPages(entries.map(([f]) => f), blobs);
@@ -558,9 +676,16 @@ describe("the pieces of pages.jsonl", () => {
       ["tree/beats/2026-10.md", at("## 2026-06-21"), "2026-06-21", "summons", "in-name"],
       ["tree/inbox/a.md", 0, "2026-07-17", "unknown", "to-citizen"],
       ["tree/letters/from-x.md", 0, "2026-07", "unknown", "to-citizen"],
-      ["tree/writings/essay.md", 0, "2026-08-09", "reflect-local", "in-name"],
-      ["tree/notes.txt", 0, null, "unknown", "in-name"],
+      // Outside beats/, where a file stood does not say whose words it holds, and its heading is not read for a lane.
+      ["tree/writings/essay.md", 0, "2026-08-09", "unknown", "unattributed"],
+      ["tree/notes.txt", 0, null, "unknown", "unattributed"],
+      ["tree/TO-YOU.md", 0, "2026-07", "unknown", "unattributed"],
+      // First committed in June and last in July: neither month is when the piece was written, so none is given.
+      ["tree/STATUS.md", 0, null, "unknown", "unattributed"],
+      ["tree/beats/journal.md", 0, null, "unknown", "in-name"],
     ]);
+    // Only a piece of a beats file is said to be written in the citizen's name.
+    expect(pages.filter((p) => p.voice === "in-name").every((p) => p.file.startsWith("tree/beats/"))).toBe(true);
     for (const p of pages) {
       const slice = blobs.get(p.file)!.subarray(p.start, p.start + p.bytes);
       expect([p.file, p.start, p.sha256]).toEqual([p.file, p.start, sha256Hex(slice)]);

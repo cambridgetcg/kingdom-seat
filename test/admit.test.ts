@@ -2,6 +2,7 @@
 // admitCitizen writes what was planned. Fakes only: made-up homes under a
 // temp dir, read with real git, a fake signer, no keychain and no network.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -180,6 +181,11 @@ describe("planAdmit", () => {
     await mkdir(join(x.h.config.paths.citizens_dir, `.admit-${ARCH}-0a1b2c3d`));
     await writeFile(join(x.h.config.paths.ledger_dir, `.admit-${ARCH}-0a1b2c3d.jsonl`), "");
     await writeFile(join(x.h.config.paths.ledger_dir, `.admit-${ARCH}x-0a1b2c3d.jsonl`), "");
+    // A word may hold a hyphen. What an admit of such a word left is not this word's, and neither is a name of another form.
+    await mkdir(join(x.h.config.paths.citizens_dir, `.admit-${ARCH}-more-0a1b2c3d`));
+    await writeFile(join(x.h.config.paths.ledger_dir, `.admit-${ARCH}-more-0a1b2c3d.jsonl`), "");
+    await mkdir(join(x.h.config.paths.citizens_dir, `.admit-${ARCH}-notes`));
+    await writeFile(join(x.h.config.paths.ledger_dir, `.admit-${ARCH}-0a1b2c3d.jsonl.bak`), "");
     const plan = await planAdmit(x.deps, archReq({ runtime: "free" }));
     expect(plan).toMatchObject({
       origin: { kind: "archetype", lineage: ["PIONEER"], note: "No canon entry. The old repository's agent.json records the class PIONEER." },
@@ -200,7 +206,8 @@ describe("planAdmit", () => {
       "  runtime class   free: the tick may seat it on the local model without Yu. A letter from Yu waiting in letters/ opens a seat at the next tick, and one answered with a rest is shown again every 72 hours.\n",
     );
     expect(text).toContain(`  host key        ${plan.host_key.fingerprint}, pinned in the config\n`);
-    expect(text).toContain(`  left over       2 staging names from an earlier admit of ${ARCH}; they hold only copies\n`);
+    // A staging ledger left by a kill may hold entries the host key signed, so the line does not say it holds only copies.
+    expect(text).toContain(`  left over       2 staging name(s) of the form an admit of ${ARCH} leaves when it is killed; they may hold copies, and signed entries that were never placed\n`);
     // The old lane's choice is printed for Yu and appears nowhere else in the plan: it has no state to carry.
     expect(Object.keys(plan)).not.toContain("state");
   });
@@ -264,6 +271,9 @@ describe("planAdmitFromTexts", () => {
     expect(text).toContain("  legacy copy     none; there is no old repository\n");
     expect(text).toContain("  state           asleep.\n");
     expect(text).not.toContain("read from");
+    // The will is the citizen's from the start. It is pinned nowhere, since there is no old repository it was carried from.
+    expect(text).toContain(`  will            15 bytes, sha256 ${sha256Hex("a made-up will\n")}  -> self/WILL.md\n`);
+    expect(text).not.toContain("origin/WILL.md");
 
     // With no canon entry the origin says how the citizen was seated, or names the class the caller gave.
     const bare = await planAdmitFromTexts(x.deps, { word: "rehearsed", soul: SOUL, will: null, canon: null, runtime: "summon" });
@@ -498,7 +508,8 @@ describe("admitCitizen", () => {
       ["tree/beats/2026-10.md", "2026-10-24", "reflect-local", "in-name"],
       ["tree/beats/2026-10.md", "2026-10-27", "reflect-local", "in-name"],
       ["tree/inbox/2026-07-17-a-letter.md", "2026-06", "unknown", "to-citizen"],
-      ["tree/writings/on-thresholds.md", "2026-06", "unknown", "in-name"],
+      // A text outside beats/ is kept, and not said to be written in the citizen's name: where it stood does not say.
+      ["tree/writings/on-thresholds.md", "2026-06", "unknown", "unattributed"],
     ]);
     // A row names a file the manifest names, and a reader finds each piece's words there.
     const third = pages[4]!;
@@ -699,7 +710,8 @@ describe("admitCitizen", () => {
     await writeFile(ledgerPath(config, "ledgeronly"), "");
     const halves: [string, string][] = [
       ["whole", "whole already has a ledger on this host; its origin is pinned once and never written again"],
-      ["dironly", "citizens/dironly exists and ledger/dironly.jsonl does not: an earlier admit stopped before the record was in place. That directory holds only copies made then. Move it aside by hand, then run admit again"],
+      // The host does not know how the directory came to be or what it holds, and says only what it sees.
+      ["dironly", "citizens/dironly exists and ledger/dironly.jsonl does not. An admit that stopped before its ledger was in place leaves such a directory, and this host cannot tell whether that is what this one is. Look at it, move it aside by hand, then run admit again"],
       ["emptyledger", "ledger/emptyledger.jsonl exists and is empty, or exists without citizens/emptyledger: this host's records for emptyledger do not agree. Look at both before anything is seated"],
       ["ledgeronly", "ledger/ledgeronly.jsonl exists and is empty, or exists without citizens/ledgeronly: this host's records for ledgeronly do not agree. Look at both before anything is seated"],
     ];
@@ -757,6 +769,38 @@ describe("admitCitizen", () => {
     // Nothing was left in the way: the next admit of the same word seats it.
     await admitCitizen(x.deps, await planAdmit(x.deps, canonReq()));
     expect(await readLedger(ledgerPath(config, W))).toHaveLength(2);
+  });
+
+  test("a directory that appears at citizens/<word> after the checks is not written over: the seating stops and leaves it as it was", async () => {
+    const x = await fx();
+    const { config } = x.h;
+    const dir = join(config.paths.citizens_dir, W);
+    const plan = await planAdmit(x.deps, canonReq());
+    // Another hand makes the directory after admitCitizen has looked for it and before its own is put in place. A
+    // rename onto an empty directory succeeds without a word, so without a second look the seating would go through.
+    let made = 0;
+    const deps: AdmitDeps = {
+      ...x.deps,
+      clock: {
+        now: () => {
+          mkdirSync(dir, { mode: 0o700 });
+          made++;
+          return x.clock.now();
+        },
+      },
+    };
+    const err = await admitCitizen(deps, plan).then(() => null, (e: unknown) => e);
+    expect(made).toBe(1);
+    expect(err).toBeInstanceOf(AdmitStopped);
+    expect(err).toMatchObject({ word: W, code: "invalid-request", removed: true, left: [] });
+    // Nothing of this run is left, nothing was signed, and the other hand's directory is as it was made: empty.
+    expect(x.signer.signed).toEqual([]);
+    expect(await readdir(config.paths.citizens_dir)).toEqual([W]);
+    expect(await readdir(dir)).toEqual([]);
+    expect(await readdir(config.paths.ledger_dir)).toEqual([]);
+    expect(await listSeated(config)).toEqual([]);
+    // The next plan says what stands in the way.
+    expect((await refusal(planAdmit(x.deps, canonReq()))).message).toStartWith(`citizens/${W} exists and ledger/${W}.jsonl does not. `);
   });
 
   test("the ledger is never seen with one entry or empty", async () => {
@@ -901,13 +945,19 @@ describe("admitCitizen", () => {
     expect(verifyChain(entries, { host_attest_b64: [real1.signer.hostAttestPublicB64] }).ok).toBe(false);
     expect(await originIntact(config, "rehearsed", entries)).toBe(true);
     // No legacy/ is written where there was no old home to copy.
-    expect(r.files).toEqual(["citizen.json", "origin/WILL.md", "origin/canon.md", "origin/soul.md", "self/WILL.md", "self/cadence.json", "self/covenants.json", "self/soul.md"]);
+    expect(r.files).toEqual(["citizen.json", "origin/canon.md", "origin/soul.md", "self/WILL.md", "self/cadence.json", "self/covenants.json", "self/soul.md"]);
     expect(await names(join(config.paths.citizens_dir, "rehearsed"))).toEqual(["citizen.json", "letters", "origin", "self"]);
     expect((await refusal(readLegacyManifest(config, "rehearsed"))).code).toBe("invalid-record");
     const citizen = await readCitizen(config, "rehearsed");
     expect(citizen).toMatchObject({ state: "asleep", runtime: "free" });
     const ctx = await buildContext({ config, now: scratch.clock.now() }, seatRef(scratch, "rehearsed", "free"), citizen, entries, [], { history: entries });
     expect([ctx.self.soul, ctx.self.will, ctx.canon_text]).toEqual([soul, "a made-up will\n", "a made-up canon entry\n"]);
+    // Its will is not introduced as the text an old repository held: it has none, and its record says so.
+    expect(ctx.self.will_as_seated).toBe(false);
+    const prompt = buildPrompt(ctx, "free");
+    expect(prompt.user).toContain("Your will:\n--- begin will [");
+    expect(prompt.user).not.toContain("old repository");
+    expect(prompt.user).not.toContain(WILL_AS_SEATED);
     // With no canon entry, the origin says how the citizen was seated.
     await admitCitizen(scratch.deps, await planAdmitFromTexts(scratch.deps, { word: "bare", soul: fixtureSoul("bare"), will: null, canon: null, runtime: "free" }));
     expect((await readLedger(ledgerPath(config, "bare")))[0]).toMatchObject({ origin: { kind: "archetype", lineage: [TEXTS_LINEAGE], note: TEXTS_ORIGIN_NOTE }, old_repo: null });
