@@ -1,7 +1,7 @@
 // Presence, proposals and decision records for birth and enrollment tests.
 // Values are placeholders; no person's details appear here. Digests come
 // from consent.ts, so a record here binds exactly as the signer checks it.
-import { confirmYuPresent, proposalDigest } from "../../../src/signer/consent.ts";
+import { confirmYuPresent, proposalDigest, type TtyIO } from "../../../src/signer/consent.ts";
 import type { ConsentRecord, Word, YuPresence } from "../../../src/types.ts";
 
 export const BIRTH_NOW = "2026-11-05T12:00:00.000Z";
@@ -17,6 +17,25 @@ export function presenceFor(word: Word, confirmedAt = "2026-11-05T11:58:00.000Z"
 export async function confirmedPresenceFor(word: Word, confirmedAt = "2026-11-05T11:58:00.000Z"): Promise<YuPresence> {
   const scope = `birth ${word}`;
   return confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => scope }, scope, () => new Date(confirmedAt));
+}
+
+/**
+ * A fake terminal that types `line` when asked (null: no answer) and keeps
+ * everything written to it, in order, so a test can read what Yu was shown
+ * and whether Yu was asked anything.
+ */
+export function typingTty(line: string | null): TtyIO & { written: string[]; asked: number } {
+  const tty = {
+    isTTY: true,
+    written: [] as string[],
+    asked: 0,
+    write: (text: string) => void tty.written.push(text),
+    readLine: async () => {
+      tty.asked++;
+      return line;
+    },
+  };
+  return tty;
 }
 
 /** The birth proposal: its body names the ledger entry of the citizen's affirmed yes. */

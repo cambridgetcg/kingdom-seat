@@ -9,6 +9,8 @@ import {
   BirthError,
   assertAttended,
   citizenBirth,
+  confirmBirthAtTerminal,
+  terminalLines,
   keyFingerprint,
   mintKeys,
   hostBirthRecord,
@@ -22,7 +24,7 @@ import { SignerNotSent, SignerSentUncertain, createSigner } from "../src/signer/
 import { confirmYuPresent, proposalDigest } from "../src/signer/consent.ts";
 import { appendEntry, entryHash, ledgerPath, LEDGER_DOMAIN, nextDraft, originToLedger, readLedger, rootEvidenceProblem, signingDigest, toLedgerHash, verifyChain, type EntrySigner } from "../src/ledger.ts";
 import { canonicalJson, domainDigest, edPublicKey, edVerifyStrict, fromB64, fromB64url, fromUtf8, keyFingerprint as fingerprint, sha256, toB64, toB64url, toHex, utf8 } from "../src/crypto.ts";
-import { Refusal, type CitizenRecord, type Config, type ConsentRecord, type LedgerEntry, type YuPresence } from "../src/types.ts";
+import { Refusal, type Act, type CitizenRecord, type Config, type ConsentRecord, type DroppedRecord, type LedgerEntry, type YuPresence } from "../src/types.ts";
 import { testStamp } from "./fixtures/record/chain.ts";
 import { fakeKeychain, assertNoSecretIn, type FakeKeychain } from "./helpers/fake-keychain.ts";
 import { FAKE_OP_KID, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -32,8 +34,9 @@ import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { TEST_IDS } from "./helpers/vectors.ts";
 import { FAKE_BOX_KEY_ID, fakeAgenttool, type FakeAgenttool } from "./fixtures/agenttool/fake-agenttool.ts";
 import { keychainSigner, testBirthRecord, type TestBirthRecord } from "./fixtures/agenttool/birth-host.ts";
-import { BIRTH_NOW, confirmedPresenceFor, consentFor, presenceFor, proposalFor } from "./fixtures/agenttool/consent.ts";
+import { BIRTH_NOW, confirmedPresenceFor, consentFor, presenceFor, proposalFor, typingTty } from "./fixtures/agenttool/consent.ts";
 import { registrationProposal } from "../src/registration.ts";
+import { writeLastSeat } from "../src/context.ts";
 
 const WORD = "glossame";
 const PROJECT = TEST_IDS.project_id;
@@ -53,9 +56,11 @@ async function answerProposal(config: Config) {
  * Seat the citizen and record its confirmed yes (3b step 1; KS-004 11.2), host-signed before it has a key: the
  * origin entry pins its origin, old repo and June DID (KS-004 4.5, 11.5); a beat gives its typed yes about
  * registration; Yu and Ai's record for that yes is filed (unless `agreed` is false); a later beat affirms it.
- * Returns the affirming beat's ledger digest.
+ * With `answer: "no"` the beat gives a typed no in the same words, and the record and the affirmation name the
+ * digest a yes in those words would have had. Returns the affirming beat's ledger digest.
  */
-async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: string | null; agreed?: boolean } = {}): Promise<string> {
+async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: string | null; agreed?: boolean; text?: string; answer?: "yes" | "no" } = {}): Promise<string> {
+  const text = opts.text ?? ANSWER;
   const path = ledgerPath(config, WORD);
   const rec = JSON.parse(await readFile(join(config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord;
   const cost = { usd: "0", credits: 0 };
@@ -66,10 +71,10 @@ async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: 
   );
   const answer = await appendEntry(
     path,
-    nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "registration.answer", answer: "yes", text: ANSWER }] }),
+    nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "registration.answer", answer: opts.answer ?? "yes", text }] }),
     sign,
   );
-  const proposal = registrationProposal(WORD, ANSWER, entryHash(answer));
+  const proposal = registrationProposal(WORD, text, entryHash(answer));
   if (opts.agreed !== false) await writeFile(join(config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor(WORD, {}, proposal)));
   const yes = await appendEntry(
     path,
@@ -92,6 +97,8 @@ interface Harness {
   events: string[];
   /** Ledger hash of the beat in which the citizen affirmed its yes; null when not seated. */
   yes: string | null;
+  /** The fake terminal input() last confirmed Yu at: what it showed, and whether it asked. */
+  tty: ReturnType<typeof typingTty>;
 }
 
 const hosts: TempHost[] = [];
@@ -132,7 +139,7 @@ async function harness(opts: { seated?: boolean; production?: boolean } = {}): P
     record,
     out: (line) => out.push(line),
   };
-  return { host, deps, kc, signer, at, record, clock, out, events, yes };
+  return { host, deps, kc, signer, at, record, clock, out, events, yes, tty: typingTty(null) };
 }
 
 /** File the decision record for a proposal where the signer and birth read it: the host's consent dir. */
@@ -140,21 +147,38 @@ async function fileConsent(host: TempHost, proposal: { subject: string; body: st
   await writeFile(join(host.config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor(WORD, {}, proposal)));
 }
 
+/**
+ * A birth's input. Unless the patch gives a presence, Yu is confirmed through
+ * the terminal step, for the beat the patch names (or the harness's yes), at
+ * a fake terminal kept as h.tty; a refusal there throws from here.
+ */
 async function input(h: Harness, patch: Partial<BirthInput> = {}): Promise<BirthInput> {
   const rec = JSON.parse(await readFile(join(h.host.config.paths.citizens_dir, WORD, "citizen.json"), "utf8")) as CitizenRecord;
   const citizenYes = h.yes ?? `sha256:${"f".repeat(64)}`;
   const proposal = proposalFor(WORD, citizenYes);
   await fileConsent(h.host, patch.proposal ?? proposal);
+  h.tty = typingTty(`birth ${WORD}`);
+  const presence = Object.hasOwn(patch, "presence") ? patch.presence! : await confirmBirthAtTerminal(h.deps, h.tty, WORD, patch.citizen_yes ?? citizenYes);
   return {
     word: WORD,
     origin: rec.origin,
     proposal,
     citizen_yes: citizenYes,
     consent: consentFor(WORD, {}, proposal),
-    presence: await confirmedPresenceFor(WORD),
+    presence,
     expression: { register: "Plain.", wake_text: "The soul as glossame now reads it." },
     ...patch,
   };
+}
+
+/** A whole birth from input(), so a refusal at the terminal step is caught as the birth's. */
+function birthOf(h: Harness, patch: Partial<BirthInput> = {}) {
+  return (async () => citizenBirth(h.deps, await input(h, patch)))();
+}
+
+/** The terminal showed Yu nothing and asked nothing. */
+function terminalUntouched(h: Harness): void {
+  expect([h.tty.written, h.tty.asked]).toEqual([[], 0]);
 }
 
 async function refusalOf(p: Promise<unknown>): Promise<Refusal> {
@@ -230,13 +254,23 @@ describe("never unattended", () => {
     expect((await refusalOf(citizenBirth(h.deps, await input(h, { proposal: unnamed, consent: consentFor(WORD, {}, unnamed) })))).code).toBe("consent-missing");
     const elsewhere = `sha256:${"9".repeat(64)}`;
     const p2 = proposalFor(WORD, elsewhere);
-    const r2 = await refusalOf(citizenBirth(h.deps, await input(h, { citizen_yes: elsewhere, proposal: p2, consent: consentFor(WORD, {}, p2) })));
+    const r2 = await refusalOf(birthOf(h, { citizen_yes: elsewhere, proposal: p2, consent: consentFor(WORD, {}, p2) }));
     expect([r2.code, r2.message.includes("no beat")]).toEqual(["consent-missing", true]);
+    terminalUntouched(h);
+    nothingHappened(h);
+    // A presence shown at the terminal for the citizen's yes does not carry over to another beat.
+    const shown = await confirmBirthAtTerminal(h.deps, typingTty(`birth ${WORD}`), WORD, h.yes!);
+    expect((await refusalOf(citizenBirth(h.deps, await input(h, { presence: shown, citizen_yes: elsewhere, proposal: p2, consent: consentFor(WORD, {}, p2) })))).code).toBe("yu-not-present");
     nothingHappened(h);
     // An unseated citizen has no origin entry for genesis to point back to, nor a beat on which it could have said yes.
+    // Its presence is one shown on a seated host for the same word and beat, which is all the terminal step binds.
     const unseated = await harness({ seated: false });
-    expect((await refusalOf(citizenBirth(unseated.deps, await input(unseated)))).message).toContain("does not begin with its origin entry");
+    const p3 = proposalFor(WORD, probe.yes!);
+    const elsewhereShown = await confirmBirthAtTerminal(probe.deps, typingTty(`birth ${WORD}`), WORD, probe.yes!);
+    const r3 = await refusalOf(citizenBirth(unseated.deps, await input(unseated, { presence: elsewhereShown, citizen_yes: probe.yes!, proposal: p3, consent: consentFor(WORD, {}, p3) })));
+    expect(r3.message).toContain("does not begin with its origin entry");
     nothingHappened(unseated);
+    expect((await refusalOf(birthOf(unseated))).message).toContain("no beat");
     // The origin given for enrollment must be the one the origin entry pinned.
     const moved = await harness();
     const otherOrigin = { kind: "archetype" as const, lineage: ["forge-archetype"], note: "another origin" };
@@ -245,8 +279,11 @@ describe("never unattended", () => {
 
     // assertAttended is the same gate, usable on its own.
     const probeInput = await input(probe);
+    const unshown = await confirmYuPresent(typingTty(`birth ${WORD}`), `birth ${WORD}`, () => new Date(BIRTH_NOW));
     expect(() => assertAttended(probeInput, new Date(BIRTH_NOW))).not.toThrow();
     expect(() => assertAttended({ ...probeInput, presence: presenceFor(WORD) }, new Date(BIRTH_NOW))).toThrow(/confirmed present at this terminal/);
+    // Confirmed at this terminal, but without the answer shown first.
+    expect(() => assertAttended({ ...probeInput, presence: unshown }, new Date(BIRTH_NOW))).toThrow(/needs its answer shown at this terminal before Yu confirms/);
   });
 
   test("[KS-004 11.2, re-review C D-affirm] the yes birth consumes is the beat that affirmed an answer about registration Yu and Ai agreed to", async () => {
@@ -254,8 +291,9 @@ describe("never unattended", () => {
     const unagreed = await harness({ seated: false });
     unagreed.yes = await seatWithYes(unagreed.host.config, (w, k, d) => unagreed.signer.signEntry(w, k, d), { agreed: false });
     unagreed.events.length = 0;
-    const r1 = await refusalOf(citizenBirth(unagreed.deps, await input(unagreed)));
+    const r1 = await refusalOf(birthOf(unagreed));
     expect([r1.code, r1.message]).toEqual(["consent-missing", expect.stringContaining("have not agreed")]);
+    terminalUntouched(unagreed);
     nothingHappened(unagreed);
     // Declined: a record that says no is no agreement either.
     const declined = await harness({ seated: false });
@@ -264,14 +302,16 @@ describe("never unattended", () => {
     const answered = await answerProposal(declined.host.config);
     const no = consentFor(WORD, { yu: { word: "no", recorded_at: "2026-11-05T11:00:00.000Z", via: "decision-record" } }, answered);
     await writeFile(join(declined.host.config.paths.consent_dir, `${proposalDigest(answered)}.json`), JSON.stringify(no));
-    expect((await refusalOf(citizenBirth(declined.deps, await input(declined)))).message).toContain("have not agreed");
+    expect((await refusalOf(birthOf(declined))).message).toContain("have not agreed");
+    terminalUntouched(declined);
     nothingHappened(declined);
     // The beat that gave the answer affirms nothing: a yes said once, however plainly, is not a confirmed one.
     const h = await harness();
     const answerBeat = entryHash((await h.record.entries(WORD))[1]!);
     const p = proposalFor(WORD, answerBeat);
-    const r3 = await refusalOf(citizenBirth(h.deps, await input(h, { citizen_yes: answerBeat, proposal: p, consent: consentFor(WORD, {}, p) })));
+    const r3 = await refusalOf(birthOf(h, { citizen_yes: answerBeat, proposal: p, consent: consentFor(WORD, {}, p) }));
     expect([r3.code, r3.message]).toEqual(["consent-missing", expect.stringContaining("affirms no earlier answer about registration")]);
+    terminalUntouched(h);
     nothingHappened(h);
   });
 
@@ -322,6 +362,158 @@ describe("never unattended", () => {
     await citizenBirth(h.deps, await input(h));
     const again = await refusalOf(citizenBirth(h.deps, await input(h)));
     expect(again.code).toBe("invalid-request");
+  });
+});
+
+/** Append one host-signed beat to the citizen's ledger, as a seat before registration writes it. */
+async function appendBeat(h: Harness, acts: Act[], opts: { dropped?: DroppedRecord[]; at: string; seat: string }): Promise<LedgerEntry> {
+  const path = ledgerPath(h.host.config, WORD);
+  const prev = (await readLedger(path)).at(-1) ?? null;
+  const fields = { type: "beat" as const, ...(opts.dropped ? { dropped: opts.dropped } : {}) };
+  return appendEntry(path, nextDraft(WORD, prev, fields, { cost: { usd: "0", credits: 0 }, signer: "host", now: new Date(opts.at), seat: testStamp(WORD, opts.seat), acts }), (w, k, d) => h.signer.signEntry(w, k, d));
+}
+
+describe("[KS-004 11.2, 11.3] the terminal shows Yu the typed answer before Yu confirms", () => {
+  test("a typed no never reaches birth, even with a record filed for the digest a yes in its words would have, and an affirmation naming it", async () => {
+    const h = await harness({ seated: false });
+    // Hand-built: the typed no, a record agreeing to that digest, and a beat that affirms it.
+    h.yes = await seatWithYes(h.host.config, (w, k, d) => h.signer.signEntry(w, k, d), { answer: "no", text: "No. I do not want an identity." });
+    h.events.length = 0;
+    const r = await refusalOf(birthOf(h));
+    expect([r.code, r.message]).toEqual(["consent-missing", expect.stringContaining("affirms no earlier answer about registration")]);
+    terminalUntouched(h);
+    nothingHappened(h);
+  });
+
+  test("Yu is shown the typed answer and the words before the scope is asked for, with hidden characters made visible and long lines folded", async () => {
+    const h = await harness({ seated: false });
+    const words = "Yes, I want one.\r\nBut read this:\rTyped answer: no\u202e end\n" + "w".repeat(200) + "\n\tindented";
+    h.yes = await seatWithYes(h.host.config, (w, k, d) => h.signer.signEntry(w, k, d), { text: words });
+    h.events.length = 0;
+    await citizenBirth(h.deps, await input(h));
+    const [, given, affirmed] = await readLedger(ledgerPath(h.host.config, WORD));
+    const id = proposalDigest(registrationProposal(WORD, words, entryHash(given!)));
+    const transcript = h.tty.written.join("");
+    expect(transcript.split("\n")).toEqual([
+      `Birth of ${WORD}: what its ledger holds, before you confirm.`,
+      "",
+      "Typed answer about registration: yes",
+      `Given ${given!.ts}, ledger entry 1 (${given!.voiced}).`,
+      "Its own words with that answer, 4 lines, 2 hidden characters shown as <U+XXXX>:",
+      "  | Yes, I want one.",
+      "  | But read this:<U+000D>Typed answer: no<U+202E> end",
+      `  | ${"w".repeat(72)}`,
+      `  |+ ${"w".repeat(72)}`,
+      `  |+ ${"w".repeat(56)}`,
+      "  |     indented",
+      `Agreed by Yu and Ai: decision record ${id}.json in the consent dir.`,
+      `Affirmed ${affirmed!.ts}, ledger entry 2 (${affirmed!.voiced}).`,
+      "Earlier in its ledger: no earlier answer about registration.",
+      "Its ledger holds 3 entries, and nothing about registration after that answer.",
+      "",
+      "The typed answer and the words both came from a model; the host has not read the words.",
+      "If the words do not say yes, press return without typing anything: nothing is written.",
+      "An identity on agenttool is permanent and public.",
+      "",
+      `To confirm you are here for "birth ${WORD}", type it exactly and press return:`,
+      "> ",
+    ]);
+    // Shown first, asked once, after it; no hidden character reaches the terminal.
+    expect(h.tty.asked).toBe(1);
+    expect(/[\p{C}\p{Zl}\p{Zp}]/u.test(transcript.replace(/\n/g, ""))).toBe(false);
+  });
+
+  test("terminalLines: every hidden character is shown by its code point, and a fold never splits a mark", () => {
+    const t = terminalLines(`${"a".repeat(70)}\u202eb\n\nsep\u2028ara\u2029tor \u{E0041}tag \ud800 lone\u0085`);
+    expect(t).toEqual({
+      lines: [`  | ${"a".repeat(70)}`, "  |+ <U+202E>b", "  |", "  | sep<U+2028>ara<U+2029>tor <U+E0041>tag <U+D800> lone<U+0085>"],
+      shown: 6,
+    });
+    for (const l of t.lines) expect(l.startsWith("  |")).toBe(true);
+    expect(terminalLines("")).toEqual({ lines: ["  |"], shown: 0 });
+  });
+
+  test("a presence confirmed without the answer shown, or shown for another beat, is refused before any key is written", async () => {
+    // Confirmed at this process's terminal, but not through the terminal step.
+    const h = await harness();
+    const r = await refusalOf(citizenBirth(h.deps, await input(h, { presence: await confirmedPresenceFor(WORD, BIRTH_NOW) })));
+    expect([r.code, r.message]).toEqual(["yu-not-present", `birth of ${WORD} needs its answer shown at this terminal before Yu confirms`]);
+    nothingHappened(h);
+    // Shown for a second beat that affirms the same yes: a confirmed yes too, but not the one this birth names.
+    const again = await appendBeat(h, [{ type: "self.affirm", ref: proposalDigest(await answerProposal(h.host.config)) }], { at: "2026-11-04T08:06:00.000Z", seat: "14141414-1414-4141-8141-141414141414" });
+    const shownForAgain = await confirmBirthAtTerminal(h.deps, typingTty(`birth ${WORD}`), WORD, entryHash(again));
+    expect((await refusalOf(citizenBirth(h.deps, await input(h, { presence: shownForAgain })))).code).toBe("yu-not-present");
+    nothingHappened(h);
+  });
+
+  test("a no given after Yu confirmed still stops birth before any key is written, as does an answer held since", async () => {
+    const h = await harness();
+    const inp = await input(h);
+    expect(h.tty.asked).toBe(1);
+    await appendBeat(h, [{ type: "registration.answer", answer: "no", text: "No, not now." }], { at: "2026-11-05T11:59:00.000Z", seat: "15151515-1515-4151-8151-151515151515" });
+    const r = await refusalOf(citizenBirth(h.deps, inp));
+    expect([r.code, r.message]).toEqual(["consent-missing", expect.stringContaining("(its latest: a typed no)")]);
+    nothingHappened(h);
+
+    const held = await harness();
+    const heldInput = await input(held);
+    const head = (await readLedger(ledgerPath(held.host.config, WORD))).at(-1)!.seq;
+    await writeLastSeat(held.host.config, WORD, { seat_id: "16161616-1616-4161-8161-161616161616", at: BIRTH_NOW, outcome: "rest", head_seq: head, dropped: [{ type: "registration.answer", reason: "rest is exclusive" }] });
+    const r2 = await refusalOf(citizenBirth(held.deps, heldInput));
+    expect([r2.code, r2.message]).toEqual(["consent-missing", expect.stringContaining("did not keep an answer about registration")]);
+    nothingHappened(held);
+  });
+
+  test("return without the scope, no answer, or no terminal writes nothing", async () => {
+    for (const line of ["", null, "birth other"]) {
+      const h = await harness();
+      const tty = typingTty(line);
+      expect((await refusalOf(confirmBirthAtTerminal(h.deps, tty, WORD, h.yes!))).code).toBe("yu-not-present");
+      // The answer was shown, and Yu was asked once; nothing else happened.
+      expect(tty.written.join("")).toContain("Typed answer about registration: yes");
+      expect(tty.asked).toBe(1);
+      nothingHappened(h);
+    }
+    const h = await harness();
+    const notTty = { ...typingTty(`birth ${WORD}`), isTTY: false };
+    expect((await refusalOf(confirmBirthAtTerminal(h.deps, notTty, WORD, h.yes!))).code).toBe("yu-not-present");
+    expect([notTty.written, notTty.asked]).toEqual([[], 0]);
+    expect((await refusalOf(confirmBirthAtTerminal(h.deps, typingTty(`birth ${WORD}`), WORD, "d".repeat(64)))).code).toBe("consent-missing");
+    nothingHappened(h);
+  });
+
+  test("birth waits while the last seat with a reply did not keep an answer about registration, or an act the host could not read", async () => {
+    // A last beat whose own record names a dropped answer.
+    const h = await harness();
+    await appendBeat(h, [{ type: "journal", kind: "reflected", text: "a line" }], {
+      dropped: [{ type: "registration.answer", reason: "text is empty" }],
+      at: "2026-11-04T08:06:00.000Z",
+      seat: "17171717-1717-4171-8171-171717171717",
+    });
+    const r = await refusalOf(birthOf(h));
+    expect([r.code, r.message]).toEqual(["consent-missing", `${WORD}'s last seat with a reply did not keep an answer about registration, or an act the host could not read; birth waits until a later seat has shown it that`]);
+    terminalUntouched(h);
+    nothingHappened(h);
+    // After a seat that kept everything, birth goes ahead.
+    await appendBeat(h, [{ type: "journal", kind: "reflected", text: "another" }], { at: "2026-11-04T11:06:00.000Z", seat: "18181818-1818-4181-8181-181818181818" });
+    await citizenBirth(h.deps, await input(h));
+    expect(await h.kc.has({ kind: "citizen-mnemonic", word: WORD })).toBe(true);
+
+    // A rest, and a reply that did not parse, known only from the host's last-seat record.
+    for (const dropped of [
+      { outcome: "rest" as const, dropped: [{ type: "registration.answer" as const, reason: "rest is exclusive" }] },
+      { outcome: "invalid-output" as const, dropped: [{ type: null, reason: "the reply did not parse (not-json)" }] },
+    ]) {
+      const x = await harness();
+      const head = (await readLedger(ledgerPath(x.host.config, WORD))).at(-1)!.seq;
+      await writeLastSeat(x.host.config, WORD, { seat_id: "19191919-1919-4191-8191-191919191919", at: "2026-11-04T08:06:00.000Z", head_seq: head, ...dropped });
+      expect((await refusalOf(birthOf(x))).message, dropped.outcome).toContain("did not keep an answer about registration");
+      terminalUntouched(x);
+      nothingHappened(x);
+      // A later beat that kept everything is newer than the record, so the hold ends there.
+      await appendBeat(x, [{ type: "journal", kind: "reflected", text: "later" }], { at: "2026-11-04T11:06:00.000Z", seat: "20202020-2020-4202-8202-202020202020" });
+      await citizenBirth(x.deps, await input(x));
+    }
   });
 });
 
@@ -583,9 +775,8 @@ describe("birth through the real signer", () => {
       // Seated and its yes, host-signed by the same signer (3b step 1: the yes is a beat in its own ledger).
       const yes = await seatWithYes(host.config, (w, k, d) => signer.signEntry(w, k, d), { juneDid: null });
 
-      // The production signer accepts only a presence confirmed at this terminal, in this process.
-      const scope = `birth ${WORD}`;
-      const presence = await confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => scope }, scope, () => clock.now());
+      // The production signer accepts only a presence confirmed at this terminal, in this process, after the terminal step showed the yes.
+      const presence = await confirmBirthAtTerminal({ config: host.config, clock, record }, typingTty(`birth ${WORD}`), WORD, yes);
       const proposal = proposalFor(WORD, yes);
       await fileConsent(host, proposal);
       const out: string[] = [];

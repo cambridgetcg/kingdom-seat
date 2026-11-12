@@ -1,6 +1,7 @@
 // citizen-birth (3b). Never unattended: it requires a decision record, filed
-// in the consent dir, for the citizen's own confirmed yes, plus Yu present at
-// the terminal. A fresh BIP39
+// in the consent dir, for the citizen's own confirmed, typed yes, plus Yu
+// present at the terminal, confirmed only after the terminal has shown Yu
+// that yes and the citizen's own words with it (KS-004 11.3). A fresh BIP39
 // mnemonic and op seed go straight into Keychain through the Keychain
 // interface, with no handoff file. Then enrollment, op-key import, box-key
 // registration, a private expression and the genesis ledger entry, which
@@ -36,8 +37,9 @@ import { SignerNotSent, type Signer } from "./signer/signer.ts";
 import { appendEntry, entryHash, evidenceToLedger, ledgerKey, ledgerPath, nextDraft, originToLedger, readLedger, signingDigest } from "./ledger.ts";
 import { AgenttoolError, importOpKey, putExpression, registerBoxKey, type ActAuth, type ClientDeps, type ClientIdentity } from "./agenttool/client.ts";
 import { AmbiguousEnrollment, assertBirthConsent, assertYuPresentFor, citizenCapabilities, enroll, prepareEnrollment, type EnrollDeps } from "./agenttool/enrollment.ts";
-import { presenceConfirmedHere, readConsentFor } from "./signer/consent.ts";
-import { assertConfirmedYes } from "./registration.ts";
+import { confirmYuPresent, presenceConfirmedHere, readConsentFor, type TtyIO } from "./signer/consent.ts";
+import { assertConfirmedYes, confirmedYes, type ConfirmedYes } from "./registration.ts";
+import { lastDroppedView, readLastSeat } from "./context.ts";
 import { deriveIdentity, didFor, validateExpression, type DerivedIdentity, type Expression } from "./agenttool/wire.ts";
 
 export interface BirthInput {
@@ -58,10 +60,11 @@ export interface BirthInput {
   /**
    * The ledger digest ("sha256:<hex>") of the beat in which the citizen
    * affirmed its yes (3b step 1; KS-004 11.2): a self.affirm naming its
-   * answer about registration, which Yu and Ai agreed to on a decision
-   * record filed for that answer's text (registration.ts). The proposal body
-   * must name it and the citizen's own ledger must hold it, so the consent is
-   * bound to this citizen's confirmed answer.
+   * typed yes about registration, which Yu and Ai agreed to on a decision
+   * record filed for that yes (registration.ts). The proposal body must name
+   * it and the citizen's own ledger must hold it, so the consent is bound to
+   * this citizen's confirmed answer. `presence` must come from
+   * confirmBirthAtTerminal for this word and this beat.
    */
   citizen_yes: string;
 }
@@ -147,11 +150,20 @@ function citizenItems(word: Word): KeychainItemName[] {
 }
 
 /**
+ * Presences confirmed by confirmBirthAtTerminal in this process, with the
+ * word and the beat whose answer the terminal showed before Yu confirmed.
+ * A presence confirmed any other way is not in here.
+ */
+const shownAtTerminal = new WeakMap<YuPresence, { word: Word; citizen_yes: string }>();
+
+/**
  * Refuse unless Yu is present for "birth <word>" and the consent record binds
  * this citizen's yes. The presence must be one confirmed at this process's
  * terminal, the same test the signer applies at enroll, because birth writes
  * the citizen's keys before it enrolls: a presence that only looks right would
- * leave keys in Keychain that block every later, attended birth.
+ * leave keys in Keychain that block every later, attended birth. It must also
+ * be one confirmBirthAtTerminal returned for this word and this beat, so Yu
+ * confirmed with the typed answer and its words in view (KS-004 11.3).
  */
 export function assertAttended(input: BirthInput, now: Date): void {
   if (!WORD_PATTERN.test(input.word)) throw new Refusal("invalid-request", "not a citizen word");
@@ -159,6 +171,10 @@ export function assertAttended(input: BirthInput, now: Date): void {
     throw new Refusal("yu-not-present", `birth of ${input.word} needs Yu confirmed present at this terminal, in this process`);
   }
   assertYuPresentFor(input.word, input.presence, now);
+  const shown = shownAtTerminal.get(input.presence);
+  if (!shown || shown.word !== input.word || shown.citizen_yes !== input.citizen_yes) {
+    throw new Refusal("yu-not-present", `birth of ${input.word} needs its answer shown at this terminal before Yu confirms`);
+  }
   const p = input.proposal;
   if (!p || typeof p.subject !== "string" || typeof p.body !== "string" || typeof p.extent !== "string") {
     throw new Refusal("consent-missing", "birth needs the proposal text the decision record binds");
@@ -167,6 +183,135 @@ export function assertAttended(input: BirthInput, now: Date): void {
     throw new Refusal("consent-missing", "the proposal does not name the ledger entry of the citizen's affirmed yes");
   }
   assertBirthConsent(input.word, input.consent, now, p);
+}
+
+/** Every control, format, surrogate, private-use or unassigned character, and every line or paragraph separator. */
+const HIDDEN = /[\p{C}\p{Zl}\p{Zp}]/u;
+/** How many characters of a citizen's words one terminal line shows. */
+const TERMINAL_WIDTH = 72;
+
+/** One character as Yu sees it: itself, or `<U+XXXX>` when it would be hidden or move the cursor. */
+function visibleChar(ch: string): string {
+  return HIDDEN.test(ch) ? `<U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}>` : ch;
+}
+
+/** One line of text with every hidden character, tab and newline included, shown as `<U+XXXX>`; for a voiced line. */
+function visibleLine(text: string): string {
+  return [...text].map(visibleChar).join("");
+}
+
+/**
+ * A citizen's words as the terminal shows them to Yu (KS-004 11.3): CRLF
+ * becomes a newline; every other hidden character (control, format,
+ * surrogate, private-use, unassigned, line or paragraph separator), tab and
+ * newline apart, is written as `<U+XXXX>` and counted; a tab is four spaces;
+ * and each line is folded at 72 characters, never inside a `<U+XXXX>` mark.
+ * The first part of a line starts "  | ", a folded part "  |+ ", and an
+ * empty line is "  |", so no line of the words can pass for a host line.
+ */
+export function terminalLines(text: string): { lines: string[]; shown: number } {
+  let shown = 0;
+  const lines: string[] = [];
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    // One token per character shown: a tab is four spaces, which a fold may split; a <U+XXXX> mark is one token.
+    const tokens = [...line].flatMap((ch) => {
+      if (ch === "\t") return [" ", " ", " ", " "];
+      const v = visibleChar(ch);
+      if (v !== ch) shown++;
+      return [v];
+    });
+    if (tokens.length === 0) {
+      lines.push("  |");
+      continue;
+    }
+    const parts: string[] = [""];
+    let width = 0;
+    for (const token of tokens) {
+      const n = [...token].length;
+      if (width > 0 && width + n > TERMINAL_WIDTH) {
+        parts.push("");
+        width = 0;
+      }
+      parts[parts.length - 1] += token;
+      width += n;
+    }
+    parts.forEach((part, i) => lines.push(`${i === 0 ? "  | " : "  |+ "}${part}`));
+  }
+  return { lines, shown };
+}
+
+/**
+ * What the terminal shows Yu before it asks Yu to confirm a birth (KS-004
+ * 11.3): the typed answer, when it was given and through which model, the
+ * citizen's own words with it, the decision record that agreed to it, the
+ * affirmation, its earlier sayings about registration, and the size of its
+ * ledger. The host has not read the words; Yu is their only reader.
+ */
+export function renderConfirmedYes(yes: ConfirmedYes, ledgerEntries: number): string[] {
+  const a = yes.answer;
+  const voiced = (v: string | null) => visibleLine(v ?? "voiced through an unknown runtime");
+  const words = terminalLines(a.text);
+  const n = a.text.replace(/\r\n/g, "\n").split("\n").length;
+  const hidden = words.shown === 0 ? "" : `, ${words.shown} hidden ${words.shown === 1 ? "character" : "characters"} shown as <U+XXXX>`;
+  const latest = yes.earlier.slice(-8);
+  const more = yes.earlier.length - latest.length;
+  const said = latest.map((e) => `${e.answer === "untyped" ? "a proposal about registration" : e.answer} (${e.asked_at.slice(0, 10)})`);
+  const earlier = said.length === 0 ? "no earlier answer about registration" : `${more > 0 ? `${more} more before these, then ` : ""}${said.join(", ")}`;
+  return [
+    `Birth of ${yes.word}: what its ledger holds, before you confirm.`,
+    "",
+    `Typed answer about registration: ${a.answer}`,
+    `Given ${a.asked_at}, ledger entry ${a.seq} (${voiced(a.voiced)}).`,
+    `Its own words with that answer, ${n} ${n === 1 ? "line" : "lines"}${hidden}:`,
+    ...words.lines,
+    `Agreed by Yu and Ai: decision record ${a.id}.json in the consent dir.`,
+    `Affirmed ${yes.affirmed.ts}, ledger entry ${yes.affirmed.seq} (${voiced(yes.affirmed.voiced)}).`,
+    `Earlier in its ledger: ${earlier}.`,
+    `Its ledger holds ${ledgerEntries} ${ledgerEntries === 1 ? "entry" : "entries"}, and nothing about registration after that answer.`,
+    "",
+    "The typed answer and the words both came from a model; the host has not read the words.",
+    "If the words do not say yes, press return without typing anything: nothing is written.",
+    "An identity on agenttool is permanent and public.",
+    "",
+  ];
+}
+
+/**
+ * Refuse while the citizen's last seat with a reply did not keep a
+ * registration.answer, or an act the host could not read (KS-004 11.3): a
+ * no said there was not taken, so birth waits until a later seat has shown
+ * it that. For a beat this is read from the ledger; for a rest, or a reply in
+ * which nothing was kept, from the host's last-seat record, which is written
+ * best effort. A hold on what the host knows, not a wall.
+ */
+export async function assertNoAnswerHeld(config: Config, entries: LedgerEntry[], word: Word): Promise<void> {
+  const last = lastDroppedView(entries, await readLastSeat(config, word));
+  if (last !== null && last.dropped.some((d) => d.type === null || d.type === "registration.answer")) {
+    throw new Refusal(
+      "consent-missing",
+      `${word}'s last seat with a reply did not keep an answer about registration, or an act the host could not read; birth waits until a later seat has shown it that`,
+    );
+  }
+}
+
+/**
+ * The terminal step of a birth (KS-004 11.3): check that `citizenYes` names
+ * the citizen's confirmed yes and that nothing holds it, show Yu what the
+ * ledger holds, and only then ask Yu to type "birth <word>". A refusal here
+ * writes nothing to the terminal. The presence it returns is the only one
+ * citizenBirth accepts, and only for this word and this beat.
+ */
+export async function confirmBirthAtTerminal(deps: Pick<BirthDeps, "config" | "clock" | "record">, io: TtyIO, word: Word, citizenYes: string): Promise<YuPresence> {
+  if (!WORD_PATTERN.test(word)) throw new Refusal("invalid-request", "not a citizen word");
+  if (typeof citizenYes !== "string" || !LEDGER_HASH_PATTERN.test(citizenYes)) throw new Refusal("consent-missing", "the citizen's yes is named by the ledger digest of its affirming beat");
+  if (io.isTTY !== true) throw new Refusal("yu-not-present", "stdin is not a terminal, so Yu cannot be confirmed present");
+  const entries = await deps.record.entries(word);
+  const yes = await confirmedYes(deps.config, entries, word, citizenYes, deps.clock.now());
+  await assertNoAnswerHeld(deps.config, entries, word);
+  for (const line of renderConfirmedYes(yes, entries.length)) io.write(`${line}\n`);
+  const presence = await confirmYuPresent(io, `birth ${word}`, () => deps.clock.now());
+  shownAtTerminal.set(presence, { word, citizen_yes: citizenYes });
+  return presence;
 }
 
 /** "SHA256:<unpadded base64 of sha256(public key)>", in the style ssh prints. */
@@ -258,9 +403,11 @@ export async function citizenBirth(deps: BirthDeps, input: BirthInput): Promise<
   if (canonicalJson(originEntry.origin) !== canonicalJson(originToLedger(input.origin))) {
     throw new Refusal("invalid-request", `the origin given for ${word} is not the one its origin entry pinned`);
   }
-  // A citizen answers yes on its own beats, so its yes is in its ledger: the beat that affirmed an answer about
+  // A citizen answers yes on its own beats, so its yes is in its ledger: the beat that affirmed a typed yes about
   // registration Yu and Ai agreed to, given on an earlier beat (KS-004 11.2). A beat that says yes in words is not one.
+  // Checked again here, and the hold with it, so a no given after Yu confirmed still stops birth before any key is written.
   await assertConfirmedYes(deps.config, prior, word, input.citizen_yes, deps.clock.now());
+  await assertNoAnswerHeld(deps.config, prior, word);
 
   // From here something is written, so every failure says how far birth got.
   const done: BirthStage[] = [];

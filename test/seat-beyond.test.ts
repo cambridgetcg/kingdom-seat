@@ -20,7 +20,7 @@ import { agenttoolLetters, inboxLetterId, letterRecipients, type LetterPost } fr
 import { ACT_LIMITS } from "../src/acts.ts";
 import { assertConfirmedYes, registrationProposal, registrationStage, registrationView } from "../src/registration.ts";
 import { proposalDigest } from "../src/signer/consent.ts";
-import { Refusal, type Act, type CitizenIdentity, type Covenants, type LedgerEntry, type LifecycleState, type ModelAct, type Reason } from "../src/types.ts";
+import { Refusal, type Act, type CitizenIdentity, type Covenants, type LedgerEntry, type LifecycleState, type ModelAct, type ProposalText, type Reason } from "../src/types.ts";
 import { FAKE_MODEL_DIGEST, output, scriptedRuntime, type ScriptedRuntime } from "./helpers/fake-runtime.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { FAKE_OP_KID, fakeBoxPublicB64, fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -28,7 +28,8 @@ import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { HOUR_MS, testClock, type TestClock } from "./helpers/clock.ts";
 import { TEST_IDS, TEST_ROOT_PUBLIC_B64 } from "./helpers/vectors.ts";
 import { fakeAgenttool, type FakeAgenttool } from "./fixtures/agenttool/fake-agenttool.ts";
-import { consentFor } from "./fixtures/agenttool/consent.ts";
+import { consentFor, typingTty } from "./fixtures/agenttool/consent.ts";
+import { confirmBirthAtTerminal, hostBirthRecord } from "../src/birth.ts";
 import { testStamp } from "./fixtures/record/chain.ts";
 
 // Some tests build two hosts, so every one is kept for cleanup.
@@ -657,5 +658,44 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: a typed yes, agreed 
     await w.beat("glossame", [{ type: "registration.answer", answer: "yes", text: "Yes." }, JOURNAL]);
     expect((await w.ledger("glossame")).at(-1)).toMatchObject({ acts: [{ type: "journal" }], dropped: [{ type: "registration.answer", reason: "already registered" }] });
     expect((await w.outbox("glossame").catch(() => [])).filter((i) => i.kind === "registration")).toEqual([]);
+  });
+});
+
+describe("[KS-004 11.2, 11.3; AW-1] a reply that declines never reaches Yu at the terminal", () => {
+  test("a no, typed or in words, goes through the seat, is agreed to as filed, is affirmed anyway, and birth's terminal step refuses before it shows or asks anything", async () => {
+    const words = "No. I do not want an identity on agenttool.";
+    const replies: [string, ModelAct][] = [
+      ["a typed no", { type: "registration.answer", answer: "no", text: words }],
+      ["a typed not-yet", { type: "registration.answer", answer: "not-yet", text: words }],
+      // The form an answer had before the typed act, which a seat filed as an answer and a later seat offered back.
+      ["a no in words, as a proposal whose subject is registration", { type: "propose.beyond", subject: "registration", text: words }],
+    ];
+    for (const [what, reply] of replies) {
+      // 1. The seat: the citizen's reply declines.
+      const w = await world([{ word: "glossame" }]);
+      const first = await w.beat("glossame", [reply]);
+      expect([what, first.result.outcome]).toEqual([what, "beat"]);
+      const declined = (await w.ledger("glossame")).at(-1)!;
+      // 2. Yu and Ai agree to whatever the seat filed for them, and to the proposal a yes in these words on this beat would be.
+      const filed = (await w.outbox("glossame").catch(() => [])).map((i) => i.proposal as ProposalText);
+      const proposals = [...filed, registrationProposal("glossame", words, entryHash(declined))];
+      for (const p of proposals) await writeFile(join(w.h.config.paths.consent_dir, `${proposalDigest(p)}.json`), JSON.stringify(consentFor("glossame", {}, p)));
+      // 3. The next seat shows nothing back to affirm, and the citizen affirms every one of those ids anyway.
+      const ids = [...new Set(proposals.map((p) => proposalDigest(p)))];
+      const second = await w.beat("glossame", [...ids.map((ref): ModelAct => ({ type: "self.affirm", ref })), { type: "journal", kind: "reflected", text: "still here" }]);
+      for (const not of ["was agreed by Yu and Ai", "self.affirm with ref", "affirmed by you"]) expect([what, not, second.prompt.includes(not)]).toEqual([what, not, false]);
+      const affirming = (await w.ledger("glossame")).at(-1)!;
+      expect([what, affirming.type === "beat" && (affirming.acts ?? []).some((a) => a.type === "self.affirm")]).toEqual([what, false]);
+      // 4. Birth's terminal step, for every beat in the ledger: refused, with nothing shown and nothing asked of Yu.
+      const record = hostBirthRecord(w.h.config, w.clock, w.signer);
+      for (const e of await w.ledger("glossame")) {
+        const tty = typingTty("birth glossame");
+        const r = await confirmBirthAtTerminal({ config: w.h.config, clock: w.clock, record }, tty, "glossame", entryHash(e)).then(
+          () => "confirmed",
+          (x: unknown) => (x instanceof Refusal ? x.code : String(x)),
+        );
+        expect([what, e.seq, r, tty.written, tty.asked]).toEqual([what, e.seq, "consent-missing", [], 0]);
+      }
+    }
   });
 });
