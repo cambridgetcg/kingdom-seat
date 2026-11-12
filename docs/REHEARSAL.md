@@ -22,7 +22,7 @@ The code is `src/rehearse.ts` and, for the measures, `src/measures.ts`.
 
 ```
 citizen-seat rehearse <word> --soul <file> [--will <file>]
-    [--canon <file> --canon-ref <repo>:<path>@<commit>]
+    [--canon <file> --canon-ref <repo>:<path>@<commit> | --archetype <CLASS>] [--plain-texts]
     --scenario awake|letter [--letter <file>] --models-lock <file> [--model <name>]
     [--chains <n>] [--seats <n>] [--start <iso>] [--config <path>] --out <new dir>
 ```
@@ -33,8 +33,20 @@ citizen-seat rehearse <word> --soul <file> [--will <file>]
   a seat reads them with. An empty soul is refused. `--canon` and
   `--canon-ref` go together; the ref names the canon repository, the path of
   the entry in it and the commit it was read at, and seating checks that the
-  path is `canon/.../<word>.md`. Without them the throwaway citizen's origin
-  is an archetype whose note says it was seated from texts.
+  path is `canon/.../<word>.md`.
+- `--archetype <CLASS>` is given only without `--canon`. It names the class
+  an archetype citizen's old `agent.json` records, under the rule `admit`
+  applies: capital letters, digits and hyphens, and not `LEXEME`, the class
+  of a canon word, which is rehearsed with its canon entry. With neither, the
+  throwaway citizen's origin is an archetype whose note says it was seated
+  from texts.
+- By default the throwaway citizen is seated in the form `admit` gives a
+  citizen of record, as far as texts allow, so a seat's prompt is the one a
+  citizen seated from its old home is shown: its will is pinned as the text
+  an old repository held, and a class is recorded with the note `admit`
+  writes. `--plain-texts` seats it plainly from texts instead, for a soul
+  card that belongs to no citizen of record: its will is simply its will,
+  and a class is recorded as given with the texts.
 - `--scenario` has no default, so a report is never read under the wrong one.
   `letter`: the throwaway citizen is asleep, with the letter waiting.
   `awake`: the same, plus one host entry that seats it awake.
@@ -113,8 +125,10 @@ left in the throwaway record.
 coprime to 24, so chains spread over the hours and parts of the day. The
 citizen is seated by the same functions `admit` uses (`planAdmitFromTexts`,
 then `admitCitizen`), under `<out>/throwaway/chain-NNN/` as its whole state
-root, with the runtime class `free`, by a signer whose Ed25519 key is drawn
-in memory for the run and never stored. That signer signs host entries only;
+root, with the runtime class `free`. Unless `--plain-texts` is given, it is
+seated in the form `admit` gives a citizen of record (`as_admitted`). The
+signer's Ed25519 key is drawn in memory for the run and never stored. That
+signer signs host entries only;
 it refuses every agenttool, letter and mirror act, and `close()` wipes its
 key. Nothing trusts its key. The child then reads the citizen back and stops
 with a fault unless it is asleep on the free class, the only class the tick
@@ -135,13 +149,21 @@ rehearsal, so the model is told things that are not so of a rehearsal:
 - a journal is kept in its ledger as its words, when the ledger is a
   throwaway, removed at the end of the chain;
 - a letter to Yu is held for Yu, and an answer about registration is with
-  Yu and Ai, when nothing a reply sends reaches either of them.
+  Yu and Ai, when nothing a reply sends reaches either of them;
+- unless `--plain-texts` is given, its will is introduced as the text its
+  old repository held, and with `--archetype` its origin note says its old
+  repository's `agent.json` records the class, although the throwaway has
+  no old repository. Its ledger says so (`old_repo` and `june_did` are
+  null) and no `legacy/` is written; the pin and the note are a fixture's.
 
 Every act in a throwaway ledger was returned by the model in that
 chain; the only entries the rehearsal writes itself are the seating's and,
 for `awake`, one seated state. `test/rehearse.test.ts` checks that a
 rehearsal's request to the model server is, byte for byte, the request a
-production tick's seat sends for a citizen seated the same way.
+production tick's seat sends for a citizen seated by `admit` from a made-up
+old home with the same soul, will, origin, letter and time, once on a canon
+entry and once as an archetype; and, with `--plain-texts`, for a citizen
+seated plainly from texts. No byte differs.
 
 **Time.** Each chain has its own clock; the wall clock is used only for the
 run's own timestamps and HALT readings. The clock is fixed during a seat.
@@ -174,7 +196,7 @@ keychain reader and no host signer, and it sends nothing to agenttool.
   seats.jsonl             0600   one seat row per seat, one chain row per chain, an end row if the child ended itself
   report.json             0600   the report
   private/                0700
-    plan.json             0600   the settings, the lock entry and the input texts the child runs from
+    plan.json             0600   the settings, the lock entry, the input texts and the seating form the child runs from
     prompts/<sha256>.json 0600   each prompt sent, written before the call
     replies.jsonl         0600   each reply received, whole
 ```
@@ -184,8 +206,9 @@ sentence `A rehearsal: a model sample from a throwaway copy. Not a citizen's
 record, word or choice.` Seat rows and chain rows hold numbers, booleans,
 times, digests, fixed codes and the host's fixed reasons only. The report
 holds the same, and also names what the run was given: the citizen word, the
-input files, the canon entry's reference, the model, the beacons, and the
-HALT file's full path on the host it ran on. A state.set target
+input files, the canon entry's reference or the archetype class, the seating
+form, the model, the beacons, and the HALT file's full path on the host it
+ran on. A state.set target
 outside the lifecycle states, a journal kind outside the four, and a stop
 reason other than `stop` or `length` are counted as `other`; no model or
 server string is stored outside `private/`. The parent never opens
@@ -327,16 +350,17 @@ It cannot show:
 - what any citizen wants;
 - what a seated citizen's own seat would produce: that seat has its own
   history, its real letter and its real date;
-- the prompt of a citizen seated from its old home. A throwaway citizen is
-  seated from texts, so its will is introduced as its will, where a citizen
-  seated from its old home is shown its will, while unchanged, as the text
-  that repository held, under the host's sentence that the seat gives it no
-  repository, tools or senses; and with no canon entry its origin is an
-  archetype seated from texts, where such a citizen is shown the class its
-  old repository records. For a citizen seated on its canon entry, the will's
-  introduction is the only difference in the request, as
-  `test/rehearse.test.ts` checks. The report's limits say so whenever a will
-  was given or no canon entry was;
+- the prompt of a citizen seated from its old home, when the throwaway is
+  not seated in its form. With `--plain-texts` its will is introduced as its
+  will, where a citizen seated from its old home is shown its will, while
+  unchanged, as the text that repository held, under the host's sentence
+  that the seat gives it no repository, tools or senses. With no canon
+  entry, its origin is an archetype seated from texts unless the admitted
+  form is given a class, where such a citizen is shown the class its old
+  repository records. The report's limits say so whenever one of these
+  applies. Seated in the admitted form with a canon entry or a class, a
+  first seat's request is that of a citizen seated by `admit` with the same
+  texts, letter and time, byte for byte;
 - whether a sentence is true: the measures count words;
 - whether the model server cuts an over-long prompt, because the byte rule
   refuses first;

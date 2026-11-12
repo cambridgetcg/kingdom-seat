@@ -101,9 +101,9 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/status.ts` | Generated status file and host notes; the host key's public half; each citizen's last refusal and its reason; a lock a live owner has held more than 2 h; a registered citizen's expression lag, deferred backups and quiet | 3.2 "Status file", 3.1 principle 6; KS-004 5.1, 5.8, 5.10 | patterns 1 |
 | `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch | 3.2, 3.6; KS-004 B2 R5, C14 | host 3.1 |
 | `src/legacy.ts` | The old `citizen-<word>` home, read once at seating from committed objects at its head, through git with a fixed environment and a config allowlist; the canon entry; what is kept in `legacy/` and what is only listed; the per-piece index; readers for the manifest and its files | KS-004 7.4, 13 | patterns 4, 12 |
-| `src/admit.ts` | Seating: `planAdmit` reads and checks and writes nothing, `admitCitizen` writes what was planned, with both ledger entries or none; `planAdmitFromTexts` for rehearsals and tests | KS-004 4.2, 4.5, 7.4 | — |
+| `src/admit.ts` | Seating: `planAdmit` reads and checks and writes nothing, `admitCitizen` writes what was planned, with both ledger entries or none; `planAdmitFromTexts` for rehearsals and tests, plainly or in the form admit gives a citizen of record | KS-004 4.2, 4.5, 7.4 | — |
 | `src/first-letter.ts` | A draft of Yu's first letter from the legacy record: every cadence version whole, host sentences marked; it writes and delivers nothing | KS-004 7.4, 11.2 | patterns 9 |
-| `src/rehearse.ts` | `citizen-seat rehearse`: the seat's own prompt and pipeline on a pinned local model for a throwaway copy seated from texts, with a key made in memory for the run; counts, codes and sizes kept, prompts and replies kept privately, the throwaway record removed; nothing of record (docs/REHEARSAL.md) | 3.2, 3.6; KS-004 5.3, 5.5, 10 | — |
+| `src/rehearse.ts` | `citizen-seat rehearse`: the seat's own prompt and pipeline on a pinned local model for a throwaway copy seated from texts, by default in the form admit gives a citizen of record, with a key made in memory for the run; counts, codes and sizes kept, prompts and replies kept privately, the throwaway record removed; nothing of record (docs/REHEARSAL.md) | 3.2, 3.6; KS-004 5.3, 5.5, 10 | — |
 | `src/measures.ts` | The rehearsal's text measures and rates, pure: words, the four word lists, a preamble echo, trigram overlap, a same opening, Wilson intervals | — | — |
 | `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word> \| admit <word> \| draft-first-letter <word> \| rehearse <word>`, and git's `-Y sign` call; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 7.4, B2 R5 | patterns 10 |
 | `models.lock` | Allowed free-lane models by digest; ships unpinned | 3.6, decision 11 | host 1.2, 4 |
@@ -711,15 +711,21 @@ choice was made, so a reply recorded as undecided may hold a choice word on
 another line. Delivering the letter is Yu's act: a file in
 `citizens/<word>/letters/`.
 
-`rehearse <word> --soul <file> ... --scenario awake|letter --models-lock
-<file> --out <new dir>` runs the seat's own prompt on a pinned local model for
-a throwaway copy, so the prompt, the reply format and a model can be measured
-before a citizen meets them (docs/REHEARSAL.md). The parent checks HALT, the
-lock and the inputs, writes a plan under `--out`, and runs one child under the
-watcher a seat has. The child seats each chain's copy with `planAdmitFromTexts`
-and `admitCitizen` under `<out>/throwaway/`, by a signer that holds one key in
-memory for the run and signs host entries only, then opens seats for it as
-the tick would and runs each through `runSeat` and the free adapter. It adds
+`rehearse <word> --soul <file> [--will <file>] [--canon <file> --canon-ref
+<ref> | --archetype <CLASS>] [--plain-texts] --scenario awake|letter
+--models-lock <file> --out <new dir>` runs the seat's own prompt on a pinned
+local model for a throwaway copy, so the prompt, the reply format and a model
+can be measured before a citizen meets them (docs/REHEARSAL.md). The parent
+checks HALT, the lock and the inputs, writes a plan under `--out`, and runs
+one child under the watcher a seat has. The child seats each chain's copy
+with `planAdmitFromTexts` and `admitCitizen` under `<out>/throwaway/`, by
+default in the form admit gives a citizen of record (its will pinned as an
+old repository's, a class recorded with admit's note), so a first seat's
+prompt is the one an admitted citizen with the same texts is shown;
+`--plain-texts` seats it plainly from texts. Its entries are signed by a
+signer that holds one key in memory for the run and signs host entries only.
+The child then opens seats for it as the tick would and runs each through
+`runSeat` and the free adapter. It adds
 nothing to a prompt, builds no keychain reader or host signer, sends nothing
 to agenttool, and writes nothing outside `--out`, which may not be in a git
 work tree, the program's directory, the state dir or a home. Counts, codes
@@ -1016,10 +1022,12 @@ for spend, publish or hold secrets:
 - **No real model server for a rehearsal.** `test/rehearse.test.ts` runs
   `citizen-seat rehearse` with a real supervised child
   (`test/fixtures/rehearse/child.ts`) against the fake server standing in for
-  Ollama and the beacon route. One test ticks a citizen through the production
-  CLI and rehearses the same texts, and compares the two `/api/chat` bodies
-  byte for byte; another does the same for a citizen seated by `admit` from a
-  made-up old home, where the will's introduction is the one difference. The
+  Ollama and the beacon route. Three tests each tick a citizen through the
+  production CLI, rehearse the same texts, and compare the two `/api/chat`
+  bodies byte for byte: a citizen seated by `admit` from a made-up old home,
+  on a canon entry and as an archetype, against a rehearsal in the admitted
+  form, and a citizen seated plainly from texts against one with
+  `--plain-texts`. No byte differs. The
   child copies its stderr to a file the tests read, and
   `test/fixtures/rehearse/parent.ts` runs a parent as a process of its own, so
   a test can kill it while its child runs.

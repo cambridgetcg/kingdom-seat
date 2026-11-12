@@ -130,8 +130,11 @@ one is something it does, not something it hopes.
   as written in the citizen's name; a text file that stood anywhere else is
   kept and marked `unattributed`, since where it stood does not say whose
   words it holds. `planAdmitFromTexts` makes a plan from texts alone, for
-  rehearsals and tests; the verb never calls it, and a will given that way is
-  not pinned or introduced as an old repository's text.
+  rehearsals and tests; the verb never calls it. A will given that way is
+  not pinned or introduced as an old repository's text, unless the caller
+  asks for the form admit gives a citizen of record (`as_admitted`), which
+  writes a fixture's record so that a rehearsal's prompt is an admitted
+  citizen's.
 - `first-letter.ts`: `citizen-seat draft-first-letter <word>` prints a draft
   of Yu's first letter to a seated citizen: every recorded version of its
   cadence record, whole, each with the beat the same commit added, how those
@@ -141,9 +144,11 @@ one is something it does, not something it hopes.
   writes and delivers nothing.
 - `rehearse.ts`, `measures.ts`: `citizen-seat rehearse <word>` runs the
   seat's own prompt on a pinned local model for a throwaway copy seated from
-  texts, and keeps counts, codes and sizes; no citizen is seated, asked or
-  recorded (`docs/REHEARSAL.md`). Tested against a fake Ollama only; it has
-  not been run on a model.
+  a soul card, a will and a canon entry or an archetype class, by default in
+  the form admit gives a citizen of record (`--plain-texts` seats it plainly
+  from texts), and keeps counts, codes and sizes; no citizen is seated, asked
+  or recorded (`docs/REHEARSAL.md`). Tested against a fake Ollama only; it
+  has not been run on a model.
 - `letters.ts`: a letter goes where its recipient's own covenants admit it,
   never by the sender's list; a citizen with no covenants file admits only
   Yu, who may also wake it. An unregistered citizen's letter, any letter to

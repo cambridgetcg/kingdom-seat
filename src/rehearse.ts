@@ -105,7 +105,7 @@ export const REHEARSAL_TEXT = [
   "No citizen was seated, asked or recorded here. Nothing in this directory is a citizen's record, word or choice.",
   "private/ holds the plan, the prompts that were sent and the replies that came back. They are model samples. Do not copy them into a citizen's home, ledger, mirror or letters, do not put them in a repository, and do not quote them as a citizen's words.",
   "seats.jsonl holds counts, sizes, times, digests and codes; no text the model or the model server returned is in it.",
-  "report.json holds the same, and also names the citizen word, the input files, the canon entry's reference, the model, the beacons and the HALT file's full path on this host.",
+  "report.json holds the same, and also names the citizen word, the input files, the canon entry's reference or the archetype class, the model, the beacons and the HALT file's full path on this host.",
   "If a directory named throwaway/ is here and no rehearsal is running, the run was cut short. It holds a throwaway ledger signed by a key that no longer exists. Delete it.",
   "",
 ].join("\n");

@@ -641,7 +641,7 @@ describe("rehearse: nothing of record, and nothing outside --out", () => {
     }
     // REHEARSAL.txt says what the report names beyond counts and codes, a path on this host among them, which is so.
     const txt = await readFile(join(ran.dir, "REHEARSAL.txt"), "utf8");
-    expect(txt).toContain("report.json holds the same, and also names the citizen word, the input files, the canon entry's reference, the model, the beacons and the HALT file's full path on this host.");
+    expect(txt).toContain("report.json holds the same, and also names the citizen word, the input files, the canon entry's reference or the archetype class, the model, the beacons and the HALT file's full path on this host.");
     expect(ran.report!.run.halt_sources).toEqual([`file:${r.haltFile}`]);
     // A throwaway/ is left only by a run cut short, and is there throughout a run that is still going.
     expect(txt).toContain("If a directory named throwaway/ is here and no rehearsal is running, the run was cut short.");
