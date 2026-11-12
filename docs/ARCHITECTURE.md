@@ -1023,12 +1023,13 @@ for spend, publish or hold secrets:
 - **No real model server for a rehearsal.** `test/rehearse.test.ts` runs
   `citizen-seat rehearse` with a real supervised child
   (`test/fixtures/rehearse/child.ts`) against the fake server standing in for
-  Ollama and the beacon route. Three tests each tick a citizen through the
+  Ollama and the beacon route. Four tests each tick a citizen through the
   production CLI, rehearse the same texts, and compare the two `/api/chat`
   bodies byte for byte: a citizen seated by `admit` from a made-up old home,
-  on a canon entry and as an archetype, against a rehearsal in the admitted
-  form, and a citizen seated plainly from texts against one with
-  `--plain-texts`. No byte differs. The
+  on a canon entry and as an archetype with a letter, and on a canon entry
+  seated awake, against a rehearsal in the admitted form, and a citizen
+  seated plainly from texts against one with `--plain-texts`. No byte
+  differs. The
   child copies its stderr to a file the tests read, and
   `test/fixtures/rehearse/parent.ts` runs a parent as a process of its own, so
   a test can kill it while its child runs.

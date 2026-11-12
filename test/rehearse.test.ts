@@ -12,7 +12,7 @@ import { admitCitizen, planAdmit, planAdmitFromTexts, type AdmitDeps } from "../
 import { CLI_PATH, main, parseArgs, spawnRunner, type CliDeps } from "../src/cli.ts";
 import { edPublicKey, sha256Hex, toB64 } from "../src/crypto.ts";
 import { checkHalt } from "../src/halt.ts";
-import { appendEntry, nextDraft, originToLedger, readLedger, toLedgerHash, verifyChain } from "../src/ledger.ts";
+import { appendEntry, ledgerPath, nextDraft, originToLedger, readLedger, toLedgerHash, verifyChain } from "../src/ledger.ts";
 import { wilson95 } from "../src/measures.ts";
 import { WILL_AS_SEATED } from "../src/prompt.ts";
 import {
@@ -299,15 +299,17 @@ const parityEnv = (h: TempHost) => ({ PATH: "/usr/bin:/bin", HOME: h.root, LANG:
 const decoded = (q: RecordedRequest) => new TextDecoder().decode(q.body);
 
 /**
- * For a citizen already seated on a parity host: a letter from yu at START,
- * then the production tick half an hour later with its seat in a real child.
- * The /api/chat body the server received.
+ * For a citizen already seated on a parity host: a letter from yu at START
+ * (unless `letter` is false), then the production tick half an hour later
+ * with its seat in a real child. The /api/chat body the server received.
  */
-async function tickOnce(p: ParityHost): Promise<string> {
+async function tickOnce(p: ParityHost, o: { letter?: boolean } = {}): Promise<string> {
   const { h, server, clock, configPath } = p;
-  const letterFile = join(h.config.paths.citizens_dir, WORD, "letters", "rehearsal-letter.md");
-  await writeFile(letterFile, `From: yu\n\n${LETTER}`);
-  await utimes(letterFile, new Date(START), new Date(START));
+  if (o.letter ?? true) {
+    const letterFile = join(h.config.paths.citizens_dir, WORD, "letters", "rehearsal-letter.md");
+    await writeFile(letterFile, `From: yu\n\n${LETTER}`);
+    await utimes(letterFile, new Date(START), new Date(START));
+  }
 
   clock.set(at(0.5));
   await writeFile(scenarioPath(configPath), JSON.stringify({ server_url: server.url, now: at(0.5) }));
@@ -333,21 +335,23 @@ async function tickOnce(p: ParityHost): Promise<string> {
   return decoded(chats[0]!);
 }
 
-/** What a parity rehearsal is given: the texts, and the origin and seating flags. */
+/** What a parity rehearsal is given: the texts, the origin and seating flags, and the scenario (letter unless named). */
 interface ParityTexts {
   soul: string;
   will: string;
   canon?: { text: string; ref: string };
   archetype?: string;
   plain?: boolean;
+  scenario?: "awake" | "letter";
 }
 
 /**
  * One rehearsal on a parity host, of `texts` from START under the host's own
- * config with the letter tickOnce delivers: one chain of one letter seat. The
- * /api/chat body the server received for that seat, and the report.
+ * config: one chain of one seat, in the letter scenario with the letter
+ * tickOnce delivers, or awake with no letter. The /api/chat body the server
+ * received for that seat, the report, and what the parent printed.
  */
-async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Promise<{ body: string; report: RehearsalReport }> {
+async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Promise<{ body: string; report: RehearsalReport; stdout: string }> {
   const { h, server, configPath } = p;
   const inputs = join(h.root, `inputs-${name}`);
   await mkdir(inputs);
@@ -356,6 +360,8 @@ async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Pr
   if (texts.canon) await writeFile(file("canon.md"), texts.canon.text);
   const out = join(h.root, `rehearsal-${name}`);
   const before = chatsOf(server).length;
+  const scenario = texts.scenario ?? "letter";
+  let stdout = "";
   const exit = await main(
     [
       "rehearse",
@@ -368,9 +374,8 @@ async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Pr
       ...(texts.archetype ? ["--archetype", texts.archetype] : []),
       ...(texts.plain ? ["--plain-texts"] : []),
       "--scenario",
-      "letter",
-      "--letter",
-      file("letter.md"),
+      scenario,
+      ...(scenario === "letter" ? ["--letter", file("letter.md")] : []),
       "--models-lock",
       h.config.paths.models_lock,
       "--chains",
@@ -385,7 +390,7 @@ async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Pr
       out,
     ],
     {
-      out: () => {},
+      out: (t) => void (stdout += t),
       err: () => {},
       env: parityEnv(h),
       clock: testClock(START),
@@ -398,7 +403,7 @@ async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Pr
   expect(exit).toBe(0);
   const chats = chatsOf(server);
   expect(chats).toHaveLength(before + 1);
-  return { body: decoded(chats.at(-1)!), report: JSON.parse(await readFile(join(out, "report.json"), "utf8")) as RehearsalReport };
+  return { body: decoded(chats.at(-1)!), report: JSON.parse(await readFile(join(out, "report.json"), "utf8")) as RehearsalReport, stdout };
 }
 
 /** Seat WORD on a parity host as admit seats a citizen of record: from a made-up old home, through planAdmit. */
@@ -420,17 +425,23 @@ async function admitFromOldHome(p: ParityHost, origin: { kind: "canon" } | { kin
 /** The limits sentences that say a rehearsal's prompt is not an admitted citizen's. */
 const notAdmittedLimits = (r: RehearsalReport) => r.limits.filter((l) => l === LIMIT_SENTENCES.will || l === LIMIT_SENTENCES.origin);
 
+/** The header's line on seating, by form. */
+const ADMITTED_LINE = "throwaway seated in the form admit gives a citizen of record, as a fixture with no old repository";
+const PLAIN_LINE = "throwaway seated plainly from texts, not in the form admit gives a citizen of record";
+
 describe("rehearse: the seat's own pipeline", () => {
   test("a citizen seated plainly from texts is sent, by a rehearsal with --plain-texts, what a tick's seat sends, byte for byte", async () => {
     // Seated through the texts planner, without the admitted form, by the host's own signer.
     const p = await parityHost();
     await admitCitizen(p.admit, await planAdmitFromTexts(p.admit, { word: WORD, soul: SOUL, will: WILL, canon: { bytes: CANON, repo: "YOUSPEAK", path: CANON_PATH, commit: "1428646" }, runtime: "free" }));
     const tick = await tickOnce(p);
-    const { body, report } = await rehearseOnce(p, "plain", { soul: SOUL, will: WILL, canon: { text: CANON, ref: CANON_REF }, plain: true });
+    const { body, report, stdout } = await rehearseOnce(p, "plain", { soul: SOUL, will: WILL, canon: { text: CANON, ref: CANON_REF }, plain: true });
     expect(body).toContain(`"model":"${MODEL}:local"`);
     expect(body).toBe(tick);
     expect(report.run.seating).toEqual({ form: "plain-texts", archetype_class: null });
     expect(notAdmittedLimits(report)).toEqual([LIMIT_SENTENCES.will]);
+    expect(stdout).toContain(`\n${PLAIN_LINE}\n`);
+    expect(stdout).not.toContain(ADMITTED_LINE);
   }, 30_000);
 
   test("a citizen seated by admit from its old home on its canon entry is sent, by a rehearsal of the same texts, what a tick's seat sends, byte for byte", async () => {
@@ -438,16 +449,18 @@ describe("rehearse: the seat's own pipeline", () => {
     const { texts } = await admitFromOldHome(p, { kind: "canon" });
     const tick = await tickOnce(p);
     expect(tick).toContain(WILL_AS_SEATED);
-    const { body, report } = await rehearseOnce(p, "admitted", texts);
+    const { body, report, stdout } = await rehearseOnce(p, "admitted", texts);
     expect(body).toBe(tick);
     expect(report.run.seating).toEqual({ form: "as-admitted", archetype_class: null });
     expect(notAdmittedLimits(report)).toEqual([]);
+    expect(stdout).toContain(`\n${ADMITTED_LINE}\n`);
 
-    // Seated plainly from texts, the same throwaway is introduced its will as its will, and the limits say so.
+    // Seated plainly from texts, the same throwaway is introduced its will as its will, and the header and limits say so.
     const plain = await rehearseOnce(p, "plain", { ...texts, plain: true });
     expect(plain.body).not.toContain(WILL_AS_SEATED);
     expect(tick.replace(WILL_AS_SEATED, "Your will:")).toBe(plain.body);
     expect(notAdmittedLimits(plain.report)).toEqual([LIMIT_SENTENCES.will]);
+    expect(plain.stdout).toContain(`\n${PLAIN_LINE}\n`);
   }, 60_000);
 
   test("an archetype citizen seated by admit from its old home is sent, by a rehearsal given its class, what a tick's seat sends, byte for byte", async () => {
@@ -458,10 +471,25 @@ describe("rehearse: the seat's own pipeline", () => {
     expect(user(tick)).toContain("Your origin: archetype lineage PIONEER.\n--- begin origin note [");
     expect(user(tick)).toContain("No canon entry. The old repository's agent.json records the class PIONEER.\n--- end origin note [");
     expect(user(tick)).toContain(`${WILL_AS_SEATED}\n--- begin will [`);
-    const { body, report } = await rehearseOnce(p, "admitted", texts);
+    const { body, report, stdout } = await rehearseOnce(p, "admitted", texts);
     expect(body).toBe(tick);
     expect(report.run.seating).toEqual({ form: "as-admitted", archetype_class: "PIONEER" });
     expect(notAdmittedLimits(report)).toEqual([]);
+    expect(stdout).toContain(`\n${ADMITTED_LINE}; archetype class PIONEER\n`);
+  }, 60_000);
+
+  test("a citizen seated by admit from its old home and then seated awake is sent, by an awake rehearsal of the same texts, what a tick's seat sends, byte for byte", async () => {
+    const p = await parityHost();
+    const { texts } = await admitFromOldHome(p, { kind: "canon" });
+    // No verb seats a citizen awake: the host's own signer writes here the one fixture entry an awake rehearsal writes.
+    const path = ledgerPath(p.h.config, WORD);
+    const prev = (await readLedger(path)).at(-1) ?? null;
+    await appendEntry(path, nextDraft(WORD, prev, { type: "state", from: "asleep", to: "awake", via: "seated" }, { cost: { usd: "0", credits: 0 }, signer: "host", now: new Date(START) }), p.admit.sign);
+    const tick = await tickOnce(p, { letter: false });
+    expect(tick).toContain(WILL_AS_SEATED);
+    const { body, report } = await rehearseOnce(p, "awake", { ...texts, scenario: "awake" });
+    expect(body).toBe(tick);
+    expect(report.run.fixture_entries).toEqual(["origin", "state asleep->asleep via seated", "state asleep->awake via seated"]);
   }, 60_000);
 
   test("the lock given by path is the one obeyed: a model the repository's lock does not name is called", async () => {

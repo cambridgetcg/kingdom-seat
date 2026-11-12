@@ -163,9 +163,10 @@ chain; the only entries the rehearsal writes itself are the seating's and,
 for `awake`, one seated state. `test/rehearse.test.ts` checks that a
 rehearsal's request to the model server is, byte for byte, the request a
 production tick's seat sends for a citizen seated by `admit` from a made-up
-old home with the same soul, will, origin, letter and time, once on a canon
-entry and once as an archetype; and, with `--plain-texts`, for a citizen
-seated plainly from texts. No byte differs.
+old home with the same soul, will, origin, letter and time: for `letter`
+once on a canon entry and once as an archetype, and for `awake` on a canon
+entry, with the seated state written by the host's own signer; and, with
+`--plain-texts`, for a citizen seated plainly from texts. No byte differs.
 
 **Time.** Each chain has its own clock; the wall clock is used only for the
 run's own timestamps and HALT readings. The clock is fixed during a seat.
