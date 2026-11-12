@@ -1314,7 +1314,7 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
   const base = ["rehearse", "glossame", "--soul", "/r/soul.md", "--scenario", "awake", "--models-lock", "/r/models.lock", "--out", "/r/out"];
 
   test("parses rehearse with its flags, and rehearse --child --plan", () => {
-    expect(parseArgs(base)).toEqual({
+    expect(parseArgs([...base, "--archetype", "PIONEER"])).toEqual({
       verb: "rehearse",
       child: false,
       word: "glossame",
@@ -1322,7 +1322,7 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
       will: null,
       canon: null,
       canon_ref: null,
-      archetype_class: null,
+      archetype_class: "PIONEER",
       plain_texts: false,
       letter: null,
       scenario: "awake",
@@ -1369,13 +1369,13 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
       start: "2026-11-12T10:00:00.000Z",
       config: "/srv/seat/config.json",
     });
-    expect(parseArgs(["rehearse", "glossame", "--soul", "/r/s.md", "--scenario", "letter", "--letter", "/r/l.md", "--models-lock", "/r/m.lock", "--out", "/r/o"])).toMatchObject({ scenario: "letter", letter: "/r/l.md" });
-    expect(parseArgs([...base, "--archetype", "PIONEER"])).toMatchObject({ canon: null, archetype_class: "PIONEER", plain_texts: false });
+    expect(parseArgs(["rehearse", "glossame", "--soul", "/r/s.md", "--plain-texts", "--scenario", "letter", "--letter", "/r/l.md", "--models-lock", "/r/m.lock", "--out", "/r/o"])).toMatchObject({ scenario: "letter", letter: "/r/l.md" });
+    expect(parseArgs([...base, "--plain-texts"])).toMatchObject({ canon: null, archetype_class: null, plain_texts: true });
     expect(parseArgs([...base, "--archetype", "PIONEER", "--plain-texts"])).toMatchObject({ archetype_class: "PIONEER", plain_texts: true });
     expect(parseArgs(["rehearse", "--child", "--plan", "/r/out/private/plan.json"])).toEqual({ verb: "rehearse", child: true, config: null, plan_path: "/r/out/private/plan.json" } satisfies Command);
   });
 
-  test("rehearse refuses relative paths, letter without --letter, canon without --canon-ref, a malformed ref, counts out of range, and --child with anything but --plan", () => {
+  test("rehearse refuses relative paths, letter without --letter, canon without --canon-ref, a malformed ref, no origin in the admitted form, counts out of range, and --child with anything but --plan", () => {
     const without = (flag: string) => {
       const i = base.indexOf(flag);
       return [...base.slice(0, i), ...base.slice(i + 2)];
@@ -1407,6 +1407,8 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
       [...base, "--archetype", "LEXEME"],
       [...base, "--archetype"],
       [...base, "--plain-texts", "yes"],
+      base,
+      [...base, "--will", "/r/WILL.md"],
       [...base, "--chains", "0"],
       [...base, "--chains", "501"],
       [...base, "--seats", "25"],
@@ -1439,6 +1441,9 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
     expect(message([...base, "--canon", "/r/c.md", "--canon-ref", "YOUSPEAK:canon/core/glossame.md@1428646", "--archetype", "PIONEER"])).toBe("--archetype is given only without --canon");
     expect(message([...base, "--archetype", "Pioneer"])).toBe("--archetype is a class of capital letters, digits and hyphens, as admit reads one from agent.json");
     expect(message([...base, "--archetype", "LEXEME"])).toBe("LEXEME is the class of a canon word, which admit seats on its canon entry: rehearse it with --canon and --canon-ref");
+    // admit seats a citizen of record on a canon entry or as an archetype: the form it gives has no third origin.
+    const noOrigin = "rehearse needs --canon with --canon-ref, or --archetype <CLASS>, for the origin admit seats a citizen of record on; or --plain-texts, to seat the throwaway plainly from texts";
+    expect([message(base), message([...base, "--will", "/r/WILL.md"])]).toEqual([noOrigin, noOrigin]);
     expect(message(["rehearse", "--child", "--plan", "/p/private/plan.json", "--plain-texts"])).toBe("--child takes only --plan");
     expect(message([...base, "--chains", "100", "--seats", "24"])).toBe("--chains times --seats is more than 2000");
     expect(message(["rehearse", "--child", "--plan", "/p/private/plan.json", "--out", "/p"])).toBe("--child takes only --plan");
@@ -1475,9 +1480,9 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
       rehearseArgv: () => [process.execPath, "-e", "process.exit(0)"],
       defaults: { config: o.defaultConfig ?? join(root, "no-config.json"), halt_file: join(o.haltDir ?? join(root, "operator"), "HALT") },
     };
-    const run = async (name: string) => {
+    const run = async (name: string, origin: string[] = ["--archetype", "PIONEER"]) => {
       const dir = join(root, name);
-      const exit = await main(["rehearse", "hope", "--soul", join(root, "soul.md"), "--scenario", "awake", "--models-lock", join(root, "models.lock"), "--chains", "1", "--seats", "1", "--out", dir], deps);
+      const exit = await main(["rehearse", "hope", "--soul", join(root, "soul.md"), ...origin, "--scenario", "awake", "--models-lock", join(root, "models.lock"), "--chains", "1", "--seats", "1", "--out", dir], deps);
       return { exit, dir, out, err };
     };
     return { root, run };
@@ -1495,11 +1500,11 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
       const plan = JSON.parse(await readFile(join(r.dir, "private", "plan.json"), "utf8"));
       expect(plan.settings_source).toBe("defaults");
       expect(plan.settings).toMatchObject({ ollama_base_url: "http://127.0.0.1:11434", beacons: [], allow_no_beacons: true, approved_model_digests: [], homes: [] });
-      // With no flag saying otherwise, the throwaway is seated as admit seats a citizen of record, and the header says so.
-      expect(plan.seating).toEqual({ form: "as-admitted", archetype_class: null });
-      expect(r.out).toContain("throwaway seated in the form admit gives a citizen of record, as a fixture with no old repository\n");
+      // Given a class and not --plain-texts, the throwaway is seated as admit seats an archetype, and the header says so.
+      expect(plan.seating).toEqual({ form: "as-admitted", archetype_class: "PIONEER" });
+      expect(r.out).toContain("throwaway seated in the form admit gives a citizen of record, as a fixture with no old repository; archetype class PIONEER\n");
       const run = JSON.parse(await readFile(join(r.dir, "report.json"), "utf8")).run;
-      expect([run.settings, run.seating]).toEqual(["defaults", { form: "as-admitted", archetype_class: null }]);
+      expect([run.settings, run.seating]).toEqual(["defaults", { form: "as-admitted", archetype_class: "PIONEER" }]);
     } finally {
       await rm(x.root, { recursive: true, force: true });
     }

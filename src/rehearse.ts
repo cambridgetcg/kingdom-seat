@@ -138,9 +138,10 @@ export type Scenario = "awake" | "letter";
 /**
  * How the throwaway citizen is seated. `as-admitted`, the default: in the
  * form admit gives a citizen of record, as far as texts allow (admit.ts
- * planAdmitFromTexts, as_admitted), so a seat's prompt is the one an admitted
- * citizen is shown. `plain-texts`: as a soul card that belongs to no citizen
- * of record, with a will that is simply its will.
+ * planAdmitFromTexts, as_admitted), on a canon entry or an archetype class,
+ * so a seat's prompt is the one an admitted citizen is shown. `plain-texts`:
+ * as a soul card that belongs to no citizen of record, with a will that is
+ * simply its will, on a canon entry, a class or neither.
  */
 export type SeatingForm = "as-admitted" | "plain-texts";
 
@@ -841,9 +842,10 @@ function limitsFor(plan: RehearsePlan): string[] {
     l.words,
     l.none_seen,
     l.throwaway,
-    // Seated as admitted, the will is introduced as an admitted citizen's is, and a class as admit records one.
+    // Seated as admitted, the will is introduced as an admitted citizen's is, and the origin is a canon entry or a
+    // class as admit records one: the parent refuses that form with neither.
     ...(plain && plan.inputs.will !== null ? [l.will] : []),
-    ...(plan.inputs.canon === null && (plain || plan.seating.archetype_class === null) ? [l.origin] : []),
+    ...(plain && plan.inputs.canon === null ? [l.origin] : []),
     ...(plan.model.seed !== null ? [l.seed] : []),
     ...(plan.settings_source === "defaults" ? [l.defaults] : []),
   ];
@@ -1187,6 +1189,12 @@ export async function rehearseParent(deps: RehearseDeps, cmd: RehearseCommand): 
   if (!WORD_PATTERN.test(word)) throw new Refusal("invalid-request", "not a citizen word");
   if (cmd.scenario === "letter" && cmd.letter === null) throw new Refusal("invalid-request", "--scenario letter needs --letter <file>");
   if (cmd.archetype_class !== null && cmd.canon !== null) throw new Refusal("invalid-request", "--archetype is given only without --canon");
+  if (cmd.canon === null && cmd.archetype_class === null && !cmd.plain_texts) {
+    throw new Refusal(
+      "invalid-request",
+      "rehearse needs --canon with --canon-ref, or --archetype <CLASS>, for the origin admit seats a citizen of record on; or --plain-texts, to seat the throwaway plainly from texts",
+    );
+  }
   const seating: Seating = { form: cmd.plain_texts ? "plain-texts" : "as-admitted", archetype_class: cmd.archetype_class };
 
   // 1. Settings, and a HALT file that can be raised.
@@ -1365,7 +1373,8 @@ export async function readPlan(planPath: string): Promise<RehearsePlan> {
     (p.scenario === "letter" && p.inputs.letter === null) ||
     !isPlain(p.seating) ||
     (p.seating.form !== "as-admitted" && p.seating.form !== "plain-texts") ||
-    (p.seating.archetype_class !== null && (typeof p.seating.archetype_class !== "string" || !ARCHETYPE_CLASS.test(p.seating.archetype_class) || p.inputs.canon !== null))
+    (p.seating.archetype_class !== null && (typeof p.seating.archetype_class !== "string" || !ARCHETYPE_CLASS.test(p.seating.archetype_class) || p.inputs.canon !== null)) ||
+    (p.seating.form === "as-admitted" && p.inputs.canon === null && p.seating.archetype_class === null)
   ) {
     throw notOwn();
   }

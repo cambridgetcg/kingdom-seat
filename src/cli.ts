@@ -325,6 +325,10 @@ function parseRehearse(flags: Map<string, string | true>, positionals: string[],
   }
   const model = flags.get("--model");
   if (model !== undefined && (typeof model !== "string" || !REHEARSE_MODEL.test(model))) throw new UsageError("--model is a model name from the lock");
+  // admit seats a citizen of record on a canon entry or as an archetype, so the form it gives needs one of the two.
+  if (canon === null && archetype === undefined && flags.get("--plain-texts") !== true) {
+    throw new UsageError("rehearse needs --canon with --canon-ref, or --archetype <CLASS>, for the origin admit seats a citizen of record on; or --plain-texts, to seat the throwaway plainly from texts");
+  }
   return {
     verb: "rehearse",
     child: false,

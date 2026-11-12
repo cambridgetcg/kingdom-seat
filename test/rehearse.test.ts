@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { OUTPUT_JSON_SCHEMA } from "../src/acts.ts";
 import { admitCitizen, planAdmit, planAdmitFromTexts, type AdmitDeps } from "../src/admit.ts";
-import { CLI_PATH, main, spawnRunner, type CliDeps } from "../src/cli.ts";
+import { CLI_PATH, main, parseArgs, spawnRunner, type CliDeps } from "../src/cli.ts";
 import { edPublicKey, sha256Hex, toB64 } from "../src/crypto.ts";
 import { checkHalt } from "../src/halt.ts";
 import { appendEntry, nextDraft, originToLedger, readLedger, toLedgerHash, verifyChain } from "../src/ledger.ts";
@@ -28,8 +28,12 @@ import {
   rehearsalConfig,
   rehearsalSettings,
   rehearsalSigner,
+  readPlan,
+  rehearseParent,
   type ChainRow,
   type RehearsalReport,
+  type RehearseCommand,
+  type RehearseDeps,
   type RehearsePlan,
   type SeatRow,
 } from "../src/rehearse.ts";
@@ -1029,7 +1033,8 @@ describe("rehearse: what a seat returned", () => {
     const bare = { ...plan, model: { ...plan.model, seed: null }, settings_source: { path: "/x/config.json", sha256: "0".repeat(64) }, inputs: { ...plan.inputs, will: null, canon } } as unknown as RehearsePlan;
     expect(buildReport(bare, [], end).limits).toEqual(always);
 
-    // Which of the two sentences on seating apply, by form, will, canon entry and class.
+    // Which of the two sentences on seating apply, by form, will, canon entry and class. The admitted form always has
+    // a canon entry or a class: the parent and readPlan refuse it with neither.
     const limitsOf = (seating: object, inputs: object) => buildReport({ ...bare, seating, inputs: { ...bare.inputs, ...inputs } } as unknown as RehearsePlan, [], end).limits.slice(always.length);
     const admitted = { form: "as-admitted", archetype_class: null };
     const classed = { form: "as-admitted", archetype_class: "PIONEER" };
@@ -1038,9 +1043,8 @@ describe("rehearse: what a seat returned", () => {
       limitsOf(plain, { will: text, canon: null }),
       limitsOf({ ...plain, archetype_class: "PIONEER" }, { will: null, canon: null }),
       limitsOf(admitted, { will: text }),
-      limitsOf(admitted, { will: text, canon: null }),
       limitsOf(classed, { will: text, canon: null }),
-    ]).toEqual([[LIMIT_SENTENCES.will], [LIMIT_SENTENCES.will, LIMIT_SENTENCES.origin], [LIMIT_SENTENCES.origin], [], [LIMIT_SENTENCES.origin], []]);
+    ]).toEqual([[LIMIT_SENTENCES.will], [LIMIT_SENTENCES.will, LIMIT_SENTENCES.origin], [LIMIT_SENTENCES.origin], [], []]);
   });
 
   test("with a fixed seed a first seat's prompt is the same in two runs and a later seat's is not, as the seed sentence says", async () => {
@@ -1200,6 +1204,48 @@ describe("rehearse: bounds and HALT", () => {
     expect(await main(["rehearse", "--child", "--plan", elsewhere], r.deps)).toBe(1);
     expect(r.stderr).toContain("the plan is not this rehearsal's own");
   });
+
+  test("a plan whose seating is missing, unknown, a class beside a canon entry, or the admitted form with neither is not run", async () => {
+    const r = await rig();
+    r.chats.push(journal("Once."));
+    const ran = await rehearse(r, args(r));
+    expect(ran.exit).toBe(0);
+    const own = JSON.parse(await readFile(join(ran.dir, "private", "plan.json"), "utf8")) as RehearsePlan;
+    // The run's plan under a fresh out of its own, changed by `edit`: what readPlan makes of it.
+    let n = 0;
+    const read = async (edit: (p: Record<string, unknown>) => void): Promise<string> => {
+      const out = join(r.root, "outs", `copied-${++n}`);
+      await mkdir(join(out, "private"), { recursive: true });
+      const copy = JSON.parse(JSON.stringify({ ...own, out })) as Record<string, unknown>;
+      edit(copy);
+      await writeFile(join(out, "private", "plan.json"), JSON.stringify(copy));
+      return readPlan(join(out, "private", "plan.json")).then(
+        (p) => `read ${p.seating.form}`,
+        (e: unknown) => (e as Error).message,
+      );
+    };
+    const noCanon = (p: Record<string, unknown>) => void ((p.inputs as Record<string, unknown>).canon = null);
+    const notOwn = "the plan is not this rehearsal's own";
+    expect([
+      await read(() => {}),
+      await read((p) => void delete p.seating),
+      await read((p) => void (p.seating = null)),
+      await read((p) => void (p.seating = { form: "admitted", archetype_class: null })),
+      await read((p) => void (p.seating = { form: "as-admitted", archetype_class: "PIONEER" })),
+      await read((p) => {
+        noCanon(p);
+        p.seating = { form: "as-admitted", archetype_class: null };
+      }),
+      await read((p) => {
+        noCanon(p);
+        p.seating = { form: "as-admitted", archetype_class: "PIONEER" };
+      }),
+      await read((p) => {
+        noCanon(p);
+        p.seating = { form: "plain-texts", archetype_class: null };
+      }),
+    ]).toEqual(["read as-admitted", notOwn, notOwn, notOwn, notOwn, notOwn, "read as-admitted", "read plain-texts"]);
+  });
 });
 
 describe("rehearse: where --out may be", () => {
@@ -1244,5 +1290,25 @@ describe("rehearse: where --out may be", () => {
     expect(ran.exit).toBe(1);
     expect(r.stderr).toContain("a canon entry is named by a repository");
     expect(await stat(ran.dir).catch(() => null)).toBeNull();
+  });
+
+  test("the parent itself refuses a class beside a canon entry, and the admitted form with neither, before anything is created", async () => {
+    const r = await rig();
+    const d = r.deps;
+    const deps: RehearseDeps = { out: d.out!, err: d.err!, env: d.env!, clock: d.clock!, fetch: d.fetch!, childArgv: d.rehearseArgv!, defaults: d.defaults!, programRoot: dirname(dirname(CLI_PATH)) };
+    const dir = join(r.root, "outs", "never-made");
+    const cmd = parseArgs(["rehearse", WORD, ...args(r), "--out", dir]);
+    if (cmd.verb !== "rehearse" || cmd.child) throw new Error("rehearse test: a parent command");
+    const noOrigin = { ...cmd, canon: null, canon_ref: null };
+    const cases: [RehearseCommand, string][] = [
+      [{ ...cmd, archetype_class: "PIONEER" }, "--archetype is given only without --canon"],
+      [noOrigin, "rehearse needs --canon with --canon-ref, or --archetype <CLASS>, for the origin admit seats a citizen of record on; or --plain-texts, to seat the throwaway plainly from texts"],
+    ];
+    for (const [c, message] of cases) {
+      const e = await rehearseParent(deps, c).then(() => null, (x: unknown) => x);
+      expect([e instanceof Refusal, (e as Refusal).code, (e as Error).message]).toEqual([true, "invalid-request", message]);
+    }
+    expect(await stat(dir).catch(() => null)).toBeNull();
+    expect([r.server.requests, r.fetched, r.stdout]).toEqual([[], [], ""]);
   });
 });

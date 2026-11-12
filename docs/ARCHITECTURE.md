@@ -721,8 +721,9 @@ one child under the watcher a seat has. The child seats each chain's copy
 with `planAdmitFromTexts` and `admitCitizen` under `<out>/throwaway/`, by
 default in the form admit gives a citizen of record (its will pinned as an
 old repository's, a class recorded with admit's note), so a first seat's
-prompt is the one an admitted citizen with the same texts is shown;
-`--plain-texts` seats it plainly from texts. Its entries are signed by a
+prompt is the one an admitted citizen with the same texts is shown. That
+form needs `--canon` or `--archetype`, the two origins admit seats a citizen
+on; `--plain-texts` seats it plainly from texts. Its entries are signed by a
 signer that holds one key in memory for the run and signs host entries only.
 The child then opens seats for it as the tick would and runs each through
 `runSeat` and the free adapter. It adds

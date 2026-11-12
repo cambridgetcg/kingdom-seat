@@ -373,8 +373,8 @@ export async function planAdmit(deps: Pick<AdmitDeps, "config" | "run" | "hostKe
  * writes for that class, under planAdmit's rule that a canon word's class
  * (LEXEME) is no archetype. The record it writes is then a fixture's, and the
  * pin and the note say things of an old repository that are not so of the
- * throwaway, which has none. With neither a canon entry nor a class the
- * origin is the one seated from texts, as without the option.
+ * throwaway, which has none. Admit seats a citizen of record on a canon entry
+ * or as an archetype, so the option refuses a request with neither.
  *
  * The admit verb never calls this, with the option or without it: a citizen
  * of record is seated from its old home at a head its origin holds.
@@ -409,6 +409,7 @@ export async function planAdmitFromTexts(deps: Pick<AdmitDeps, "config" | "hostK
       const cls = req.archetype_class;
       if (cls !== undefined && (typeof cls !== "string" || !ARCHETYPE_CLASS.test(cls))) throw new Refusal("invalid-request", "an archetype class is capital letters, digits and hyphens");
       if (admitted && cls === CANON_WORD_CLASS) throw new Refusal("invalid-request", "LEXEME is the class of a canon word, which admit seats on its canon entry; give the canon entry instead");
+      if (admitted && cls === undefined) throw new Refusal("invalid-request", "admit seats a citizen of record on a canon entry or as an archetype; give the canon entry or the class");
       origin =
         cls === undefined
           ? { kind: "archetype", lineage: [TEXTS_LINEAGE], note: TEXTS_ORIGIN_NOTE }

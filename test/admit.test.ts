@@ -347,13 +347,18 @@ describe("planAdmitFromTexts", () => {
     expect(buildPrompt(ctx, "free").user).toContain(`${WILL_AS_SEATED}\n--- begin will [`);
 
     // A class gives the lineage and note planAdmit writes for it, under planAdmit's rule; with neither a canon entry
-    // nor a class the origin is the one seated from texts. Without the option a class keeps its texts note.
+    // nor a class there is no origin admit gives, and the option refuses. Without the option a class keeps its texts
+    // note, and neither gives the origin seated from texts.
     const recorded = (await planAdmit(x.deps, archReq())).origin;
     const classed = await planAdmitFromTexts(x.deps, { word: ARCH, soul: SOUL, will: null, canon: null, archetype_class: "PIONEER", as_admitted: true, runtime: "summon" });
     expect(classed.origin).toEqual(recorded);
     expect(recorded).toEqual({ kind: "archetype", lineage: ["PIONEER"], note: "No canon entry. The old repository's agent.json records the class PIONEER." });
-    const bare = await planAdmitFromTexts(x.deps, { word: ARCH, soul: SOUL, will: null, canon: null, as_admitted: true, runtime: "summon" });
-    expect(bare.origin).toEqual({ kind: "archetype", lineage: [TEXTS_LINEAGE], note: TEXTS_ORIGIN_NOTE });
+    const bare = { word: ARCH, soul: SOUL, will: "a made-up will\n", canon: null, runtime: "summon" as const };
+    expect(await refusal(planAdmitFromTexts(x.deps, { ...bare, as_admitted: true }))).toEqual({
+      code: "invalid-request",
+      message: "admit seats a citizen of record on a canon entry or as an archetype; give the canon entry or the class; nothing was written",
+    });
+    expect((await planAdmitFromTexts(x.deps, bare)).origin).toEqual({ kind: "archetype", lineage: [TEXTS_LINEAGE], note: TEXTS_ORIGIN_NOTE });
     const lexeme = { word: ARCH, soul: SOUL, will: null, canon: null, archetype_class: "LEXEME", runtime: "summon" as const };
     expect(await refusal(planAdmitFromTexts(x.deps, { ...lexeme, as_admitted: true }))).toEqual({
       code: "invalid-request",

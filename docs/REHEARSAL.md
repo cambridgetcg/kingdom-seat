@@ -37,9 +37,11 @@ citizen-seat rehearse <word> --soul <file> [--will <file>]
 - `--archetype <CLASS>` is given only without `--canon`. It names the class
   an archetype citizen's old `agent.json` records, under the rule `admit`
   applies: capital letters, digits and hyphens, and not `LEXEME`, the class
-  of a canon word, which is rehearsed with its canon entry. With neither, the
-  throwaway citizen's origin is an archetype whose note says it was seated
-  from texts.
+  of a canon word, which is rehearsed with its canon entry. `admit` seats a
+  citizen of record on a canon entry or as an archetype, so a run names one
+  of the two unless `--plain-texts` is given, and is refused otherwise. With
+  `--plain-texts` and neither, the throwaway citizen's origin is an archetype
+  whose note says it was seated from texts.
 - By default the throwaway citizen is seated in the form `admit` gives a
   citizen of record, as far as texts allow, so a seat's prompt is the one a
   citizen seated from its old home is shown: its will is pinned as the text
@@ -351,16 +353,18 @@ It cannot show:
 - what a seated citizen's own seat would produce: that seat has its own
   history, its real letter and its real date;
 - the prompt of a citizen seated from its old home, when the throwaway is
-  not seated in its form. With `--plain-texts` its will is introduced as its
-  will, where a citizen seated from its old home is shown its will, while
+  seated with `--plain-texts`. Its will is then introduced as its will,
+  where a citizen seated from its old home is shown its will, while
   unchanged, as the text that repository held, under the host's sentence
   that the seat gives it no repository, tools or senses. With no canon
-  entry, its origin is an archetype seated from texts unless the admitted
-  form is given a class, where such a citizen is shown the class its old
-  repository records. The report's limits say so whenever one of these
-  applies. Seated in the admitted form with a canon entry or a class, a
-  first seat's request is that of a citizen seated by `admit` with the same
-  texts, letter and time, byte for byte;
+  entry, its origin note says it was seated from texts, and its lineage is
+  the class given or `seated-from-texts`, where such a citizen is shown the
+  class its old `agent.json` records under the note `admit` writes. The
+  report's limits say so whenever one of these applies. Seated in the
+  admitted form, which needs a canon entry or a class, a first seat's
+  request is that of a citizen seated by `admit` on the free class at the
+  time the chain is seated, with the same texts and letter, and for `awake`
+  the same seated state, byte for byte;
 - whether a sentence is true: the measures count words;
 - whether the model server cuts an over-long prompt, because the byte rule
   refuses first;
