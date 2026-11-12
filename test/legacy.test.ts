@@ -306,15 +306,15 @@ describe("readLegacyHome", () => {
         LICENSE: "a licence\n",
         "meta.env": "A=1\n",
       },
-      // Two names that differ only by case: the first is kept, the second listed.
-      { executable: ["beats/run-me.md"], index: { "beats/OK.md": "the same name in capitals\n" } },
+      // Names that differ only by case, a file's or a directory's: the first is kept, the second listed.
+      { executable: ["beats/run-me.md"], index: { "beats/OK.md": "the same name in capitals\n", "Beats/other.md": "the same directory in capitals\n", "notes.TXT/inside.md": "a directory named as a kept file\n" } },
     );
     const home = await readLegacyHome(real, repo.dir, W);
     expect(home.will).toBeNull();
     expect(home.files.map((f) => [f.path, f.kind])).toEqual([
       ["beats/OK.md", "beats"],
       ["beats/Ok.txt", "beats"],
-      ["notes.txt", "other"],
+      ["notes.TXT/inside.md", "other"],
     ]);
     expect(Object.fromEntries(home.not_copied.map((s) => [s.path, s.reason]))).toEqual({
       ".heartbeat/state.md": "hidden",
@@ -322,6 +322,7 @@ describe("readLegacyHome", () => {
       LICENSE: "template",
       "a/b/c/d/e/f/too-deep.md": "path",
       "agent.json": "template",
+      "Beats/other.md": "path",
       "beats/-dash.md": "path",
       "beats/binary.md": "not-text",
       "beats/has space.md": "path",
@@ -329,6 +330,7 @@ describe("readLegacyHome", () => {
       "beats/run-me.md": "executable",
       [`${W}.md`]: "soul",
       "meta.env": "template",
+      "notes.txt": "path",
       "sub/claude.local.md": "agent-instruction-file",
       "tool.py": "not-text",
     });

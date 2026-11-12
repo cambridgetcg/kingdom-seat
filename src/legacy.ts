@@ -495,21 +495,44 @@ export async function readLegacyHome(run: CommandRunner, home: string, word: Wor
 
   // What the path rules keep is counted from the tree's own sizes, so a home too large to keep is refused before any of it is read.
   const keep: { e: TreeEntry; kind: LegacyKind }[] = [];
-  const taken = new Set<string>();
+  // Every name kept so far, file or directory, by its case-folded path and the spelling it was first seen in.
+  const taken = new Map<string, string>();
+  const fits = (path: string): boolean => {
+    const segs = path.split("/");
+    for (let i = 1; i < segs.length; i++) {
+      const dir = segs.slice(0, i).join("/");
+      const seen = taken.get(dir.toLowerCase());
+      if (seen !== undefined && seen !== `${dir}/`) return false;
+    }
+    return !taken.has(path.toLowerCase());
+  };
+  const take = (path: string): void => {
+    const segs = path.split("/");
+    for (let i = 1; i < segs.length; i++) taken.set(segs.slice(0, i).join("/").toLowerCase(), `${segs.slice(0, i).join("/")}/`);
+    taken.set(path.toLowerCase(), path);
+  };
   let total = 0;
-  for (const e of [...tree].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
-    const sorted = sortBlob(e, word);
-    if ("skip" in sorted) skip(e, sorted.skip);
-    // The host's own filesystem may fold case, so two names that differ only by case cannot both be kept.
-    else if (taken.has(e.path.toLowerCase())) skip(e, "path");
-    else if (e.size > LEGACY_LIMITS.file_bytes) {
-      throw new Refusal("oversize", `${e.path} is ${e.size} bytes, over the ${LEGACY_LIMITS.file_bytes}-byte limit for a file kept in legacy/; nothing is cut`);
-    } else {
-      taken.add(e.path.toLowerCase());
-      keep.push({ e, kind: sorted.kind });
-      total += e.size;
+  const byPath = (a: { path: string }, b: { path: string }) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  const sorted = [...tree].sort(byPath).map((e) => ({ e, as: sortBlob(e, word) }));
+  // The host's own filesystem may fold case, so two names that differ only by case cannot both be kept: the first
+  // is, the second is listed. The record's own places (beats/, inbox/, letters/, the cadence file, markers) are
+  // taken first, so a stray directory spelled in another case never stands in for one of them.
+  for (const pass of ["named", "other"] as const) {
+    for (const { e, as } of sorted) {
+      if ("skip" in as) {
+        if (pass === "named") skip(e, as.skip);
+      } else if ((as.kind === "other") !== (pass === "other")) continue;
+      else if (!fits(e.path)) skip(e, "path");
+      else if (e.size > LEGACY_LIMITS.file_bytes) {
+        throw new Refusal("oversize", `${e.path} is ${e.size} bytes, over the ${LEGACY_LIMITS.file_bytes}-byte limit for a file kept in legacy/; nothing is cut`);
+      } else {
+        take(e.path);
+        keep.push({ e, kind: as.kind });
+        total += e.size;
+      }
     }
   }
+  keep.sort((a, b) => byPath(a.e, b.e));
   if (keep.length > LEGACY_LIMITS.files || total > LEGACY_LIMITS.total_bytes) throw over(keep.length, total);
 
   const histories = new Map<string, LegacyCommit[]>();
@@ -537,7 +560,7 @@ export async function readLegacyHome(run: CommandRunner, home: string, word: Wor
       authored: authoredAs(commits),
     });
   }
-  not_copied.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  not_copied.sort(byPath);
 
   // The versions of the cadence file and their beats are kept too, and count toward the same limits.
   const cadence = await readCadence(git, head, word, histories.get("CADENCE.md") ?? null, (name, bytes) => {

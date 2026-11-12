@@ -488,7 +488,7 @@ export async function admitCitizen(deps: AdmitDeps, plan: AdmitPlan): Promise<Ad
         {
           type: "origin",
           origin: originToLedger(plan.origin),
-          origin_soul_hash: toLedgerHash(plan.soul.sha256),
+          origin_soul_hash: toLedgerHash(sha256Hex(bytes.soul)),
           old_repo: plan.old_repo ? { url: plan.old_repo.url, head: plan.old_repo.head } : null,
           june_did: plan.june_did,
         },
