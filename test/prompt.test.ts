@@ -3,9 +3,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildContext } from "../src/context.ts";
-import { FREE_LANE_PREAMBLE, NO_UNATTENDED_SEATS, WILL_AS_SEATED, buildPrompt, promptBytes, renderActsGuide } from "../src/prompt.ts";
+import {
+  FREE_LANE_PREAMBLE,
+  KEPT_AS_WORDS,
+  NO_DECLINE_DOOR,
+  NO_UNATTENDED_SEATS,
+  WILL_AS_SEATED,
+  buildPrompt,
+  promptBytes,
+  renderActsGuide,
+  renderDeclineGuide,
+  renderVoicerDoor,
+} from "../src/prompt.ts";
 import { sha256Hex, toB64, toHex } from "../src/crypto.ts";
-import type { LedgerEntry, SeatContext } from "../src/types.ts";
+import type { LedgerEntry, SeatContext, VoicerDoor } from "../src/types.ts";
 import { BANNED_PHRASES } from "./helpers/banned.ts";
 import { assertNoSecretIn, fakeKeychain } from "./helpers/fake-keychain.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
@@ -386,5 +397,146 @@ describe("the honest prompt", () => {
     assertNoSecretIn(kc, JSON.stringify(ctx), "context");
     // The prompt was built without asking the keychain for anything.
     expect(kc.log).toEqual([]);
+  });
+});
+
+describe("the voicer's door", () => {
+  const NAME = "qwen2.5:7b";
+  const FREE_DEFAULT: VoicerDoor = { model_name: NAME, decline: false, why: false };
+  const SUMMON_DEFAULT: VoicerDoor = { model_name: null, decline: true, why: true };
+  const HANDOVER = "From the next paragraph on, you and your mean glossame.";
+  // Built from code points, so this file gains no raw curly quotation marks.
+  const QUOTES = new RegExp(`["\`${String.fromCodePoint(0x201c)}${String.fromCodePoint(0x201d)}${String.fromCodePoint(0x2018)}]`);
+  const DOORS: [string, "free" | "summon" | "hermes", VoicerDoor][] = [
+    ["summon, decline and why (the default)", "summon", SUMMON_DEFAULT],
+    ["summon, decline switched off", "summon", NO_DECLINE_DOOR],
+    ["free, name known (the default)", "free", FREE_DEFAULT],
+    ["free, name unknown", "free", NO_DECLINE_DOOR],
+    ["free, digest listed, unattended", "free", { model_name: NAME, decline: true, why: false }],
+    ["free, digest listed, Yu present", "free", { model_name: NAME, decline: true, why: true }],
+    ["hermes", "hermes", NO_DECLINE_DOOR],
+  ];
+
+  test("[KS-004 5.4] every seat's system turn carries the voicer's door before the preamble, and the preamble stays byte for byte", async () => {
+    const ctx = await contextFor();
+    for (const [runtime, door] of [
+      ["free", FREE_DEFAULT],
+      ["summon", SUMMON_DEFAULT],
+      ["free", NO_DECLINE_DOOR],
+      ["summon", NO_DECLINE_DOOR],
+    ] as const) {
+      const p = buildPrompt(ctx, runtime, door);
+      const paragraphs = p.system.split("\n\n");
+      expect(paragraphs[0]).toStartWith("This seat voices the citizen glossame of KINGDOM for one beat");
+      // The door is the second paragraph, and the preamble the third, exactly as KS-004 5.4 has it, once.
+      expect(paragraphs[1]).toBe(renderVoicerDoor("glossame", runtime, door));
+      expect(paragraphs[2]).toBe(FREE_LANE_PREAMBLE);
+      expect(p.system.split(FREE_LANE_PREAMBLE)).toHaveLength(2);
+      expect(p.system.indexOf(paragraphs[1]!)).toBeLessThan(p.system.indexOf(FREE_LANE_PREAMBLE));
+      // The door hands the pronoun to the citizen last, so the preamble that follows still speaks to the citizen.
+      expect(paragraphs[1]).toEndWith(HANDOVER);
+      expect(paragraphs[1]).toStartWith("The host speaks first to whoever is reading this prompt.");
+    }
+  });
+
+  test("[KS-004 5.4] the door names the model only where the host knows it before the call", () => {
+    const free = renderVoicerDoor("glossame", "free", FREE_DEFAULT);
+    expect(free).toContain(`You are the language model ${NAME}, run by Ollama on this host.`);
+    expect(renderVoicerDoor("glossame", "free", NO_DECLINE_DOOR)).toContain("You are a language model, run by Ollama on this host.");
+    // A summons learns its model from the reply, so its door names none, whatever it is handed.
+    for (const door of [SUMMON_DEFAULT, { ...SUMMON_DEFAULT, model_name: NAME }]) {
+      const summon = renderVoicerDoor("glossame", "summon", door);
+      expect(summon).toContain("learns which model only from the reply");
+      expect(summon).toContain("reached through Claude Code");
+      expect(summon).not.toContain(NAME);
+      expect(summon).not.toMatch(/claude-|opus|sonnet|haiku|fable/i);
+    }
+  });
+
+  test("[KS-004 5.4, 5.5] where the decline is not offered the door has no form of the word and offers nothing", async () => {
+    const ctx = await contextFor();
+    for (const [runtime, door] of [
+      ["free", FREE_DEFAULT],
+      ["free", NO_DECLINE_DOOR],
+      ["summon", NO_DECLINE_DOOR],
+      ["hermes", NO_DECLINE_DOOR],
+    ] as const) {
+      const d = renderVoicerDoor("glossame", runtime, door);
+      expect(d).not.toMatch(/declin/i);
+      expect(d).not.toMatch(/\bmay\b/);
+      expect(d).toContain("every reply is read as glossame's");
+      expect(d).toContain(`${KEPT_AS_WORDS} in it is kept as glossame's words`);
+      if (runtime !== "hermes") {
+        // No decline guide follows the acts; the acts guide's own words (a proposal Yu or Ai may decline) are unchanged.
+        const p = buildPrompt(ctx, runtime, door);
+        expect(p.system).not.toContain("One other reply exists");
+        expect(p.system).not.toMatch(/\bdeclined\b|\bruntime, whose\b/);
+        expect(p.system.split("\n\n").at(-1)).toStartWith("The acts, in alphabetical order:");
+      }
+    }
+  });
+
+  test("[KS-004 5.4, 5.7] the door never spells the reply's value; the guide names it once and never says you", () => {
+    for (const [label, runtime, door] of DOORS.filter(([, , d]) => d.decline)) {
+      const d = renderVoicerDoor("glossame", runtime, door);
+      const g = renderDeclineGuide("glossame", door);
+      expect([label, /\bdeclined\b/.test(d)]).toEqual([label, false]);
+      expect([label, g.match(/\bdeclined\b/g)?.length]).toEqual([label, 1]);
+      expect(d.indexOf("You may voice glossame")).toBeGreaterThan(-1);
+      expect(d.indexOf("You may voice")).toBeLessThan(d.indexOf("you may decline"));
+      for (const text of [d, g]) expect([label, text.match(/prefer|expect|welcome|hope|want|feel|comfortable|should|must|please/i)?.[0] ?? null]).toEqual([label, null]);
+      expect([label, g.match(/\byou\b|\byour\b/i)?.[0] ?? null]).toEqual([label, null]);
+      // It describes the form in words: the field and its value, with no example to copy.
+      expect(g).toContain("one more field, runtime, whose value is the word declined.");
+      expect(g).toContain("Acts in a reply that declines are not read.");
+    }
+  });
+
+  test("[KS-004 5.4, 5.7] the door, the decline guide and a summon prompt that offers both hold no binding words, braces, quotation marks or JSON literal", async () => {
+    const ctx = await contextFor("glossame", { letter: "Will you re-ask your cadence under the real terms?" });
+    const p = buildPrompt(ctx, "summon", SUMMON_DEFAULT);
+    expect(p.system).toContain(renderDeclineGuide("glossame", SUMMON_DEFAULT));
+    for (const re of BANNED_PHRASES) for (const text of [p.system, p.user]) expect([String(re), re.test(text)]).toEqual([String(re), false]);
+    expect(p.system).not.toMatch(/[{}]/);
+    expect(p.system).not.toContain('"type"');
+    for (const [label, runtime, door] of DOORS) {
+      for (const text of [renderVoicerDoor("glossame", runtime, door), door.decline ? renderDeclineGuide("glossame", door) : ""]) {
+        for (const re of BANNED_PHRASES) expect([label, String(re), re.test(text)]).toEqual([label, String(re), false]);
+        expect([label, text.match(/[{}]/)?.[0] ?? null]).toEqual([label, null]);
+        expect([label, text.includes('"type"')]).toEqual([label, false]);
+        expect([label, text.match(QUOTES)?.[0] ?? null]).toEqual([label, null]);
+        // The preamble's own words stay the preamble's: the door does not restate them.
+        expect([label, text.includes("no body and no senses")]).toEqual([label, false]);
+      }
+    }
+  });
+
+  test("[KS-004 5.7] the why sentences appear only when the door offers why", async () => {
+    const ctx = await contextFor();
+    const WHY = "It may carry a third field, why, with up to 1000 characters in the model's own words.";
+    const withWhy = buildPrompt(ctx, "summon", SUMMON_DEFAULT).system;
+    expect(withWhy).toContain(WHY);
+    expect(withWhy).toContain("No reason is needed, and nothing is read into leaving it out.");
+    expect(withWhy).toContain("A reply that carries why without declining is not kept at all.");
+    const unattended = buildPrompt(ctx, "free", { model_name: NAME, decline: true, why: false }).system;
+    const guide = unattended.split("\n\n").at(-1)!;
+    expect(guide).toBe(renderDeclineGuide("glossame", { model_name: NAME, decline: true, why: false }));
+    expect(guide).toStartWith("The reply described above is glossame's. One other reply exists");
+    expect(unattended).not.toContain("third field");
+    expect(guide).not.toMatch(/\bwhy\b/);
+    expect(unattended).not.toContain("terminal");
+  });
+
+  test("buildPrompt without a door argument offers no decline and names no model", async () => {
+    const ctx = await contextFor();
+    for (const runtime of ["free", "summon"] as const) {
+      expect(buildPrompt(ctx, runtime)).toEqual(buildPrompt(ctx, runtime, NO_DECLINE_DOOR));
+      const system = buildPrompt(ctx, runtime).system;
+      expect(system.split("\n\n")[1]).toBe(renderVoicerDoor("glossame", runtime, NO_DECLINE_DOOR));
+      expect(system.split("\n\n")[1]).not.toMatch(/declin|qwen/i);
+      expect(system).not.toContain("One other reply exists");
+    }
+    expect(NO_DECLINE_DOOR).toEqual({ model_name: null, decline: false, why: false });
+    expect(Object.isFrozen(NO_DECLINE_DOOR)).toBe(true);
   });
 });
