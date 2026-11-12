@@ -155,7 +155,7 @@ const BEYOND_SELF_TARGETS = new Set<string>(["expression.porch"]);
 const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Siblings of self/ that the host keeps, and self/ subtrees that belong to named targets. */
-const RESERVED_DIRS = new Set(["ledger", "proposals", "receipts", "origin", "versions", "letters", "outbox", "seats", "expression", "skills"]);
+const RESERVED_DIRS = new Set(["ledger", "proposals", "receipts", "origin", "versions", "letters", "outbox", "seats", "legacy", "expression", "skills"]);
 /** Agent instruction files would load in any session opened on a mirror; run.sh and citizen.json are the host's. */
 const HOST_OWNED_NAMES = new Set(["claude.md", "agents.md", "gemini.md", "run.sh", "citizen.json"]);
 

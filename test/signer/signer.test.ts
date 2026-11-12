@@ -1012,6 +1012,30 @@ describe("secrets never leave", () => {
     const zoeme = await fx.signer.publicKeys("zoeme");
     expect(zoeme).toMatchObject({ op_b64: null, op_kid: null, root_b64: TEST_ROOT_PUBLIC_B64 });
   });
+
+  test("hostPublicKey returns the public half only, reads only host/attest-seed, and refuses with keychain-missing or keychain-locked", async () => {
+    const before = fx.kc.log.length;
+    const key = await fx.signer.hostPublicKey();
+    expect(key).toBe(toB64(edPublicKey(HOST_SEED)));
+    assertNoSecretIn(fx.kc, key, "hostPublicKey");
+    // One read, of the host's own seed: no citizen item, and no citizen record on disk is needed for it.
+    expect(fx.kc.log.slice(before)).toEqual([{ op: "read", item: "host/attest-seed" }]);
+    // The seed it was handed is wiped once the public half is derived.
+    expect(fx.handedOut.at(-1)!.every((b) => b === 0)).toBe(true);
+
+    fx.kc.locked = true;
+    const locked = await fx.signer.hostPublicKey().then(() => null, (e: unknown) => e);
+    expect(locked).toBeInstanceOf(Refusal);
+    expect((locked as Refusal).code).toBe("keychain-locked");
+    fx.kc.locked = false;
+
+    // A host that holds no host key says so, where state() still answers "ready" for it.
+    const empty = createSigner({ keychain: fakeKeychain(), config: fx.host.config, clock: fx.clock, fetch: fetchVia(fx.server), spendSoFar: (word) => fx.spend(word), agreements: async () => [] });
+    const missing = await empty.hostPublicKey().then(() => null, (e: unknown) => e);
+    expect(missing).toBeInstanceOf(Refusal);
+    expect((missing as Refusal).code).toBe("keychain-missing");
+    expect(await empty.state()).toBe("ready");
+  });
 });
 
 describe("birth's own steps, between enroll and the saved identity", () => {

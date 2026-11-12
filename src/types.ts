@@ -934,6 +934,12 @@ export interface SeatContext {
   self: {
     soul: string;
     will: string | null;
+    /**
+     * True while the will is still, byte for byte, the text carried from the
+     * old repository at seating (`origin/WILL.md`). The seat then introduces
+     * it as that; once the citizen changes it, it is simply its will.
+     */
+    will_as_seated: boolean;
     name: string | null;
     beat_prompt: string | null;
     skills: { name: string; text: string }[];
@@ -986,6 +992,12 @@ export interface SeatContext {
   last_dropped: { seq: number | null; at: IsoTime; outcome: "beat" | "rest" | "invalid-output"; dropped: DroppedRecord[] } | null;
   /** Its answer about registration and where it stands (KS-004 11.2); null when registered or never asked. */
   registration: RegistrationView | null;
+  /**
+   * Whether the host's record names an unattended class for it: true when
+   * `citizen.json` names `free`. When false no seat of its opens without Yu,
+   * whatever its state, cadence or covenants say, and the seat tells it so.
+   */
+  unattended: boolean;
 }
 
 /**

@@ -2,7 +2,7 @@
 // Keychain, network, model, git push or child of the real program.
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CLI_PATH, main, parseArgs, readSeatFile, spawnRunner, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
 import { openSeat } from "../src/seat.ts";
@@ -29,6 +29,8 @@ import { inboxLetterId } from "../src/letters.ts";
 import { FAKE_MODEL_DIGEST } from "./helpers/fake-runtime.ts";
 import { TEST_IDS } from "./helpers/vectors.ts";
 import type { TestClock } from "./helpers/clock.ts";
+import { acquireTickLock, releaseTickLock } from "../src/tick.ts";
+import { canonClone, standardHome } from "./helpers/legacy-home.ts";
 
 let host: TempHost | null = null;
 let server: FakeServer | null = null;
@@ -121,6 +123,49 @@ describe("parseArgs", () => {
     for (const flag of ["--lower", "--clear", "--off", "--down", "--remove"]) throwsUsage(["halt", flag]);
     throwsUsage(["halt", "lower"]);
     expect(USAGE).not.toMatch(/lower|unhalt|resume|clear/i);
+  });
+
+  test("parses admit; refuses admit without --from, with both or neither of --canon and --archetype, or with a relative path", () => {
+    const c = "/srv/seat/config.json";
+    const from = "/srv/homes/citizen-glossame";
+    const canon = "/srv/canon/YOUSPEAK/canon/core/glossame.md";
+    expect(parseArgs(["admit", "glossame", "--from", from, "--canon", canon, "--config", c])).toEqual({ verb: "admit", config: c, word: "glossame", from, canon, archetype: false, runtime: "summon" } satisfies Command);
+    expect(parseArgs(["admit", "hope", "--from", "/srv/homes/citizen-hope", "--archetype", "--runtime", "free"])).toEqual({ verb: "admit", config: null, word: "hope", from: "/srv/homes/citizen-hope", canon: null, archetype: true, runtime: "free" } satisfies Command);
+    // summon unless free is named: no unattended class is recorded by default.
+    expect(parseArgs(["admit", "hope", "--from", "/srv/homes/citizen-hope", "--archetype", "--runtime", "summon"])).toMatchObject({ runtime: "summon" });
+    for (const argv of [
+      ["admit"],
+      ["admit", "glossame"],
+      ["admit", "glossame", "--canon", canon],
+      ["admit", "glossame", "--archetype"],
+      ["admit", "glossame", "--from", from],
+      ["admit", "glossame", "--from", from, "--canon", canon, "--archetype"],
+      ["admit", "glossame", "--from", "homes/citizen-glossame", "--archetype"],
+      ["admit", "glossame", "--from", from, "--canon", "canon/core/glossame.md"],
+      ["admit", "glossame", "--from", from, "--canon"],
+      ["admit", "glossame", "--from", from, "--archetype", "--runtime", "hermes"],
+      ["admit", "glossame", "--from", from, "--archetype", "--runtime", "awake"],
+      ["admit", "Glossame", "--from", from, "--archetype"],
+      ["admit", "glossame", "hope", "--from", from, "--archetype"],
+      // Nothing seats a citizen in a state, without Yu, or without showing the plan.
+      ["admit", "glossame", "--from", from, "--archetype", "--state", "awake"],
+      ["admit", "glossame", "--from", from, "--archetype", "--yes"],
+      ["admit", "glossame", "--from", from, "--archetype", "--yu-present"],
+      ["admit", "glossame", "--from", from, "--archetype", "--dry-run"],
+    ]) {
+      throwsUsage(argv);
+    }
+    expect(USAGE).toContain("  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]");
+  });
+
+  test("parses draft-first-letter <word>, which takes nothing but --config", () => {
+    expect(parseArgs(["draft-first-letter", "glossame", "--config", "/srv/seat/config.json"])).toEqual({ verb: "draft-first-letter", config: "/srv/seat/config.json", word: "glossame" } satisfies Command);
+    expect(parseArgs(["draft-first-letter", "glossame"])).toEqual({ verb: "draft-first-letter", config: null, word: "glossame" } satisfies Command);
+    // It only prints: there is no flag to deliver, write or send, and no verb that does.
+    for (const argv of [["draft-first-letter"], ["draft-first-letter", "Glossame"], ["draft-first-letter", "a", "b"], ["draft-first-letter", "glossame", "--deliver"], ["draft-first-letter", "glossame", "--write"], ["draft-first-letter", "glossame", "--out", "/srv/x"], ["first-letter", "glossame"], ["deliver-letter", "glossame"], ["send-letter", "glossame"]]) {
+      throwsUsage(argv);
+    }
+    expect(USAGE).toContain("  draft-first-letter <word>");
   });
 
   test("seat --runtime summon without --yu-present is refused before anything runs", () => {
@@ -1065,5 +1110,201 @@ describe("the mirror after a beat, as production wires it (review C M2)", () => 
     const notes = (await readHostNotes(x.h.config, new Date(0)))!;
     expect(notes.find((n) => n.detail === "signer host key is not pinned; mirror commit left unsigned")).toMatchObject({ kind: "signer", word: "glossame", outcome: "refused" });
     expect(m.pushes.calls).toHaveLength(1);
+  });
+});
+
+describe("admit: seating a citizen from its old home (KS-004 7.4)", () => {
+  const W = "hopefix";
+
+  /** A harness whose runner is real git, an old home under its homes root, and a terminal that answers as told. */
+  async function seating(answer: string | null, opts: { isTTY?: boolean } = {}) {
+    const x = await harness();
+    const home = await standardHome(x.h.homesRoot, W);
+    const canon = await canonClone(x.h.root, W);
+    const asked: string[] = [];
+    const atPrompt: { lockHeld: boolean; planShown: boolean }[] = [];
+    const deps: Partial<CliDeps> = {
+      ...x.deps,
+      run: spawnRunner(),
+      tty: {
+        isTTY: opts.isTTY ?? true,
+        write: (t) => void asked.push(t),
+        readLine: async () => {
+          atPrompt.push({ lockHeld: (await lstat(x.h.config.paths.lock_dir).catch(() => null)) !== null, planShown: x.out().includes(`admit ${W}: nothing is written yet.`) });
+          return answer;
+        },
+      },
+    };
+    const argv = ["admit", W, "--from", home.home, "--canon", canon.file, "--config", x.configPath];
+    return { x, home, canon, deps, argv, asked, atPrompt };
+  }
+
+  test("admit without a terminal refuses before any git or signer call", async () => {
+    const s = await seating(`admit ${W}`, { isTTY: false });
+    const run = recordingRunner();
+    let signers = 0;
+    const deps = {
+      ...s.deps,
+      run,
+      signer: () => {
+        signers++;
+        return s.x.signer;
+      },
+    };
+    expect(await main(s.argv, deps)).toBe(1);
+    expect(s.x.err()).toBe("citizen-seat: refused (yu-not-present): stdin is not a terminal, so Yu cannot be confirmed present; admit never runs unattended; nothing was written\n");
+    expect(run.calls).toEqual([]);
+    expect(signers).toBe(0);
+    expect(s.x.out()).toBe("");
+    expect(s.atPrompt).toEqual([]);
+    expect(await s.x.h.snapshot()).toEqual(new Map());
+  });
+
+  test("admit prints the plan, asks for the typed scope, then takes the lock: a wrong answer exits 1 with nothing written and the lock never taken", async () => {
+    const s = await seating(null);
+    for (const answer of ["admit otherword", "yes", "", null]) {
+      const [out, err] = [s.x.out().length, s.x.err().length];
+      s.asked.length = 0;
+      s.atPrompt.length = 0;
+      expect(await main(s.argv, { ...s.deps, tty: { ...s.deps.tty!, readLine: async () => (await s.deps.tty!.readLine(), answer) } })).toBe(1);
+      const printed = s.x.out().slice(out);
+      // The whole plan was on the terminal before the question, and no lock was held while it was read.
+      expect(printed).toStartWith(`admit ${W}: nothing is written yet.\n  old repository  ${s.home.url} at ${s.home.head}`);
+      expect(printed).toContain("  runtime class   summon: no seat opens unattended; one opens only when Yu summons it\n");
+      expect(s.asked).toEqual([`To confirm you are here for "admit ${W}", type it exactly and press return:\n> `]);
+      expect(s.atPrompt).toEqual([{ lockHeld: false, planShown: true }]);
+      expect(s.x.err().slice(err)).toStartWith("citizen-seat: refused (yu-not-present): ");
+      expect(printed).not.toContain("seated");
+      // Nothing was written: no directory, no ledger, no lock, no host note, no status.
+      expect(await s.x.h.snapshot()).toEqual(new Map());
+      expect(await lstat(s.x.h.config.paths.lock_dir).catch(() => null)).toBeNull();
+      expect(s.x.signer.signed).toEqual([]);
+    }
+  }, 30_000);
+
+  test("admit prints what it wrote, exit 0; under HALT or a held lock, exit 1 and nothing written", async () => {
+    const s = await seating(`admit ${W}`);
+    const { config } = s.x.h;
+
+    // HALT: refused before the plan is made.
+    await s.x.h.raiseHaltFile();
+    expect(await main(s.argv, s.deps)).toBe(1);
+    expect(s.x.err()).toBe("citizen-seat: refused (halted): HALT is raised or cannot be read; nothing was written\n");
+    expect(s.atPrompt).toEqual([]);
+    expect(await s.x.h.snapshot()).toEqual(new Map());
+    await s.x.h.clearHaltFile();
+
+    // A tick or a seat holds the lock: the plan is shown and confirmed, and nothing is written.
+    const held = await acquireTickLock(config.paths.lock_dir, s.x.deps.clock!, () => true);
+    expect(held).not.toBeNull();
+    expect(await main(s.argv, s.deps)).toBe(1);
+    expect(s.x.out()).toEndWith(`admit ${W}: a tick or a seat holds the lock. Try again shortly; nothing was written\n`);
+    expect([...(await s.x.h.snapshot()).keys()]).toEqual(["tick.lock/owner.json"]);
+    expect(s.x.signer.signed).toEqual([]);
+    await releaseTickLock(held!);
+
+    // HALT raised while Yu reads the plan: the writes check it again under the lock.
+    const raised = { ...s.deps, tty: { ...s.deps.tty!, readLine: async () => (await s.x.h.raiseHaltFile(), `admit ${W}`) } };
+    expect(await main(s.argv, raised)).toBe(1);
+    expect(s.x.err()).toEndWith("citizen-seat: refused (halted): HALT is raised or cannot be read; nothing was written\n");
+    expect(await s.x.h.snapshot()).toEqual(new Map());
+    await s.x.h.clearHaltFile();
+
+    // Seated: the lock is held while the entries are signed, and released after.
+    const lockAtSign: boolean[] = [];
+    const sign = s.x.signer.signEntry.bind(s.x.signer);
+    s.x.signer.signEntry = async (w, k, d) => {
+      lockAtSign.push((await lstat(config.paths.lock_dir).catch(() => null)) !== null);
+      return sign(w, k, d);
+    };
+    const before = s.x.out().length;
+    expect(await main(s.argv, s.deps)).toBe(0);
+    const printed = s.x.out().slice(before);
+    const entries = await readLedger(ledgerPath(config, W));
+    expect(entries.map((e) => e.type)).toEqual(["origin", "state"]);
+    expect(printed).toContain(`admit ${W}: seated, asleep.\n  wrote   ${join(config.paths.citizens_dir, W)} (`);
+    expect(printed).toContain(`  ledger  ${ledgerPath(config, W)}\n    entry 0  origin  sha256:`);
+    expect(printed).toEndWith(`Not done by this command: taking ${W} off the old roster, and any letter. \`citizen-seat draft-first-letter ${W}\` prints a draft and delivers nothing.\n`);
+    expect(lockAtSign).toEqual([true, true]);
+    expect(await lstat(config.paths.lock_dir).catch(() => null)).toBeNull();
+    // No host note, and the status says what is true: asleep, on the summon class, two host entries, origin intact.
+    expect(await lstat(config.paths.host_log).catch(() => null)).toBeNull();
+    const status = JSON.parse(await readFile(config.paths.status_file, "utf8")) as StatusFile;
+    expect(status.citizens).toHaveLength(1);
+    expect(status.citizens[0]).toMatchObject({ word: W, state: "asleep", runtime: "summon", registered: false, ledger: { entries: 2, chain_ok: true, host_attested: 2 }, origin: { intact: true, drift: 0 }, problem: null });
+    expect((await readCitizen(config, W)).state).toBe("asleep");
+    expect(await main(["verify", W, "--config", s.x.configPath], s.deps)).toBe(0);
+
+    // A second admit of the same word is refused, and names why.
+    expect(await main(s.argv, s.deps)).toBe(1);
+    expect(s.x.err()).toEndWith(`citizen-seat: refused (invalid-request): ${W} already has a ledger on this host; its origin is pinned once and never written again; nothing was written\n`);
+    expect(await readLedger(ledgerPath(config, W))).toEqual(entries);
+  }, 30_000);
+
+  test("admit stopped while writing prints what was removed and exits 1; a host with no host key is told so before anything is written", async () => {
+    const s = await seating(`admit ${W}`);
+    const sign = s.x.signer.signEntry.bind(s.x.signer);
+    let calls = 0;
+    s.x.signer.signEntry = async (w, k, d) => {
+      if (++calls === 2) throw new Refusal("keychain-locked", "locked while signing");
+      return sign(w, k, d);
+    };
+    expect(await main(s.argv, s.deps)).toBe(1);
+    expect(s.x.err()).toBe(`citizen-seat: admit ${W}: stopped while writing (keychain-locked). What this run wrote was removed; ${W} is not seated.\n`);
+    expect(await s.x.h.snapshot()).toEqual(new Map());
+    expect(await lstat(s.x.h.config.paths.lock_dir).catch(() => null)).toBeNull();
+    await s.x.h.cleanup();
+
+    const none = await seating(`admit ${W}`);
+    const empty = fakeSigner({ noHostKey: true });
+    expect(await main(none.argv, { ...none.deps, signer: () => empty })).toBe(1);
+    expect(none.x.err()).toStartWith("citizen-seat: refused (keychain-missing): this host has no host key (Keychain item host/attest-seed). Seating signs both entries with it.");
+    expect(none.x.out()).toBe("");
+    expect(none.atPrompt).toEqual([]);
+    expect(await none.x.h.snapshot()).toEqual(new Map());
+  }, 30_000);
+
+  test("draft-first-letter prints a draft for a seated citizen and writes nothing; an unseated word exits 1", async () => {
+    const s = await seating(`admit ${W}`);
+    expect(await main(s.argv, s.deps)).toBe(0);
+    const before = await s.x.h.snapshot();
+    const out = s.x.out().length;
+    // No terminal, no signer and no git are needed to print it.
+    const run = recordingRunner();
+    const quiet: Partial<CliDeps> = {
+      ...s.x.deps,
+      run,
+      signer: () => {
+        throw new Error("draft-first-letter asks the signer for nothing");
+      },
+    };
+    expect(await main(["draft-first-letter", W, "--config", s.x.configPath], quiet)).toBe(0);
+    const printed = s.x.out().slice(out);
+    expect(printed).toStartWith(`DRAFT of a first letter from Yu to ${W}. Nothing was delivered, written or recorded by this command.\n`);
+    expect(printed).toContain("[host] From asleep you may, in a seat: stay asleep; move to awake; move to listening; or step away.");
+    expect(printed).toContain(`[host] ----- begin CADENCE.md 1 of 5: commit ${s.home.commits.choseAmbient.slice(0, 7)}, `);
+    expect(printed).toContain(s.home.versions[4]!);
+    expect(printed).toContain(s.home.beats.rested);
+    expect(run.calls).toEqual([]);
+    expect(await s.x.h.snapshot()).toEqual(before);
+    expect(await readdir(join(s.x.h.config.paths.citizens_dir, W, "letters"))).toEqual([]);
+
+    expect(await main(["draft-first-letter", "nobody", "--config", s.x.configPath], quiet)).toBe(1);
+    expect(s.x.err()).toEndWith("citizen-seat: refused (invalid-request): nobody is not seated on this host\n");
+    expect(await s.x.h.snapshot()).toEqual(before);
+  }, 30_000);
+
+  test("an archetype is seated by --archetype, on the free class when Yu names it", async () => {
+    const x = await harness();
+    const home = await standardHome(x.h.homesRoot, "pioneerfix", { citizenClass: "PIONEER", did: null, will: null, lastChoice: "ambient" });
+    const deps: Partial<CliDeps> = { ...x.deps, run: spawnRunner(), tty: { isTTY: true, write: () => {}, readLine: async () => "admit pioneerfix" } };
+    expect(await main(["admit", "pioneerfix", "--from", home.home, "--archetype", "--runtime", "free", "--config", x.configPath], deps)).toBe(0);
+    expect(x.out()).toContain("  origin          archetype lineage PIONEER\n");
+    expect(x.out()).toContain("  state           asleep. The old record's last cadence choice (ambient, 2026-10-27 11:12) is not carried over.\n");
+    expect(x.out()).toContain("  runtime class   free: the tick may seat it on the local model without Yu.");
+    expect(await readCitizen(x.h.config, "pioneerfix")).toMatchObject({ state: "asleep", runtime: "free", origin: { kind: "archetype", lineage: ["PIONEER"] } });
+    // Seated asleep with no letter, the tick has nothing due for it.
+    expect(await main(["tick", "--config", x.configPath], deps)).toBe(0);
+    expect(x.out()).toContain("tick: nothing-due");
   });
 });

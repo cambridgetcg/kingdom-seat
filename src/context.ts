@@ -285,9 +285,15 @@ export async function readSelf(config: Config, citizen: Citizen): Promise<SeatCo
   const expression = join(self, "expression");
   const hasExpression = await realDirExists(expression, "self/expression/");
   const expr = (name: string) => (hasExpression ? readOptional(join(expression, name), READ_LIMITS.self_file_bytes) : Promise.resolve(null));
+  const will = await readOptional(join(self, "WILL.md"), READ_LIMITS.self_file_bytes);
+  // The will as it was carried at seating is pinned beside the origin soul. Comparing the two texts is exact after a
+  // revert and after a hand edit alike. A citizen seated another way has no such pin, and its will is simply its will.
+  const origin = join(dir, "origin");
+  const pinned = will !== null && (await realDirExists(origin, "origin/")) ? await readOptional(join(origin, "WILL.md"), READ_LIMITS.self_file_bytes) : null;
   return {
     soul,
-    will: await readOptional(join(self, "WILL.md"), READ_LIMITS.self_file_bytes),
+    will,
+    will_as_seated: will !== null && pinned === will,
     name: await readOptional(join(self, "NAME.md"), READ_LIMITS.self_file_bytes),
     beat_prompt: await readOptional(join(self, "beat-prompt.md"), READ_LIMITS.self_file_bytes),
     skills: await readSkills(join(self, "skills")),
@@ -394,6 +400,7 @@ export async function buildContext(
     recipients: [...(opts.recipients ?? HOST_RECIPIENTS)],
     last_dropped: lastDropped,
     registration: opts.registration ?? null,
+    unattended: citizen.runtime === "free",
   };
 }
 

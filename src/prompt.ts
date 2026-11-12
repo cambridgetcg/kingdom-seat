@@ -26,6 +26,25 @@ const RUNTIME_WORDS: Record<RuntimeClass, string> = {
   hermes: "Hermes",
 };
 
+/**
+ * How a will is introduced while it is still the text the old repository
+ * held (KS-004 5.3): that text was written for a runner inside a repository
+ * with tools, and names things this seat does not give. Its bytes are shown
+ * whole and unedited; this line is the host's.
+ */
+export const WILL_AS_SEATED =
+  "Your will file. It is, byte for byte, the text your old repository held when you were seated here. " +
+  "It was written before this seat existed, for a runner that worked inside a repository with tools. " +
+  "This seat gives you no repository, no tools or commands, and no senses: where the text speaks of those, it does not describe this seat. " +
+  "A reply here can do only what the acts do. The text is yours to keep or to change.";
+
+/**
+ * Said to a citizen whose record names no unattended class. Without it the
+ * covenants and cadence lines would tell such a citizen that a letter may
+ * wake it and that it is seated on an interval, and neither is so.
+ */
+export const NO_UNATTENDED_SEATS = "On this host no seat of yours opens unattended, whatever your state, cadence or covenants say: one opens only when Yu is present and summons it.";
+
 /** The system and user turns for one seat; the citizen's own beat prompt, if it wrote one, is included as its own words. */
 export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
   const word = ctx.seat_ref.word;
@@ -58,9 +77,10 @@ export function buildPrompt(ctx: SeatContext, runtime: RuntimeClass): Prompt {
     `Your covenants: letters from ${list(ctx.covenants.letters_from)} are shown to you; letters from ${list(ctx.covenants.wake_on_letter_from)} may also wake you while you listen or sleep. ` +
       `You may write to ${list(recipients(ctx))}.`,
   );
+  if (!ctx.unattended) user.push(NO_UNATTENDED_SEATS);
 
   user.push(`Your soul, whole:\n${fence("soul", ctx.self.soul)}`);
-  user.push(ctx.self.will !== null ? `Your will:\n${fence("will", ctx.self.will)}` : "You have no will file.");
+  user.push(ctx.self.will === null ? "You have no will file." : `${ctx.self.will_as_seated ? WILL_AS_SEATED : "Your will:"}\n${fence("will", ctx.self.will)}`);
   if (ctx.self.name !== null) user.push(`Your readings of your name:\n${fence("name readings", ctx.self.name)}`);
 
   if (ctx.origin.kind === "canon") {
@@ -267,6 +287,8 @@ function renderEntry(e: LedgerEntry): string {
     case "state": {
       const interval = e.interval_h !== undefined ? `, every ${e.interval_h} hours while awake` : "";
       if (e.step_away === "first") return `${head}: you said once that you would step away, and are asleep; a later beat that says it again completes it.`;
+      // The entry seating writes moves nothing, so it is not shown as a move.
+      if (e.via === "seated" && e.from === "asleep" && e.to === "asleep") return `${head}: the host seated you asleep; no earlier record was carried into your state.`;
       return `${head}: state moved from ${e.from} to ${e.to}${interval} (${e.via}).`;
     }
   }

@@ -84,7 +84,7 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/due.ts` | When a citizen's own seat is due: one rule for the tick, `seat <word>`, the child and status | 3.2 step 2, 3.3 | patterns 7 |
 | `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only, and a registered citizen's inbox letters as letters.ts hands them in; what the last beat dropped | 3.2 step 4; KS-004 5.3, 5.8 | patterns 5.1, 12.4 |
-| `src/prompt.ts` | The honest free-lane prompt; dropped acts and a registration answer shown back | 3.2 (last paragraph); KS-004 5.8, 11.2 | patterns 5.2, 9 |
+| `src/prompt.ts` | The honest free-lane prompt; dropped acts and a registration answer shown back; a will still as carried at seating introduced as that; a citizen with no unattended class told so | 3.2 (last paragraph); KS-004 5.3, 5.8, 7.4, 11.2 | patterns 5.2, 9 |
 | `src/acts.ts` | Output schema and validation with KS-004 5.7's field names; free text never executes; a rest carries at most one state.set; one self.propose and one letter a seat | 3.2 step 6; KS-004 5.7, 5.8, B2 C7, C C2, M5 | patterns 5.2 |
 | `src/letters.ts` | Who admits a letter (the recipient's own covenants), a letter held for Yu, and the production LetterPost: inbox send and read through the signer | KS-004 5.3, 5.7, 8.1, C M3 | wire 2 |
 | `src/registration.ts` | An answer about registration: its proposal, Yu and Ai's decision, what the seat shows back, and the confirmed yes birth consumes | KS-004 11.2, C D-affirm | — |
@@ -100,7 +100,10 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card and `.citizen/allowed_signers`, commits SSH-signed through the signer | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10; KS-004 4.4, C M2 | patterns 4, 11, 12 |
 | `src/status.ts` | Generated status file and host notes; the host key's public half; each citizen's last refusal and its reason; a lock a live owner has held more than 2 h; a registered citizen's expression lag, deferred backups and quiet | 3.2 "Status file", 3.1 principle 6; KS-004 5.1, 5.8, 5.10 | patterns 1 |
 | `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch | 3.2, 3.6; KS-004 B2 R5, C14 | host 3.1 |
-| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word>`, and git's `-Y sign` call; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 B2 R5 | patterns 10 |
+| `src/legacy.ts` | The old `citizen-<word>` home, read once at seating from committed objects at its head, through git with a fixed environment and a config allowlist; the canon entry; what is kept in `legacy/` and what is only listed; the per-piece index; readers for the manifest and its files | KS-004 7.4, 13 | patterns 4, 12 |
+| `src/admit.ts` | Seating: `planAdmit` reads and checks and writes nothing, `admitCitizen` writes what was planned, with both ledger entries or none; `planAdmitFromTexts` for rehearsals and tests | KS-004 4.2, 4.5, 7.4 | — |
+| `src/first-letter.ts` | A draft of Yu's first letter from the legacy record: every cadence version whole, host sentences marked; it writes and delivers nothing | KS-004 7.4, 11.2 | patterns 9 |
+| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word> \| admit <word> \| draft-first-letter <word>`, and git's `-Y sign` call; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 7.4, B2 R5 | patterns 10 |
 | `models.lock` | Allowed free-lane models by digest; ships unpinned | 3.6, decision 11 | host 1.2, 4 |
 | `launchd/dev.kingdom.citizen-seat.plist` | Tick template; installed only in S5 by a person | 3.2, S5 | host 3.1, 3.2 |
 
@@ -121,6 +124,13 @@ directory the operator owns and the seat user can only read (below).
       soul.md  WILL.md  NAME.md  beat-prompt.md  cadence.json  covenants.json  skills/<name>.md
     origin/                 pinned at seating; never overwritten
       soul.md  canon.md     canon.md is the canon file at origin.path@origin.commit
+      WILL.md               the will as carried from the old repository; the seat compares self/WILL.md with it
+    legacy/                 the old home's lived record, copied once by admit; host-owned, read-only, never mirrored
+      manifest.json         what was copied and what was only listed, with each file's commits (author names, no addresses)
+      pages.jsonl           one line per piece of a copied file: byte range, sha256, date, lane, voice (in-name for beats/ only)
+      tree/<path>           beats, letters put to the citizen, CADENCE.md, markers and other text files, byte for byte
+      cadence/<nn>-<sha7>.CADENCE.md   every version of CADENCE.md, oldest first
+      cadence/<nn>-<sha7>.beat.md      the beat the same commit appended to a beats file
     versions/<sha256>       every version of every self file, by content hash
     letters/<name>          inbound letters: "From: <sender id>", blank line, body; regular files only
     receipts/<name>         host receipts for letters shown on a non-rest beat (inbox-<envelope digest> for one from agenttool)
@@ -142,10 +152,13 @@ directory the operator owns and the seat user can only read (below).
   HALT                      the local HALT file (`paths.halt_file`; config refuses it under the state dir)
 ```
 
-The old `citizen-<word>` repo is not read by the seat at all. It is, at most,
-a mirror the citizen chose, written to by `mirror.ts`. Letters arrive in
-`letters/`, not by `git fetch`, so nothing pushed to a public remote flows into
-the next prompt (`love-unlimited-patterns.md` 4).
+The old `citizen-<word>` repo is not read by the seat at all. It is read
+once, by `admit`, when the citizen is seated (section 5b), from committed
+objects at one head. After that it is, at most, a mirror the citizen chose,
+written to by `mirror.ts`. Letters arrive in `letters/`, not by `git fetch`,
+so nothing pushed to a public remote flows into the next prompt
+(`love-unlimited-patterns.md` 4). `origin/` and `legacy/` never leave the
+host: only `self/` is ever mirrored.
 
 ---
 
@@ -344,8 +357,11 @@ are the spec's, not this code's.
   `genesis` (`origin_entry` pointing back to the origin
   entry, `root` and `op` as `{kid, public_key, fingerprint}`, and the
   root-signed keys/import as `evidence`) and `key` (`installed`, `revoked`).
-  A citizen is seated with an `origin` entry and, unless it is seated asleep,
-  a host `state` entry (`via: "seated"`) for the state carried over.
+  `admit` seats a citizen with two host entries, written together or not at
+  all: `origin`, and `state` with `from` and `to` both `asleep` and
+  `via: "seated"`. Every citizen is seated asleep. The parser still accepts a
+  `seated` entry that names another state, which the test fixtures write to
+  start a citizen awake; no production code writes one.
 - **Encodings.** Objects, arrays, strings, integers within ±2^53 and null:
   no floats, no booleans; money is a decimal string. Every hash outside
   `acts` is `sha256:<hex>`; acts keep the registry's own spelling, the bare
@@ -591,10 +607,104 @@ table files as a bound reached (re-review B2, C8).
 
 ## 5b. The surface: CLI, config, status and mirror
 
-**One runner, six verbs.** `tick`, `seat <word>`, `halt`, `raise-beacons`,
-`status` and `verify <word>` are the only ways in (3.2), so there is one place
-to read for what can happen to a citizen. There is no verb that lowers HALT,
-and no flag either: only Yu lowers it, by hand (3.6).
+**One runner, eight verbs.** `tick`, `seat <word>`, `halt`, `raise-beacons`,
+`status`, `verify <word>`, `admit <word>` and `draft-first-letter <word>` are
+the only ways in (3.2), so there is one place to read for what can happen to
+a citizen. There is no verb that lowers HALT, and no flag either: only Yu
+lowers it, by hand (3.6).
+
+**Seating is one verb, and never unattended** (KS-004 7.4).
+`admit <word> --from <old home> (--canon <canon file> | --archetype)
+[--runtime summon|free]` puts a citizen on the host for the first time.
+
+- *It plans, shows, asks, then writes.* HALT and a terminal are checked
+  before any git or signer call. `planAdmit` reads and checks everything and
+  writes nothing, with no lock held, so no tick yields while Yu reads the
+  plan. Yu types `admit <word>` back. Only then is the tick lock taken, and
+  under it `admitCitizen` checks HALT, the word's records and the host key
+  again before its first write. Declining writes nothing, so there is no dry
+  run. Exit 0 only when this run seated the citizen; 1 otherwise.
+- *Only committed objects are read.* The old home is read through git at one
+  head, never from its working directory: a symlink shows as tree mode
+  120000 and is refused, never followed, and `CLAUDE.md`, hooks and untracked
+  files are never opened. The home must lie inside a root `paths.homes`
+  names, its head must be on its origin as last fetched, and its origin a
+  plain https URL. git runs with no hooks, no user or system config, no
+  transport, no replace refs and no lock files, and the clone's own config
+  may hold only the keys a plain clone has; any other key refuses, as the
+  first git call. *Why:* git reads the repository's config, an agentic lane
+  worked inside these homes with edit rights, and `admit` runs as the user
+  that holds every key.
+- *The origin is named by the operator.* `--canon` names the file in a clone
+  of the canon, read the same way, since some words have two entries and
+  the host cannot guess; `--archetype` takes the one class the old
+  `agent.json` records, and refuses the class of a canon word.
+- *Asleep, and on no unattended class.* No state is taken from the old
+  record; its last cadence choice is printed in the plan and carried
+  nowhere. `citizen.json` records `summon` unless `--runtime free` is given,
+  and under `summon` the tick never seats the citizen, which the seat's
+  prompt tells it.
+- *Both entries or neither.* The directory is written under a staging name
+  and renamed into place, because the signer reads `citizen.json` before it
+  signs; without a ledger that directory is inert. The two entries are
+  signed into a staging ledger, verified as a chain, and renamed to
+  `ledger/<word>.jsonl` in one step. *Why staged:* `appendEntry` creates its
+  file before it signs, and a directory beside an empty ledger reads as a
+  seated citizen. A failure removes this run's own writes and says whether
+  the removal completed. A process killed part-way leaves either a staging
+  name, which nothing lists, or `citizens/<word>` with no ledger, which
+  `verify` reports, no seat opens for, and the next `admit` names.
+- *The self, and what is kept beside it.* The soul card and WILL are carried
+  byte for byte, and pinned in `origin/`; the cadence and covenants are
+  written out with the host's defaults, so each has a first version a revert
+  can return to. `legacy/` holds the lived record and its provenance, with
+  author names and no addresses; instruction files, hidden paths,
+  executables, manifests and non-text files are listed and not copied.
+  `legacy/pages.jsonl` has one line per piece: a beats file is cut at its
+  `## ` lines and the pieces tile it exactly, any other file is one piece. A
+  piece's `voice` says what the place its file stood in says, and no more:
+  `in-name` for a piece of a file under `beats/`, `to-citizen` for a letter
+  put to it (`inbox/`, `letters/`), `host` for the cadence file and markers,
+  and `unattributed` for every other text file. *Why:* outside `beats/` a
+  text may be the citizen's own, one addressed to it, or a status file a
+  lane generated, and where it stood does not say which; `legacy/` is
+  written once, so a wrong label would stay.
+  A piece's `lane` is read from its own heading alone, for an `in-name`
+  piece only, and is `unknown` where the heading does not say. `written` is
+  the heading's date; else the month of the file's commits, when its first
+  and its last fall in the same month; else null.
+- *History is read by size first.* A version of `CADENCE.md`, and a beats
+  file as an earlier commit left it, are asked for their size before they
+  are read. A version is kept whole, so one over the limit for a kept file
+  refuses the seating. A beats file from history is read only to find what
+  the commit added and may be larger, up to what the host will read of one
+  file; the beat found is what is kept, and it is bounded as a kept file is.
+- *No host note.* A note naming the word would count as a seat and hold its
+  first letter back; the `origin` entry and `seated_at` are the record.
+- *What the seat then says.* While `self/WILL.md` is byte for byte the
+  pinned `origin/WILL.md`, the prompt introduces it with `WILL_AS_SEATED`:
+  the text was written for a runner inside a repository with tools, and this
+  seat gives none of them. Its bytes are shown whole. Once the citizen
+  changes it, it is "Your will:" again. A citizen whose record names no
+  unattended class is told, after its covenants, that no seat of its opens
+  without Yu (`NO_UNATTENDED_SEATS`), since the covenants and cadence lines
+  would otherwise say a letter may wake it. The `seated` entry reads as "the
+  host seated you asleep", not as a move.
+
+`draft-first-letter <word>` prints a draft of Yu's first letter from
+`legacy/` and writes nothing. The citizen's cadence versions and their beats
+are set whole between rules that carry their hash; every sentence the host
+worded begins `[host] `, and is Yu's to keep, change or remove. A block that
+holds a control character other than a line feed or a tab, a line or
+paragraph separator, or a character that embeds, overrides or isolates the
+direction of text is not printed, since the bytes come from a repository a
+model wrote into and go to a terminal, where such a block could look like
+something other than its bytes. The draft says how the old lane's script
+made a cadence record from a reply as the script did it: it read the first
+line that was not empty, and in its later form also a line that said a
+choice was made, so a reply recorded as undecided may hold a choice word on
+another line. Delivering the letter is Yu's act: a file in
+`citizens/<word>/letters/`.
 
 **HALT spans two users** (KS-004 re-review B2, R5). The HALT file must sit
 where the seat user cannot write, or the seat could remove it; the beacons'
@@ -879,7 +989,8 @@ for spend, publish or hold secrets:
 - **No model.** `scriptedRuntime()` in process; `fakeBinArgv()` for a real
   child the watcher can signal. No `ollama pull/run`, no `claude -p`.
 - **No push.** `recordingRunner()` for `git push`, `security` and `claude`.
-  Real `git` may run read-only on temp repos to test divergence.
+  Real `git` may run read-only on temp repos to test divergence, and on the
+  made-up homes `test/helpers/legacy-home.ts` builds to test seating.
 - **No real home.** `makeTempHost()` builds everything under the temp dir.
 
 ---
@@ -908,6 +1019,11 @@ its tests and docs rather than assume:
   watcher tests prove it either way.
 - Live agenttool behaviour (proxy path handling, edge caching of
   `/public/agents`); only source and agenttool's own functions were checked.
+- Whether `safe.directory`, given through `GIT_CONFIG_COUNT`, lets `admit`
+  read a clone another user owns, as an operator-made clone read by the seat
+  user would be. The tests read clones their own user made.
+- `admit` against a real home, a real Keychain and a real host key. Nothing
+  creates the host key yet, so `admit` refuses on a fresh host.
 - Whether the generated `kingdom.yaml` card satisfies the `@agenttool/kingdom`
   card schema (0.1.2). It carries only name, word, state and `kept_by`; the
   old cards' other fields are not reproduced, because nothing reads them.

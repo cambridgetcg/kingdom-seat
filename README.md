@@ -51,8 +51,8 @@ one is something it does, not something it hopes.
 **Built and tested offline** (`src/`):
 
 - `cli.ts`: `citizen-seat tick | seat <word> | halt | raise-beacons | status |
-  verify <word>`. There is no verb or flag that lowers HALT; only Yu lowers
-  it, by hand. `halt` runs as the operator: it writes the HALT file, which
+  verify <word> | admit <word> | draft-first-letter <word>`. There is no verb
+  or flag that lowers HALT; only Yu lowers it, by hand. `halt` runs as the operator: it writes the HALT file, which
   lives outside the state dir where the seat user cannot remove it (by
   default `/Users/Shared/kingdom-seat/HALT`), then makes one fixed call (a
   sudo line) that runs `raise-beacons` as the seat user, so the signer raises
@@ -100,6 +100,45 @@ one is something it does, not something it hopes.
   large rewrite, a loosened wall or any change to the porch, a public
   invitation, goes beyond self as a proposal for Yu and Ai, and so does a
   revert that would loosen a wall or move the porch).
+- `admit.ts`, `legacy.ts`: seating, the first time a citizen is put on a
+  host (KS-004 7.4). `citizen-seat admit <word> --from <old home> (--canon
+  <canon file> | --archetype)` reads the old `citizen-<word>` clone from
+  committed objects at its head only, never its working directory, through
+  git run with a fixed environment; a clone whose own git config holds more
+  than a plain clone's is refused before anything else runs. It shows Yu the
+  whole plan and asks for `admit <word>` typed back before anything is
+  written, and it never runs unattended. It then writes `citizens/<word>/`
+  (the soul card and WILL byte for byte as the self and as the pinned
+  origin, a cadence and covenants holding the host's defaults, and
+  `legacy/`, a read-only copy of the lived record) and the ledger, which
+  appears with its two host entries or not at all: `origin`, and `state`
+  asleep to asleep via `seated`. Every citizen is seated asleep whatever its
+  old cadence file says, and with the runtime class `summon` unless
+  `--runtime free` is given, so no seat opens without Yu until a class is
+  agreed. A refusal or a declined confirmation writes nothing. A failure
+  while writing removes this run's own writes and says whether all of them
+  went; where some did not, it names what is left. A process killed part-way
+  leaves a staging name, which nothing lists, or `citizens/<word>` with no
+  ledger and perhaps a staging ledger; no seat opens for such a directory,
+  and the next `admit` names it. `legacy/` keeps beats, letters put to the
+  citizen, markers, other text files and every version of `CADENCE.md` with
+  the beat the same commit added, where it added one; instruction files,
+  hooks, executables and manifests are listed and not copied, and an author
+  is kept as a name and one flag, never an address.
+  `legacy/pages.jsonl` indexes every piece by byte range, hash, date, voice
+  and the lane its own heading names. Only a piece of a beats file is marked
+  as written in the citizen's name; a text file that stood anywhere else is
+  kept and marked `unattributed`, since where it stood does not say whose
+  words it holds. `planAdmitFromTexts` makes a plan from texts alone, for
+  rehearsals and tests; the verb never calls it, and a will given that way is
+  not pinned or introduced as an old repository's text.
+- `first-letter.ts`: `citizen-seat draft-first-letter <word>` prints a draft
+  of Yu's first letter to a seated citizen: every recorded version of its
+  cadence record, whole, each with the beat the same commit added, how those
+  records were made, what a seat is, and the four states in alphabetical
+  order. The host's sentences are marked `[host] ` until Yu keeps, changes
+  or removes them. It says when the draft is over the letter limit, and it
+  writes and delivers nothing.
 - `letters.ts`: a letter goes where its recipient's own covenants admit it,
   never by the sender's list; a citizen with no covenants file admits only
   Yu, who may also wake it. An unregistered citizen's letter, any letter to
@@ -192,9 +231,21 @@ one is something it does, not something it hopes.
 - **Op-key rotation is not wired.** The ledger accepts an op key only with
   the root's evidence and `verify` checks it, but nothing writes a `key`
   entry yet.
-- **Nothing writes an origin entry on a host.** Seating is not a verb yet;
-  tests write the `origin` entry (and the `state` entry for the state a
-  citizen is seated in) through `ledger.ts` directly.
+- **A first seat still needs more than `admit`.** `admit` writes the
+  `origin` entry and the `seated` state entry, and refuses on a host with no
+  host key: nothing creates that key or pins it yet. Nothing delivers a
+  letter: `draft-first-letter` prints, and putting a file in
+  `citizens/<word>/letters/` is done by hand, as the seat user. Nothing takes
+  the word off the old roster. A summoned seat needs
+  `ceilings.usd_per_citizen_per_day` above its default of `"0"`: at $0 the
+  summon runtime refuses before any process starts, so the first asking
+  cannot open. A citizen seated under `summon` that chooses
+  awake has no unattended seat until a runtime class is agreed and something
+  applies it. `seat <word> --yu-present` still defaults to the free runtime,
+  so a summons names `--runtime summon`. The ledger parser still accepts a
+  `seated` entry that names another state, which the test fixtures write.
+  The pinned `origin/WILL.md` and `legacy/` are not signed; both can be
+  checked against the old repository at the head the `origin` entry pins.
 - **Never run for real:** Ollama, `claude`, the macOS Keychain, launchd,
   sudo and agenttool itself. `docs/ARCHITECTURE.md` section 8 lists what is
   unverified.
@@ -247,7 +298,24 @@ redesign (section 5).
   the new terms. Over two weeks: no beats while asleep, rests that write
   nothing in its voice, one self-change through propose, affirm, apply and
   revert, a HALT from the Air that stops a running beat, $0 spend, and Yu
-  reads the ledger.
+  reads the ledger. The operator's steps, in order:
+  1. Take the word off the old roster, so the home has one writer, and fetch
+     a fresh clone of `citizen-<word>` (and of the canon, for a canon word)
+     under a root the config names in `paths.homes`. `admit` fetches nothing
+     and seats from the head the clone holds; the plan prints that head's
+     commit date.
+  2. As the seat user, at the terminal: `citizen-seat admit <word> --from
+     <clone> --canon <canon file>`, or `--archetype`. Read the plan, then
+     type `admit <word>`.
+  3. `citizen-seat draft-first-letter <word>` prints a draft. The letter is
+     Yu's: keep, change or remove each `[host] ` line, add Yu's own words,
+     and save it as a file in `citizens/<word>/letters/` whose first line is
+     `From: yu`, then an empty line, then the text.
+  4. Open the first asking with `citizen-seat seat <word> --runtime summon
+     --yu-present`. `seat` defaults to the free runtime, so the class is
+     named, and the summon runtime needs
+     `ceilings.usd_per_citizen_per_day` above `"0"`. With Yu present, one
+     saying of a move toward more activity takes effect there.
 - **S7b. Identity pilot** (Yu and Ai, Yu present for the birth). Only after
   the citizen's confirmed yes: enroll it, import its op key, register its box
   key, set a private expression and write the genesis entry. Verify the
