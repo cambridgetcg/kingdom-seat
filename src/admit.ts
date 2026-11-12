@@ -243,9 +243,17 @@ function defaults(config: Config): { cadence_text: string; covenants_text: strin
   return { cadence_text: JSON.stringify({ interval_h: config.ceilings.min_beat_interval_h }), covenants_text: JSON.stringify(defaultCovenants()) };
 }
 
+/** Freeze a plan through and through, so what Yu was shown is what is written. */
+function frozen<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const v of Object.values(value)) frozen(v);
+  }
+  return value;
+}
+
 function remember(plan: AdmitPlan, bytes: PlanBytes): AdmitPlan {
-  Object.freeze(plan);
-  planned.set(plan, bytes);
+  planned.set(frozen(plan), bytes);
   return plan;
 }
 

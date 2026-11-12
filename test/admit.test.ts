@@ -920,6 +920,11 @@ describe("admitCitizen", () => {
   test("admitCitizen refuses a plan it did not make, and a host key that changed since the plan", async () => {
     const x = await fx();
     const plan = await planAdmit(x.deps, canonReq());
+    // A plan cannot be altered after Yu has read it: it is frozen through and through.
+    expect(() => ((plan as { runtime: string }).runtime = "free")).toThrow(TypeError);
+    expect(() => ((plan.origin as { repo: string }).repo = "ELSEWHERE")).toThrow(TypeError);
+    expect(() => ((plan.old_repo as { head: string }).head = "0".repeat(40))).toThrow(TypeError);
+    expect([plan.runtime, plan.origin.kind === "canon" && plan.origin.repo, plan.old_repo!.head]).toEqual(["summon", "YOUSPEAK", std.head]);
     const notMade = "admitCitizen takes only a plan a planner returned in this process; nothing was written";
     for (const forged of [{ ...plan }, JSON.parse(JSON.stringify(plan)) as AdmitPlan, Object.freeze({ ...plan, runtime: "free" as const }), null as unknown as AdmitPlan]) {
       expect(await refusal(admitCitizen(x.deps, forged))).toEqual({ code: "invalid-request", message: notMade });
