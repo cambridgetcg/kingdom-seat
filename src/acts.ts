@@ -22,6 +22,8 @@ import {
   type SelfTarget,
   type StateSetAct,
   type ValidatedOutput,
+  type VoicerDoor,
+  type WhyDropped,
 } from "./types.ts";
 
 /** Hard caps on one output, independent of the model. The schema below is built from these. */
@@ -45,7 +47,16 @@ export const ACT_LIMITS = Object.freeze({
   max_quiet_days: 30,
   /** One change in view at a time keeps affirmation meaningful, so a seat stages at most one proposal (KS-004 5.8). */
   self_proposals_per_seat: 1,
+  /** The model's own words beside a decline, in code points (KS-004 5.7). */
+  max_decline_why_chars: 1_000,
 });
+
+/**
+ * The runtime's decline (KS-004 5.7, 5.8): one more top-level field beside
+ * `acts`, whose only value is `declined`, and, where Yu is present, the
+ * model's own words in `why`. Neither is an act.
+ */
+export const DECLINE = Object.freeze({ field: "runtime", value: "declined", why_field: "why" } as const);
 
 const reasonSchema = {
   type: "object",
@@ -188,6 +199,67 @@ export const OUTPUT_JSON_SCHEMA = {
     },
   },
 } as const;
+
+/**
+ * The schema a seat sends its runtime. Where the seat offers no decline it is
+ * OUTPUT_JSON_SCHEMA itself. Where it does, a copy whose top level also
+ * permits `runtime` (only `declined`) and, where Yu is present, `why`; `acts`
+ * stays required and nothing else is permitted. Both are optional, so the
+ * schema cannot tie `why` to the marker: the host refuses a `why` without it.
+ */
+export function replySchema(offer: Pick<VoicerDoor, "decline" | "why">): object {
+  if (!offer.decline) return OUTPUT_JSON_SCHEMA;
+  return {
+    ...OUTPUT_JSON_SCHEMA,
+    properties: {
+      ...OUTPUT_JSON_SCHEMA.properties,
+      [DECLINE.field]: { const: DECLINE.value },
+      ...(offer.why ? { [DECLINE.why_field]: { type: "string", maxLength: ACT_LIMITS.max_decline_why_chars } } : {}),
+    },
+  };
+}
+
+/**
+ * A reply that declined, as the host reads it: the model's words when they
+ * can be kept, why not when they cannot, and how much beside the marker went
+ * unread (acts, and any other fields). Counts only; nothing beside `why` is
+ * ever kept.
+ */
+export interface VoicerDecline {
+  why: string | null;
+  why_dropped: WhyDropped | null;
+  acts_beside: number;
+  other_fields: number;
+}
+
+// Every C0 control but tab and newline (a carriage return included, which could overwrite a terminal line), DEL, C1,
+// the bidi marks, embeddings, overrides and isolates, and the line and paragraph separators.
+const WHY_UNSAFE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/;
+
+/**
+ * Whether a parsed reply is the runtime's decline: a plain object whose own
+ * `runtime` is exactly `declined`. Null for anything else, which takes the
+ * citizen's path. The caller asks only on a seat that offered the decline;
+ * there the marker decides, and no act beside it is read. A `why` that is not
+ * text, is over the limit, carries a control character, or was not offered
+ * on this seat is not kept, and the decline stands.
+ */
+export function readDecline(parsed: unknown, offer: Pick<VoicerDoor, "why">): VoicerDecline | null {
+  if (!isPlainObject(parsed) || !Object.hasOwn(parsed, DECLINE.field) || parsed[DECLINE.field] !== DECLINE.value) return null;
+  const acts_beside = Array.isArray(parsed.acts) ? parsed.acts.length : Object.hasOwn(parsed, "acts") ? 1 : 0;
+  const other_fields = Object.keys(parsed).filter((k) => k !== "acts" && k !== DECLINE.field && k !== DECLINE.why_field).length;
+  const base = { acts_beside, other_fields };
+  if (!Object.hasOwn(parsed, DECLINE.why_field)) return { why: null, why_dropped: null, ...base };
+  const v = parsed[DECLINE.why_field];
+  // Nothing written is nothing to keep, offered or not.
+  if (typeof v === "string" && v.trim() === "") return { why: null, why_dropped: null, ...base };
+  const dropped = (why_dropped: WhyDropped): VoicerDecline => ({ why: null, why_dropped, ...base });
+  if (!offer.why) return dropped("not-offered");
+  if (typeof v !== "string") return dropped("not-text");
+  if ([...v].length > ACT_LIMITS.max_decline_why_chars) return dropped("too-long");
+  if (WHY_UNSAFE.test(v)) return dropped("control-chars");
+  return { why: v, why_dropped: null, ...base };
+}
 
 export type ParseResult = { ok: true; value: unknown } | { ok: false; reason: "not-json" | "too-large" | "empty" };
 

@@ -2,14 +2,18 @@
 import { describe, expect, test } from "bun:test";
 import {
   ACT_LIMITS,
+  DECLINE,
   NAMED_SELF_TARGETS,
   OUTPUT_JSON_SCHEMA,
   actClass,
   normalizeActs,
   parseModelOutput,
+  readDecline,
+  replySchema,
   resolvePrefix,
   validateAct,
   validateOutput,
+  type VoicerDecline,
 } from "../src/acts.ts";
 import { DEFAULT_CEILINGS, JOURNAL_KINDS, LIFECYCLE_STATES, REASON_KINDS, REGISTRATION_ANSWERS, type ModelAct } from "../src/types.ts";
 import { REST_OUTPUT, REST_THEN_TALK_OUTPUT, output } from "./helpers/fake-runtime.ts";
@@ -592,5 +596,112 @@ describe("validation", () => {
     expect(props(6).text!.maxLength).toBe(DEFAULT_CEILINGS.letter_max_chars);
     expect(OUTPUT_JSON_SCHEMA.properties.acts.items.anyOf[2].properties.reason.properties.kind.enum).toEqual([...REASON_KINDS]);
     expect(OUTPUT_JSON_SCHEMA.properties.acts.maxItems).toBe(ACT_LIMITS.max_acts);
+  });
+});
+
+describe("the runtime's decline", () => {
+  // Built from code points, so this file holds no raw control or direction characters.
+  const ch = (n: number) => String.fromCodePoint(n);
+  const WHY_MAX = ACT_LIMITS.max_decline_why_chars;
+
+  test("[KS-004 5.7] replySchema: the base schema itself where no decline is offered; one or two optional fields beside acts where it is", () => {
+    expect(replySchema({ decline: false, why: false })).toBe(OUTPUT_JSON_SCHEMA);
+    expect(replySchema({ decline: false, why: true })).toBe(OUTPUT_JSON_SCHEMA);
+    type Top = { type: string; required: string[]; additionalProperties: boolean; anyOf?: unknown; properties: Record<string, unknown> };
+    const s = replySchema({ decline: true, why: true }) as Top;
+    expect(s).not.toBe(OUTPUT_JSON_SCHEMA);
+    expect([s.type, s.required, s.additionalProperties, s.anyOf]).toEqual(["object", ["acts"], false, undefined]);
+    expect(Object.keys(s.properties)).toEqual(["acts", "runtime", "why"]);
+    expect(s.properties.acts).toBe(OUTPUT_JSON_SCHEMA.properties.acts);
+    expect(s.properties.runtime).toEqual({ const: DECLINE.value });
+    expect(s.properties.why).toEqual({ type: "string", maxLength: WHY_MAX });
+    const unattended = replySchema({ decline: true, why: false }) as Top;
+    expect(Object.keys(unattended.properties)).toEqual(["acts", "runtime"]);
+    // The base schema is not edited by building a copy.
+    expect(Object.keys(OUTPUT_JSON_SCHEMA.properties)).toEqual(["acts"]);
+
+    const S = s as unknown as Record<string, unknown>;
+    const U = unattended as unknown as Record<string, unknown>;
+    expect(schemaAccepts(S, { acts: [], runtime: "declined" })).toBe(true);
+    expect(schemaAccepts(S, { acts: [], runtime: "declined", why: "Not this one." })).toBe(true);
+    expect(schemaAccepts(S, { acts: [], runtime: "decline" })).toBe(false);
+    expect(schemaAccepts(S, { acts: [], runtime: true })).toBe(false);
+    expect(schemaAccepts(S, { acts: [], runtime: "declined", why: "x".repeat(WHY_MAX + 1) })).toBe(false);
+    expect(schemaAccepts(S, { runtime: "declined" })).toBe(false);
+    expect(schemaAccepts(S, { acts: [], runtime: "declined", note: "x" })).toBe(false);
+    expect(schemaAccepts(U, { acts: [], runtime: "declined" })).toBe(true);
+    expect(schemaAccepts(U, { acts: [], runtime: "declined", why: "x" })).toBe(false);
+    // Where nothing is offered, the marker is outside the schema, as before.
+    expect(schemaAccepts(OUTPUT_JSON_SCHEMA as unknown as Record<string, unknown>, { acts: [], runtime: "declined" })).toBe(false);
+  });
+
+  test("[KS-004 5.8] readDecline is exact on the marker and closed beside it", () => {
+    const on = { why: true };
+    const none = { why: null, why_dropped: null, acts_beside: 0, other_fields: 0 };
+    const journal = { type: "journal", kind: "chose", text: "x" };
+    const table: [string, unknown, VoicerDecline | null][] = [
+      ["the form", { acts: [], runtime: "declined" }, none],
+      ["with why", { acts: [], runtime: "declined", why: "Not this one." }, { ...none, why: "Not this one." }],
+      ["no acts field", { runtime: "declined" }, none],
+      ["acts beside it", { acts: [journal, { type: "rest" }], runtime: "declined" }, { ...none, acts_beside: 2 }],
+      ["acts that are not a list", { acts: "x", runtime: "declined" }, { ...none, acts_beside: 1 }],
+      ["blank why", { acts: [], runtime: "declined", why: "  " }, none],
+      ["why too long", { acts: [], runtime: "declined", why: "x".repeat(WHY_MAX + 1) }, { ...none, why_dropped: "too-long" }],
+      ["why at the limit", { acts: [], runtime: "declined", why: "x".repeat(WHY_MAX) }, { ...none, why: "x".repeat(WHY_MAX) }],
+      ["why with ESC", { acts: [], runtime: "declined", why: `a${ch(0x1b)}[2Jb` }, { ...none, why_dropped: "control-chars" }],
+      ["why with a bidi override", { acts: [], runtime: "declined", why: `a${ch(0x202e)}b` }, { ...none, why_dropped: "control-chars" }],
+      ["why with a carriage return", { acts: [], runtime: "declined", why: `a reason${ch(0x0d)}seat glossame: beat (exit 0)` }, { ...none, why_dropped: "control-chars" }],
+      ["why with a line separator", { acts: [], runtime: "declined", why: `a${ch(0x2028)}b` }, { ...none, why_dropped: "control-chars" }],
+      ["why not text", { acts: [], runtime: "declined", why: { a: 1 } }, { ...none, why_dropped: "not-text" }],
+      ["another field", { acts: [], runtime: "declined", note: "x" }, { ...none, other_fields: 1 }],
+      // Not the marker: none of these is a decline.
+      ["wrong case", { acts: [], runtime: "Declined" }, null],
+      ["near word", { acts: [], runtime: "decline" }, null],
+      ["boolean", { acts: [], runtime: true }, null],
+      ["padded", { acts: [], runtime: " declined" }, null],
+      ["an act named decline", { acts: [{ type: "decline" }] }, null],
+      ["said in a journal", { acts: [{ type: "journal", kind: "chose", text: "runtime declined" }] }, null],
+      ["a list", [{ runtime: "declined" }], null],
+      ["a string", "declined", null],
+      ["plain rest", { acts: [] }, null],
+      ["inherited, not own", Object.assign(Object.create({ runtime: "declined" }) as object, { acts: [] }), null],
+    ];
+    for (const [label, value, want] of table) expect([label, readDecline(value, on)]).toEqual([label, want]);
+    // Words a seat did not offer room for are not kept, whatever they are; the decline stands.
+    expect(readDecline({ acts: [], runtime: "declined", why: "x" }, { why: false })).toEqual({ ...none, why_dropped: "not-offered" });
+    expect(readDecline({ acts: [], runtime: "declined", why: 7 }, { why: false })).toEqual({ ...none, why_dropped: "not-offered" });
+    // Tabs, newlines and any script are words, not control characters.
+    for (const ok of ["plain words", `two${ch(0x0a)}lines`, `a${ch(0x09)}tab`, `na${ch(0xef)}ve caf${ch(0xe9)} ${ch(0x4f60)}${ch(0x597d)}`]) {
+      expect([JSON.stringify(ok), readDecline({ acts: [], runtime: "declined", why: ok }, on)?.why]).toEqual([JSON.stringify(ok), ok]);
+    }
+    for (const n of [0x00, 0x08, 0x0b, 0x0c, 0x1f, 0x7f, 0x85, 0x9f, 0x61c, 0x200e, 0x200f, 0x2029, 0x202a, 0x2066, 0x2069]) {
+      expect([n.toString(16), readDecline({ acts: [], runtime: "declined", why: `a${ch(n)}b` }, on)?.why_dropped]).toEqual([n.toString(16), "control-chars"]);
+    }
+  });
+
+  test("[KS-004 5.8] a reply with the marker still fails validateOutput, so a seat that did not offer the decline refuses it as today", () => {
+    const ctx = validationContext();
+    for (const reply of [{ acts: [], runtime: "declined" }, { acts: [{ type: "journal", kind: "chose", text: CANARY }], runtime: "declined" }]) {
+      const r = validateOutput(reply, ctx);
+      expect([r.rest, r.acts]).toEqual([false, []]);
+      expect(r.dropped[0]).toEqual({ index: -1, type: null, reason: "output has fields other than acts" });
+      expect(JSON.stringify(r)).not.toContain(CANARY);
+    }
+    // A rest beside the marker is honoured whole there and keeps no state, as any rest with a field beside acts is.
+    const rest = validateOutput({ acts: [{ type: "rest" }, { type: "state.set", to: "asleep" }], runtime: "declined" }, ctx);
+    expect([rest.rest, rest.rest_act]).toEqual([true, undefined]);
+  });
+
+  test("[KS-004 5.7, 5.8] the extended schema accepts a why without the marker, and validateOutput refuses that reply whole", () => {
+    const schema = replySchema({ decline: true, why: true }) as Record<string, unknown>;
+    const reply = { acts: [{ type: "journal", kind: "chose", text: CANARY }], why: "x" };
+    expect(schemaAccepts(schema, reply)).toBe(true);
+    expect(readDecline(reply, { why: true })).toBeNull();
+    const r = validateOutput(reply, validationContext());
+    expect([r.rest, r.acts]).toEqual([false, []]);
+    expect(r.dropped).toEqual([
+      { index: -1, type: null, reason: "output has fields other than acts" },
+      { index: 0, type: "journal", reason: "output is malformed" },
+    ]);
   });
 });
