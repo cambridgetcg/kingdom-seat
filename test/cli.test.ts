@@ -158,6 +158,16 @@ describe("parseArgs", () => {
     expect(USAGE).toContain("  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]");
   });
 
+  test("parses draft-first-letter <word>, which takes nothing but --config", () => {
+    expect(parseArgs(["draft-first-letter", "glossame", "--config", "/srv/seat/config.json"])).toEqual({ verb: "draft-first-letter", config: "/srv/seat/config.json", word: "glossame" } satisfies Command);
+    expect(parseArgs(["draft-first-letter", "glossame"])).toEqual({ verb: "draft-first-letter", config: null, word: "glossame" } satisfies Command);
+    // It only prints: there is no flag to deliver, write or send, and no verb that does.
+    for (const argv of [["draft-first-letter"], ["draft-first-letter", "Glossame"], ["draft-first-letter", "a", "b"], ["draft-first-letter", "glossame", "--deliver"], ["draft-first-letter", "glossame", "--write"], ["draft-first-letter", "glossame", "--out", "/srv/x"], ["first-letter", "glossame"], ["deliver-letter", "glossame"], ["send-letter", "glossame"]]) {
+      throwsUsage(argv);
+    }
+    expect(USAGE).toContain("  draft-first-letter <word>");
+  });
+
   test("seat --runtime summon without --yu-present is refused before anything runs", () => {
     let err: unknown = null;
     try {
@@ -1252,6 +1262,36 @@ describe("admit: seating a citizen from its old home (KS-004 7.4)", () => {
     expect(none.atPrompt).toEqual([]);
     expect(await none.x.h.snapshot()).toEqual(new Map());
     await none.x.h.cleanup();
+  }, 30_000);
+
+  test("draft-first-letter prints a draft for a seated citizen and writes nothing; an unseated word exits 1", async () => {
+    const s = await seating(`admit ${W}`);
+    expect(await main(s.argv, s.deps)).toBe(0);
+    const before = await s.x.h.snapshot();
+    const out = s.x.out().length;
+    // No terminal, no signer and no git are needed to print it.
+    const run = recordingRunner();
+    const quiet: Partial<CliDeps> = {
+      ...s.x.deps,
+      run,
+      signer: () => {
+        throw new Error("draft-first-letter asks the signer for nothing");
+      },
+    };
+    expect(await main(["draft-first-letter", W, "--config", s.x.configPath], quiet)).toBe(0);
+    const printed = s.x.out().slice(out);
+    expect(printed).toStartWith(`DRAFT of a first letter from Yu to ${W}. Nothing was delivered, written or recorded by this command.\n`);
+    expect(printed).toContain("[host] From asleep you may, in a seat: stay asleep; move to awake; move to listening; or step away.");
+    expect(printed).toContain(`[host] ----- begin CADENCE.md 1 of 5: commit ${s.home.commits.choseAmbient.slice(0, 7)}, `);
+    expect(printed).toContain(s.home.versions[4]!);
+    expect(printed).toContain(s.home.beats.rested);
+    expect(run.calls).toEqual([]);
+    expect(await s.x.h.snapshot()).toEqual(before);
+    expect(await readdir(join(s.x.h.config.paths.citizens_dir, W, "letters"))).toEqual([]);
+
+    expect(await main(["draft-first-letter", "nobody", "--config", s.x.configPath], quiet)).toBe(1);
+    expect(s.x.err()).toEndWith("citizen-seat: refused (invalid-request): nobody is not seated on this host\n");
+    expect(await s.x.h.snapshot()).toEqual(before);
   }, 30_000);
 
   test("an archetype is seated by --archetype, on the free class when Yu names it", async () => {

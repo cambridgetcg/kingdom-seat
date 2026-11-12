@@ -9,6 +9,7 @@
 //   citizen-seat status               regenerate and print the status file
 //   citizen-seat verify <word>        verify a citizen's ledger chain and signatures, offline
 //   citizen-seat admit <word>         seat a citizen for the first time, from its old home, with Yu at the terminal
+//   citizen-seat draft-first-letter <word>   print a draft of Yu's first letter to a seated citizen; delivers nothing
 //
 // There is no verb to lower HALT. Only Yu lowers it, by hand (3.6).
 //
@@ -26,6 +27,7 @@ import { SSHSIG_MAX_MESSAGE_BYTES, parseSshEd25519 } from "./ssh.ts";
 import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
 import { AdmitStopped, admitCitizen, planAdmit, renderAdmitPlan, renderAdmitResult, type AdmitDeps } from "./admit.ts";
+import { draftFirstLetter } from "./first-letter.ts";
 import { ledgerPath, readLedger, readRegularText, verifyChain } from "./ledger.ts";
 import { pushMirror, stageMirror, type MirrorKeys, type MirrorSigning } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
@@ -99,6 +101,7 @@ export type Command =
       archetype: boolean;
       runtime: "free" | "summon";
     }
+  | { verb: "draft-first-letter"; config: string | null; word: Word }
   | { verb: "help" };
 
 export const USAGE = [
@@ -110,6 +113,7 @@ export const USAGE = [
   "  status [--json]",
   "  verify <word>",
   "  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]",
+  "  draft-first-letter <word>",
 ].join("\n");
 
 /** This file, so a parent can run its own child under the same interpreter. */
@@ -123,7 +127,7 @@ export class UsageError extends Error {
 /* ── Parsing ──────────────────────────────────────────────────────────── */
 
 type FlagKind = "value" | "switch";
-const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify", "admit"] as const;
+const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify", "admit", "draft-first-letter"] as const;
 const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   tick: { "--config": "value" },
   seat: { "--config": "value", "--runtime": "value", "--why": "value", "--yu-present": "switch", "--child": "switch", "--seat-ref": "value" },
@@ -133,6 +137,7 @@ const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   status: { "--config": "value", "--json": "switch" },
   verify: { "--config": "value" },
   admit: { "--config": "value", "--from": "value", "--canon": "value", "--archetype": "switch", "--runtime": "value" },
+  "draft-first-letter": { "--config": "value" },
 };
 const WHY_MAX = 200;
 
@@ -192,6 +197,8 @@ export function parseArgs(argv: string[]): Command {
       return { verb: "status", config, json: flags.get("--json") === true };
     case "verify":
       return { verb: "verify", config, word: oneWord(positionals, "verify") };
+    case "draft-first-letter":
+      return { verb: "draft-first-letter", config, word: oneWord(positionals, "draft-first-letter") };
     case "admit": {
       const word = oneWord(positionals, "admit");
       const from = flags.get("--from") as string | undefined;
@@ -609,6 +616,16 @@ async function verbAdmit(ctx: Ctx, cmd: Extract<Command, { verb: "admit" }>): Pr
 }
 
 /**
+ * Print a draft of Yu's first letter to a seated citizen (first-letter.ts).
+ * It reads the legacy record seating kept and writes nothing: no letter, no
+ * host note, no status. Delivering a letter is Yu's act, not this verb's.
+ */
+async function verbDraftFirstLetter(ctx: Ctx, word: Word): Promise<ExitCode> {
+  ctx.deps.out((await draftFirstLetter(ctx.config, word)).text);
+  return EXIT.OK;
+}
+
+/**
  * After a seat, stage and push the mirror when the seat changed what it
  * shows: any beat, or a rest that kept a move of state (KS-004 B2 C7), which
  * would otherwise leave the card's old state up until the next beat. A rest
@@ -896,9 +913,9 @@ function describeError(e: unknown): string {
  * signer, which rest the citizens; 1 for every other wall and for a record or
  * request that cannot be read, so a monitor pages on a symlinked letter rather
  * than reading it as a closed class. The registry is about seats: for verify,
- * status, halt, raise-beacons and admit a wall means the verb could not do
- * its job (1), so a locked keychain never reads as a chain verified, and HALT
- * never reads as a citizen seated.
+ * status, halt, raise-beacons, admit and draft-first-letter a wall means the
+ * verb could not do its job (1), so a locked keychain never reads as a chain
+ * verified, and HALT never reads as a citizen seated.
  */
 function exitFor(e: unknown, verb: Command["verb"] | null = null): ExitCode {
   if (!(e instanceof Refusal)) return EXIT.ERROR;
@@ -1010,6 +1027,8 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
         return await verbVerify(ctx, cmd.word);
       case "admit":
         return await verbAdmit(ctx, cmd);
+      case "draft-first-letter":
+        return await verbDraftFirstLetter(ctx, cmd.word);
       case "seat":
         return cmd.child ? await verbSeatChild(ctx, cmd) : await verbSeatParent(ctx, cmd);
     }

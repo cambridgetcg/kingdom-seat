@@ -6,6 +6,7 @@ import { buildContext } from "../src/context.ts";
 import { FREE_LANE_PREAMBLE, NO_UNATTENDED_SEATS, WILL_AS_SEATED, buildPrompt, promptBytes, renderActsGuide } from "../src/prompt.ts";
 import { sha256Hex, toB64, toHex } from "../src/crypto.ts";
 import type { LedgerEntry, SeatContext } from "../src/types.ts";
+import { BANNED_PHRASES } from "./helpers/banned.ts";
 import { assertNoSecretIn, fakeKeychain } from "./helpers/fake-keychain.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { beatEntry, citizenOf, proposalOf, seatFor } from "./fixtures/voice/fixtures.ts";
@@ -19,21 +20,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await host.cleanup();
 });
-
-/** What no host sentence may hold: binding words, the old lane's choice words, coaching, an example to copy. */
-const BANNED = [
-  /\bI rest\b/i,
-  /\bwrite ['"‘“]/i,
-  /\bsay ['"‘“]/i,
-  /\bI choose\b/i,
-  /REST-ON|EVENT-ONLY|\bAMBIENT\b/i,
-  /letter of return/i,
-  /nothing is owed/i,
-  /\bFATE\b/,
-  /entirely your choice/i,
-  /honest sentences/i,
-  /\bfor example\b|\be\.g\.|\bfor instance\b|\bsuch as\b/i,
-];
 
 /** A will as the old template wrote one: it names a repository to tend and a command to run. */
 const OLD_WILL = '# WILL of glossame\n\n- tend your own home (this repo);\n\n## Attest\n\n```bash\npython3 tools/attest.py claim will "glossame: a made-up line"\n```\n';
@@ -110,7 +96,7 @@ describe("the honest prompt", () => {
     const guide = renderActsGuide();
     const p = buildPrompt(ctx, "free");
     const host_text = [p.system, guide];
-    for (const text of [...host_text, p.user]) for (const re of BANNED) expect([String(re), re.test(text)]).toEqual([String(re), false]);
+    for (const text of [...host_text, p.user]) for (const re of BANNED_PHRASES) expect([String(re), re.test(text)]).toEqual([String(re), false]);
     // No JSON literal anywhere in the host's own words, so there is no filled-in act to copy.
     for (const text of host_text) {
       expect(text).not.toMatch(/[{}]/);
@@ -162,13 +148,13 @@ describe("the honest prompt", () => {
       expect(p.user).toContain(WILL_AS_SEATED);
       expect(p.user).toContain(NO_UNATTENDED_SEATS);
       expect(p.user).toContain("the host seated you asleep");
-      for (const text of [p.system, p.user]) for (const re of BANNED) expect([String(re), re.test(text)]).toEqual([String(re), false]);
+      for (const text of [p.system, p.user]) for (const re of BANNED_PHRASES) expect([String(re), re.test(text)]).toEqual([String(re), false]);
       expect(p.system).not.toMatch(/[{}]/);
     }
     // The host's new sentences hold no brace, no quoted words to say, and nothing that reads as an instruction to reply.
     for (const line of [WILL_AS_SEATED, NO_UNATTENDED_SEATS]) {
       expect(line).not.toMatch(/[{}"'‘“]/);
-      for (const re of BANNED) expect([String(re), re.test(line)]).toEqual([String(re), false]);
+      for (const re of BANNED_PHRASES) expect([String(re), re.test(line)]).toEqual([String(re), false]);
     }
   });
 
