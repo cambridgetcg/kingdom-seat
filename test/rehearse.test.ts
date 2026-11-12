@@ -476,6 +476,21 @@ describe("rehearse: the seat's own pipeline", () => {
     expect(report.run.seating).toEqual({ form: "as-admitted", archetype_class: "PIONEER" });
     expect(notAdmittedLimits(report)).toEqual([]);
     expect(stdout).toContain(`\n${ADMITTED_LINE}; archetype class PIONEER\n`);
+
+    // Seated plainly from texts with the same class, the lineage is the same: the origin note and the will's
+    // introduction differ, and the limits say so in those terms.
+    const plain = await rehearseOnce(p, "plain", { ...texts, plain: true });
+    const notes = [
+      "No canon entry. The old repository's agent.json records the class PIONEER.",
+      "No canon entry and no old repository. The class PIONEER was given to the host with the texts.",
+    ] as const;
+    // The note's fence tag follows its text.
+    const untagged = (t: string) => t.replace(/origin note \[[0-9a-f]{12}\]/g, "origin note [-]");
+    expect(user(plain.body)).toContain("Your origin: archetype lineage PIONEER.\n--- begin origin note [");
+    expect(untagged(user(tick).replace(WILL_AS_SEATED, "Your will:").replace(notes[0], notes[1]))).toBe(untagged(user(plain.body)));
+    expect(notAdmittedLimits(plain.report)).toEqual([LIMIT_SENTENCES.will, LIMIT_SENTENCES.origin]);
+    expect(LIMIT_SENTENCES.origin).toContain("its origin note says it was seated from texts");
+    expect(LIMIT_SENTENCES.origin).not.toContain("instead the class");
   }, 60_000);
 
   test("a citizen seated by admit from its old home and then seated awake is sent, by an awake rehearsal of the same texts, what a tick's seat sends, byte for byte", async () => {

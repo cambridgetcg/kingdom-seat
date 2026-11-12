@@ -118,7 +118,7 @@ export const LIMIT_SENTENCES = Object.freeze({
   none_seen: "When none is seen in n tries, the rate can still be about 3.8 in n plus 3.8. The intervals are 95% Wilson intervals.",
   throwaway: "The throwaway citizen has only this chain's record and no siblings. A seated citizen's prompt also carries its own history.",
   will: "The throwaway citizen is seated plainly from texts, so its will is introduced as its will. A citizen seated from its old home is shown its will, while unchanged, as the text that repository held, under the host's sentence that the seat gives it no repository, tools or senses.",
-  origin: "With no canon entry, the throwaway citizen's origin is an archetype seated from texts. A citizen seated from its old home is shown instead the class its old repository records, which --archetype gives a rehearsal not seated plainly from texts.",
+  origin: "With no canon entry, the throwaway citizen is seated plainly from texts as an archetype: its origin note says it was seated from texts, and its lineage is the class --archetype gave, or seated-from-texts without one. A citizen seated from its old home is shown the class its old agent.json records, under the note admit writes, as is a rehearsal given --archetype without --plain-texts.",
   seed: "The lock fixes a seed. A first seat's reply then depends only on the dates and times in its prompt; a later seat's prompt also holds the ids of the chain's earlier seats, which are new in every run, and their replies, so a run is not repeated exactly.",
   defaults: "No host configuration was read: the limits stated to the model are the built-in defaults, and HALT was watched at the file only.",
 } as const);
