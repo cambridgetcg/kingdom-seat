@@ -1447,6 +1447,7 @@ describe("rehearse: the command line (src/rehearse.ts)", () => {
   test("USAGE names rehearse", () => {
     expect(USAGE).toContain("  rehearse <word> --soul <file>");
     expect(USAGE).toContain("--models-lock <file>");
+    expect(USAGE).toContain("| --archetype <CLASS>] [--plain-texts]");
     expect(USAGE).not.toMatch(/lower|unhalt|resume|clear/i);
   });
 
