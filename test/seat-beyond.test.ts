@@ -670,7 +670,7 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: a typed yes, agreed 
   });
 });
 
-describe("[KS-004 11.2, 11.3; AW-1] a reply that declines never reaches Yu at the terminal", () => {
+describe("[KS-004 11.2, 11.3] a reply that declines never reaches Yu at the terminal", () => {
   test("a no, typed or in words, goes through the seat, is agreed to as filed, is affirmed anyway, and birth's terminal step refuses before it shows or asks anything", async () => {
     const words = "No. I do not want an identity on agenttool.";
     const replies: [string, ModelAct][] = [
