@@ -300,6 +300,9 @@ describe("proposals", () => {
       "file:proposals/x.md",
       "file:origin/soul.md",
       "file:versions/x.md",
+      // The record of the old home, kept beside the self at seating, is the host's (KS-004 7.4).
+      "file:legacy/x.md",
+      "file:Legacy/tree/beats/2026-10.md",
       "file:CLAUDE.md",
       "file:notes/claude.md",
       "file:tool.sh",

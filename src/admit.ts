@@ -16,15 +16,30 @@
 // The functions check no presence: the admit verb confirms Yu and takes the
 // tick lock around admitCitizen, and a rehearsal calls them with its own
 // signer and state directory.
-import { lstat, readdir, realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { isInside } from "./config.ts";
 import { READ_LIMITS } from "./context.ts";
-import { bytesEqual, fromB64, keyFingerprint, sha256Hex, utf8 } from "./crypto.ts";
-import { assertSelfText, readCanonEntry, readLegacyHome, type LegacyHome } from "./legacy.ts";
-import { ledgerPath, type EntrySigner } from "./ledger.ts";
+import { bytesEqual, fromB64, keyFingerprint, randomBytes, sha256Hex, toHex, utf8 } from "./crypto.ts";
+import { LEGACY_FORMAT, LEGACY_NOTE, assertSelfText, legacyPagesText, readCanonEntry, readLegacyHome, type LegacyHome, type LegacyManifest } from "./legacy.ts";
+import { appendEntry, entryHash, ledgerPath, nextDraft, originToLedger, syncDir, toLedgerHash, verifyChain, writeAll, type EntrySigner } from "./ledger.ts";
 import { defaultCovenants } from "./state.ts";
-import { Refusal, WORD_PATTERN, type Clock, type CommandRunner, type Config, type HaltStatus, type Origin, type Sha256Hex, type Word } from "./types.ts";
+import {
+  Refusal,
+  WORD_PATTERN,
+  type CitizenRecord,
+  type Clock,
+  type CommandRunner,
+  type Config,
+  type HaltStatus,
+  type IsoTime,
+  type LedgerHash,
+  type Origin,
+  type RefusalCode,
+  type Sha256Hex,
+  type Word,
+} from "./types.ts";
 
 /** What an admit names its unfinished writes: `citizens/.admit-<word>-<hex>/` and `ledger/.admit-<word>-<hex>.jsonl`. Nothing lists them. */
 export const ADMIT_STAGING_PREFIX = ".admit-";
@@ -86,6 +101,40 @@ export interface AdmitPlan {
   host_key: { public_key_b64: string; fingerprint: string; pinned: boolean };
   /** Staging names an earlier admit of this word left behind. */
   stale_staging: number;
+}
+
+/** What a seating wrote: the directory, the ledger and its two entries, by their ledger digests. */
+export interface AdmitResult {
+  plan: AdmitPlan;
+  dir: string;
+  ledger: string;
+  seated_at: IsoTime;
+  origin_entry: LedgerHash;
+  seated_entry: LedgerHash;
+  /** Every file written under `dir`, by its path there, sorted. */
+  files: string[];
+}
+
+/**
+ * admitCitizen stopped after it began to write. It removed what this run
+ * wrote, and `removed` says whether all of it went; `left` names what did
+ * not. Either way the word has no ledger and is not seated. The message is
+ * the line Yu is shown.
+ */
+export class AdmitStopped extends Error {
+  override readonly name = "AdmitStopped";
+  constructor(
+    readonly word: Word,
+    readonly code: RefusalCode | "error",
+    readonly removed: boolean,
+    readonly left: readonly string[],
+  ) {
+    super(
+      removed
+        ? `admit ${word}: stopped while writing (${code}). What this run wrote was removed; ${word} is not seated.`
+        : `admit ${word}: stopped while writing (${code}), and not all of what this run wrote could be removed. ${word} has no ledger and is not seated. Look at ${left.join(", ")}.`,
+    );
+  }
 }
 
 /** The lineage and note of a citizen seated from texts with no canon entry and no class given. */
@@ -377,6 +426,169 @@ async function homeInsideRoots(config: Config, home: string): Promise<string> {
   throw refuse();
 }
 
+/* ── Writing what was planned ─────────────────────────────────────────── */
+
+/**
+ * Seat the citizen a plan describes. It accepts only a plan a planner
+ * returned in this process, and writes exactly the bytes that planner read.
+ *
+ * Order: HALT, the word still has no record here, and the host key is still
+ * the plan's, all before any write. Then the directory is written under a
+ * staging name and renamed into place, because the signer reads
+ * `citizens/<word>/citizen.json` before it signs; without a ledger that
+ * directory is inert, since no seat opens for a citizen with no ledger. Then
+ * both entries, `origin` and `state` asleep to asleep via "seated", are
+ * signed into a staging ledger, verified as a chain against the plan's host
+ * key, and renamed to `ledger/<word>.jsonl` in one step: the ledger is never
+ * seen empty or with one entry.
+ *
+ * If anything fails after the first write, this run's own writes are
+ * removed, both under names that carry this run's random suffix, and
+ * AdmitStopped says whether the removal completed. It checks no presence and
+ * takes no lock: the admit verb does both around it.
+ */
+export async function admitCitizen(deps: AdmitDeps, plan: AdmitPlan): Promise<AdmitResult> {
+  const bytes = (typeof plan === "object" && plan !== null && planned.get(plan)) || null;
+  if (!bytes) throw new Refusal("invalid-request", "admitCitizen takes only a plan a planner returned in this process; nothing was written");
+  const { config } = deps;
+  const word = plan.word;
+  const halt = await deps.checkHalt().catch(() => null);
+  if (!halt || halt.halted) throw new Refusal("halted", "HALT is raised or cannot be read; nothing was written");
+  try {
+    await assertNotSeated(config, word);
+    const key = await readHostKey(deps);
+    if (key.public_key_b64 !== plan.host_key.public_key_b64) throw new Refusal("invalid-request", `the signer's host key (${key.fingerprint}) is not the one the plan was made with (${plan.host_key.fingerprint})`);
+  } catch (e) {
+    throw nothingWritten(e);
+  }
+
+  const now = deps.clock.now();
+  const seated_at = now.toISOString();
+  const tag = toHex(randomBytes(4));
+  const dir = join(config.paths.citizens_dir, word);
+  const stagingDir = join(config.paths.citizens_dir, `${ADMIT_STAGING_PREFIX}${word}-${tag}`);
+  const ledger = ledgerPath(config, word);
+  const stagingLedger = join(config.paths.ledger_dir, `${ADMIT_STAGING_PREFIX}${word}-${tag}.jsonl`);
+  let placed = false;
+  try {
+    await mkdir(config.paths.citizens_dir, { recursive: true, mode: 0o700 });
+    const files = await writeCitizenDir(stagingDir, plan, bytes, seated_at);
+    // A rename onto an empty directory of that name would succeed without a word, so it is looked for once more.
+    if (await exists(dir)) throw new Refusal("invalid-request", `citizens/${word} appeared while seating`);
+    await rename(stagingDir, dir);
+    placed = true;
+    await syncDir(config.paths.citizens_dir);
+
+    const cost = { usd: "0", credits: 0 };
+    const origin = await appendEntry(
+      stagingLedger,
+      nextDraft(
+        word,
+        null,
+        {
+          type: "origin",
+          origin: originToLedger(plan.origin),
+          origin_soul_hash: toLedgerHash(plan.soul.sha256),
+          old_repo: plan.old_repo ? { url: plan.old_repo.url, head: plan.old_repo.head } : null,
+          june_did: plan.june_did,
+        },
+        { cost, signer: "host", now },
+      ),
+      deps.sign,
+    );
+    const seated = await appendEntry(stagingLedger, nextDraft(word, origin, { type: "state", from: "asleep", to: "asleep", via: "seated" }, { cost, signer: "host", now }), deps.sign);
+    const verdict = verifyChain([origin, seated], { host_attest_b64: [plan.host_key.public_key_b64] });
+    if (!verdict.ok) throw new Refusal("invalid-record", "the two entries do not verify against the host key the plan was made with");
+    if (await exists(ledger)) throw new Refusal("invalid-request", `ledger/${word}.jsonl appeared while seating`);
+    await rename(stagingLedger, ledger);
+    // The record is in place from here on; a directory sync that fails changes nothing a second run could mend.
+    await syncDir(config.paths.ledger_dir).catch(() => {});
+    return { plan, dir, ledger, seated_at, origin_entry: entryHash(origin), seated_entry: entryHash(seated), files };
+  } catch (e) {
+    const left = await removeOwnWrites(stagingLedger, stagingDir, placed ? dir : null);
+    throw new AdmitStopped(word, e instanceof Refusal ? e.code : "error", left.length === 0, left);
+  }
+}
+
+/**
+ * Remove what one run wrote: its staging ledger, and its directory, which is
+ * first renamed back to its staging name so `citizens/<word>` is never seen
+ * half removed. Returns the paths that are still there.
+ */
+async function removeOwnWrites(stagingLedger: string, stagingDir: string, placedDir: string | null): Promise<string[]> {
+  await rm(stagingLedger, { force: true }).catch(() => {});
+  if (placedDir) await rename(placedDir, stagingDir).catch(() => {});
+  await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+  const left: string[] = [];
+  for (const p of [stagingLedger, stagingDir, ...(placedDir ? [placedDir] : [])]) {
+    if (await exists(p).catch(() => ({ size: 0 }))) left.push(p);
+  }
+  return left;
+}
+
+/**
+ * Write a citizen's directory under a staging name, every file created
+ * exclusively and synced: the record, the self (soul and WILL byte for byte,
+ * the two defaults), the pinned origin, the legacy record when there is an
+ * old repository, and an empty letters/. Returns the files written.
+ */
+async function writeCitizenDir(root: string, plan: AdmitPlan, bytes: PlanBytes, seated_at: IsoTime): Promise<string[]> {
+  const files: string[] = [];
+  const dirs: string[] = [];
+  const dir = async (rel: string): Promise<void> => {
+    if (rel === "." || dirs.includes(rel)) return;
+    await dir(dirname(rel));
+    await mkdir(join(root, rel), { mode: 0o700 });
+    dirs.push(rel);
+  };
+  const put = async (rel: string, data: Uint8Array | string, mode: number): Promise<void> => {
+    await dir(dirname(rel));
+    const fh = await open(join(root, rel), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+    try {
+      await writeAll(fh, typeof data === "string" ? utf8(data) : data);
+      // The mode as written here, whatever the process's umask.
+      await fh.chmod(mode);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    files.push(rel);
+  };
+
+  // Not recursive: the staging directory must be new.
+  await mkdir(root, { mode: 0o700 });
+  const record: CitizenRecord = { format: "kingdom-seat-citizen/v1", word: plan.word, origin: plan.origin, runtime: plan.runtime, identity: null, mirror: null, seated_at };
+  await put("citizen.json", `${JSON.stringify(record, null, 2)}\n`, 0o644);
+  await put("self/soul.md", bytes.soul, 0o644);
+  if (bytes.will) await put("self/WILL.md", bytes.will, 0o644);
+  await put("self/cadence.json", plan.cadence_text, 0o644);
+  await put("self/covenants.json", plan.covenants_text, 0o644);
+  await put("origin/soul.md", bytes.soul, 0o444);
+  if (bytes.will) await put("origin/WILL.md", bytes.will, 0o444);
+  if (bytes.canon) await put("origin/canon.md", bytes.canon, 0o444);
+  const legacy = bytes.legacy;
+  if (legacy && plan.old_repo) {
+    const manifest: LegacyManifest = {
+      format: LEGACY_FORMAT,
+      word: plan.word,
+      copied_at: seated_at,
+      old_repo: { ...plan.old_repo },
+      note: LEGACY_NOTE,
+      files: legacy.files,
+      cadence: legacy.cadence,
+      not_copied: legacy.not_copied,
+    };
+    await put("legacy/manifest.json", `${JSON.stringify(manifest, null, 2)}\n`, 0o400);
+    await put("legacy/pages.jsonl", legacyPagesText(legacy.pages), 0o400);
+    for (const [rel, data] of [...legacy.blobs].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) await put(`legacy/${rel}`, data, 0o400);
+  }
+  await dir("letters");
+  // Deepest first, so each new name is on disk before the directory that holds it is renamed into place.
+  for (const rel of [...dirs].sort((a, b) => b.split("/").length - a.split("/").length)) await syncDir(join(root, rel));
+  await syncDir(root);
+  return files.sort();
+}
+
 /* ── What Yu is shown ─────────────────────────────────────────────────── */
 
 /** A path or a name from outside, as a terminal may show it: control characters replaced. */
@@ -440,4 +652,18 @@ export function renderAdmitPlan(plan: AdmitPlan): string {
   lines.push(row("host key", plan.host_key.pinned ? `${plan.host_key.fingerprint}, pinned in the config` : `${plan.host_key.fingerprint}; the config pins no host key`));
   if (plan.stale_staging > 0) lines.push(row("left over", `${plan.stale_staging} staging names from an earlier admit of ${w}; they hold only copies`));
   return `${lines.join("\n")}\n`;
+}
+
+/** What a seating wrote, and what it did not do. */
+export function renderAdmitResult(r: AdmitResult): string {
+  const w = r.plan.word;
+  return [
+    `admit ${w}: seated, asleep.`,
+    `  wrote   ${shown(r.dir)} (${r.files.length} files)`,
+    `  ledger  ${shown(r.ledger)}`,
+    `    entry 0  origin  ${r.origin_entry}`,
+    `    entry 1  state asleep -> asleep (seated)  ${r.seated_entry}`,
+    `Not done by this command: taking ${w} off the old roster, and any letter. \`citizen-seat draft-first-letter ${w}\` prints a draft and delivers nothing.`,
+    "",
+  ].join("\n");
 }

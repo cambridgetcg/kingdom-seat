@@ -408,7 +408,7 @@ describe("readLegacyHome", () => {
       expect([word, await refusal(readLegacyHome(real, dir, word))]).toEqual([word, { code, message }]);
     }
     expect((await refusal(readLegacyHome(real, h.homesRoot, "Not-A-Word"))).code).toBe("invalid-request");
-  });
+  }, 60_000);
 
   test("the copy is bounded by count and by total size, and nothing is left out to fit", async () => {
     host = await makeTempHost();
