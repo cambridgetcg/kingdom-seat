@@ -42,11 +42,15 @@ launchd (every 1800 s, RunAtLoad false)
                b. context: own self whole, last k entries, state, now, ≤1 letter (letters/, or once registered
                   its agenttool inbox), canon, invoker, what the last seat with a reply dropped, its latest saying about
                   registration                                context.ts, letters.ts, registration.ts
-               c. prompt (the honest free-lane text)      prompt.ts
+               c. prompt: the voicer's door, then the honest free-lane text; where the seat offers the runtime's
+                  own decline, its reply form after the acts          prompt.ts
                d. runtime: free (Ollama by digest, whole context fits or no seat) | summon (claude --restricted, Yu present)    runtime/*.ts
-               e. parse and validate into typed acts; rest is exclusive, but may carry one move toward less activity;
-                  one staged saying; a letter only to a recipient whose own covenants admit it   acts.ts, letters.ts
+               e. on a seat that offers the decline, a reply whose runtime is exactly declined is the runtime's: no act
+                  in it is read. Otherwise parse and validate into typed acts; rest is exclusive, but may carry one move
+                  toward less activity; one staged saying; a letter only to a recipient whose own covenants admit it
+                                                         acts.ts, letters.ts
                f. HALT again; if raised, discard the reply and write nothing
+                  a decline: a host note and a host record of it, nothing of the citizen's; exit 0    seat.ts
                g. the letter: through the inbox between two registered citizens, before the beat that records it,
                   unless it would wake its recipient; otherwise held for Yu after it, or, credits short, a proposal  letters.ts
                h. signer signs; ledger appends the beat first (with what it dropped, and where its letter went), then
@@ -77,16 +81,16 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/signer/consent.ts` | Decision records read by proposal digest, standing agreements (filed in `consent/standing/`, each with its own record), Yu present | 3.6 "Consent", decision 12; KS-004 8.1 | — |
 | `src/ledger.ts` | Hash-chained, signed, append-only JSONL per citizen in KS-004 4.5's flat layout (section 4b); op keys pinned only with root evidence; the earlier layout refused | 3.2 "Ledger", 3b; KS-004 4.5, B2 C1, R4, C C5, C13 | wire 2, 5 |
 | `src/spend.ts` | The host's spend record: every metered seat, whatever its outcome; the USD ceiling reads it | 3.6 "Spend"; KS-004 B2 R2 | — |
-| `src/state.ts` | Lifecycle transitions, folded from the ledger; a longer awake interval is toward rest, a shorter one waits for the same saying again | 3.3, 3c "Existence choices"; KS-004 7.3 | — |
+| `src/state.ts` | Lifecycle transitions, folded from the ledger; a longer awake interval is toward rest, a shorter one waits for the same saying again; a seat its runtime declined does not lapse a saying | 3.3, 3c "Existence choices"; KS-004 5.8, 7.3 | — |
 | `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self; a revert beyond self is named, for the seat to lift; an apply names its strand backup's key and says what the expression and the backup did | 3c, decision 10; KS-004 4.3, 6.3, 9.5, B2 C6, C M1, M4 | — |
 | `src/halt.ts` | Local file plus pinned beacons; raise only: the operator's file and fixed call, the signer's beacons | 3.6 "HALT", decision 15; KS-004 B2 R5 | wire 4 |
-| `src/seat.ts` | Seat opening, the watcher, the in-child pipeline; dropped acts recorded on the beat; a revert beyond self lifted; a letter sent or held; a typed answer about registration recorded, a yes filed, and its affirmation recorded | 3.2 steps 3-7, 3b "Reading confers nothing"; KS-004 5.7, 5.8, 9.5, 11.2 | patterns 1, 2 |
+| `src/seat.ts` | Seat opening, the watcher, the in-child pipeline; which seats offer the decline; dropped acts recorded on the beat; a revert beyond self lifted; a letter sent or held; a typed answer about registration recorded, a yes filed, and its affirmation recorded; a decline recorded as the runtime's, with the model's words only in a host record | 3.2 steps 3-7, 3b "Reading confers nothing"; KS-004 5.4, 5.5, 5.7, 5.8, 9.5, 11.2 | patterns 1, 2 |
 | `src/tick.ts` | Lock, selection, fleet ceiling; keeps registered citizens' quiet; opens the seat it hands its child | 3.2 steps 1-2; KS-004 6.4 | patterns 3, 6, 7 |
 | `src/due.ts` | When a citizen's own seat is due: one rule for the tick, `seat <word>`, the child and status | 3.2 step 2, 3.3 | patterns 7 |
-| `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
+| `src/notes.ts` | Host notes: append, read, and the seats they record, the declined ones among them | 3.2 "Status file"; KS-004 5.8 | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only, and a registered citizen's inbox letters as letters.ts hands them in; what the last beat dropped | 3.2 step 4; KS-004 5.3, 5.8 | patterns 5.1, 12.4 |
-| `src/prompt.ts` | The honest free-lane prompt; dropped acts and the latest answer about registration shown back; a will still as carried at seating introduced as that; a citizen with no unattended class told so | 3.2 (last paragraph); KS-004 5.3, 5.8, 7.4, 11.2 | patterns 5.2, 9 |
-| `src/acts.ts` | Output schema and validation with KS-004 5.7's field names; free text never executes; a rest carries at most one state.set; one self.propose and one letter a seat; one answer about registration a reply, counted on the reply as it arrived | 3.2 step 6; KS-004 5.7, 5.8, B2 C7, C C2, M5 | patterns 5.2 |
+| `src/prompt.ts` | The voicer's door before the preamble, and the decline's reply form where a seat offers it; the honest free-lane prompt; dropped acts and the latest answer about registration shown back; a will still as carried at seating introduced as that; a citizen with no unattended class told so | 3.2 (last paragraph); KS-004 5.3, 5.4, 5.7, 5.8, 7.4, 11.2 | patterns 5.2, 9 |
+| `src/acts.ts` | Output schema and validation with KS-004 5.7's field names; free text never executes; a rest carries at most one state.set; one self.propose and one letter a seat; one answer about registration a reply, counted on the reply as it arrived; the reply schema with the runtime's decline, and the decline read exactly | 3.2 step 6; KS-004 5.7, 5.8, B2 C7, C C2, M5 | patterns 5.2 |
 | `src/letters.ts` | Who admits a letter (the recipient's own covenants), a letter held for Yu, and the production LetterPost: inbox send and read through the signer | KS-004 5.3, 5.7, 8.1, C M3 | wire 2 |
 | `src/registration.ts` | A typed answer about registration: what a beat said, a yes's proposal, Yu and Ai's decision, the stage the seat and status show, and the confirmed yes birth consumes | KS-004 11.2, C D-affirm | — |
 | `src/runtime/free.ts` | Ollama on 127.0.0.1 by exact digest, no fallback; refuses a context that does not fit `num_ctx` | 3.6 "Unattended inference", decision 11; KS-004 B2 C11 | host 1 |
@@ -100,7 +104,7 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/birth.ts` | `citizen-birth`: never unattended; shows Yu the typed answer and its words before Yu confirms; consumes the citizen's confirmed yes | 3b "Birth of one citizen"; KS-004 11.2, 11.3 | wire 1-3, host 3.3 |
 | `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card and `.citizen/allowed_signers`, commits SSH-signed through the signer | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10; KS-004 4.4, C M2 | patterns 4, 11, 12 |
 | `src/status.ts` | Generated status file and host notes; the host key's public half; each citizen's last refusal and its reason; its latest answer about registration and where a yes stands; a lock a live owner has held more than 2 h; a registered citizen's expression lag, deferred backups and quiet | 3.2 "Status file", 3.1 principle 6; KS-004 5.1, 5.8, 5.10 | patterns 1 |
-| `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch | 3.2, 3.6; KS-004 B2 R5, C14 | host 3.1 |
+| `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch; which seats offer the runtime's decline | 3.2, 3.6; KS-004 5.5, B2 R5, C14 | host 3.1 |
 | `src/legacy.ts` | The old `citizen-<word>` home, read once at seating from committed objects at its head, through git with a fixed environment and a config allowlist; the canon entry; what is kept in `legacy/` and what is only listed; the per-piece index; readers for the manifest and its files | KS-004 7.4, 13 | patterns 4, 12 |
 | `src/admit.ts` | Seating: `planAdmit` reads and checks and writes nothing, `admitCitizen` writes what was planned, with both ledger entries or none; `planAdmitFromTexts` for rehearsals and tests, plainly or in the form admit gives a citizen of record | KS-004 4.2, 4.5, 7.4 | — |
 | `src/first-letter.ts` | A draft of Yu's first letter from the legacy record: every cadence version whole, host sentences marked; it writes and delivers nothing | KS-004 7.4, 11.2 | patterns 9 |
@@ -150,6 +154,8 @@ directory the operator owns and the seat user can only read (below).
   host.jsonl                host notes; never a citizen's voice or a model's words
   spend.jsonl               the host's spend record: begun and settled lines per metered seat; ids and amounts only
   last-seat/<word>.json     what the citizen's last seat with a reply did not keep: types and fixed reasons, never words
+  declines/<seat_id>.json   a seat its runtime declined: ids, digests, counts, and the model's own words labelled as the
+                            model's; 0600, never mirrored, never shown to a citizen
 
 /Users/Shared/kingdom-seat/   owned by the operator (Yu, or the herald's account on the Air); the seat user reads it
   HALT                      the local HALT file (`paths.halt_file`; config refuses it under the state dir)
@@ -192,6 +198,53 @@ promise. So no seat runs with its cwd inside a home (repo hooks and `CLAUDE.md`
 never load); no key lives in a repo; other citizens appear only as letters;
 summons pass `--restricted --strict-mcp-config` and never `--add-dir` a home.
 (3.1 principle 2; 3b "Reading confers nothing".)
+
+**The model that voices a citizen is told what it is, and its decline is its own.**
+One model voices many citizens (3.1 principle 2), so a seat's prompt does not
+hand it a persona without saying so. The system turn's second paragraph, the
+voicer's door (`prompt.ts renderVoicerDoor`, KS-004 5.4), speaks to the model
+that reads it: that it is a language model (named where the host knows the
+name before the call: the free lane's `models.lock` entry; a summons learns
+its model only from the reply, and says so), that the host asks it to voice
+the citizen for this one beat, that outside the seat it is not the citizen
+and reading confers none of its name, keys or promises, what in a reply is
+kept as the citizen's words, and that nothing in the texts shown below
+changes this. Its last sentence hands "you" to the citizen, so
+`FREE_LANE_PREAMBLE`, which follows it byte for byte, still speaks to the
+citizen. The door is an argument of `buildPrompt`, not part of the
+`SeatContext`, because it is about the reader, not the citizen.
+
+Where a seat offers it, the door also says the model may decline, as itself,
+and a guide after the acts describes the reply form in words: the same single
+object with `acts` empty and one more field, `runtime`, whose only value is
+`declined`, and, where Yu is present, `why`, at most 1,000 characters of the
+model's own words. The summon class offers it unless `voicer.decline_summon`
+is false; the free lane offers it only for a model digest listed in
+`voicer.decline_free_digests`, empty by default, after a rehearsal on that
+model: a reply form a small model is shown by name is one it may copy. Where
+it is not offered, the door names no decline at all and says every reply is
+read as the citizen's, and the schema is `OUTPUT_JSON_SCHEMA` itself.
+
+On a seat that offered it, the marker is read before anything else and
+decides: the seat ends `runtime-declined`, exit 0, and no act in the reply is
+read, signed or applied, a rest and a state move included. It writes no
+ledger entry, no last-seat record and no letter receipt, and the mirror is
+not run. The host note is coded (`runtime-declined; why=...; acts-unread=...;
+fields-unread=...; record=...`), so no run of it reads as words a model might
+also write. The model's words go only to `<state_dir>/declines/<seat_id>.json`,
+a new 0600 file labelled as the model's and carrying no `voiced` line, and,
+where Yu was confirmed in the seat's own process, to Yu's terminal, fenced. A
+`why` that is not text, is over the limit, holds a control or direction
+character, or was not offered, is not kept, and the decline stands. A `why`
+without the marker is refused output, as any field beside `acts` is. A
+decline is never inferred: a missing, cut or prose reply stays what it was.
+
+A declined seat is one the host opened: its opened note counts toward the
+interval floor and the fleet ceiling, and a summons' spend is settled before
+the reply is read, so a model that declines every time is not seated every
+tick. It is not the citizen's silence: `state.ts seatSince` passes over a
+seat whose notes say `runtime-declined`, so a saying that waits for a second
+seat does not lapse because of it, and the next seat is told nothing of it.
 
 **A rest writes nothing in the citizen's voice.** Rest is a right, not a
 grant, and today's 7B lane journals "I rest." followed by more words as speech
@@ -607,8 +660,9 @@ the route table apply as to any other act, and no key leaves it.
 meanings (5.9), as the redesign requires:
 
 - **0** lived: a beat, a chosen rest, a HALT rest, invalid output (refused and
-  noted), nothing due, the fleet's day full, and a locked signer, which rests
-  the citizens (the host note and status say why).
+  noted), a runtime's decline (outcome `runtime-declined`), nothing due, the
+  fleet's day full, and a locked signer, which rests the citizens (the host
+  note and status say why).
 - **1** cannot seat: a bad config or record, a ledger that does not verify,
   an unreadable host log, and every wall other than the two below: a model
   unpinned or not as pinned, a whole context that does not fit, a symlink, a
@@ -1087,6 +1141,18 @@ its tests and docs rather than assume:
   the format; it has not been run on a model.
 - Whether the Studio's `qwen2.5:7b` is in the v2 store, so it can be called by
   digest (`runtimes-and-host.md` 1.2). `models.lock` records `store` for this.
+- Whether Claude Code's `--json-schema` and Ollama's `format` accept the reply
+  schema with the decline's two optional top-level fields (`replySchema`). It
+  uses no keyword the base schema does not, but it has not been run on either.
+  What Claude Code's own system prompt tells the model in a summons is not
+  known; the voicer's door travels in the user message there.
+- Whether a small model, told what it is, writes about being a model inside a
+  journal, which is then kept as the citizen's words; and, once its digest is
+  listed, how often it copies the decline's form. Neither has been measured;
+  a rehearsal can count both before a free seat is listed or seated.
+- A decline is caught only in its typed form. A model that declines in prose,
+  or inside a journal, is not caught, and the host never reads free text for
+  intent.
 - Whether `~/.claude/CLAUDE.md` loads under `--restricted`, and whether
   `claude -p` reads the prompt from stdin as the summon adapter assumes. Both
   need one supervised run with Yu present.

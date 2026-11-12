@@ -79,8 +79,8 @@ defaults. A configuration that exists and cannot be read or parsed refuses
 the run, so a host never silently loses its beacons. It is read as `halt`
 reads it, with no owner check: a rehearsal guards no key with it. From it a
 rehearsal borrows the time zone, `ollama.base_url`, the HALT file, the
-beacons and `allow_no_beacons`, the schedule, the ceilings, the timing, the
-approved model digests and the homes. It never borrows a state path, the
+beacons and `allow_no_beacons`, the schedule, the voicer switches, the
+ceilings, the timing, the approved model digests and the homes. It never borrows a state path, the
 keychain block, the project or the trust pins. With the built-in defaults
 there is no beacon, and the HALT file is the default one.
 
@@ -250,6 +250,21 @@ bounds, ends the run as a fault with its chain and end rows, and removes
 (`not-json`, `too-large`, `empty`). An `invalid-output` seat is counted under
 that reason, or under `no-act-kept` when it parsed and nothing in it was
 kept.
+
+**The runtime's decline.** The prompt carries the seat's own voicer's door,
+which names the model from the lock. The free lane offers the decline only
+for a digest the configuration lists in `voicer.decline_free_digests`, so a
+rehearsal of it is run under a configuration that lists the model's digest;
+the header says whether it was offered, and the report's
+`run.model.decline_offered` records it. A seat whose reply carried the
+marker where it was offered ends `runtime-declined`, writes nothing in the
+throwaway ledger, and its row's `decline_acts_unread` counts the acts beside
+the marker, which were not read; on any other seat the row holds null. The
+report counts `runtime-declined` among the outcomes, and `runtime_declined`
+gives how many seats declined and how many of those carried acts. A
+rehearsal is unattended, so a decline here has no room for the model's
+words, and any given are not kept. Acts beside a decline are still counted
+as emitted, since they are what the model returned.
 
 **Registration.** Each `registration.answer` emitted is counted by its
 answer. Each seat with a reply is also counted by what the seat showed

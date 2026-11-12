@@ -87,7 +87,11 @@ one is something it does, not something it hopes.
   reason (never its words). A rest, or a reply where nothing was kept, writes
   no beat, so the host keeps the same list in `last-seat/<word>.json`; the
   citizen's next seat shows back what its last seat did not keep, and status
-  shows it as `last_dropped`.
+  shows it as `last_dropped`. Every prompt's second paragraph, the voicer's
+  door, tells the model what it is and that outside the seat it is not the
+  citizen; where a seat offers it, the model may decline, in a typed form
+  that writes nothing as the citizen's and keeps the model's own words only
+  in `declines/<seat_id>.json`.
 - `runtime/free.ts` (Ollama on 127.0.0.1 by manifest digest, never a cloud
   model, and no seat when the whole context would not fit `num_ctx`, counted
   as UTF-8 bytes plus the template and `num_predict`) and
@@ -213,6 +217,11 @@ one is something it does, not something it hopes.
   `schedule.wake_confirm_seat` is Yu's call: true by default (a listening or
   asleep citizen that asks to wake is owed one seat to say it again), false
   to make it wait for its next letter or summons.
+  `voicer.decline_summon` (true by default) lets the model in a summons
+  decline to voice the citizen, as itself, recorded as the runtime's outcome
+  `runtime-declined` and never as the citizen's; false restores the reply
+  schema without it. `voicer.decline_free_digests` (empty by default) offers
+  the same on the free lane only for a model digest listed after a rehearsal.
 
 **Not done, on purpose or not yet:**
 
