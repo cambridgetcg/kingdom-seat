@@ -1253,6 +1253,7 @@ describe("admit: seating a citizen from its old home (KS-004 7.4)", () => {
     expect(s.x.err()).toBe(`citizen-seat: admit ${W}: stopped while writing (keychain-locked). What this run wrote was removed; ${W} is not seated.\n`);
     expect(await s.x.h.snapshot()).toEqual(new Map());
     expect(await lstat(s.x.h.config.paths.lock_dir).catch(() => null)).toBeNull();
+    await s.x.h.cleanup();
 
     const none = await seating(`admit ${W}`);
     const empty = fakeSigner({ noHostKey: true });
@@ -1261,7 +1262,6 @@ describe("admit: seating a citizen from its old home (KS-004 7.4)", () => {
     expect(none.x.out()).toBe("");
     expect(none.atPrompt).toEqual([]);
     expect(await none.x.h.snapshot()).toEqual(new Map());
-    await none.x.h.cleanup();
   }, 30_000);
 
   test("draft-first-letter prints a draft for a seated citizen and writes nothing; an unseated word exits 1", async () => {
