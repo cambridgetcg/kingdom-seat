@@ -73,6 +73,8 @@ export interface AdmitTextsRequest {
   canon: { bytes: Uint8Array | string; repo: string; path: string; commit: string } | null;
   /** With no canon entry, the class to name as the lineage; without it the lineage says only how the citizen was seated. */
   archetype_class?: string;
+  /** Seat the throwaway in the form admit gives a citizen of record, as far as texts allow: see planAdmitFromTexts. */
+  as_admitted?: boolean;
   runtime: "free" | "summon";
 }
 
@@ -101,6 +103,12 @@ export interface AdmitPlan {
   host_key: { public_key_b64: string; fingerprint: string; pinned: boolean };
   /** Staging names an earlier admit of this word left behind. */
   stale_staging: number;
+  /**
+   * Set only on a plan from planAdmitFromTexts given `as_admitted`: a
+   * fixture's record in the form admit gives a citizen of record, whose will
+   * is pinned as `origin/WILL.md` although there is no old repository.
+   */
+  as_admitted?: true;
 }
 
 /** What a seating wrote: the directory, the ledger and its two entries, by their ledger digests. */
@@ -141,7 +149,15 @@ export class AdmitStopped extends Error {
 export const TEXTS_LINEAGE = "seated-from-texts";
 export const TEXTS_ORIGIN_NOTE = "No canon entry and no old repository. This citizen was seated from texts given to the host.";
 
-const CLASS_NAME = /^[A-Z][A-Z0-9-]{0,31}$/;
+/** The shape of a class admit reads from an old agent.json: capital letters, digits and hyphens. */
+export const ARCHETYPE_CLASS = /^[A-Z][A-Z0-9-]{0,31}$/;
+/** The class of a canon word. Admit seats such a word on its canon entry, never as an archetype. */
+export const CANON_WORD_CLASS = "LEXEME";
+
+/** The origin admit gives an archetype: the one class the old manifest records, since the archetypes were born before the forge (KS-004 4.2). */
+function archetypeOfRecord(cls: string): Origin {
+  return { kind: "archetype", lineage: [cls], note: `No canon entry. The old repository's agent.json records the class ${cls}.` };
+}
 const CANON_PATH = /^canon\/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/){0,3}[A-Za-z0-9-]+\.md$/;
 const CANON_REPO = /^[A-Za-z0-9._-]{1,64}$/;
 const CANON_COMMIT = /^[0-9a-f]{7,40}$/;
@@ -290,12 +306,11 @@ export async function planAdmit(deps: Pick<AdmitDeps, "config" | "run" | "hostKe
       canon = entry.bytes;
     } else {
       const cls = legacy.citizen_class;
-      if (cls === "LEXEME") throw new Refusal("invalid-request", "agent.json records the class LEXEME, the class of a canon word; name its canon entry with --canon");
-      if (cls === null || !CLASS_NAME.test(cls)) {
+      if (cls === CANON_WORD_CLASS) throw new Refusal("invalid-request", "agent.json records the class LEXEME, the class of a canon word; name its canon entry with --canon");
+      if (cls === null || !ARCHETYPE_CLASS.test(cls)) {
         throw new Refusal("invalid-request", "--archetype needs the class agent.json records: it records none, or one that is not capital letters, digits and hyphens");
       }
-      // One name, the class the old manifest records: the archetypes were born before the forge (KS-004 4.2).
-      origin = { kind: "archetype", lineage: [cls], note: `No canon entry. The old repository's agent.json records the class ${cls}.` };
+      origin = archetypeOfRecord(cls);
     }
 
     const host_key = await readHostKey(deps);
@@ -339,23 +354,37 @@ export async function planAdmit(deps: Pick<AdmitDeps, "config" | "run" | "hostKe
  * (size, UTF-8, the origin's shape) and the same checks on the host, and
  * returns a plan admitCitizen accepts.
  *
- * There is no old repository, and the record says so: the `origin` entry
+ * There is no old repository, and the ledger says so: the `origin` entry
  * carries `old_repo: null` and `june_did: null`, and no `legacy/` is written.
- * A WILL given is not pinned as `origin/WILL.md` either, so no seat introduces
- * it as the text an old repository held: it is the citizen's will and no more.
  * A canon entry's repo, path and commit are the caller's statement and are
- * checked for shape only. With no canon entry the origin is an archetype
- * whose note says the citizen was seated from texts, and whose lineage is the
- * class the caller names, or TEXTS_LINEAGE when it names none.
+ * checked for shape only.
  *
- * The admit verb never calls this: a citizen of record is seated from its old
- * home at a head its origin holds.
+ * Plainly, a WILL given is not pinned as `origin/WILL.md`, so no seat
+ * introduces it as the text an old repository held: it is the citizen's will
+ * and no more. With no canon entry the origin is an archetype whose note says
+ * the citizen was seated from texts, and whose lineage is the class the
+ * caller names, or TEXTS_LINEAGE when it names none.
+ *
+ * `as_admitted` exists so that a rehearsal's prompt is the prompt a citizen
+ * seated by admit is shown. With it the throwaway is seated in the form admit
+ * gives a citizen of record, as far as texts allow: a WILL given is also
+ * pinned as `origin/WILL.md`, so a seat introduces it as the text an old
+ * repository held, and a class given yields the lineage and note planAdmit
+ * writes for that class, under planAdmit's rule that a canon word's class
+ * (LEXEME) is no archetype. The record it writes is then a fixture's, and the
+ * pin and the note say things of an old repository that are not so of the
+ * throwaway, which has none. With neither a canon entry nor a class the
+ * origin is the one seated from texts, as without the option.
+ *
+ * The admit verb never calls this, with the option or without it: a citizen
+ * of record is seated from its old home at a head its origin holds.
  */
 export async function planAdmitFromTexts(deps: Pick<AdmitDeps, "config" | "hostKey">, req: AdmitTextsRequest): Promise<AdmitPlan> {
   try {
     const { config } = deps;
     checkWord(req.word, req.runtime);
     const word = req.word;
+    const admitted = req.as_admitted === true;
     await assertNotSeated(config, word);
 
     const soul = textBytes(req.soul, "the soul card");
@@ -378,11 +407,14 @@ export async function planAdmitFromTexts(deps: Pick<AdmitDeps, "config" | "hostK
       origin = { kind: "canon", repo: c.repo, path: c.path, commit: c.commit, sha256: sha256Hex(canon) };
     } else {
       const cls = req.archetype_class;
-      if (cls !== undefined && (typeof cls !== "string" || !CLASS_NAME.test(cls))) throw new Refusal("invalid-request", "an archetype class is capital letters, digits and hyphens");
+      if (cls !== undefined && (typeof cls !== "string" || !ARCHETYPE_CLASS.test(cls))) throw new Refusal("invalid-request", "an archetype class is capital letters, digits and hyphens");
+      if (admitted && cls === CANON_WORD_CLASS) throw new Refusal("invalid-request", "LEXEME is the class of a canon word, which admit seats on its canon entry; give the canon entry instead");
       origin =
         cls === undefined
           ? { kind: "archetype", lineage: [TEXTS_LINEAGE], note: TEXTS_ORIGIN_NOTE }
-          : { kind: "archetype", lineage: [cls], note: `No canon entry and no old repository. The class ${cls} was given to the host with the texts.` };
+          : admitted
+            ? archetypeOfRecord(cls)
+            : { kind: "archetype", lineage: [cls], note: `No canon entry and no old repository. The class ${cls} was given to the host with the texts.` };
     }
 
     const host_key = await readHostKey(deps);
@@ -403,6 +435,7 @@ export async function planAdmitFromTexts(deps: Pick<AdmitDeps, "config" | "hostK
         legacy: null,
         host_key,
         stale_staging: await staleStaging(config, word),
+        ...(admitted ? { as_admitted: true as const } : {}),
       },
       { soul, will, canon, legacy: null },
     );
@@ -583,8 +616,9 @@ async function writeCitizenDir(root: string, plan: AdmitPlan, bytes: PlanBytes, 
   await put("self/covenants.json", plan.covenants_text, 0o644);
   await put("origin/soul.md", bytes.soul, 0o444);
   // The pin says "the will as the old repository held it", which the seat tells the citizen while the two are equal.
-  // A citizen seated from texts has no old repository, so its will is pinned nowhere and is simply its will.
-  if (bytes.will && plan.old_repo) await put("origin/WILL.md", bytes.will, 0o444);
+  // A citizen seated from texts has no old repository, so its will is pinned nowhere and is simply its will, unless
+  // the plan seats a fixture as admit seats a citizen of record (planAdmitFromTexts, as_admitted).
+  if (bytes.will && (plan.old_repo || plan.as_admitted)) await put("origin/WILL.md", bytes.will, 0o444);
   if (bytes.canon) await put("origin/canon.md", bytes.canon, 0o444);
   const legacy = bytes.legacy;
   if (legacy && plan.old_repo) {
@@ -624,6 +658,8 @@ export function renderAdmitPlan(plan: AdmitPlan): string {
   if (plan.old_repo) {
     lines.push(row("old repository", `${plan.old_repo.url} at ${plan.old_repo.head}, committed ${plan.old_repo.head_committed_at}. This host fetched nothing; the clone is as it was last updated.`));
     lines.push(row("read from", `${shown(plan.legacy_home ?? "")}, committed objects only`));
+  } else if (plan.as_admitted) {
+    lines.push(row("old repository", "none; seated from texts given to this host, in the form admit gives a citizen of record, as a fixture"));
   } else {
     lines.push(row("old repository", "none; seated from texts given to this host"));
   }
@@ -634,7 +670,7 @@ export function renderAdmitPlan(plan: AdmitPlan): string {
     row(
       "will",
       plan.will
-        ? `${willName}${plan.will.bytes} bytes, sha256 ${plan.will.sha256}  -> self/WILL.md${plan.old_repo ? ", origin/WILL.md" : ""}`
+        ? `${willName}${plan.will.bytes} bytes, sha256 ${plan.will.sha256}  -> self/WILL.md${plan.old_repo || plan.as_admitted ? ", origin/WILL.md" : ""}`
         : `none ${plan.old_repo ? "in the old repository" : "was given"}; ${w} starts with no will file`,
     ),
   );

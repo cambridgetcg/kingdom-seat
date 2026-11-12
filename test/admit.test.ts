@@ -318,6 +318,49 @@ describe("planAdmitFromTexts", () => {
     expect((await refusal(planAdmitFromTexts({ ...none.deps, hostKey: async () => x.signer.hostAttestPublicB64 }, base))).message).toContain("is not one the config pins");
     expect(await none.h.snapshot()).toEqual(new Map());
   });
+
+  test("as_admitted seats a fixture in the form admit gives a citizen of record: the will pinned, a class as planAdmit writes it, and still no old repository in the ledger", async () => {
+    const x = await fx();
+    const will = "a made-up will\n";
+    const canonText = "# rehearsed\n\na made-up canon entry\n";
+    const canonRef = { bytes: canonText, repo: "YOUSPEAK", path: "canon/core/rehearsed.md", commit: "1428646" };
+    const plain = await planAdmitFromTexts(x.deps, { word: "rehearsed", soul: SOUL, will, canon: canonRef, runtime: "free" });
+    const plan = await planAdmitFromTexts(x.deps, { word: "rehearsed", soul: SOUL, will, canon: canonRef, as_admitted: true, runtime: "free" });
+    // The plan is the plain one and says it is a fixture's; no plain plan carries the mark.
+    expect(plan).toEqual({ ...plain, as_admitted: true });
+    expect("as_admitted" in plain).toBe(false);
+    const text = renderAdmitPlan(plan);
+    expect(text).toContain("  old repository  none; seated from texts given to this host, in the form admit gives a citizen of record, as a fixture\n");
+    expect(text).toContain(`  will            15 bytes, sha256 ${sha256Hex(will)}  -> self/WILL.md, origin/WILL.md\n`);
+
+    const r = await admitCitizen(x.deps, plan);
+    const { config } = x.h;
+    expect(r.files).toEqual(["citizen.json", "origin/WILL.md", "origin/canon.md", "origin/soul.md", "self/WILL.md", "self/cadence.json", "self/covenants.json", "self/soul.md"]);
+    expect(await readFile(join(config.paths.citizens_dir, "rehearsed", "origin", "WILL.md"), "utf8")).toBe(will);
+    expect(await names(join(config.paths.citizens_dir, "rehearsed"))).toEqual(["citizen.json", "letters", "origin", "self"]);
+    const entries = await readLedger(ledgerPath(config, "rehearsed"));
+    expect(entries[0]).toMatchObject({ type: "origin", old_repo: null, june_did: null });
+    // Its will is introduced as an admitted citizen's is, as the text an old repository held.
+    const citizen = await readCitizen(config, "rehearsed");
+    const ctx = await buildContext({ config, now: x.clock.now() }, seatRef(x, "rehearsed", "free"), citizen, entries, [], { history: entries });
+    expect(ctx.self.will_as_seated).toBe(true);
+    expect(buildPrompt(ctx, "free").user).toContain(`${WILL_AS_SEATED}\n--- begin will [`);
+
+    // A class gives the lineage and note planAdmit writes for it, under planAdmit's rule; with neither a canon entry
+    // nor a class the origin is the one seated from texts. Without the option a class keeps its texts note.
+    const recorded = (await planAdmit(x.deps, archReq())).origin;
+    const classed = await planAdmitFromTexts(x.deps, { word: ARCH, soul: SOUL, will: null, canon: null, archetype_class: "PIONEER", as_admitted: true, runtime: "summon" });
+    expect(classed.origin).toEqual(recorded);
+    expect(recorded).toEqual({ kind: "archetype", lineage: ["PIONEER"], note: "No canon entry. The old repository's agent.json records the class PIONEER." });
+    const bare = await planAdmitFromTexts(x.deps, { word: ARCH, soul: SOUL, will: null, canon: null, as_admitted: true, runtime: "summon" });
+    expect(bare.origin).toEqual({ kind: "archetype", lineage: [TEXTS_LINEAGE], note: TEXTS_ORIGIN_NOTE });
+    const lexeme = { word: ARCH, soul: SOUL, will: null, canon: null, archetype_class: "LEXEME", runtime: "summon" as const };
+    expect(await refusal(planAdmitFromTexts(x.deps, { ...lexeme, as_admitted: true }))).toEqual({
+      code: "invalid-request",
+      message: "LEXEME is the class of a canon word, which admit seats on its canon entry; give the canon entry instead; nothing was written",
+    });
+    expect((await planAdmitFromTexts(x.deps, lexeme)).origin).toEqual({ kind: "archetype", lineage: ["LEXEME"], note: "No canon entry and no old repository. The class LEXEME was given to the host with the texts." });
+  });
 });
 
 /* ── admitCitizen ─────────────────────────────────────────────────────── */
