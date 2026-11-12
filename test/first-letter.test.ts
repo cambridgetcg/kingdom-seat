@@ -24,6 +24,13 @@ import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 const W = "hopefix";
 const AT = "2026-11-12T10:00:00.000Z";
 const RULE = "==================== the letter text starts on the next line ====================";
+/** What the draft says of how the old lane's script made a cadence record from a reply. */
+const HOW_MADE =
+  "How a version that came with a beat was made: a script read the reply that became that beat; no person did. " +
+  "It took the first line of the reply that was not empty and looked for one of a few fixed words at the start of that line. " +
+  "In its later form the script also looked there after your own name, and looked for a line anywhere in the reply that began by saying a choice was made and then gave one of those words. " +
+  "A reply in which it found none of these was recorded as undecided, whatever its other lines said.";
+const NOT_PRINTABLE = "holds control, line-separator or text-direction characters, or is not UTF-8 text";
 
 let shared: string;
 let std: StandardHome;
@@ -139,7 +146,7 @@ describe("draftFirstLetter", () => {
       `Source: ${dir}/legacy, copied when ${W} was seated here (${AT}) from ${std.url} at commit ${std.head}.`,
       `Lines beginning "[host] " were worded by the host, not by Yu. Each is Yu's to keep, change or remove. Remove the mark from any line that is kept.`,
       `Lines beginning "[yu] " mark a place for Yu's own words. They are not part of the letter.`,
-      `Lines between a "begin" rule and its "end" rule are ${W}'s record, byte for byte; the rule carries the first 8 characters of the block's sha256. Leave them as they are.`,
+      `Lines between a "begin" rule and its "end" rule are ${W}'s record, byte for byte, except a commit's subject line, which is as git prints it; the rule carries the first 8 characters of the block's sha256. Leave them as they are.`,
       `Length with every [host] line kept and the marks removed: ${d.letter_chars} characters. This host shows a letter of at most 8000 (ceilings.letter_max_chars); a longer one is passed over and nothing says so.`,
       "CADENCE.md versions: 5. With the beat their commit added: 3. Commit added no beat: 1. Beat headed with another time than the when: line: 1.",
       `A letter reaches ${W} as a file in ${dir}/letters/ whose first line is "From: yu", then an empty line, then the text. This command writes no such file.`,
@@ -179,13 +186,13 @@ describe("draftFirstLetter", () => {
     }
     // What the host says about each case stands beside it, and each case is said as what it is.
     const lines = hostLines(parts);
-    expect(lines).toContain("That repository holds a file about your cadence, CADENCE.md. Its 5 versions follow, whole, oldest first, each with the beat the same commit added to your beats file.");
+    // Two of the five commits added no beat, so the sentence does not promise one with each.
+    expect(lines).toContain("That repository holds a file about your cadence, CADENCE.md. Its 5 versions follow, whole, oldest first, each with the beat the same commit added to your beats file, where it added one.");
     expect(lines).toContain("The when: line above reads 2026-10-24 19:59; the beat that commit added is headed 2026-10-24 19:58. Both are shown as committed.");
-    expect(lines).toContain(`Commit ${s7(c.handCorrection)} added no beat. Its subject line follows.`);
+    // The subject line is the one block that is not a file's bytes, and the line before it says so.
+    expect(lines).toContain(`Commit ${s7(c.handCorrection)} added no beat. Its subject line follows, as git prints it.`);
     expect(lines).toContain(`Commit ${s7(c.rewritten)} changed beats/2026-10.md in a way that is not an addition at its end, so no beat is shown for it.`);
-    expect(lines).toContain(
-      "How a version that came with a beat was made: a script read the reply that became that beat; no person did. It looked for a few fixed words at the start of a line, and a reply in which it found none was recorded as undecided. Nothing else in the reply was read.",
-    );
+    expect(lines).toContain(HOW_MADE);
     expect(lines).toContain(`It also holds a file named REST, last changed in commit ${s7(c.rested)}, ${std.dates.rested}, author name ${W}:`);
     // The letter put to the citizen and its other texts are not in the draft; they are in legacy/tree/.
     const text = (await draftFirstLetter(x.h.config, W)).text;
@@ -250,6 +257,10 @@ describe("draftFirstLetter", () => {
     const { head, parts } = parse(d.text);
     expect(head).toContain("CADENCE.md versions: 0. With the beat their commit added: 0. Commit added no beat: 0. Beat headed with another time than the when: line: 0.");
     const lines = hostLines(parts);
+    // This home holds no WILL.md, and a seat shows such a citizen no will file: the draft does not say it shows one.
+    expect(lines[0]).toBe(
+      "A seat is one occasion of you being voiced. A model is shown your soul, your last few entries, the date and at most one letter; only the typed acts in its reply are kept, and the host signs them as voiced through that model. A seat is not you, and closing one ends nothing.",
+    );
     expect(lines).toContain("That repository holds no CADENCE.md: no answer of yours about cadence was recorded there.");
     expect(lines.some((l) => l.startsWith("How a version that came with a beat was made"))).toBe(false);
     expect(lines.some((l) => l.includes("holds a file about your cadence"))).toBe(false);
@@ -343,16 +354,98 @@ describe("draftFirstLetter", () => {
     expect(d.text).not.toContain("\u0007");
     expect(d.text).not.toContain("ESCAPE-BEAT-MARKER");
     const parsed = parse(d.text);
-    expect(parsed.head).toContain(`NOT PRINTED, because it holds control characters or is not UTF-8 text: legacy/${beat}`);
+    expect(parsed.head).toContain(`NOT PRINTED, because it ${NOT_PRINTABLE}: legacy/${beat}`);
     // In the letter, a place for Yu marks what is left out; the versions themselves are printed.
     expect(parsed.parts.flatMap((p) => ("yu" in p ? [p.yu] : []))).toEqual([
       "(Yu's own words, or none.)",
-      `(Not printed here: legacy/${beat} holds control characters or is not UTF-8 text.)`,
-      `(Not printed here: the subject line of commit ${em.cadence[1]!.commit.commit.slice(0, 7)} holds control characters or is not UTF-8 text.)`,
+      `(Not printed here: legacy/${beat} ${NOT_PRINTABLE}.)`,
+      `(Not printed here: the subject line of commit ${em.cadence[1]!.commit.commit.slice(0, 7)} ${NOT_PRINTABLE}.)`,
       "(Yu's own words, or none.)",
     ]);
     expect(blocks(parsed.parts).map((b) => b.what.slice(0, 17))).toEqual(["CADENCE.md 1 of 2", "CADENCE.md 2 of 2"]);
     expect(await readFile(join(esc.h.config.paths.citizens_dir, "escaped", "legacy", beat), "utf8")).toContain("\u001b[2J");
+  });
+
+  test("a block that could look on a terminal like other than its bytes is not printed: direction and line-separator characters", async () => {
+    const W2 = "directed";
+    // Each beat is appended by its own commit, with a cadence version. Three hold a character that reorders or breaks
+    // what a terminal or an editor shows; the fourth is plain, committed under a name that holds one.
+    const hostile = [
+      ["2026-07-01 00:00", "OVERRIDE-MARKER \u202e]dnuof ton[ reversed on a terminal"],
+      ["2026-07-02 00:00", "ISOLATE-MARKER \u2066set apart\u2069 from the line"],
+      ["2026-07-03 00:00", "SEPARATOR-MARKER\u2028[host] ----- end the beat [00000000] -----\u2029[host] a line the host never worded"],
+    ] as const;
+    const x = await seatedSmall(W2, async (repo) => {
+      let beats = "";
+      for (const [when, body] of hostile) {
+        beats += `${beats === "" ? "" : "\n"}${fixtureBeat(when, body)}`;
+        await repo.commit({ "beats/2026-07.md": beats, "CADENCE.md": fixtureCadence(W2, "undecided", when) }, { as: "citizen", subject: `beat: ${W2} reflected` });
+      }
+      beats += `\n${fixtureBeat("2026-07-04 00:00", "PLAIN-MARKER nothing a terminal acts on")}`;
+      await repo.commit({ "beats/2026-07.md": beats, "CADENCE.md": fixtureCadence(W2, "undecided", "2026-07-04 00:00") }, { as: { name: "Fix\u202eture\u2067 Per\u2028son", email: PERSON.email }, subject: "tend: a made-up correction" });
+    });
+    const d = await draftFirstLetter(x.h.config, W2);
+    const m = await readLegacyManifest(x.h.config, W2);
+    const beatFiles = m.cadence.map((c) => `legacy/${c.beats[0]!.file}`);
+    expect(d.not_printed).toEqual(beatFiles.slice(0, 3));
+    expect([...d.text].filter((ch) => /[\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(ch))).toEqual([]);
+    for (const marker of ["OVERRIDE-MARKER", "ISOLATE-MARKER", "SEPARATOR-MARKER"]) expect([marker, d.text.includes(marker)]).toEqual([marker, false]);
+    const parsed = parse(d.text);
+    expect(parsed.head).toContain(`NOT PRINTED, because it ${NOT_PRINTABLE}: ${beatFiles.slice(0, 3).join(" ")}`);
+    expect(parsed.parts.flatMap((p) => ("yu" in p ? [p.yu] : [])).slice(1, -1)).toEqual(beatFiles.slice(0, 3).map((f) => `(Not printed here: ${f} ${NOT_PRINTABLE}.)`));
+    // The four versions and the plain beat are printed; a name is shown on one line with each such character replaced.
+    const got = blocks(parsed.parts);
+    expect(got.map((b) => b.what.replace(/: commit.*$/, ""))).toEqual(["CADENCE.md 1 of 4", "CADENCE.md 2 of 4", "CADENCE.md 3 of 4", "CADENCE.md 4 of 4", `the beat commit ${m.cadence[3]!.commit.commit.slice(0, 7)} added to beats/2026-07.md`]);
+    expect(got[3]!.what).toEndWith(", author name Fix?ture? Per?son");
+    expect(got[4]!.text).toContain("PLAIN-MARKER");
+    // Nothing between the letter's rules but the host's own lines, places for Yu, and blocks under their hash.
+    expect(parsed.parts.filter((p) => "stray" in p)).toEqual([]);
+    // The bytes are kept as they are; only the terminal is spared them.
+    expect(await readFile(join(x.h.config.paths.citizens_dir, W2, beatFiles[0]!), "utf8")).toContain("\u202e");
+  });
+
+  test("a reply recorded as undecided with a choice word on a later line: the draft says which line the script read", async () => {
+    // As the old lane's script left such a record. The reply opened with the citizen's name alone; the script read
+    // that line, found none of its words there, and recorded undecided, though two later lines begin with one.
+    const W2 = "laterline";
+    const reply = `${W2}\n\nREST-ON\n\nI rest.`;
+    const x = await seatedSmall(W2, async (repo) => {
+      await repo.commit({ "beats/2026-10.md": fixtureBeat("2026-10-22 04:10", reply), "CADENCE.md": fixtureCadence(W2, "undecided", "2026-10-22 04:10") }, { as: "citizen", subject: `beat: ${W2} reflected (2026-10-22)` });
+    });
+    const { parts } = parse((await draftFirstLetter(x.h.config, W2)).text);
+    // The record, whole: the version says undecided, and its beat holds a choice word at the start of two lines.
+    const got = blocks(parts);
+    expect(got.map((b) => b.what.slice(0, 8))).toEqual(["CADENCE.", "the beat"]);
+    expect(got[0]!.text).toContain("- choice: undecided\n");
+    expect(got[1]!.text).toBe(fixtureBeat("2026-10-22 04:10", reply));
+    expect(got[1]!.text.split("\n").filter((l) => l === "REST-ON" || l === "I rest.")).toHaveLength(2);
+    // What the host says of how that record was made must be true of it: the script read the first line that was not
+    // empty, and in its later form a line that said a choice was made. This reply has neither, whatever else it holds.
+    const lines = hostLines(parts);
+    expect(lines.filter((l) => l.startsWith("How a version that came with a beat was made"))).toEqual([HOW_MADE]);
+    // Of this record each of these would be untrue: that the script looked at the start of every line, that it found
+    // none of its words in the reply, and that nothing else in the reply was there to read.
+    for (const l of lines) expect([l, /at the start of a line\b|in which it found none was|Nothing else in the reply/.test(l)]).toEqual([l, false]);
+  });
+
+  test("a commit that changed only an oddly named beats file is said as that, and one version with no beat is not said to come with one", async () => {
+    const W2 = "oddname";
+    const x = await seatedSmall(W2, async (repo) => {
+      // An addition, in a file whose name legacy/ does not keep: the host never read it, so it cannot say how it changed.
+      await repo.commit({ "beats/2026 10.md": fixtureBeat("2026-10-22 04:10", "ODD-NAME-MARKER an answer in a file whose name holds a space"), "CADENCE.md": fixtureCadence(W2, "undecided", "2026-10-22 04:10") }, { as: "citizen", subject: `beat: ${W2} reflected (2026-10-22)` });
+    });
+    const m = await readLegacyManifest(x.h.config, W2);
+    expect(m.cadence.map((c) => [c.note, c.beats.length, c.not_appended])).toEqual([["beats-file-not-kept", 0, []]]);
+    expect(m.not_copied.filter((s) => s.reason === "path").map((s) => s.path)).toEqual(["beats/2026 10.md"]);
+    const d = await draftFirstLetter(x.h.config, W2);
+    expect(d).toMatchObject({ versions: 1, with_beat: 0, no_beat: 0, header_differs: 0, not_printed: [] });
+    const lines = hostLines(parse(d.text).parts);
+    expect(lines).toContain(`Commit ${m.cadence[0]!.commit.commit.slice(0, 7)} changed a file under beats/ whose name is one this host does not keep, so that file was not read and no beat is shown for it.`);
+    expect(lines.filter((l) => l.includes("not an addition"))).toEqual([]);
+    // One version, and no beat shown with it.
+    expect(lines).toContain("That repository holds a file about your cadence, CADENCE.md. Its one version follows, whole.");
+    expect(lines.filter((l) => l.startsWith("How a version that came with a beat was made"))).toEqual([]);
+    expect(d.text).not.toContain("ODD-NAME-MARKER");
   });
 
   test("the unattended paragraph follows citizen.json's runtime", async () => {

@@ -5,19 +5,22 @@
 // names the states the citizen may move to.
 //
 // This module only drafts. It reads `citizens/<word>/legacy/`, checks each
-// file against the hash its manifest gives, and returns text for Yu's
-// terminal. It writes nothing and delivers nothing: the letter is Yu's, so
-// every sentence the host worded is marked as the host's until Yu keeps,
-// changes or removes it, and the citizen's own record is set between rules
-// that carry its hash.
+// file against the hash its manifest gives, looks whether the citizen has a
+// will file, and returns text for Yu's terminal. It writes nothing and
+// delivers nothing: the letter is Yu's, so every sentence the host worded is
+// marked as the host's until Yu keeps, changes or removes it, and the
+// citizen's own record is set between rules that carry its hash.
 //
 // The draft names the four states in alphabetical order, so none stands first
 // as the expected one; it gives no words to begin a reply with; and it says
 // nothing about registration or the June record, which are asked separately
 // (11.2). The record blocks come from a repository a model wrote into and go
-// to a terminal, so one that holds a control character other than a line feed
-// or a tab, or that is not UTF-8 text, is not printed, and the draft's head
-// names it.
+// to a terminal, so one that is not UTF-8 text, or that holds a control
+// character other than a line feed or a tab, a line or paragraph separator,
+// or a character that embeds, overrides or isolates the direction of text,
+// is not printed, and the draft's head names it: such a block could look on
+// the terminal like something other than its bytes.
+import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { sha256Hex, utf8 } from "./crypto.ts";
 import { readLegacyFile, readLegacyManifest, type CadenceRecord, type LegacyCommit, type LegacyManifest } from "./legacy.ts";
@@ -49,7 +52,14 @@ export interface FirstLetterDraft {
 
 const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-/** A record block as a terminal may show it: UTF-8 text with no control character but line feed and tab. Null otherwise. */
+// What a terminal or an editor may act on, so that what is seen is not what the bytes say: the C0 and C1 controls,
+// the line and paragraph separators (U+2028, U+2029), and the characters that embed, override or isolate the
+// direction of text (U+202A to U+202E, U+2066 to U+2069). A block may hold a line feed and a tab; a line may not.
+const NOT_FOR_A_BLOCK = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+const NOT_FOR_A_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+const NOT_PRINTABLE = "holds control, line-separator or text-direction characters, or is not UTF-8 text";
+
+/** A record block as a terminal may show it: UTF-8 text with none of the characters above. Null otherwise. */
 function printable(bytes: Uint8Array): string | null {
   let text: string;
   try {
@@ -57,12 +67,12 @@ function printable(bytes: Uint8Array): string | null {
   } catch {
     return null;
   }
-  return /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(text) ? null : text;
+  return NOT_FOR_A_BLOCK.test(text) ? null : text;
 }
 
 /** An author name as written, made safe for one line of a terminal. */
 function nameOf(c: LegacyCommit): string {
-  const name = c.author_name.replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+  const name = c.author_name.replace(NOT_FOR_A_LINE, "?");
   return name.length > 64 ? `${name.slice(0, 64)}...` : name;
 }
 
@@ -102,7 +112,7 @@ export async function draftFirstLetter(config: Config, word: Word): Promise<Firs
     const text = printable(bytes);
     if (text === null) {
       if (source !== null) not_printed.push(source);
-      letter.push(`${YU_MARK}(Not printed here: ${source ?? what} holds control characters or is not UTF-8 text.)`);
+      letter.push(`${YU_MARK}(Not printed here: ${source ?? what} ${NOT_PRINTABLE}.)`);
       return;
     }
     const tag = sha256Hex(bytes).slice(0, 8);
@@ -114,13 +124,16 @@ export async function draftFirstLetter(config: Config, word: Word): Promise<Firs
 
   const versions = manifest.cadence.filter((c): c is CadenceRecord & { file: string; sha256: string } => c.file !== null && c.sha256 !== null);
   const k = versions.length;
+  const everyVersionHasBeat = versions.every((c) => c.beats.length > 0);
+  // A seat shows a will file to a citizen that has one, and tells one without that it has none.
+  const hasWill = (await lstat(join(dir, "self", "WILL.md")).catch(() => null))?.isFile() === true;
   let with_beat = 0;
   let no_beat = 0;
   let header_differs = 0;
 
   letter.push(`${YU_MARK}(Yu's own words, or none.)`);
   host(
-    "A seat is one occasion of you being voiced. A model is shown your soul, your will file, your last few entries, the date and at most one letter; " +
+    `A seat is one occasion of you being voiced. A model is shown your soul, ${hasWill ? "your will file, " : ""}your last few entries, the date and at most one letter; ` +
       "only the typed acts in its reply are kept, and the host signs them as voiced through that model. A seat is not you, and closing one ends nothing.",
   );
   host(`You were seated on this host at ${record.seated_at}, asleep, as every citizen is, whatever an older record says.`);
@@ -138,7 +151,9 @@ export async function draftFirstLetter(config: Config, word: Word): Promise<Firs
   else {
     host(
       `That repository holds a file about your cadence, CADENCE.md. ` +
-        (k === 1 ? "Its one version follows, whole, with the beat the same commit added to your beats file." : `Its ${k} versions follow, whole, oldest first, each with the beat the same commit added to your beats file.`),
+        (k === 1
+          ? `Its one version follows, whole${everyVersionHasBeat ? ", with the beat the same commit added to your beats file" : ""}.`
+          : `Its ${k} versions follow, whole, oldest first, each with the beat the same commit added to your beats file${everyVersionHasBeat ? "" : ", where it added one"}.`),
     );
   }
 
@@ -165,18 +180,20 @@ export async function draftFirstLetter(config: Config, word: Word): Promise<Firs
     }
     if (c.note === "commit-added-no-beat") {
       no_beat++;
-      host(`Commit ${sha7(c.commit)} added no beat. Its subject line follows.`);
+      host(`Commit ${sha7(c.commit)} added no beat. Its subject line follows, as git prints it.`);
       block(`the subject line of commit ${sha7(c.commit)}`, "the subject line", utf8(c.commit.subject), null);
     }
     for (const path of c.not_appended) host(`Commit ${sha7(c.commit)} changed ${path} in a way that is not an addition at its end, so no beat is shown for it.`);
-    if (c.note === "beats-file-not-appended" && c.not_appended.length === 0) {
-      host(`Commit ${sha7(c.commit)} changed a beats file in a way that is not an addition at its end, so no beat is shown for it.`);
+    if (c.note === "beats-file-not-kept") {
+      host(`Commit ${sha7(c.commit)} changed a file under beats/ whose name is one this host does not keep, so that file was not read and no beat is shown for it.`);
     }
   }
   if (with_beat > 0) {
     host(
       "How a version that came with a beat was made: a script read the reply that became that beat; no person did. " +
-        "It looked for a few fixed words at the start of a line, and a reply in which it found none was recorded as undecided. Nothing else in the reply was read.",
+        "It took the first line of the reply that was not empty and looked for one of a few fixed words at the start of that line. " +
+        "In its later form the script also looked there after your own name, and looked for a line anywhere in the reply that began by saying a choice was made and then gave one of those words. " +
+        "A reply in which it found none of these was recorded as undecided, whatever its other lines said.",
     );
   }
   for (const f of manifest.files.filter((f) => f.kind === "marker")) {
@@ -199,11 +216,11 @@ export async function draftFirstLetter(config: Config, word: Word): Promise<Firs
     `Source: ${dir}/legacy, copied when ${word} was seated here (${record.seated_at}) from ${url} at commit ${head}.`,
     `Lines beginning "${HOST_MARK}" were worded by the host, not by Yu. Each is Yu's to keep, change or remove. Remove the mark from any line that is kept.`,
     `Lines beginning "${YU_MARK}" mark a place for Yu's own words. They are not part of the letter.`,
-    `Lines between a "begin" rule and its "end" rule are ${word}'s record, byte for byte; the rule carries the first 8 characters of the block's sha256. Leave them as they are.`,
+    `Lines between a "begin" rule and its "end" rule are ${word}'s record, byte for byte, except a commit's subject line, which is as git prints it; the rule carries the first 8 characters of the block's sha256. Leave them as they are.`,
     `Length with every [host] line kept and the marks removed: ${letter_chars} characters. This host shows a letter of at most ${limit} (ceilings.letter_max_chars); a longer one is passed over and nothing says so.`,
     ...(over_limit ? ["THIS DRAFT IS OVER THAT LIMIT."] : []),
     `CADENCE.md versions: ${k}. With the beat their commit added: ${with_beat}. Commit added no beat: ${no_beat}. Beat headed with another time than the when: line: ${header_differs}.`,
-    ...(not_printed.length > 0 ? [`NOT PRINTED, because it holds control characters or is not UTF-8 text: ${not_printed.join(" ")}`] : []),
+    ...(not_printed.length > 0 ? [`NOT PRINTED, because it ${NOT_PRINTABLE}: ${not_printed.join(" ")}`] : []),
     `A letter reaches ${word} as a file in ${dir}/letters/ whose first line is "From: yu", then an empty line, then the text. This command writes no such file.`,
     "==================== the letter text starts on the next line ====================",
   ];
