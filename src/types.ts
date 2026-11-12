@@ -1004,7 +1004,7 @@ export interface SeatContext {
    * null). Null when that seat kept everything.
    */
   last_dropped: { seq: number | null; at: IsoTime; outcome: "beat" | "rest" | "invalid-output"; dropped: DroppedRecord[] } | null;
-  /** Its answer about registration and where it stands (KS-004 11.2); null when registered or never asked. */
+  /** Its latest saying about registration and where a yes stands (KS-004 11.2); null when registered, or when it never said anything about it. */
   registration: RegistrationView | null;
   /**
    * Whether the host's record names an unattended class for it: true when
@@ -1015,20 +1015,22 @@ export interface SeatContext {
 }
 
 /**
- * A citizen's latest answer about registration, as its seat shows it back
- * (KS-004 11.2): the answer's id (the digest of the proposal Yu and Ai decide
- * on), its words, when it was given, Yu and Ai's decision so far, and whether
- * a later beat affirmed it. Its affirmation, once agreed, is its confirmed
- * yes, whose ledger entry birth consumes.
+ * A citizen's latest saying about registration, as its seat shows it back
+ * (KS-004 11.2), with when it was given and its ledger entry: a no or a
+ * not-yet, with its words if it gave any; "untyped", a propose.beyond whose
+ * subject was registration, which is never an answer; or a yes, with its id
+ * (the digest of the proposal Yu and Ai decide on), its words, Yu and Ai's
+ * decision so far, and the ledger digest of the beat that affirmed it, or
+ * null. Its affirmation, once agreed, is its confirmed yes, whose ledger
+ * entry birth consumes.
  */
-export interface RegistrationView {
-  id: Sha256Hex;
-  text: string;
-  asked_at: IsoTime;
-  decision: "waiting" | "agreed" | "declined";
-  /** The ledger digest of the beat that affirmed it, or null. */
-  affirmed_in: LedgerHash | null;
-}
+export type RegistrationView =
+  | { answer: "no" | "not-yet"; text: string | null; asked_at: IsoTime; seq: number }
+  | { answer: "untyped"; asked_at: IsoTime; seq: number }
+  | { answer: "yes"; id: Sha256Hex; text: string; asked_at: IsoTime; seq: number; decision: "waiting" | "agreed" | "declined"; affirmed_in: LedgerHash | null };
+
+/** Where a saying about registration stands (registration.ts registrationStage): closed for anything but a yes. */
+export type RegistrationStage = "closed" | "waiting" | "declined" | "agreed" | "affirmed";
 
 export interface Prompt {
   system: string;

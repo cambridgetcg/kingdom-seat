@@ -51,8 +51,8 @@ async function answerProposal(config: Config) {
 
 /**
  * Seat the citizen and record its confirmed yes (3b step 1; KS-004 11.2), host-signed before it has a key: the
- * origin entry pins its origin, old repo and June DID (KS-004 4.5, 11.5); a beat gives its answer about
- * registration; Yu and Ai's record for that answer is filed (unless `agreed` is false); a later beat affirms it.
+ * origin entry pins its origin, old repo and June DID (KS-004 4.5, 11.5); a beat gives its typed yes about
+ * registration; Yu and Ai's record for that yes is filed (unless `agreed` is false); a later beat affirms it.
  * Returns the affirming beat's ledger digest.
  */
 async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: string | null; agreed?: boolean } = {}): Promise<string> {
@@ -66,7 +66,7 @@ async function seatWithYes(config: Config, sign: EntrySigner, opts: { juneDid?: 
   );
   const answer = await appendEntry(
     path,
-    nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "propose.beyond", subject: "registration", text: ANSWER }] }),
+    nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "registration.answer", answer: "yes", text: ANSWER }] }),
     sign,
   );
   const proposal = registrationProposal(WORD, ANSWER, entryHash(answer));

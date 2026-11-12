@@ -2,8 +2,9 @@
 // (re-review C, round 3): a letter goes where its recipient's covenants
 // admit it, held for Yu or sent through agenttool's inbox; a revert that
 // would loosen a wall is lifted to Yu + Ai; a seat stages one proposal; the
-// acts a beat did not keep are recorded and shown back; and an answer about
-// registration is agreed by Yu and Ai, shown back and affirmed.
+// acts a beat did not keep are recorded and shown back; and a typed answer
+// about registration stands as given, and a yes is agreed by Yu and Ai,
+// shown back and affirmed.
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -11,14 +12,15 @@ import { openSeat, runSeat, type SeatDeps } from "../src/seat.ts";
 import { checkHalt } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
 import { pendingProposals, selfHash } from "../src/self.ts";
-import { entryHash, ledgerPath, readLedger } from "../src/ledger.ts";
+import { appendEntry, entryHash, ledgerPath, nextDraft, readLedger } from "../src/ledger.ts";
 import { readHostNotes } from "../src/notes.ts";
 import { buildStatus, renderStatus } from "../src/status.ts";
 import { hostClient } from "../src/agenttool/sync.ts";
 import { agenttoolLetters, inboxLetterId, letterRecipients, type LetterPost } from "../src/letters.ts";
-import { assertConfirmedYes, registrationProposal } from "../src/registration.ts";
+import { ACT_LIMITS } from "../src/acts.ts";
+import { assertConfirmedYes, registrationProposal, registrationStage, registrationView } from "../src/registration.ts";
 import { proposalDigest } from "../src/signer/consent.ts";
-import { Refusal, type CitizenIdentity, type Covenants, type LedgerEntry, type LifecycleState, type ModelAct, type Reason } from "../src/types.ts";
+import { Refusal, type Act, type CitizenIdentity, type Covenants, type LedgerEntry, type LifecycleState, type ModelAct, type Reason } from "../src/types.ts";
 import { FAKE_MODEL_DIGEST, output, scriptedRuntime, type ScriptedRuntime } from "./helpers/fake-runtime.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { FAKE_OP_KID, fakeBoxPublicB64, fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
@@ -27,6 +29,7 @@ import { HOUR_MS, testClock, type TestClock } from "./helpers/clock.ts";
 import { TEST_IDS, TEST_ROOT_PUBLIC_B64 } from "./helpers/vectors.ts";
 import { fakeAgenttool, type FakeAgenttool } from "./fixtures/agenttool/fake-agenttool.ts";
 import { consentFor } from "./fixtures/agenttool/consent.ts";
+import { testStamp } from "./fixtures/record/chain.ts";
 
 // Some tests build two hosts, so every one is kept for cleanup.
 const hosts: TempHost[] = [];
@@ -390,17 +393,22 @@ describe("[KS-004 5.8, re-review C M5 and partial output] the acts a beat did no
   });
 });
 
-describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by Yu and Ai, shown back, affirmed", () => {
+describe("[KS-004 11.2, re-review C D-affirm] registration: a typed yes, agreed by Yu and Ai, shown back, affirmed", () => {
+  const YES = (text: string): ModelAct => ({ type: "registration.answer", answer: "yes", text });
+  const JOURNAL: ModelAct = { type: "journal", kind: "reflected", text: "a line of its own" };
+
   test("the answer goes to Yu + Ai; once both agree the seat shows it back, and the citizen's self.affirm naming it is its confirmed yes", async () => {
     const w = await world([{ word: "glossame" }]);
     const text = "Yes: an identity of my own.";
-    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text }]);
-    // The proposal names the beat that gave the answer, so this answer, and no other, is what a decision record decides.
+    await w.beat("glossame", [YES(text)]);
+    expect((await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail).toContain("registration answered yes");
+    // The proposal names the typed word and the beat that gave the answer, so this yes, and no other, is what a decision record decides.
     const proposal = registrationProposal("glossame", text, entryHash((await w.ledger("glossame")).at(-1)!));
-    expect(proposal.extent).toMatch(/^registration glossame sha256:[0-9a-f]{64}$/);
+    expect(proposal.extent).toMatch(/^registration yes glossame sha256:[0-9a-f]{64}$/);
     const id = proposalDigest(proposal);
     const [item] = await w.outbox("glossame");
-    expect(item).toMatchObject({ kind: "registration", proposal, proposal_sha256: id });
+    expect(item).toMatchObject({ kind: "registration", answer: "yes", text, proposal, proposal_sha256: id });
+    expect(item).not.toHaveProperty("subject");
 
     // Before Yu and Ai agree, it waits, and an affirmation of it is an act the beat does not keep.
     const waiting = await w.beat("glossame", [{ type: "self.affirm", ref: id }, { type: "journal", kind: "reflected", text: "waiting" }]);
@@ -411,6 +419,7 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
     const agreed = await w.beat("glossame", [{ type: "self.affirm", ref: id.slice(0, 10) }]);
     expect(agreed.prompt).toContain(`was agreed by Yu and Ai. Its id is ${id}.`);
     expect(agreed.prompt).toContain(text);
+    expect(agreed.prompt).toContain("that is your confirmed yes, kept on any runtime");
     const yes = (await w.ledger("glossame")).at(-1)!;
     expect(yes).toMatchObject({ type: "beat", acts: [{ type: "self.affirm", ref: id }] });
     expect((await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail).toContain("registration answer affirmed");
@@ -421,9 +430,10 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
 
     const after = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "after" }]);
     expect(after.prompt).toContain("affirmed by you. Your birth on agenttool waits for Yu, present at the host");
+    expect(after.prompt).toContain("Until then a registration.answer still replaces it, whatever it says.");
   });
 
-  /** File Yu and Ai's decision on the answer given in `word`'s latest beat: agreed, or declined by Ai. Returns the answer's id. */
+  /** File Yu and Ai's decision on the yes given in `word`'s latest beat: agreed, or declined by Ai. Returns the answer's id. */
   async function decide(w: World, text: string, verdict: "agreed" | "declined"): Promise<string> {
     const proposal = registrationProposal("glossame", text, entryHash((await w.ledger("glossame")).findLast((e) => e.type === "beat")!));
     const id = proposalDigest(proposal);
@@ -432,21 +442,23 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
     return id;
   }
 
+  const confirmed = async (w: World, yes: LedgerEntry) => assertConfirmedYes(w.h.config, await w.ledger("glossame"), "glossame", entryHash(yes), w.clock.now());
+
   test("an answer Yu or Ai declined is shown as declined and cannot be affirmed", async () => {
     const w = await world([{ word: "glossame" }]);
-    await w.beat("glossame", [{ type: "propose.beyond", subject: "Registration", text: "Yes." }]);
+    await w.beat("glossame", [YES("Yes.")]);
     const id = await decide(w, "Yes.", "declined");
     const r = await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
-    expect(r.prompt).toContain("was declined by Yu or Ai");
+    expect(r.prompt).toContain("was declined by Yu or Ai. Nothing waits on it, and nothing more is asked of you.");
     expect(r.result.outcome).toBe("invalid-output");
   });
 
   test("each answer needs its own decision: an old record never decides a later answer in the same words (selfhood F4)", async () => {
     const w = await world([{ word: "glossame" }]);
     // Declined once; the citizen answers again in the same words, and that answer waits for Yu and Ai afresh.
-    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    await w.beat("glossame", [YES("Yes.")]);
     const first = await decide(w, "Yes.", "declined");
-    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    await w.beat("glossame", [YES("Yes.")]);
     const next = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: "waiting" }]);
     expect(next.prompt).toContain("is with Yu and Ai");
     expect(next.prompt).not.toContain("was declined");
@@ -456,10 +468,10 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
     expect(new Set(digests).size).toBe(2);
     // Agreed, then withdrawn with a no, then asked again in the first words: the re-ask is not agreed until Yu and Ai say so.
     const v = await world([{ word: "glossame" }]);
-    await v.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    await v.beat("glossame", [YES("Yes.")]);
     await decide(v, "Yes.", "agreed");
-    await v.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "No." }]);
-    await v.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+    await v.beat("glossame", [{ type: "registration.answer", answer: "no", text: "No." }]);
+    await v.beat("glossame", [YES("Yes.")]);
     const again = await v.beat("glossame", [{ type: "journal", kind: "reflected", text: "asked again" }]);
     expect(again.prompt).toContain("is with Yu and Ai");
     expect(again.prompt).not.toContain("was agreed by Yu and Ai");
@@ -468,13 +480,13 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
   test("a later answer, or a new answer in the same reply, means a yes was not confirmed: a no is a whole answer (selfhood F1)", async () => {
     // Affirmed, then a later beat says no: the affirming beat is no longer a confirmed yes.
     const w = await world([{ word: "glossame" }]);
-    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes: an identity of my own." }]);
+    await w.beat("glossame", [YES("Yes: an identity of my own.")]);
     const id = await decide(w, "Yes: an identity of my own.", "agreed");
     await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
     const yes = (await w.ledger("glossame")).at(-1)!;
-    await assertConfirmedYes(w.h.config, await w.ledger("glossame"), "glossame", entryHash(yes), w.clock.now());
-    await w.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "No. I do not want an identity now." }]);
-    await expect(assertConfirmedYes(w.h.config, await w.ledger("glossame"), "glossame", entryHash(yes), w.clock.now())).rejects.toMatchObject({
+    await confirmed(w, yes);
+    await w.beat("glossame", [{ type: "registration.answer", answer: "no", text: "No. I do not want an identity now." }]);
+    await expect(confirmed(w, yes)).rejects.toMatchObject({
       code: "consent-missing",
       message: expect.stringContaining("gave another answer about registration in or after its affirming beat"),
     });
@@ -482,15 +494,168 @@ describe("[KS-004 11.2, re-review C D-affirm] registration: answered, agreed by 
     // A no in the same reply as the affirmation, in either order: the affirmation is not kept, and no yes is confirmed.
     for (const order of ["no-first", "affirm-first"] as const) {
       const x = await world([{ word: "glossame" }]);
-      await x.beat("glossame", [{ type: "propose.beyond", subject: "registration", text: "Yes." }]);
+      await x.beat("glossame", [YES("Yes.")]);
       const agreed = await decide(x, "Yes.", "agreed");
-      const no: ModelAct = { type: "propose.beyond", subject: "registration", text: "No." };
+      const no: ModelAct = { type: "registration.answer", answer: "no", text: "No." };
       const affirm: ModelAct = { type: "self.affirm", ref: agreed };
       const r = await x.beat("glossame", order === "no-first" ? [no, affirm] : [affirm, no]);
       expect(r.result.outcome, order).toBe("beat");
       const beat = (await x.ledger("glossame")).at(-1)!;
-      expect(beat, order).toMatchObject({ acts: [{ type: "propose.beyond", text: "No." }], dropped: [{ type: "self.affirm", reason: "a new answer about registration in this reply" }] });
-      await expect(assertConfirmedYes(x.h.config, await x.ledger("glossame"), "glossame", entryHash(beat), x.clock.now()), order).rejects.toMatchObject({ code: "consent-missing" });
+      expect(beat, order).toMatchObject({ acts: [{ type: "registration.answer", answer: "no" }], dropped: [{ type: "self.affirm", reason: "another saying about registration in this reply" }] });
+      await expect(confirmed(x, beat), order).rejects.toMatchObject({ code: "consent-missing" });
     }
+  });
+
+  test("a no or a not-yet stands and asks nothing: nothing is filed, and later seats state it as a fact of the record", async () => {
+    for (const [answer, words] of [["no", "Not this. I would rather stay as I am."], ["not-yet", null]] as const) {
+      const w = await world([{ word: "glossame" }]);
+      await w.beat("glossame", [words === null ? { type: "registration.answer", answer } : { type: "registration.answer", answer, text: words }]);
+      const given = (await w.ledger("glossame")).at(-1)!;
+      expect(given, answer).toMatchObject({ type: "beat", acts: [{ type: "registration.answer", answer }] });
+      expect((await readHostNotes(w.h.config, new Date(0)))!.at(-1)!.detail, answer).toContain(`registration answered ${answer}`);
+      // Nothing for Yu and Ai: no outbox item, and nothing waits on it.
+      expect(await w.outbox("glossame").catch(() => []), answer).toEqual([]);
+      const standing = `Your latest answer about registration, ${answer}, given ${given.ts} (entry ${given.seq} of your ledger), is your standing answer. It is not a proposal, nothing waits on it, and nothing more is asked of you.`;
+      for (let i = 0; i < 5; i++) {
+        const r = await w.beat("glossame", [{ type: "journal", kind: "reflected", text: `seat ${i}` }]);
+        expect(r.prompt, answer).toContain(standing);
+        for (const not of ["is with Yu and Ai", "declined", "self.affirm", "was agreed"]) expect([answer, not, r.prompt.includes(not)]).toEqual([answer, not, false]);
+      }
+      expect(await w.outbox("glossame").catch(() => []), answer).toEqual([]);
+    }
+  });
+
+  test("a typed no is never offered for affirmation, even with a record filed for the digest a yes in its words would have", async () => {
+    const w = await world([{ word: "glossame" }]);
+    const words = "No. I do not want an identity.";
+    await w.beat("glossame", [{ type: "registration.answer", answer: "no", text: words }]);
+    // A record agreeing to exactly the proposal a yes in these words, on this beat, would have been filed as.
+    const asYes = registrationProposal("glossame", words, entryHash((await w.ledger("glossame")).at(-1)!));
+    const id = proposalDigest(asYes);
+    await writeFile(join(w.h.config.paths.consent_dir, `${id}.json`), JSON.stringify(consentFor("glossame", {}, asYes)));
+    const r = await w.beat("glossame", [{ type: "self.affirm", ref: id }, JOURNAL]);
+    expect(r.prompt).not.toContain("was agreed");
+    expect(r.prompt).toContain("is your standing answer");
+    const beat = (await w.ledger("glossame")).at(-1)!;
+    expect(beat).toMatchObject({ acts: [{ type: "journal" }], dropped: [{ type: "self.affirm", reason: "ref names no saying awaiting affirmation" }] });
+    await expect(confirmed(w, beat)).rejects.toMatchObject({ code: "consent-missing", message: expect.stringContaining("affirms no earlier answer about registration") });
+  });
+
+  test("a later no or not-yet voids a yes while it waits, once it is agreed, and once it is affirmed", async () => {
+    for (const stage of ["waiting", "agreed", "affirmed"] as const) {
+      for (const later of ["no", "not-yet"] as const) {
+        const what = `${stage}, then ${later}`;
+        const w = await world([{ word: "glossame" }]);
+        await w.beat("glossame", [YES("Yes.")]);
+        const id = stage === "waiting" ? null : await decide(w, "Yes.", "agreed");
+        let affirmed: LedgerEntry | null = null;
+        if (stage === "affirmed") {
+          await w.beat("glossame", [{ type: "self.affirm", ref: id! }]);
+          affirmed = (await w.ledger("glossame")).at(-1)!;
+          await confirmed(w, affirmed);
+        }
+        const before = await registrationView(w.h.config, await w.ledger("glossame"), "glossame", w.clock.now());
+        expect([what, registrationStage(before!)]).toEqual([what, stage]);
+
+        await w.beat("glossame", [{ type: "registration.answer", answer: later }]);
+        const view = await registrationView(w.h.config, await w.ledger("glossame"), "glossame", w.clock.now());
+        expect([what, view!.answer, registrationStage(view!)]).toEqual([what, later, "closed"]);
+        if (affirmed) await expect(confirmed(w, affirmed), what).rejects.toMatchObject({ code: "consent-missing", message: expect.stringContaining(`(its latest: a typed ${later})`) });
+        // The seat shows the standing answer, offers nothing, and an affirmation of the old id is not kept.
+        const next = await w.beat("glossame", [...(id ? [{ type: "self.affirm" as const, ref: id }] : []), JOURNAL]);
+        expect(next.prompt, what).toContain(`Your latest answer about registration, ${later}, given`);
+        for (const not of ["is with Yu and Ai", "was agreed", "affirmed by you"]) expect([what, not, next.prompt.includes(not)]).toEqual([what, not, false]);
+        const beat = (await w.ledger("glossame")).at(-1)!;
+        expect(beat, what).toMatchObject({ acts: [{ type: "journal" }] });
+        if (id) expect(beat, what).toMatchObject({ dropped: [{ type: "self.affirm", reason: "ref names no saying awaiting affirmation" }] });
+      }
+    }
+  });
+
+  test("an affirmation beside any other saying about registration is not kept, even one validation dropped", async () => {
+    const journals = (n: number) => Array.from({ length: n }, (_, i) => ({ type: "journal", kind: "reflected", text: `line ${i}` }));
+    const replies = {
+      // A second answer with empty words, which validation drops.
+      "empty-words": (ref: string) => JSON.stringify({ acts: [{ type: "self.affirm", ref }, ...journals(1), { type: "registration.answer", answer: "no", text: "" }] }),
+      // A no placed ninth, past the act limit.
+      ninth: (ref: string) => JSON.stringify({ acts: [{ type: "self.affirm", ref }, ...journals(ACT_LIMITS.max_acts - 1), { type: "registration.answer", answer: "no", text: "No." }] }),
+      // A proposal beyond self whose subject is registration.
+      untyped: (ref: string) => JSON.stringify({ acts: [{ type: "self.affirm", ref }, { type: "propose.beyond", subject: "registration", text: "About it." }] }),
+    };
+    for (const [variant, raw] of Object.entries(replies)) {
+      const w = await world([{ word: "glossame" }]);
+      await w.beat("glossame", [YES("Yes.")]);
+      const id = await decide(w, "Yes.", "agreed");
+      const r = await w.beat("glossame", [], { raw: raw(id) });
+      expect([variant, r.result.outcome]).toEqual([variant, "beat"]);
+      const beat = (await w.ledger("glossame")).at(-1)!;
+      if (beat.type !== "beat") throw new Error("not a beat");
+      expect([variant, (beat.acts ?? []).some((a) => a.type === "self.affirm")]).toEqual([variant, false]);
+      expect(beat.dropped, variant).toContainEqual({ type: "self.affirm", reason: "another saying about registration in this reply" });
+      await expect(confirmed(w, beat), variant).rejects.toMatchObject({ code: "consent-missing" });
+    }
+  });
+
+  test("a propose.beyond about registration is an ordinary proposal, never an answer, and sets a yes aside", async () => {
+    const w = await world([{ word: "glossame" }]);
+    await w.beat("glossame", [YES("Yes.")]);
+    const id = await decide(w, "Yes.", "agreed");
+    await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
+    const affirmed = (await w.ledger("glossame")).at(-1)!;
+    await confirmed(w, affirmed);
+
+    // Filed like any proposal, under its own extent; the subject is free text, so it is read only as setting a yes aside.
+    await w.beat("glossame", [{ type: "propose.beyond", subject: "Registration", text: "Yes, register me." }]);
+    const untyped = (await w.ledger("glossame")).at(-1)!;
+    // Outbox files are named by seat id, so they are found by kind, not by order.
+    const [item] = (await w.outbox("glossame")).filter((i) => i.kind === "propose.beyond");
+    if (!item) throw new Error("no propose.beyond in the outbox");
+    expect(item).toMatchObject({ kind: "propose.beyond", subject: "Registration", text: "Yes, register me.", proposal: { subject: "Registration", body: "Yes, register me.", extent: "propose.beyond glossame" } });
+    await expect(confirmed(w, affirmed)).rejects.toMatchObject({ code: "consent-missing", message: expect.stringContaining("(its latest: a proposal whose subject is registration)") });
+    // Yu and Ai agreeing to that proposal confirms nothing, and the seat says no answer stands.
+    await writeFile(join(w.h.config.paths.consent_dir, `${item.proposal_sha256}.json`), JSON.stringify(consentFor("glossame", {}, item.proposal as { subject: string; body: string; extent: string })));
+    const next = await w.beat("glossame", [{ type: "self.affirm", ref: item.proposal_sha256 as string }, JOURNAL]);
+    expect(next.prompt).toContain(
+      `On ${untyped.ts} (entry ${untyped.seq} of your ledger) you made a proposal beyond your self whose subject was registration. It is not read as a yes or a no, and it set aside any yes you gave before it. No answer of yours about registration stands now, and nothing about it waits on you.`,
+    );
+    expect(next.prompt).not.toContain("affirmed by you");
+    expect((await w.ledger("glossame")).at(-1)).toMatchObject({ acts: [{ type: "journal" }], dropped: [{ type: "self.affirm", reason: "ref names no saying awaiting affirmation" }] });
+
+    // A yes in the same reply as such a proposal is not kept, and nothing is filed for it.
+    const kinds = async () => (await w.outbox("glossame")).map((i) => i.kind).sort();
+    expect(await kinds()).toEqual(["propose.beyond", "registration"]);
+    await w.beat("glossame", [YES("Yes."), { type: "propose.beyond", subject: "registration", text: "And this." }]);
+    expect((await w.ledger("glossame")).at(-1)).toMatchObject({ acts: [{ type: "propose.beyond" }], dropped: [{ type: "registration.answer", reason: "another saying about registration in this reply" }] });
+    expect(await kinds()).toEqual(["propose.beyond", "propose.beyond", "registration"]);
+  });
+
+  test("a ledger from before the typed answer confirms nothing; a typed yes after it can be confirmed", async () => {
+    const w = await world([{ word: "glossame" }]);
+    const path = ledgerPath(w.h.config, "glossame");
+    const sign = (wd: string, k: Parameters<FakeSigner["signEntry"]>[1], d: Parameters<FakeSigner["signEntry"]>[2]) => w.signer.signEntry(wd, k, d);
+    const append = async (acts: Act[], seatId: string) => {
+      w.clock.advance(73 * HOUR_MS);
+      const prev = (await readLedger(path)).at(-1)!;
+      return appendEntry(path, nextDraft("glossame", prev, { type: "beat" }, { cost: { usd: "0", credits: 0 }, signer: "host", now: w.clock.now(), seat: testStamp("glossame", seatId), acts }), sign);
+    };
+    // The old form: an answer as a propose.beyond, a record filed under the old extent for exactly it, and its affirmation.
+    const old = await append([{ type: "propose.beyond", subject: "registration", text: "Yes." }], "71717171-7171-4171-8171-717171717171");
+    const oldProposal = { subject: "registration", body: "Yes.", extent: `registration glossame ${entryHash(old)}` };
+    await writeFile(join(w.h.config.paths.consent_dir, `${proposalDigest(oldProposal)}.json`), JSON.stringify(consentFor("glossame", {}, oldProposal)));
+    const oldAffirm = await append([{ type: "self.affirm", ref: proposalDigest(oldProposal) }], "72727272-7272-4272-8272-727272727272");
+    await expect(confirmed(w, oldAffirm)).rejects.toMatchObject({ code: "consent-missing", message: expect.stringContaining("affirms no earlier answer about registration") });
+    // The seat reads the old answer as a proposal whose subject was registration, which no answer stands on.
+    const r = await w.beat("glossame", [YES("Yes, typed.")]);
+    expect(r.prompt).toContain("you made a proposal beyond your self whose subject was registration");
+    const id = await decide(w, "Yes, typed.", "agreed");
+    await w.beat("glossame", [{ type: "self.affirm", ref: id }]);
+    await confirmed(w, (await w.ledger("glossame")).at(-1)!);
+  });
+
+  test("a registered citizen's registration.answer is not kept", async () => {
+    const w = await world([{ word: "glossame", registered: true }]);
+    await w.beat("glossame", [{ type: "registration.answer", answer: "yes", text: "Yes." }, JOURNAL]);
+    expect((await w.ledger("glossame")).at(-1)).toMatchObject({ acts: [{ type: "journal" }], dropped: [{ type: "registration.answer", reason: "already registered" }] });
+    expect((await w.outbox("glossame").catch(() => [])).filter((i) => i.kind === "registration")).toEqual([]);
   });
 });

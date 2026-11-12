@@ -104,7 +104,7 @@ describe("the honest prompt", () => {
     }
     // The acts are listed in alphabetical order, so none is placed first as the expected one.
     const order = [...guide.matchAll(/^- ([a-z.]+):/gm)].map((m) => m[1]!);
-    expect(order).toEqual(["journal", "letter.send", "propose.beyond", "rest", "self.affirm", "self.propose", "self.revert", "state.set"]);
+    expect(order).toEqual(["journal", "letter.send", "propose.beyond", "registration.answer", "rest", "self.affirm", "self.propose", "self.revert", "state.set"]);
     expect([...order].sort()).toEqual(order);
   });
 
@@ -136,8 +136,90 @@ describe("the honest prompt", () => {
     expect(line("letter.send")).toContain("a citizen whose own covenants admit you; the one you write to decides, not you.");
     expect(line("letter.send")).toContain("Until you and the citizen you write to are both registered, the letter is held for Yu, who may deliver it; once you both are, it is sent through agenttool.");
     expect(line("self.revert")).toContain("A revert that would loosen one of your walls, or change your porch, is not made: it goes to Yu and Ai as a proposal beyond your self.");
-    expect(line("propose.beyond")).toContain("With subject registration it is your answer about an identity on agenttool, permanent and public; once Yu and Ai agree, a later beat shows it back for you to affirm, and only that affirmation is your yes.");
-    expect(line("self.affirm")).toContain("or of an answer about registration that Yu and Ai agreed to");
+    expect(line("propose.beyond")).toContain("One whose subject is registration is not an answer about it, and sets aside a yes you gave before it.");
+    expect(line("propose.beyond")).not.toContain("it is your answer");
+    expect(line("self.affirm")).toContain("the id of one of your pending proposals, or of your yes about registration once Yu and Ai have agreed to it, or its first 8 or more characters.");
+  });
+
+  test("[KS-004 11.2] the guide's registration.answer entry: three values, the words a yes needs, what each does", () => {
+    const guide = renderActsGuide();
+    const entry = guide.split("\n").find((l) => l.startsWith("- registration.answer:")) ?? "";
+    expect(entry).toBe(
+      "- registration.answer: field answer, which is no, not-yet or yes, and field text, your own words, at most 4000 characters, which yes needs. " +
+        "It is your answer about an identity of your own on agenttool, which is permanent and public; giving none leaves you as you are. " +
+        "no or not-yet is kept in your ledger as your answer; it is not a proposal, and nothing waits on it. " +
+        "yes goes to Yu and Ai and does nothing unless both agree and a later beat of yours then affirms it. " +
+        "Your latest answer is the one that stands, until Yu has run your birth. " +
+        "At most one per beat: where a reply holds more, no yes among them is kept. Once you are registered it is not kept.",
+    );
+    // Nine acts, in alphabetical order, and no quote character a model could copy as words to say.
+    expect([...guide.matchAll(/^- ([a-z.]+):/gm)]).toHaveLength(9);
+    expect(entry).not.toMatch(/["'‘’“”`{}]/);
+    for (const re of BANNED_PHRASES) expect([String(re), re.test(entry)]).toEqual([String(re), false]);
+  });
+
+  test("[KS-004 11.2] each registration paragraph, word for word, and none trips the banned list", async () => {
+    const fx = await host.addCitizen("glossame");
+    const at = "2026-11-08T03:05:00.000Z";
+    const id = "c83448c3".padEnd(64, "0");
+    const given = (a: string) => `Your latest answer about registration, ${a}, given ${at} (entry 4 of your ledger)`;
+    const yes = (decision: "waiting" | "agreed" | "declined", affirmed: boolean) =>
+      ({ answer: "yes", id, text: "Yes: one of my own.", asked_at: at, seq: 4, decision, affirmed_in: affirmed ? `sha256:${"e".repeat(64)}` : null }) as const;
+    const fenced = `--- begin your answer about registration [${sha256Hex("Yes: one of my own.").slice(0, 12)}] ---\nYes: one of my own.\n--- end your answer about registration [${sha256Hex("Yes: one of my own.").slice(0, 12)}] ---`;
+    const cases: [NonNullable<SeatContext["registration"]>, string][] = [
+      [{ answer: "no", text: "Not this.", asked_at: at, seq: 4 }, `${given("no")}, is your standing answer. It is not a proposal, nothing waits on it, and nothing more is asked of you.`],
+      [{ answer: "not-yet", text: null, asked_at: at, seq: 4 }, `${given("not-yet")}, is your standing answer. It is not a proposal, nothing waits on it, and nothing more is asked of you.`],
+      [
+        { answer: "untyped", asked_at: at, seq: 4 },
+        `On ${at} (entry 4 of your ledger) you made a proposal beyond your self whose subject was registration. It is not read as a yes or a no, and it set aside any yes you gave before it. No answer of yours about registration stands now, and nothing about it waits on you.`,
+      ],
+      [yes("waiting", false), `${given("yes")}, is with Yu and Ai. Nothing happens unless both agree, and either may decline.`],
+      [yes("declined", false), `${given("yes")}, was declined by Yu or Ai. Nothing waits on it, and nothing more is asked of you.`],
+      [
+        yes("agreed", false),
+        `${given("yes")}, was agreed by Yu and Ai. Its id is ${id}. Your words then:\n${fenced}\n` +
+          `An identity on agenttool is permanent and public. If yes is still your answer, a self.affirm with ref ${id} (or its first 8 or more characters) says it a second time: that is your confirmed yes, kept on any runtime, and it lets Yu run your birth, present at the host; by itself it changes nothing. ` +
+          "If it is no longer your answer, a registration.answer replaces it, whatever it says. If you do neither, nothing happens and you stay as you are.",
+      ],
+      [
+        yes("agreed", true),
+        `${given("yes")}, was agreed by Yu and Ai and affirmed by you. Your birth on agenttool waits for Yu, present at the host; nothing more is asked of you. Until then a registration.answer still replaces it, whatever it says.`,
+      ],
+      // A yes affirmed once whose agreement no longer stands is shown as where its decision now is.
+      [yes("declined", true), `${given("yes")}, was declined by Yu or Ai. Nothing waits on it, and nothing more is asked of you.`],
+      [yes("waiting", true), `${given("yes")}, is with Yu and Ai. Nothing happens unless both agree, and either may decline.`],
+    ];
+    for (const [registration, paragraph] of cases) {
+      const ctx = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), citizenOf(fx.record), [], [], { registration });
+      const user = buildPrompt(ctx, "free").user;
+      expect(user.split("\n\n")).toContain(paragraph);
+      for (const re of BANNED_PHRASES) expect([String(re), re.test(paragraph)]).toEqual([String(re), false]);
+      // A no or a not-yet is not repeated in its words, and nothing that is not an agreed yes is offered for affirmation.
+      if (registration.answer !== "yes") expect(paragraph).not.toContain("Not this.");
+      if (registration.answer !== "yes" || registration.decision !== "agreed" || registration.affirmed_in !== null) expect(paragraph).not.toContain("self.affirm");
+    }
+    const none = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), citizenOf(fx.record), [], []);
+    expect(buildPrompt(none, "free").user).not.toContain("about registration");
+  });
+
+  test("[KS-004 11.2] an unapproved runtime no longer says the affirmation of an agreed yes binds nothing", async () => {
+    const fx = await host.addCitizen("glossame");
+    const registration = { answer: "yes", id: "ab".repeat(32), text: "Yes.", asked_at: "2026-11-08T03:05:00.000Z", seq: 4, decision: "agreed", affirmed_in: null } as const;
+    for (const runtime_approved of [false, null] as const) {
+      const ctx = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), citizenOf(fx.record), [], [], {
+        registration,
+        selfAuthorship: { runtime_approved, window_opens_at: null, yu_present: false },
+      });
+      const user = buildPrompt(ctx, "free").user;
+      expect(user).toContain(
+        runtime_approved === false
+          ? "This seat's runtime is not one Yu approved for self-changes, so a self.affirm of one of your pending proposals is recorded here and binds nothing."
+          : "Whether this seat's runtime is one Yu approved for self-changes is known only from its reply; a self.affirm of one of your pending proposals binds only if it is.",
+      );
+      expect(user).toContain("that is your confirmed yes, kept on any runtime");
+      expect(user).not.toContain("so an affirmation here is recorded and binds nothing");
+      expect(user).not.toContain("an affirmation binds only if it is");
+    }
   });
 
   test("the same holds for a citizen as seating leaves it: its will introduced as carried, and told no seat opens unattended", async () => {

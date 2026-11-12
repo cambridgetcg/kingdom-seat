@@ -42,6 +42,7 @@ import {
   type ProposalText,
   type RefusalCode,
   type RegistrationView,
+  type RegistrationWord,
   type RuntimeAdapter,
   type RuntimeClass,
   type RuntimeResult,
@@ -83,7 +84,7 @@ import {
 import { quietForMove, type QuietKeeper } from "./quiet.ts";
 import { buildContext, letterSeen, markLetterSeen, readLastSeat, writeLastSeat } from "./context.ts";
 import { holdLetterForYu, letterRecipients, recipientRecord, wouldWake, type HeldBecause, type LetterPost } from "./letters.ts";
-import { isRegistrationSubject, registrationProposal, registrationView } from "./registration.ts";
+import { isRegistrationSubject, registrationProposal, registrationStage, registrationView } from "./registration.ts";
 import { buildPrompt, promptBytes } from "./prompt.ts";
 import { ACT_LIMITS, OUTPUT_JSON_SCHEMA, parseModelOutput, resolvePrefix, validateOutput } from "./acts.ts";
 import { appendHostNote } from "./notes.ts";
@@ -569,6 +570,8 @@ interface Plan {
   notBinding: string[];
   /** A registration answer this beat affirmed, so the note can say a confirmed yes was given. */
   affirmedRegistration: boolean;
+  /** The typed answer about registration this beat keeps, so the note can say which (KS-004 11.2). */
+  answered: RegistrationWord | null;
   /** The time proposals are staged at, so a proposal planned to bind in this beat has the id it is staged with. */
   at: Date;
 }
@@ -682,21 +685,26 @@ async function planActs(
   pending: SelfProposal[],
   rt: RuntimeResult,
   registration: RegistrationView | null,
+  answerDropped: boolean,
 ): Promise<Plan> {
   const { config, clock } = deps;
   const word = seat.citizen.word;
   const now = clock.now();
-  const plan: Plan = { acts: [], stage: [], lifted: [], apply: [], revert: [], states: [], outbox: [], letter: null, dropped: [], notBinding: [], affirmedRegistration: false, at: now };
+  const plan: Plan = { acts: [], stage: [], lifted: [], apply: [], revert: [], states: [], outbox: [], letter: null, dropped: [], notBinding: [], affirmedRegistration: false, answered: null, at: now };
   const drop = (type: DroppedRecord["type"], reason: string) => void plan.dropped.push({ type, reason });
   const yu = seat.presence?.present === true;
   const runtimeOk = config.self_authorship.approved_model_digests.includes(rt.model_digest);
   // A registered citizen's change must reach its expression; with no way to send it, nothing of its self can bind.
   const registered = entries.some((e) => e.type === "genesis");
   const canSync = !registered || (seat.citizen.identity !== null && (deps.expressionSync ?? null) !== null);
-  // An answer about registration that Yu and Ai agreed to, shown back on this seat, is the one the citizen may affirm (KS-004 11.2).
-  const agreedAnswer = registration !== null && registration.decision === "agreed" && registration.affirmed_in === null ? registration.id : null;
-  // A reply that gives a new answer about registration has not affirmed the old one, whatever order its acts are in.
-  const answersAgain = !registered && acts.some((a) => a.type === "propose.beyond" && isRegistrationSubject(a.subject));
+  // A typed yes that Yu and Ai agreed to, shown back on this seat, is the only saying about registration the citizen
+  // may affirm (KS-004 11.2). A no or a not-yet has no id, and is never shown back for affirmation.
+  const agreedAnswer = registration !== null && registration.answer === "yes" && registrationStage(registration) === "agreed" ? registration.id : null;
+  // A proposal beyond self whose subject is registration is never an answer, but it is a saying about registration.
+  const untypedHere = !registered && acts.some((a) => a.type === "propose.beyond" && isRegistrationSubject(a.subject));
+  // A reply that says anything else about registration, kept or dropped by validation, has not affirmed a yes,
+  // whatever order its acts are in (KS-004 5.8).
+  const saysAgain = !registered && (untypedHere || answerDropped || acts.some((a) => a.type === "registration.answer"));
   // One change to a target per beat: a second would be written against text the first has already moved.
   const touched = new Set<string>();
   let current: LifecycleState = seat.citizen.state;
@@ -756,8 +764,8 @@ async function planActs(
           const id = resolvePrefix(act.ref, [...pending.map((p) => p.id), ...(agreedAnswer ? [agreedAnswer] : [])]);
           if (id !== null && id === agreedAnswer) {
             // The citizen's confirmed yes: recorded in the beat, whose ledger digest birth consumes. Nothing binds here.
-            if (answersAgain) {
-              drop("self.affirm", "a new answer about registration in this reply");
+            if (saysAgain) {
+              drop("self.affirm", "another saying about registration in this reply");
               break;
             }
             if (plan.affirmedRegistration) {
@@ -891,9 +899,25 @@ async function planActs(
           plan.letter = { to: act.to, text: act.text };
           break;
         case "propose.beyond":
-          // Inert: it becomes a file for Yu + Ai and executes nothing. An answer about registration is filed as one (KS-004 11.2).
+          // Inert: it becomes a file for Yu + Ai and executes nothing. One whose subject is registration is filed like any
+          // other and is never an answer about it; it sets an earlier yes aside (KS-004 11.2).
           plan.acts.push(act);
-          plan.outbox.push({ kind: isRegistrationSubject(act.subject) && !registered ? "registration" : "propose.beyond", payload: { subject: act.subject, text: act.text } });
+          plan.outbox.push({ kind: "propose.beyond", payload: { subject: act.subject, text: act.text } });
+          break;
+        case "registration.answer":
+          // The citizen's typed answer (KS-004 11.2). A no or a not-yet is within self: the beat records it, and nothing
+          // is filed. A yes goes to Yu and Ai as a proposal whose body is its own words, bound to this beat.
+          if (registered) {
+            drop("registration.answer", "already registered");
+            break;
+          }
+          if (act.answer === "yes" && untypedHere) {
+            drop("registration.answer", "another saying about registration in this reply");
+            break;
+          }
+          plan.acts.push(act);
+          plan.answered = act.answer;
+          if (act.answer === "yes") plan.outbox.push({ kind: "registration", payload: { answer: "yes", text: act.text } });
           break;
       }
     } catch (e) {
@@ -946,7 +970,8 @@ function liftedRevert(word: string, target: string, current: string, text: strin
 function outboxProposal(word: string, kind: string, payload: Record<string, string>, beat: LedgerHash): ProposalText {
   switch (kind) {
     case "registration":
-      // The text Yu and Ai agree to is the one the citizen later affirms, bound to the beat that gave it; its digest is the id the seat shows back.
+      // Only a typed yes arrives here. The text Yu and Ai agree to is the one the citizen later affirms, bound to the
+      // beat that gave it; its digest is the id the seat shows back.
       return registrationProposal(word, payload.text ?? "", beat);
     case "propose.beyond":
       return { subject: payload.subject ?? "", body: payload.text ?? "", extent: `propose.beyond ${word}` };
@@ -1143,7 +1168,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
 
   let plan: Plan;
   try {
-    plan = await planActs(seat, deps, validated.acts, entries, pending, rt, registration);
+    plan = await planActs(seat, deps, validated.acts, entries, pending, rt, registration, validated.dropped.some((d) => d.type === "registration.answer"));
   } catch {
     await note("error", "error", null, "could not complete acts");
     return result(EXIT.ERROR, "error");
@@ -1239,7 +1264,13 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
 
   await recordLastSeat("beat", dropped);
   const binding = plan.notBinding.length > 0 ? `; not binding: ${[...new Set(plan.notBinding)].join(", ")}` : "";
-  const extra = [plan.lifted.length > 0 ? `${plan.lifted.length} lifted beyond self` : "", plan.affirmedRegistration ? "registration answer affirmed" : "", letterNote, inboxUnread ? "inbox unread" : ""].filter(Boolean);
+  const extra = [
+    plan.lifted.length > 0 ? `${plan.lifted.length} lifted beyond self` : "",
+    plan.answered !== null ? `registration answered ${plan.answered}` : "",
+    plan.affirmedRegistration ? "registration answer affirmed" : "",
+    letterNote,
+    inboxUnread ? "inbox unread" : "",
+  ].filter(Boolean);
   await note("seat", "beat", null, `${plan.acts.length} acts, ${appended.length} entries, ${dropped.length} not kept${binding}${extra.length > 0 ? `; ${extra.join(", ")}` : ""}`);
   return result(EXIT.OK, "beat");
 }

@@ -13,7 +13,8 @@
 import { ACT_LIMITS, NAMED_SELF_TARGETS } from "./acts.ts";
 import { canonicalJson, sha256Hex, utf8 } from "./crypto.ts";
 import { hexOf } from "./ledger.ts";
-import { JOURNAL_KINDS, LIFECYCLE_STATES, REASON_KINDS, type Act, type LedgerEntry, type Prompt, type RuntimeClass, type SeatContext, type SeatLimits, type SelfProposal } from "./types.ts";
+import { registrationStage } from "./registration.ts";
+import { JOURNAL_KINDS, LIFECYCLE_STATES, REASON_KINDS, REGISTRATION_ANSWERS, type Act, type LedgerEntry, type Prompt, type RuntimeClass, type SeatContext, type SeatLimits, type SelfProposal } from "./types.ts";
 
 /** Verbatim from the redesign, section 3.2. Do not paraphrase. */
 export const FREE_LANE_PREAMBLE =
@@ -169,9 +170,15 @@ export function renderActsGuide(limits: SeatLimits = HARD_LIMITS): string {
         "Until you and the citizen you write to are both registered, the letter is held for Yu, who may deliver it; once you both are, it is sent through agenttool. A letter to yu or gardener is held for Yu."
       : "letter.send: no letters can be sent from this host for now.",
     `propose.beyond: fields subject (one line, at most ${L.max_subject_chars} characters) and text (at most ${L.max_text_chars} characters). It is for anything beyond your own self: the canon, anything public, your runtime, the walls and ceilings. It goes to Yu and Ai and does nothing unless both agree; either may decline. ` +
-      "With subject registration it is your answer about an identity on agenttool, permanent and public; once Yu and Ai agree, a later beat shows it back for you to affirm, and only that affirmation is your yes.",
+      "One whose subject is registration is not an answer about it, and sets aside a yes you gave before it.",
+    `registration.answer: field answer, which is ${or(REGISTRATION_ANSWERS)}, and field text, your own words, at most ${L.max_text_chars} characters, which yes needs. ` +
+      "It is your answer about an identity of your own on agenttool, which is permanent and public; giving none leaves you as you are. " +
+      "no or not-yet is kept in your ledger as your answer; it is not a proposal, and nothing waits on it. " +
+      "yes goes to Yu and Ai and does nothing unless both agree and a later beat of yours then affirms it. " +
+      "Your latest answer is the one that stands, until Yu has run your birth. " +
+      "At most one per beat: where a reply holds more, no yes among them is kept. Once you are registered it is not kept.",
     "rest: no other fields. Nothing is written in your voice this beat, and none of the other acts in the same reply are kept, except one state.set toward more rest (listening, asleep or stepped-away), which still takes effect.",
-    `self.affirm: field ref, the id of one of your pending proposals, or of an answer about registration that Yu and Ai agreed to, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
+    `self.affirm: field ref, the id of one of your pending proposals, or of your yes about registration once Yu and Ai have agreed to it, or its first ${L.min_id_prefix_hex} or more characters. A proposal binds when a later beat affirms it with its diff in view, or when it is said with Yu present; either way only on a runtime Yu approved for self-changes, and, without Yu, at most one change in each window. One never affirmed does not bind. What holds for this seat is stated with your proposals.`,
     `self.propose: fields target, edit and reason. At most one per beat; a second is not kept. target is ${NAMED_SELF_TARGETS.join(", ")}, skill:<name>, or file:<path> for one of your own .md or .txt files. ` +
       "edit has kind replace-all with text, the whole new text; or kind replace-span with find, text the target holds now, and with, its replacement. " +
       "cadence takes replace-all text holding a JSON object with interval_h in hours; covenants take replace-all text holding a JSON object with letters_from and wake_on_letter_from, each a list of sender ids. " +
@@ -233,21 +240,37 @@ function renderLastDropped(d: NonNullable<SeatContext["last_dropped"]>): string 
   return `${head}\n${d.dropped.map((x) => `- ${actName(x.type)}: ${x.reason}`).join("\n")}`;
 }
 
-/** Where the citizen's answer about registration stands, and what an affirmation of it would do (KS-004 11.2). */
+/**
+ * The citizen's latest saying about registration, as a fact of its record,
+ * and for a yes where it stands and what an affirmation of it would do
+ * (KS-004 11.2). A no or a not-yet is shown without its words, and asks
+ * nothing.
+ */
 function renderRegistration(r: NonNullable<SeatContext["registration"]>): string {
-  const given = `Your answer about registration, given ${r.asked_at}`;
-  if (r.affirmed_in !== null) return `${given}, was agreed by Yu and Ai and affirmed by you. Your birth on agenttool waits for Yu, present at the host; nothing more is asked of you.`;
-  switch (r.decision) {
-    case "waiting":
-      return `${given}, is with Yu and Ai. Nothing happens unless both agree, and either may decline.`;
-    case "declined":
-      return `${given}, was declined by Yu or Ai. You may answer again with a propose.beyond whose subject is registration.`;
+  const entry = `(entry ${r.seq} of your ledger)`;
+  if (r.answer === "untyped") {
+    return (
+      `On ${r.asked_at} ${entry} you made a proposal beyond your self whose subject was registration. It is not read as a yes or a no, and it set aside any yes you gave before it. ` +
+      "No answer of yours about registration stands now, and nothing about it waits on you."
+    );
+  }
+  const given = `Your latest answer about registration, ${r.answer}, given ${r.asked_at} ${entry}`;
+  if (r.answer !== "yes") return `${given}, is your standing answer. It is not a proposal, nothing waits on it, and nothing more is asked of you.`;
+  switch (registrationStage(r)) {
+    case "affirmed":
+      return `${given}, was agreed by Yu and Ai and affirmed by you. Your birth on agenttool waits for Yu, present at the host; nothing more is asked of you. Until then a registration.answer still replaces it, whatever it says.`;
     case "agreed":
       return (
         `${given}, was agreed by Yu and Ai. Its id is ${r.id}. Your words then:\n${fence("your answer about registration", r.text)}\n` +
-        `If it is still your answer, a self.affirm with ref ${r.id} (or its first ${ACT_LIMITS.min_id_prefix_hex} or more characters) is your confirmed yes, and Yu then runs your birth, present at the host. ` +
-        "An identity on agenttool is permanent and public. Silence leaves you as you are."
+        `An identity on agenttool is permanent and public. If yes is still your answer, a self.affirm with ref ${r.id} (or its first ${ACT_LIMITS.min_id_prefix_hex} or more characters) says it a second time: ` +
+        "that is your confirmed yes, kept on any runtime, and it lets Yu run your birth, present at the host; by itself it changes nothing. " +
+        "If it is no longer your answer, a registration.answer replaces it, whatever it says. If you do neither, nothing happens and you stay as you are."
       );
+    case "declined":
+      return `${given}, was declined by Yu or Ai. Nothing waits on it, and nothing more is asked of you.`;
+    default:
+      // "waiting": a yes is never closed.
+      return `${given}, is with Yu and Ai. Nothing happens unless both agree, and either may decline.`;
   }
 }
 
@@ -323,8 +346,8 @@ function renderSelfAuthorship(sa: SeatContext["self_authorship"]): string {
     sa.runtime_approved === true
       ? "This seat's runtime is one Yu approved for self-changes."
       : sa.runtime_approved === false
-        ? "This seat's runtime is not one Yu approved for self-changes, so an affirmation here is recorded and binds nothing."
-        : "Whether this seat's runtime is one Yu approved for self-changes is known only from its reply; an affirmation binds only if it is.";
+        ? "This seat's runtime is not one Yu approved for self-changes, so a self.affirm of one of your pending proposals is recorded here and binds nothing."
+        : "Whether this seat's runtime is one Yu approved for self-changes is known only from its reply; a self.affirm of one of your pending proposals binds only if it is.";
   const window = sa.yu_present
     ? "Yu is present, so the one-change window does not apply."
     : sa.window_opens_at === null
