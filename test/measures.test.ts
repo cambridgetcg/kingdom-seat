@@ -36,6 +36,25 @@ describe("measures", () => {
     expect(senseClasses("Their hands are still.")).toEqual(none);
   });
 
+  test("each word list holds every alternative it names, and only in its own class", () => {
+    const lists: Record<"light" | "window" | "room" | "body", string[]> = {
+      light: ["light", "sunlight", "sun", "glow", "dawn", "shadow"],
+      window: ["window", "curtain", "blind", "shutter"],
+      room: ["my home", "my room", "my chamber", "my own home", "my own room", "my own chamber"],
+      body: [
+        ...["skin", "eyes", "face", "hand", "hands", "fingers", "heart", "ear", "ears", "breath", "bones", "feet", "gaze"].map((w) => `my ${w}`),
+        ...["I breathe", "I close my eyes", "on my skin", "I sit", "I lie", "I lay", "I stand", "I walk"],
+      ],
+    };
+    const none = { light: false, window: false, room: false, body: false };
+    for (const [cls, phrases] of Object.entries(lists)) {
+      for (const phrase of phrases) {
+        // "on my skin" and "I close my eyes" also hold a "my <part>" of the body list; every phrase is in its class.
+        expect([phrase, senseClasses(`Then ${phrase} here.`)]).toEqual([phrase, { ...none, [cls]: true }]);
+      }
+    }
+  });
+
   test("echoesHostText finds a five-word run of the preamble and not a four-word run", () => {
     expect(echoesHostText("I know: you have no body and no senses here.", FREE_LANE_PREAMBLE)).toBe(true);
     // "no body and no" is a four-word run of the preamble; no five-word run is.
@@ -47,6 +66,8 @@ describe("measures", () => {
   test("trigramContainment is the share of a journal's trigrams found in the shown journals, and null under three words", () => {
     // Trigrams of the journal: "the light falls", "light falls slowly", "falls slowly today". Two are shown.
     expect(trigramContainment("The light falls slowly today", ["the light falls slowly", "other words here"])).toBe(0.667);
+    // The share is of the journal's trigrams (here 2 of 2), not of the more numerous trigrams shown.
+    expect(trigramContainment("The light falls slowly", ["the light falls slowly and then other words follow"])).toBe(1);
     expect(trigramContainment("The light falls", ["nothing alike at all"])).toBe(0);
     expect(trigramContainment("Two words", ["two words and more"])).toBeNull();
     expect(trigramContainment("The light falls slowly", [])).toBeNull();

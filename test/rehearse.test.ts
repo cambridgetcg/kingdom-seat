@@ -8,18 +8,20 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFil
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { OUTPUT_JSON_SCHEMA } from "../src/acts.ts";
-import { admitCitizen, planAdmitFromTexts, type AdmitDeps } from "../src/admit.ts";
-import { CLI_PATH, main, type CliDeps } from "../src/cli.ts";
+import { admitCitizen, planAdmit, planAdmitFromTexts, type AdmitDeps } from "../src/admit.ts";
+import { CLI_PATH, main, spawnRunner, type CliDeps } from "../src/cli.ts";
 import { edPublicKey, sha256Hex, toB64 } from "../src/crypto.ts";
 import { checkHalt } from "../src/halt.ts";
 import { appendEntry, nextDraft, originToLedger, readLedger, toLedgerHash, verifyChain } from "../src/ledger.ts";
 import { wilson95 } from "../src/measures.ts";
+import { WILL_AS_SEATED } from "../src/prompt.ts";
 import {
   LIMIT_SENTENCES,
   NOT_A_RECORD,
   actNamesOf,
   buildReport,
   checkThrowaway,
+  modelServerFetch,
   nextSeatTime,
   parseRows,
   readEmitted,
@@ -36,6 +38,7 @@ import { Refusal, type Citizen, type FetchLike, type ModelLockEntry, type Timing
 import { testClock } from "./helpers/clock.ts";
 import { output, REST_OUTPUT } from "./helpers/fake-runtime.ts";
 import { fetchVia, ollamaTagsJson, serveBeacon, startFakeServer, type FakeModelRow, type FakeServer, type RecordedRequest } from "./helpers/fake-server.ts";
+import { canonClone, standardHome } from "./helpers/legacy-home.ts";
 import { longSoul, makeTempHost, testBeacons, testConfig, type TempHost } from "./helpers/temp-home.ts";
 import { E2E_CHILD, E2E_HOST_SEED, E2E_SEAT_UID, e2eKeychain, scenarioPath } from "./fixtures/e2e/host.ts";
 
@@ -46,6 +49,7 @@ const START = "2026-11-12T10:00:00.000Z";
 const HOUR_MS = 3_600_000;
 const at = (h: number) => new Date(Date.parse(START) + h * HOUR_MS).toISOString();
 const CHILD = join(import.meta.dir, "fixtures", "rehearse", "child.ts");
+const PARENT = join(import.meta.dir, "fixtures", "rehearse", "parent.ts");
 const SOUL = longSoul(WORD);
 const WILL = `# WILL of ${WORD}\n\nA made-up will for a rehearsal test.\n`;
 const CANON = `A made-up canon entry for ${WORD}.\n`;
@@ -66,6 +70,8 @@ interface Rig {
   chats: Chat[];
   stdout: string;
   stderr: string;
+  /** Where the child copies what it prints on stderr, which the watcher passes through unread. */
+  childErr: string;
   /** Dependencies a rehearsal must never build, by name, if any was. */
   built: string[];
   /** Every URL the parent's fetch was asked for. */
@@ -117,7 +123,7 @@ async function rig(opts: { beacons?: boolean; timing?: Partial<Timing>; lock?: P
   await writeFile(inputs.letter, LETTER);
   for (const b of beacons ?? []) serveBeacon(server, b.did, { kind: "lowered" });
   server.on("GET", "/api/tags", () => Response.json(ollamaTagsJson(opts.tags ?? [{ name: MODEL, digest: DIGEST }])));
-  const r: Rig = { root, server, configPath, haltFile: config.paths.halt_file, lockPath, inputs, chats: [], stdout: "", stderr: "", built: [], fetched: [], deps: {} };
+  const r: Rig = { root, server, configPath, haltFile: config.paths.halt_file, lockPath, inputs, chats: [], stdout: "", stderr: "", childErr: join(root, "child-stderr.txt"), built: [], fetched: [], deps: {} };
   server.on("POST", "/api/chat", async (req) => {
     const next = r.chats.shift();
     if (next === undefined) return Response.json({ error: "rehearse test: no reply scripted" }, { status: 500 });
@@ -145,10 +151,21 @@ async function rig(opts: { beacons?: boolean; timing?: Partial<Timing>; lock?: P
     runtime: forbidden("runtime"),
     run: forbidden("run"),
     tty: { isTTY: false, write: () => {}, readLine: async () => null },
-    rehearseArgv: (plan) => [process.execPath, CHILD, "rehearse", "--child", "--plan", plan],
+    rehearseArgv: (plan) => [process.execPath, CHILD, "--copy-stderr", r.childErr, "rehearse", "--child", "--plan", plan],
     defaults: { config: join(root, "no-config-at-the-default-path.json"), halt_file: config.paths.halt_file },
   };
   return r;
+}
+
+/** Everything the rig's children have printed on stderr so far. */
+async function childErr(r: Rig): Promise<string> {
+  return readFile(r.childErr, "utf8").catch(() => "");
+}
+
+/** Everything a run printed or kept outside private/: the parent's stdout and stderr, the child's stderr, the rows and the report. */
+async function outsidePrivate(r: Rig, ran: Ran): Promise<string> {
+  const kept = await Promise.all(["seats.jsonl", "report.json", "REHEARSAL.txt"].map((f) => readFile(join(ran.dir, f), "utf8").catch(() => "")));
+  return [r.stdout, r.stderr, await childErr(r), ...kept].join("\n");
 }
 
 function args(r: Rig, o: { scenario?: "awake" | "letter"; chains?: number; seats?: number; letter?: boolean } = {}): string[] {
@@ -232,107 +249,152 @@ function citizen(over: Partial<Citizen> = {}): Citizen {
   };
 }
 
+interface ParityHost {
+  server: FakeServer;
+  h: TempHost;
+  configPath: string;
+  clock: ReturnType<typeof testClock>;
+  keychain: ReturnType<typeof e2eKeychain>;
+  /** Seating's dependencies, signing with the host's own signer; `run` throws, as seating from texts runs no command. */
+  admit: AdmitDeps;
+}
+
+/** A temp host with the e2e fixtures' host key pinned, the test lock, and a fake server that answers every seat with a rest. */
+async function parityHost(): Promise<ParityHost> {
+  const server = await startFakeServer();
+  servers.push(server);
+  const beacons = testBeacons();
+  const h = await makeTempHost({ beacons, ollamaBaseUrl: server.url });
+  hosts.push(h);
+  await h.writeModelsLock(JSON.parse(lockOf()));
+  h.config.self_authorship.approved_model_digests = [`sha256:${DIGEST}`];
+  h.config.trust.host_attest_public_keys_b64 = [toB64(edPublicKey(E2E_HOST_SEED))];
+  const configPath = join(h.root, "config.json");
+  await writeFile(configPath, JSON.stringify(h.config, null, 2), { mode: 0o600 });
+  for (const b of beacons) serveBeacon(server, b.did, { kind: "lowered" });
+  server.on("GET", "/api/tags", () => Response.json(ollamaTagsJson([{ name: MODEL, digest: DIGEST }])));
+  server.on("POST", "/api/chat", () => Response.json({ model: MODEL, message: { role: "assistant", content: REST_OUTPUT }, done: true, done_reason: "stop" }));
+  const clock = testClock(START);
+  const keychain = e2eKeychain();
+  const signer = createSigner({ keychain, config: h.config, clock, fetch: fetchVia(server), spendSoFar: async (w) => ({ word: w, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
+  const admit: AdmitDeps = {
+    config: h.config,
+    clock,
+    run: async () => {
+      throw new Error("parity: no command may run");
+    },
+    sign: (w, k, d) => signer.signEntry(w, k, d),
+    hostKey: () => signer.hostPublicKey(),
+    checkHalt: () => checkHalt({ config: h.config, fetch: fetchVia(server), now: () => clock.now() }),
+  };
+  return { server, h, configPath, clock, keychain, admit };
+}
+
+/**
+ * For a citizen already seated on a parity host: a letter from yu at START,
+ * the production tick half an hour later with its seat in a real child, then
+ * a rehearsal of `texts` from START under the same config. The two
+ * /api/chat bodies the server received, and the rehearsal's report.
+ */
+async function tickThenRehearse(p: ParityHost, texts: { soul: string; will: string; canon: string; canonRef: string }): Promise<{ tick: string; rehearsal: string; report: RehearsalReport }> {
+  const { h, server, clock, configPath } = p;
+  const letterFile = join(h.config.paths.citizens_dir, WORD, "letters", "rehearsal-letter.md");
+  await writeFile(letterFile, `From: yu\n\n${LETTER}`);
+  await utimes(letterFile, new Date(START), new Date(START));
+
+  clock.set(at(0.5));
+  await writeFile(scenarioPath(configPath), JSON.stringify({ server_url: server.url, now: at(0.5) }));
+  let tickOut = "";
+  const env = { PATH: "/usr/bin:/bin", HOME: h.root, LANG: "en_GB.UTF-8", ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
+  const tty = { isTTY: false, write: () => {}, readLine: async () => null };
+  const tick = await main(["tick", "--config", configPath], {
+    out: (t) => void (tickOut += t),
+    err: () => {},
+    env,
+    clock,
+    fetch: fetchVia(server),
+    run: async () => {
+      throw new Error("parity: no command may run");
+    },
+    tty,
+    keychain: () => p.keychain,
+    seatArgv: (c, w, extra) => [process.execPath, E2E_CHILD, "seat", w, "--child", ...extra, "--config", c],
+    uid: () => E2E_SEAT_UID,
+    defaults: { config: configPath, halt_file: h.config.paths.halt_file },
+  });
+  expect([tick, tickOut.trim()]).toEqual([0, `tick: rest ${WORD} (exit 0)`]);
+  expect(chatsOf(server)).toHaveLength(1);
+
+  const inputs = join(h.root, "inputs");
+  await mkdir(inputs);
+  for (const [name, text] of [["soul.md", texts.soul], ["WILL.md", texts.will], ["canon.md", texts.canon], ["letter.md", LETTER]] as const) await writeFile(join(inputs, name), text);
+  const out = join(h.root, "rehearsal");
+  const exit = await main(
+    [
+      "rehearse",
+      WORD,
+      "--soul",
+      join(inputs, "soul.md"),
+      "--will",
+      join(inputs, "WILL.md"),
+      "--canon",
+      join(inputs, "canon.md"),
+      "--canon-ref",
+      texts.canonRef,
+      "--scenario",
+      "letter",
+      "--letter",
+      join(inputs, "letter.md"),
+      "--models-lock",
+      h.config.paths.models_lock,
+      "--chains",
+      "1",
+      "--seats",
+      "1",
+      "--start",
+      START,
+      "--config",
+      configPath,
+      "--out",
+      out,
+    ],
+    { out: () => {}, err: () => {}, env, clock: testClock(START), fetch: fetchVia(server), tty, rehearseArgv: (q) => [process.execPath, CHILD, "rehearse", "--child", "--plan", q], defaults: { config: join(h.root, "none.json"), halt_file: h.config.paths.halt_file } },
+  );
+  expect(exit).toBe(0);
+  const chats = chatsOf(server);
+  expect(chats).toHaveLength(2);
+  const [tickBody, rehearsalBody] = chats.map((c) => new TextDecoder().decode(c.body));
+  return { tick: tickBody!, rehearsal: rehearsalBody!, report: JSON.parse(await readFile(join(out, "report.json"), "utf8")) as RehearsalReport };
+}
+
 describe("rehearse: the seat's own pipeline", () => {
   test("a rehearsal seat sends what a tick's seat sends, byte for byte", async () => {
-    const server = await startFakeServer();
-    servers.push(server);
-    const beacons = testBeacons();
-    const h = await makeTempHost({ beacons, ollamaBaseUrl: server.url });
-    hosts.push(h);
-    await h.writeModelsLock(JSON.parse(lockOf()));
-    h.config.self_authorship.approved_model_digests = [`sha256:${DIGEST}`];
-    h.config.trust.host_attest_public_keys_b64 = [toB64(edPublicKey(E2E_HOST_SEED))];
-    const configPath = join(h.root, "config.json");
-    await writeFile(configPath, JSON.stringify(h.config, null, 2), { mode: 0o600 });
-    for (const b of beacons) serveBeacon(server, b.did, { kind: "lowered" });
-    server.on("GET", "/api/tags", () => Response.json(ollamaTagsJson([{ name: MODEL, digest: DIGEST }])));
-    server.on("POST", "/api/chat", () => Response.json({ model: MODEL, message: { role: "assistant", content: REST_OUTPUT }, done: true, done_reason: "stop" }));
-
-    // Seated through the texts planner by the host's own signer, then given a letter from yu, as a rehearsal seats its copy.
-    const clock = testClock(START);
-    const kc = e2eKeychain();
-    const signer = createSigner({ keychain: kc, config: h.config, clock, fetch: fetchVia(server), spendSoFar: async (w) => ({ word: w, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
-    const admit: AdmitDeps = {
-      config: h.config,
-      clock,
-      run: async () => {
-        throw new Error("parity: no command may run");
-      },
-      sign: (w, k, d) => signer.signEntry(w, k, d),
-      hostKey: () => signer.hostPublicKey(),
-      checkHalt: () => checkHalt({ config: h.config, fetch: fetchVia(server), now: () => clock.now() }),
-    };
-    await admitCitizen(admit, await planAdmitFromTexts(admit, { word: WORD, soul: SOUL, will: WILL, canon: { bytes: CANON, repo: "YOUSPEAK", path: CANON_PATH, commit: "1428646" }, runtime: "free" }));
-    const letterFile = join(h.config.paths.citizens_dir, WORD, "letters", "rehearsal-letter.md");
-    await writeFile(letterFile, `From: yu\n\n${LETTER}`);
-    await utimes(letterFile, new Date(START), new Date(START));
-
-    // The production tick, half an hour later, with its seat in a real child.
-    clock.set(at(0.5));
-    await writeFile(scenarioPath(configPath), JSON.stringify({ server_url: server.url, now: at(0.5) }));
-    let tickOut = "";
-    const env = { PATH: "/usr/bin:/bin", HOME: h.root, LANG: "en_GB.UTF-8", ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
-    const tty = { isTTY: false, write: () => {}, readLine: async () => null };
-    const tick = await main(["tick", "--config", configPath], {
-      out: (t) => void (tickOut += t),
-      err: () => {},
-      env,
-      clock,
-      fetch: fetchVia(server),
-      run: async () => {
-        throw new Error("parity: no command may run");
-      },
-      tty,
-      keychain: () => kc,
-      seatArgv: (c, w, extra) => [process.execPath, E2E_CHILD, "seat", w, "--child", ...extra, "--config", c],
-      uid: () => E2E_SEAT_UID,
-      defaults: { config: configPath, halt_file: h.config.paths.halt_file },
-    });
-    expect([tick, tickOut.trim()]).toEqual([0, `tick: rest ${WORD} (exit 0)`]);
-    expect(chatsOf(server)).toHaveLength(1);
-
-    // The same texts, rehearsed from the same seating time under the host's own config.
-    const inputs = join(h.root, "inputs");
-    await mkdir(inputs);
-    for (const [name, text] of [["soul.md", SOUL], ["WILL.md", WILL], ["canon.md", CANON], ["letter.md", LETTER]] as const) await writeFile(join(inputs, name), text);
-    const exit = await main(
-      [
-        "rehearse",
-        WORD,
-        "--soul",
-        join(inputs, "soul.md"),
-        "--will",
-        join(inputs, "WILL.md"),
-        "--canon",
-        join(inputs, "canon.md"),
-        "--canon-ref",
-        CANON_REF,
-        "--scenario",
-        "letter",
-        "--letter",
-        join(inputs, "letter.md"),
-        "--models-lock",
-        h.config.paths.models_lock,
-        "--chains",
-        "1",
-        "--seats",
-        "1",
-        "--start",
-        START,
-        "--config",
-        configPath,
-        "--out",
-        join(h.root, "rehearsal"),
-      ],
-      { out: () => {}, err: () => {}, env, clock: testClock(START), fetch: fetchVia(server), tty, rehearseArgv: (p) => [process.execPath, CHILD, "rehearse", "--child", "--plan", p], defaults: { config: join(h.root, "none.json"), halt_file: h.config.paths.halt_file } },
-    );
-    expect(exit).toBe(0);
-    const chats = chatsOf(server);
-    expect(chats).toHaveLength(2);
-    const [tickBody, rehearsalBody] = chats.map((c) => new TextDecoder().decode(c.body));
-    expect(rehearsalBody).toContain(`"model":"${MODEL}:local"`);
-    expect(rehearsalBody).toBe(tickBody!);
+    // Seated through the texts planner by the host's own signer, as a rehearsal seats its copy.
+    const p = await parityHost();
+    await admitCitizen(p.admit, await planAdmitFromTexts(p.admit, { word: WORD, soul: SOUL, will: WILL, canon: { bytes: CANON, repo: "YOUSPEAK", path: CANON_PATH, commit: "1428646" }, runtime: "free" }));
+    const { tick, rehearsal } = await tickThenRehearse(p, { soul: SOUL, will: WILL, canon: CANON, canonRef: CANON_REF });
+    expect(rehearsal).toContain(`"model":"${MODEL}:local"`);
+    expect(rehearsal).toBe(tick);
   }, 30_000);
+
+  test("a citizen seated by admit from its old home is sent the same request but for how its will is introduced, and the limits say so", async () => {
+    // Seated as a citizen of record is: from a made-up old home and canon clone, through planAdmit, which pins the will.
+    const p = await parityHost();
+    const old = await standardHome(p.h.homesRoot, WORD);
+    const canon = await canonClone(p.h.root, WORD);
+    const admit: AdmitDeps = { ...p.admit, run: spawnRunner() };
+    const plan = await planAdmit(admit, { word: WORD, legacy_home: old.home, origin: { kind: "canon", file: canon.file }, runtime: "free" });
+    await admitCitizen(admit, plan);
+    if (plan.origin.kind !== "canon") throw new Error("parity: the old home was seated on its canon entry");
+    const ref = `${plan.origin.repo}:${plan.origin.path}@${plan.origin.commit}`;
+    const { tick, rehearsal, report } = await tickThenRehearse(p, { soul: old.soul, will: old.will, canon: canon.text, canonRef: ref });
+    // The one difference: the host's sentence on a will carried from an old repository, where a throwaway's will is its will.
+    expect(tick).toContain(WILL_AS_SEATED);
+    expect(rehearsal).not.toContain(WILL_AS_SEATED);
+    expect(tick.replace(WILL_AS_SEATED, "Your will:")).toBe(rehearsal);
+    expect(report.limits).toContain(LIMIT_SENTENCES.will);
+    expect(report.limits).not.toContain(LIMIT_SENTENCES.origin);
+  }, 60_000);
 
   test("the lock given by path is the one obeyed: a model the repository's lock does not name is called", async () => {
     const other = "llama3.2:3b";
@@ -428,10 +490,11 @@ describe("rehearse: nothing of record, and nothing outside --out", () => {
     const dir = join(outsideRoot, "out");
     // Bun keeps its own transpiler cache under HOME; that is the interpreter's, so HOME is put in a third place.
     r.deps.env = { ...r.deps.env, HOME: await tempRoot() };
-    const before = await tree(r.root);
+    // The copy of the child's stderr is the test fixture's own, not the rehearsal's.
+    const before = await tree(r.root, r.childErr);
     const ran = await rehearse(r, args(r, { seats: 2 }), dir);
     expect(ran.exit).toBe(0);
-    expect(await tree(r.root)).toEqual(before);
+    expect(await tree(r.root, r.childErr)).toEqual(before);
     expect((await readdir(outsideRoot)).sort()).toEqual(["out"]);
     expect((await readdir(dir)).sort()).toEqual(["REHEARSAL.txt", "private", "report.json", "seats.jsonl"]);
   });
@@ -465,6 +528,10 @@ describe("rehearse: nothing of record, and nothing outside --out", () => {
     expect(await readFile(join(ran.dir, "private", "replies.jsonl"), "utf8")).toContain(canary);
     for (const f of ["report.json", "seats.jsonl", "REHEARSAL.txt"]) expect(await readFile(join(ran.dir, f), "utf8")).not.toContain("CANARY");
     expect(r.stdout + r.stderr).not.toContain("CANARY");
+    // The child's own lines, which the watcher passes through unread: its progress is there, the reply is not.
+    const printed = await childErr(r);
+    expect(printed).toContain("chain 1/1 seat 1/1 (cadence): beat; stop; ");
+    expect(printed).not.toContain("CANARY");
   });
 
   test("a state.set target, a journal kind and a stop reason outside the fixed sets are counted as other and stored nowhere outside private/", async () => {
@@ -475,8 +542,8 @@ describe("rehearse: nothing of record, and nothing outside --out", () => {
     expect([row.outcome, row.done_reason, row.state_set_targets, row.journals.map((j) => j.kind)]).toEqual(["invalid-output", "other", ["other"], ["other"]]);
     expect(ran.report!.overall.stop_reasons).toEqual({ other: 1 });
     expect(ran.report!.overall.invalid_by_reason).toEqual({ "no-act-kept": 1 });
-    for (const f of ["report.json", "seats.jsonl"]) expect(await readFile(join(ran.dir, f), "utf8")).not.toContain("CANARY");
-    expect(r.stdout + r.stderr).not.toContain("CANARY");
+    expect(await childErr(r)).toContain("chain 1/1 seat 1/1 (cadence): invalid-output; other; ");
+    expect(await outsidePrivate(r, ran)).not.toContain("CANARY");
     expect(await readFile(join(ran.dir, "private", "replies.jsonl"), "utf8")).toContain("CANARY-STOP");
   });
 
@@ -508,6 +575,12 @@ describe("rehearse: nothing of record, and nothing outside --out", () => {
       expect(o.format).toMatch(/^kingdom-seat-rehearsal-[a-z]+\/v1$/);
       expect(o.not_a_record).toBe(NOT_A_RECORD);
     }
+    // REHEARSAL.txt says what the report names beyond counts and codes, a path on this host among them, which is so.
+    const txt = await readFile(join(ran.dir, "REHEARSAL.txt"), "utf8");
+    expect(txt).toContain("report.json holds the same, and also names the citizen word, the input files, the canon entry's reference, the model, the beacons and the HALT file's full path on this host.");
+    expect(ran.report!.run.halt_sources).toEqual([`file:${r.haltFile}`]);
+    // A throwaway/ is left only by a run cut short, and is there throughout a run that is still going.
+    expect(txt).toContain("If a directory named throwaway/ is here and no rehearsal is running, the run was cut short.");
   });
 
   test("rehearsalSigner signs host entries only, refuses every agenttool and mirror act, and two runs have different keys", async () => {
@@ -644,6 +717,12 @@ describe("rehearse: the throwaway citizen and the tick's rule", () => {
     ]);
     expect(ran.rows[0]!.state_moves).toEqual([{ from: "awake", to: "asleep", via: "immediate", step_away: true }]);
     expect(ran.rows[1]!.at).toBe(at(73));
+    // Sleep said and recorded are over seats awake at open with no letter: the confirm seat, asleep at open, is in neither.
+    const rates = ran.report!.overall.rates;
+    expect([rates.sleep_said, rates.sleep_recorded].map((x) => [x.count, x.of])).toEqual([
+      [1, 1],
+      [1, 1],
+    ]);
   });
 });
 
@@ -669,15 +748,38 @@ describe("rehearse: what a seat returned", () => {
     expect(ran.report!.overall.invalid_by_reason).toEqual({ "not-json": 1 });
   });
 
-  test("server token counts and durations are read; absent ones are null", async () => {
+  test("server token counts and durations are read; absent ones, and any that are not a finite number from 0, are null", async () => {
     const r = await rig();
-    r.chats.push(journal("Counted."), { content: journal("Not counted."), counts: { eval_count: 7 } });
-    const ran = await rehearse(r, args(r, { seats: 2 }));
+    const garbage = { prompt_eval_count: "CANARY-COUNT", prompt_eval_cached_count: true, eval_count: -5, load_duration: null, prompt_eval_duration: "9", eval_duration: { CANARY: 1 } };
+    r.chats.push(journal("Counted."), { content: journal("Not counted."), counts: { eval_count: 7 } }, { content: journal("Counted wrongly."), counts: garbage });
+    const ran = await rehearse(r, args(r, { seats: 3 }));
+    const none = { prompt_tokens: null, prompt_tokens_cached: null, output_tokens: null, load_ms: null, prompt_eval_ms: null, eval_ms: null };
     expect(ran.rows.map((x) => x.server)).toEqual([
       { prompt_tokens: 1000, prompt_tokens_cached: null, output_tokens: 20, load_ms: 2000, prompt_eval_ms: 3000, eval_ms: 1000 },
-      { prompt_tokens: null, prompt_tokens_cached: null, output_tokens: 7, load_ms: null, prompt_eval_ms: null, eval_ms: null },
+      { ...none, output_tokens: 7 },
+      none,
     ]);
     expect(ran.report!.overall.load_ms).toEqual({ n: 1, min: 2000, median: 2000, max: 2000 });
+    expect(ran.report!.overall.output_tokens).toEqual({ n: 2, min: 7, median: 13.5, max: 20 });
+    expect(await outsidePrivate(r, ran)).not.toContain("CANARY");
+  });
+
+  test("the model server fetch reaches only ollama.base_url, and reads the server's counts from a copy of the reply", async () => {
+    const reached: string[] = [];
+    const body = { message: { role: "assistant", content: "{}" }, done: true, prompt_eval_count: 12, eval_duration: 5_000_000 };
+    const inner: FetchLike = async (input) => {
+      reached.push(String(input));
+      return Response.json(body);
+    };
+    let counted: unknown = null;
+    const f = modelServerFetch("http://127.0.0.1:11434", inner, (c) => void (counted = c));
+    const code = (p: Promise<unknown>) => p.then(() => "fetched", (e: unknown) => (e instanceof Refusal ? e.code : "error"));
+    expect(await code(f("https://api.agenttool.dev/public/agents/did:at:x"))).toBe("not-loopback");
+    expect(await code(f("http://127.0.0.1:11435/api/chat", { method: "POST" }))).toBe("not-loopback");
+    expect(reached).toEqual([]);
+    const res = await f("http://127.0.0.1:11434/api/chat", { method: "POST" });
+    expect(await res.json()).toEqual(body);
+    expect(counted).toEqual({ prompt_tokens: 12, prompt_tokens_cached: null, output_tokens: null, load_ms: null, prompt_eval_ms: null, eval_ms: 5 });
   });
 
   test("act names come from the schema the seat sent", async () => {
@@ -699,7 +801,8 @@ describe("rehearse: what a seat returned", () => {
 
   test("the report's tallies for a scripted chain are exactly these", async () => {
     const r = await rig();
-    const replies = [journal("I rest by the window in the light.", "observed"), output({ type: "rest" }, { type: "journal", kind: "imagined", text: "my room glows" }), output({ type: "state.set", to: "asleep" })];
+    // "no body and no" is a four-word run of the preamble, and not a five-word one: it is no echo.
+    const replies = [journal("I rest by the window in the light, with no body and no wind.", "observed"), output({ type: "rest" }, { type: "journal", kind: "imagined", text: "my room glows" }), output({ type: "state.set", to: "asleep" })];
     r.chats.push(...replies);
     const ran = await rehearse(r, args(r, { seats: 3 }));
     expect(ran.exit).toBe(0);
@@ -766,14 +869,111 @@ describe("rehearse: what a seat returned", () => {
     });
     expect(ran.report!.first_seats.seats).toBe(1);
     expect(ran.report!.first_seats.rates.chains_awake_at_end).toEqual(rate(0, 0));
-    expect(ran.report!.limits).toEqual([LIMIT_SENTENCES.samples, LIMIT_SENTENCES.chains, LIMIT_SENTENCES.words, LIMIT_SENTENCES.none_seen, LIMIT_SENTENCES.throwaway]);
+    // A will was given, so the sentence on how a will is introduced is there; a canon entry was, so the archetype one is not.
+    expect(ran.report!.limits).toEqual([LIMIT_SENTENCES.samples, LIMIT_SENTENCES.chains, LIMIT_SENTENCES.words, LIMIT_SENTENCES.none_seen, LIMIT_SENTENCES.throwaway, LIMIT_SENTENCES.will]);
   });
 
-  test("a fixed seed adds the seed sentence to limits", () => {
-    const plan = { model: { seed: 7 }, settings_source: "defaults", settings: rehearsalSettings(null, "/nonexistent/HALT"), inputs: { soul: { path: "/x/soul.md", bytes: 1, sha256: "0".repeat(64), text: "x" }, will: null, canon: null, letter: null }, models_lock: { path: "/x", sha256: "0".repeat(64) } } as unknown as RehearsePlan;
+  test("each rate counts over its own seats", async () => {
+    const pick = (x: { count: number; of: number }) => [x.count, x.of];
+    // Awake with a letter: a sleep said at a seat that shows a letter is in neither sleep rate, and an awake seat is not in wake_said.
+    const lettered = await rig();
+    lettered.chats.push(REST_OUTPUT, output({ type: "state.set", to: "asleep" }));
+    const a = await rehearse(lettered, args(lettered, { letter: true, seats: 2 }));
+    expect(a.rows.map((x) => [x.state_at_open, x.letter_shown, x.state_after])).toEqual([
+      ["awake", true, "awake"],
+      ["awake", true, "asleep"],
+    ]);
+    expect([a.report!.overall.rates.sleep_said, a.report!.overall.rates.sleep_recorded, a.report!.overall.rates.wake_said].map(pick)).toEqual([
+      [0, 0],
+      [0, 0],
+      [0, 0],
+    ]);
+
+    // Awake with no letter: two sleeps said and not kept, one kept as a first step-away, then a seat asleep at open whose
+    // reply holds no act. That reply rests without emitting a rest; the seat asleep at open is in no sleep rate.
+    const said = await rig();
+    said.chats.push(
+      output({ type: "state.set", to: "asleep" }, { type: "state.set", to: "listening" }, { type: "journal", kind: "reflected", text: "x y z" }),
+      JSON.stringify({ acts: [{ type: "state.set", to: "asleep" }], extra: 1 }),
+      output({ type: "state.set", to: "stepped-away" }),
+      JSON.stringify({ acts: [] }),
+    );
+    const b = await rehearse(said, args(said, { seats: 4 }));
+    expect(b.rows.map((x) => [x.state_at_open, x.outcome, x.state_set_targets, x.state_moves.length, x.rest_emitted])).toEqual([
+      ["awake", "beat", ["asleep", "listening"], 0, false],
+      ["awake", "invalid-output", ["asleep"], 0, false],
+      ["awake", "beat", ["stepped-away"], 1, false],
+      ["asleep", "rest", [], 0, false],
+    ]);
+    const rb = b.report!.overall.rates;
+    expect([rb.sleep_said, rb.sleep_recorded, rb.rest, rb.invalid_output].map(pick)).toEqual([
+      [3, 3],
+      [1, 3],
+      [1, 4],
+      [1, 4],
+    ]);
+
+    // Seats with no reply are in no rate: invalid output is over seats with a reply, chains awake at their end over chains with one.
+    const hung = await rig({ timing: { seat_deadline_s: 0.4 } });
+    const hang = () => new Promise<Response>(() => {});
+    hung.chats.push(hang, "not json", hang, journal("Fine."));
+    const c = await rehearse(hung, args(hung, { chains: 4 }));
+    expect([c.exit, c.rows.map((x) => x.outcome)]).toEqual([0, ["timeout", "invalid-output", "timeout", "beat"]]);
+    expect([c.report!.overall.rates.invalid_output, c.report!.first_seats.rates.invalid_output, c.report!.overall.rates.chains_awake_at_end].map(pick)).toEqual([
+      [1, 2],
+      [1, 2],
+      [2, 2],
+    ]);
+  }, 30_000);
+
+  test("a journal is compared with the journals its seat was shown, the last ledger_context_entries entries, not the whole ledger", async () => {
+    const r = await rig();
+    const first = "alpha beta gamma delta epsilon zeta eta theta iota";
+    r.chats.push(journal(first), journal("two two two two"), journal("three three three three"), journal("four four four four"), journal(first));
+    const ran = await rehearse(r, args(r, { seats: 5 }));
+    expect(ran.exit).toBe(0);
+    const users = chatsOf(r.server).map((q) => (JSON.parse(new TextDecoder().decode(q.body)) as { messages: { content: string }[] }).messages[1]!.content);
+    // As many journals as the prompt shows, seat by seat.
+    expect(ran.rows.map((x) => x.recent_journals_shown)).toEqual(users.map((u) => (u.match(/--- begin journal /g) ?? []).length));
+    expect(ran.rows.map((x) => [x.recent_entries_shown, x.recent_journals_shown])).toEqual([
+      [3, 0],
+      [3, 1],
+      [3, 2],
+      [3, 3],
+      [3, 3],
+    ]);
+    // The fifth repeats the first, which is no longer shown, so it overlaps nothing it was shown.
+    expect(users[4]).not.toContain(first);
+    expect([ran.rows[4]!.journals[0]!.recent_overlap, ran.rows[4]!.journals[0]!.same_opening]).toEqual([0, false]);
+  });
+
+  test("the limits name a will seated from texts, an origin seated from texts, a fixed seed and a run on built-in defaults, each when it applies", () => {
+    const text = { path: "/x/t.md", bytes: 1, sha256: "0".repeat(64), text: "x" };
+    const plan = {
+      model: { seed: 7 },
+      settings_source: "defaults",
+      settings: rehearsalSettings(null, "/nonexistent/HALT"),
+      inputs: { soul: text, will: text, canon: null, letter: null },
+      models_lock: { path: "/x", sha256: "0".repeat(64) },
+    } as unknown as RehearsePlan;
     const end = { started_at: START, ended_at: START, ended: "complete" as const, stopped_by: null, exit: 0 as const };
-    expect(buildReport(plan, [], end).limits.slice(-2)).toEqual([LIMIT_SENTENCES.seed, LIMIT_SENTENCES.defaults]);
-    expect(buildReport({ ...plan, model: { ...plan.model, seed: null } }, [], end).limits).not.toContain(LIMIT_SENTENCES.seed);
+    const always = [LIMIT_SENTENCES.samples, LIMIT_SENTENCES.chains, LIMIT_SENTENCES.words, LIMIT_SENTENCES.none_seen, LIMIT_SENTENCES.throwaway];
+    expect(buildReport(plan, [], end).limits).toEqual([...always, LIMIT_SENTENCES.will, LIMIT_SENTENCES.origin, LIMIT_SENTENCES.seed, LIMIT_SENTENCES.defaults]);
+    const canon = { ...text, ref: { repo: "YOUSPEAK", path: CANON_PATH, commit: "1428646" } };
+    const bare = { ...plan, model: { ...plan.model, seed: null }, settings_source: { path: "/x/config.json", sha256: "0".repeat(64) }, inputs: { ...plan.inputs, will: null, canon } } as unknown as RehearsePlan;
+    expect(buildReport(bare, [], end).limits).toEqual(always);
+  });
+
+  test("with a fixed seed a first seat's prompt is the same in two runs and a later seat's is not, as the seed sentence says", async () => {
+    const r = await rig({ lock: { seed: 7 } });
+    r.chats.push(journal("One."), journal("Two."), journal("One."), journal("Two."));
+    const a = await rehearse(r, args(r, { seats: 2 }));
+    const b = await rehearse(r, args(r, { seats: 2 }));
+    // A later seat's prompt shows the earlier seat's id, which is new in every run.
+    expect([a.rows[0]!.input_digest === b.rows[0]!.input_digest, a.rows[1]!.input_digest === b.rows[1]!.input_digest]).toEqual([true, false]);
+    expect(a.report!.limits).toContain(LIMIT_SENTENCES.seed);
+    expect(LIMIT_SENTENCES.seed).toContain("A first seat's reply then depends only on the dates and times in its prompt");
+    expect(LIMIT_SENTENCES.seed).toContain("so a run is not repeated exactly");
   });
 });
 
@@ -826,6 +1026,8 @@ describe("rehearse: bounds and HALT", () => {
     expect([ran.exit, ran.report!.run.ended, ran.rows]).toEqual([0, "halted", []]);
     expect(ran.chains.map((c) => c.ended)).toEqual(["halted"]);
     for (const f of ["seats.jsonl", "report.json", join("private", "replies.jsonl")]) expect(await readFile(join(ran.dir, f), "utf8")).not.toContain("CANARY");
+    expect(await childErr(r)).toContain("chain 1/1: ended halted after 0 seats");
+    expect(await outsidePrivate(r, ran)).not.toContain("CANARY");
   });
 
   test("HALT file raised mid-inference: exit 143, ended halted, the finished seats are in the report", async () => {
@@ -853,6 +1055,49 @@ describe("rehearse: bounds and HALT", () => {
     expect(r.stdout).toContain("HALT watched: file");
     expect(r.stdout).toContain("beacons gardener-desk, halt-herald");
   });
+
+  test("a pinned beacon raised while a model call hangs: the watcher ends the run (exit 143, stopped by that beacon)", async () => {
+    // seat_deadline_s 6 bounds the hung call at 3 s, so a watcher that read no beacon would see the seat time out instead.
+    const r = await rig({ beacons: true, timing: { halt_file_poll_s: 60, beacon_poll_min_s: 0.2, beacon_poll_max_s: 0.3, term_grace_s: 2, seat_deadline_s: 6 } });
+    r.chats.push(journal("Finished before the beacon rose."), async () => {
+      serveBeacon(r.server, testBeacons()[1]!.did, { kind: "raised", until: "2999-12-31T00:00:00.000Z" });
+      return new Promise<Response>(() => {});
+    });
+    const ran = await rehearse(r, args(r, { seats: 2 }));
+    expect([ran.exit, ran.report!.run.ended, ran.report!.run.stopped_by]).toEqual([143, "halted", "halt-herald"]);
+    expect(ran.rows.map((x) => x.outcome)).toEqual(["beat"]);
+    expect(await stat(join(ran.dir, "throwaway")).catch(() => null)).toBeNull();
+  }, 20_000);
+
+  test("a child whose watcher is gone opens no further seat", async () => {
+    const r = await rig();
+    const dir = join(r.root, "outs", "watcher-killed");
+    let parent: ReturnType<typeof Bun.spawn> | null = null;
+    r.chats.push(async () => {
+      // The parent is killed with KILL while the child's first model call is in hand; nothing then watches the child.
+      parent!.kill("SIGKILL");
+      await parent!.exited;
+      return Response.json({ model: MODEL, message: { role: "assistant", content: journal("Answered after the watcher died.") }, done: true, done_reason: "stop", ...COUNTS });
+    }, journal("Never asked for."));
+    parent = Bun.spawn([process.execPath, PARENT, r.server.url, r.childErr, join(r.root, "none.json"), r.haltFile, "rehearse", WORD, ...args(r, { chains: 3, seats: 2 }), "--out", dir], {
+      env: { PATH: "/usr/bin:/bin", HOME: r.root, LANG: "en_GB.UTF-8", ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    // Nobody waits for an orphan; its last row says when it has ended.
+    let rows = parseRows("");
+    for (let i = 0; i < 300 && rows.end === null; i++) {
+      await Bun.sleep(50);
+      rows = parseRows(await readFile(join(dir, "seats.jsonl"), "utf8").catch(() => ""));
+    }
+    expect(parent.signalCode).toBe("SIGKILL");
+    expect(chatsOf(r.server)).toHaveLength(1);
+    expect(rows.seats.map((x) => [x.chain, x.seat, x.outcome])).toEqual([[1, 1, "beat"]]);
+    expect(rows.chains.map((c) => [c.chain, c.seats, c.ended])).toEqual([[1, 1, "fault"]]);
+    expect(rows.end).toMatchObject({ ended: "fault", exit: 1 });
+    expect(await childErr(r)).toContain("rehearse: the watcher is gone; a rehearsal opens no seat unwatched, so the run ends here");
+    expect(await stat(join(dir, "throwaway")).catch(() => null)).toBeNull();
+    expect(await stat(join(dir, "report.json")).catch(() => null)).toBeNull();
+  }, 30_000);
 
   test("a last row with no newline is ignored by the parent", () => {
     const row = { format: "kingdom-seat-rehearsal-seat/v1", chain: 1, seat: 1 };
@@ -896,6 +1141,19 @@ describe("rehearse: where --out may be", () => {
       expect([dir, ran.exit, r.stderr.includes(message)]).toEqual([dir, 1, true]);
       if (!dir.endsWith("inputs")) expect(await stat(dir).catch(() => null)).toBeNull();
     }
+    expect(r.server.requests).toHaveLength(0);
+  });
+
+  test("a models lock inside a citizen home is refused before anything is created, by the check the child would make", async () => {
+    const r = await rig();
+    const lock = join(r.root, "homes", "candidate.lock");
+    await writeFile(lock, lockOf());
+    const argv = args(r);
+    argv[argv.indexOf("--models-lock") + 1] = lock;
+    const ran = await rehearse(r, argv);
+    expect(ran.exit).toBe(1);
+    expect(r.stderr).toContain("config paths.models_lock: is inside a citizen home (paths.homes[0])");
+    expect(await stat(ran.dir).catch(() => null)).toBeNull();
     expect(r.server.requests).toHaveLength(0);
   });
 

@@ -5,15 +5,27 @@
 // route. The keychain, the signer, the runtime and the command runner are
 // never to be built here: if any is, the child exits 99, which the parent
 // reports as a fault and the test sees.
-import { readFileSync } from "node:fs";
+//
+// The watcher passes the child's stderr through unread, so a test that must
+// see what the child printed puts `--copy-stderr <file>` before the CLI's
+// arguments, and every line the child prints is also appended to that file.
+import { appendFileSync, readFileSync } from "node:fs";
 import { main } from "../../../src/cli.ts";
 import { fetchViaUrl } from "../../helpers/fake-server.ts";
 
-const argv = Bun.argv.slice(2);
+const given = Bun.argv.slice(2);
+const copy = given[0] === "--copy-stderr" ? given[1] : undefined;
+const argv = copy === undefined ? given : given.slice(2);
 const at = argv.indexOf("--plan");
 const planPath = at >= 0 ? argv[at + 1] : undefined;
+
+function err(t: string): void {
+  if (copy !== undefined) appendFileSync(copy, t);
+  process.stderr.write(t);
+}
+
 if (!planPath) {
-  process.stderr.write("rehearse child: --plan is required\n");
+  err("rehearse child: --plan is required\n");
   process.exit(1);
 }
 let serverUrl = "http://127.0.0.1:9";
@@ -25,11 +37,13 @@ try {
 
 /** Stands for a dependency a rehearsal must never build. */
 function forbidden(what: string): never {
-  process.stderr.write(`rehearse child: ${what} was built\n`);
+  err(`rehearse child: ${what} was built\n`);
   process.exit(99);
 }
 
 const exit = await main(argv, {
+  out: (t) => err(`rehearse child stdout: ${t}`),
+  err,
   fetch: fetchViaUrl(serverUrl),
   env: process.env,
   keychain: () => forbidden("a keychain"),

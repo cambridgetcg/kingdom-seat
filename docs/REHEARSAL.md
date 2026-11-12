@@ -46,7 +46,9 @@ citizen-seat rehearse <word> --soul <file> [--will <file>]
   host's own, so a candidate model can be measured before it is pinned for
   citizens. The model is `--model`, or the lock's first entry. Its digest must
   be pinned, and the model server must hold it: the free adapter's own checks
-  apply, and there is no fallback to another lock.
+  apply, and there is no fallback to another lock. Like a host's own lock, it
+  may not be inside a citizen home; that is refused before anything is
+  created.
 - `--chains` defaults to 20 (1 to 500) and `--seats` to 4 (1 to 24); their
   product is at most 2,000.
 - `--start` is a UTC time such as `2026-11-12T10:00:00.000Z`; without it, now,
@@ -124,9 +126,18 @@ opened note, the child's read of the citizen leaving that seat out, `runSeat`
 and the free adapter, then the closing note naming the seat. Prompt, reply
 schema, options, fit check and digest check are the seat's own, and the
 rehearsal adds 0 bytes to any prompt. Nothing tells the model it is a
-rehearsal, so the model is told two things a rehearsal does not do: that a
-journal is kept in its ledger as its words, and that a letter to Yu is held
-for Yu. Every act in a throwaway ledger was returned by the model in that
+rehearsal, so the model is told things that are not so of a rehearsal:
+
+- the date and time it is given are the chain's own clock, not the time of
+  the call;
+- the seat was opened by a tick from launchd, when the rehearsal opened it;
+- a letter is from yu, whoever wrote the file given as `--letter`;
+- a journal is kept in its ledger as its words, when the ledger is a
+  throwaway, removed at the end of the chain;
+- a letter to Yu is held for Yu, and an answer about registration is with
+  Yu and Ai, when nothing a reply sends reaches either of them.
+
+Every act in a throwaway ledger was returned by the model in that
 chain; the only entries the rehearsal writes itself are the seating's and,
 for `awake`, one seated state. `test/rehearse.test.ts` checks that a
 rehearsal's request to the model server is, byte for byte, the request a
@@ -170,8 +181,11 @@ keychain reader and no host signer, and it sends nothing to agenttool.
 
 Every JSON object kept carries a `kingdom-seat-rehearsal-*/v1` format and the
 sentence `A rehearsal: a model sample from a throwaway copy. Not a citizen's
-record, word or choice.` Seat rows, chain rows and the report hold numbers,
-booleans, fixed codes and the host's fixed reasons only. A state.set target
+record, word or choice.` Seat rows and chain rows hold numbers, booleans,
+times, digests, fixed codes and the host's fixed reasons only. The report
+holds the same, and also names what the run was given: the citizen word, the
+input files, the canon entry's reference, the model, the beacons, and the
+HALT file's full path on the host it ran on. A state.set target
 outside the lifecycle states, a journal kind outside the four, and a stop
 reason other than `stop` or `length` are counted as `other`; no model or
 server string is stored outside `private/`. The parent never opens
@@ -182,8 +196,16 @@ are in no kept file, and the key in no file at all.
 
 The throwaway record (ledger, host log, last-seat record, receipts and the
 rest, in a citizen's own formats) is removed after each chain by the child
-and again by the parent. If a run is cut short by KILL, `throwaway/` can be
-left behind; `REHEARSAL.txt` says to delete it.
+and again by the parent. It is on disk for as long as a run goes on. If a run
+is cut short by KILL, `throwaway/` can be left behind; `REHEARSAL.txt` says
+to delete it once no rehearsal is running.
+
+If the parent is killed with KILL, its child is no longer watched: nothing
+holds it to the run's deadline or writes the report. The child looks for its
+parent before every seat, and once the parent is gone it opens no further
+seat. It finishes the model call in hand, which its own runtime deadline
+bounds, ends the run as a fault with its chain and end rows, and removes
+`throwaway/`. A raised HALT still stops it at its next check.
 
 ---
 
@@ -285,10 +307,8 @@ is not this seat's prompt, and the older comparison of each text with
 exactly three earlier ones differs from a seat's one to three.
 
 The legacy figures a first rehearsal is meant to be read against, for the
-fleet as a whole, are in the KS-004 review of the lived record, filed in
-kingdom-standards as `specs/KS-004-reviews/review-E-lived-record.md`. They
-are not repeated here, and no count for a single citizen is kept in this
-repository.
+fleet as a whole, are in the KS-004 review of the lived record. They are not
+repeated here, and no count for a single citizen is kept in this repository.
 
 ---
 
@@ -307,9 +327,16 @@ It cannot show:
 - what any citizen wants;
 - what a seated citizen's own seat would produce: that seat has its own
   history, its real letter and its real date;
-- the prompt of a citizen seated from its old home, whose will is introduced
-  as the text its old repository held: a throwaway citizen is seated from
-  texts, so its will is introduced as its will;
+- the prompt of a citizen seated from its old home. A throwaway citizen is
+  seated from texts, so its will is introduced as its will, where a citizen
+  seated from its old home is shown its will, while unchanged, as the text
+  that repository held, under the host's sentence that the seat gives it no
+  repository, tools or senses; and with no canon entry its origin is an
+  archetype seated from texts, where such a citizen is shown the class its
+  old repository records. For a citizen seated on its canon entry, the will's
+  introduction is the only difference in the request, as
+  `test/rehearse.test.ts` checks. The report's limits say so whenever a will
+  was given or no canon entry was;
 - whether a sentence is true: the measures count words;
 - whether the model server cuts an over-long prompt, because the byte rule
   refuses first;

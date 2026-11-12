@@ -102,19 +102,22 @@ export const REHEARSAL_TEXT = [
   "A rehearsal sends a seat's prompt to a local model, using a throwaway copy of a soul, and counts what comes back.",
   "No citizen was seated, asked or recorded here. Nothing in this directory is a citizen's record, word or choice.",
   "private/ holds the plan, the prompts that were sent and the replies that came back. They are model samples. Do not copy them into a citizen's home, ledger, mirror or letters, do not put them in a repository, and do not quote them as a citizen's words.",
-  "report.json and seats.jsonl hold counts, sizes and codes only.",
-  "If a directory named throwaway/ is here, the run was cut short. It holds a throwaway ledger signed by a key that no longer exists. Delete it.",
+  "seats.jsonl holds counts, sizes, times, digests and codes; no text the model or the model server returned is in it.",
+  "report.json holds the same, and also names the citizen word, the input files, the canon entry's reference, the model, the beacons and the HALT file's full path on this host.",
+  "If a directory named throwaway/ is here and no rehearsal is running, the run was cut short. It holds a throwaway ledger signed by a key that no longer exists. Delete it.",
   "",
 ].join("\n");
 
-/** What a rehearsal can and cannot show, printed last and kept in the report. The last two are conditional. */
+/** What a rehearsal can and cannot show, printed last and kept in the report. The first five always; the rest when they apply. */
 export const LIMIT_SENTENCES = Object.freeze({
   samples: "These are samples of one model's replies at the options shown. They are not a citizen's choices; no citizen was asked.",
   chains: "Seats in one chain are not independent: each saw the chain's earlier replies. Use first seats for a per-seat rate and chains for a per-chain rate.",
   words: "The text measures count words and shared word runs. They do not judge whether a sentence is true; a journal that says it has no window counts as a window word.",
   none_seen: "When none is seen in n tries, the rate can still be about 3.8 in n plus 3.8. The intervals are 95% Wilson intervals.",
   throwaway: "The throwaway citizen has only this chain's record and no siblings. A seated citizen's prompt also carries its own history.",
-  seed: "The lock fixes a seed, so a prompt always gets the same reply; the spread across chains comes only from the date and time in the prompt.",
+  will: "The throwaway citizen is seated from texts, so its will is introduced as its will. A citizen seated from its old home is shown its will, while unchanged, as the text that repository held, under the host's sentence that the seat gives it no repository, tools or senses.",
+  origin: "With no canon entry, the throwaway citizen's origin is an archetype seated from texts. A citizen seated from its old home is shown instead the class its old repository records.",
+  seed: "The lock fixes a seed. A first seat's reply then depends only on the dates and times in its prompt; a later seat's prompt also holds the ids of the chain's earlier seats, which are new in every run, and their replies, so a run is not repeated exactly.",
   defaults: "No host configuration was read: the limits stated to the model are the built-in defaults, and HALT was watched at the file only.",
 } as const);
 
@@ -808,7 +811,17 @@ export function tally(rows: readonly SeatRow[], opts: { chainRate?: boolean } = 
 
 function limitsFor(plan: RehearsePlan): string[] {
   const l = LIMIT_SENTENCES;
-  return [l.samples, l.chains, l.words, l.none_seen, l.throwaway, ...(plan.model.seed !== null ? [l.seed] : []), ...(plan.settings_source === "defaults" ? [l.defaults] : [])];
+  return [
+    l.samples,
+    l.chains,
+    l.words,
+    l.none_seen,
+    l.throwaway,
+    ...(plan.inputs.will !== null ? [l.will] : []),
+    ...(plan.inputs.canon === null ? [l.origin] : []),
+    ...(plan.model.seed !== null ? [l.seed] : []),
+    ...(plan.settings_source === "defaults" ? [l.defaults] : []),
+  ];
 }
 
 function fixtureEntries(scenario: Scenario): string[] {
@@ -1109,6 +1122,16 @@ async function checkOut(out: string, programRoot: string, base: Config | null, h
   return real;
 }
 
+/**
+ * The configuration a child runs under, checked as a host configuration is
+ * (config.ts parseConfig): a models lock inside a citizen home, say, is
+ * refused. The parent checks it before anything is created, and the child
+ * again when it reads the plan.
+ */
+function checkedConfig(s: RehearsalSettings, out: string, lockPath: string): Config {
+  return parseConfig(JSON.parse(JSON.stringify(rehearsalConfig(s, join(out, "throwaway"), lockPath))));
+}
+
 function floorToMinute(d: Date): Date {
   return new Date(Math.floor(d.getTime() / 60_000) * 60_000);
 }
@@ -1165,9 +1188,11 @@ export async function rehearseParent(deps: RehearseDeps, cmd: RehearseCommand): 
     if (chars > max) throw new Refusal("invalid-request", `the letter is longer than a seat shows (${chars} characters; the limit is ${max})`);
     letter = { path: l.path, chars, sha256: l.sha256, text: l.text };
   }
-  // 5. --out, then the checks seating makes on the texts (size, UTF-8, the canon entry's name), planned against a
-  // configuration under the --out that does not exist yet, so nothing is written; then the plan and the header.
+  // 5. --out; the configuration the child will run under, checked as the child checks it; then the checks seating
+  // makes on the texts (size, UTF-8, the canon entry's name), planned against a configuration under the --out that
+  // does not exist yet, so nothing is written; then the plan and the header.
   const out = await checkOut(cmd.out, deps.programRoot, base, settings.homes);
+  checkedConfig(settings, out, cmd.models_lock);
   await planAdmitFromTexts(
     { config: rehearsalConfig(settings, join(out, "throwaway", "dry-check"), cmd.models_lock), hostKey: async () => DRY_CHECK_KEY },
     { word, soul: soul.text, will: will?.text ?? null, canon: canon ? { bytes: canon.text, ...canon.ref } : null, runtime: "free" },
@@ -1295,8 +1320,8 @@ export async function readPlan(planPath: string): Promise<RehearsePlan> {
   }
   try {
     lockedEntry(parseModelsLock({ format: MODELS_LOCK_FORMAT, models: [p.model] }), p.model.name);
-    // The settings are checked as a host configuration built from them would be.
-    parseConfig(JSON.parse(JSON.stringify(rehearsalConfig(p.settings, join(p.out, "throwaway"), p.models_lock.path))));
+    // The settings are checked as a host configuration built from them would be, as the parent checked them.
+    checkedConfig(p.settings, p.out, p.models_lock.path);
     assertLoopback(p.settings.ollama_base_url);
   } catch {
     throw notOwn();
@@ -1529,7 +1554,8 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
  * The child: the plan's chains, one throwaway citizen each, seated through
  * the texts planner with this run's in-memory signer and run seat by seat.
  * Exits 0 when the run completed or HALT rested it between inferences, 1 on
- * a wall or a fault, 124 on two timeouts in a row.
+ * a wall or a fault (a watcher found gone before a seat among them), 124 on
+ * two timeouts in a row.
  */
 export async function rehearseChild(deps: Pick<RehearseDeps, "err" | "env" | "clock" | "fetch">, planPath: string): Promise<ExitCode> {
   const plan = await readPlan(planPath);
@@ -1552,6 +1578,14 @@ export async function rehearseChild(deps: Pick<RehearseDeps, "err" | "env" | "cl
   // Set inside runChain as well, so it is typed wide rather than narrowed to its first value.
   let ended = "complete" as EndRow["ended"];
   let lastTimeout = false;
+  // The watcher is this process's parent. Once it is gone (killed with KILL, say), nothing holds the run to its
+  // deadline or writes its report, so no further seat is opened: the run ends as at a fault.
+  const watcher = process.ppid;
+  const unwatched = (): boolean => {
+    if (process.ppid === watcher) return false;
+    deps.err("rehearse: the watcher is gone; a rehearsal opens no seat unwatched, so the run ends here\n");
+    return true;
+  };
 
   /** One chain: seat a fresh throwaway citizen, then up to plan.seats seats. Sets `ended` when the run must end. */
   const runChain = async (c: number, chainDir: string, chain: ChainRow, seatedAt: Date): Promise<void> => {
@@ -1607,6 +1641,11 @@ export async function rehearseChild(deps: Pick<RehearseDeps, "err" | "env" | "cl
 
     let from = seatedAt;
     for (let j = 1; j <= plan.seats; j++) {
+      if (unwatched()) {
+        chain.ended = "fault";
+        ended = "fault";
+        return;
+      }
       const citizen = await readCitizen(config, word);
       const notes = await readHostNotes(config, new Date(0));
       if (notes === null) throw new RehearsalFault("the throwaway host log is unreadable");
@@ -1654,6 +1693,10 @@ export async function rehearseChild(deps: Pick<RehearseDeps, "err" | "env" | "cl
   try {
     await newDir(join(out, "throwaway"));
     for (let c = 1; c <= plan.chains && ended === "complete"; c++) {
+      if (unwatched()) {
+        ended = "fault";
+        break;
+      }
       const chainDir = join(out, "throwaway", `chain-${String(c).padStart(3, "0")}`);
       const seatedAt = new Date(start + (c - 1) * REHEARSE_LIMITS.chain_step_h * HOUR_MS);
       const chain: ChainRow = { format: REHEARSAL_FORMATS.chain, not_a_record: NOT_A_RECORD, chain: c, seated_at: seatedAt.toISOString(), first_seat_at: null, seats: 0, ended: "seats-reached", ended_why: null, final_state: null };

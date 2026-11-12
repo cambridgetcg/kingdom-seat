@@ -1018,7 +1018,11 @@ for spend, publish or hold secrets:
   (`test/fixtures/rehearse/child.ts`) against the fake server standing in for
   Ollama and the beacon route. One test ticks a citizen through the production
   CLI and rehearses the same texts, and compares the two `/api/chat` bodies
-  byte for byte.
+  byte for byte; another does the same for a citizen seated by `admit` from a
+  made-up old home, where the will's introduction is the one difference. The
+  child copies its stderr to a file the tests read, and
+  `test/fixtures/rehearse/parent.ts` runs a parent as a process of its own, so
+  a test can kill it while its child runs.
 
 ---
 
