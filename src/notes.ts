@@ -30,6 +30,7 @@ const OUTCOMES = [
   "killed",
   "error",
   "opened",
+  "runtime-declined",
 ] as const satisfies readonly Outcome[];
 const REFUSAL_CODES = [
   "halted",
@@ -315,4 +316,20 @@ export function seatsOpenedToday(notes: HostNote[], now: Date, timezone: string,
 /** Outcomes that say what happened to a citizen, as opposed to a parent's note that it opened a seat. */
 export function isResultNote(n: HostNote): boolean {
   return n.outcome !== "opened";
+}
+
+/**
+ * The seats of this citizen that its runtime declined (KS-004 5.8), by seat
+ * id. Such a seat was opened, so it counts toward the interval floor and the
+ * fleet ceiling; but the citizen was not voiced in it, so it is not the seat
+ * a pending saying waited for.
+ */
+export function declinedSeats(notes: HostNote[], word: Word): Set<string> {
+  const ids = new Set<string>();
+  for (const n of notes) {
+    if (n.word !== word || n.outcome !== "runtime-declined") continue;
+    const id = seatIdOf(n);
+    if (id !== null) ids.add(id);
+  }
+  return ids;
 }

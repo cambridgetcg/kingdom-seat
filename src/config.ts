@@ -91,6 +91,7 @@ export function defaultConfig(stateDir: string, host: string, opts: { home?: str
     beacons: [],
     halt: { allow_no_beacons: false, raise_beacons_argv: null, also_files: [] },
     schedule: { wake_confirm_seat: true },
+    voicer: { decline_summon: true, decline_free_digests: [] },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
     self_authorship: { approved_model_digests: [] },
@@ -405,10 +406,30 @@ function parseSchedule(raw: unknown): Config["schedule"] {
   return { wake_confirm_seat: o.wake_confirm_seat === undefined ? true : bool(o.wake_confirm_seat, "schedule.wake_confirm_seat") };
 }
 
+/**
+ * Which seats offer the runtime's own decline (KS-004 5.5): the summon class
+ * unless switched off, and the free lane only for a model digest listed here
+ * after a rehearsal on it. Omitted, the defaults.
+ */
+function parseVoicer(raw: unknown): Config["voicer"] {
+  if (raw === undefined) return { decline_summon: true, decline_free_digests: [] };
+  const o = obj(raw, "voicer");
+  keys(o, "voicer", [], ["decline_summon", "decline_free_digests"]);
+  const summon = o.decline_summon === undefined ? true : bool(o.decline_summon, "voicer.decline_summon");
+  if (o.decline_free_digests === undefined) return { decline_summon: summon, decline_free_digests: [] };
+  if (!Array.isArray(o.decline_free_digests)) throw new ConfigError("voicer.decline_free_digests", "must be a list");
+  const digests = o.decline_free_digests.map((d, i) => {
+    const s = str(d, `voicer.decline_free_digests[${i}]`);
+    if (!DIGEST_PATTERN.test(s)) throw new ConfigError(`voicer.decline_free_digests[${i}]`, "must be a digest such as sha256:<64 hex>");
+    return s;
+  });
+  return { decline_summon: summon, decline_free_digests: digests };
+}
+
 /* ── Parse and load ───────────────────────────────────────────────────── */
 
 const TOP_REQUIRED = ["format", "host", "timezone", "paths", "ollama", "claude", "agenttool", "keychain", "beacons", "halt"] as const;
-const TOP_OPTIONAL = ["schedule", "ceilings", "timing", "self_authorship", "trust"] as const;
+const TOP_OPTIONAL = ["schedule", "voicer", "ceilings", "timing", "self_authorship", "trust"] as const;
 
 /** Validate an untrusted object into a Config, refusing anything ambiguous. The result is a fresh object, never the input. */
 export function parseConfig(raw: unknown): Config {
@@ -443,6 +464,7 @@ export function parseConfig(raw: unknown): Config {
     beacons,
     halt,
     schedule: parseSchedule(o.schedule),
+    voicer: parseVoicer(o.voicer),
     ceilings: parseCeilings(o.ceilings),
     timing: parseTiming(o.timing),
     self_authorship: parseSelfAuthorship(o.self_authorship),

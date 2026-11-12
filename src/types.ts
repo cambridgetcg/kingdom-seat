@@ -68,7 +68,13 @@ export type Outcome =
   | "killed"
   | "error"
   /** A host note only: a parent opened a seat after its walls passed; the child's own note says what followed. */
-  | "opened";
+  | "opened"
+  /**
+   * The model declined to voice the citizen, in the reply form the seat
+   * offered for it (KS-004 5.8). The runtime's outcome, never the citizen's:
+   * nothing is written in its voice and no ledger entry is made.
+   */
+  | "runtime-declined";
 
 /* ── Refusals ─────────────────────────────────────────────────────────── */
 
@@ -1037,6 +1043,35 @@ export interface Prompt {
   user: string;
 }
 
+/**
+ * What the host says to the model that reads a seat's prompt, before it
+ * hands the pronoun to the citizen (KS-004 5.4): the model's name where the
+ * host knows it before the call, whether this seat offers the runtime's own
+ * decline, and whether a decline may carry the model's words (only where Yu
+ * is present to read them).
+ */
+export interface VoicerDoor {
+  model_name: string | null;
+  decline: boolean;
+  why: boolean;
+}
+
+/** Why the words beside a decline were not kept. The decline stands in each case. */
+export type WhyDropped = "not-text" | "too-long" | "control-chars" | "not-offered";
+
+/**
+ * A seat its runtime declined, as the seat returns it: the model's id, its
+ * own words if they were kept, why they were not, how many acts beside the
+ * marker went unread, and where the host's record of it was written.
+ */
+export interface DeclineView {
+  model: string;
+  why: string | null;
+  why_dropped: WhyDropped | null;
+  acts_beside: number;
+  record: string | null;
+}
+
 /** What one runtime call returns to the seat. The seat validates `raw_output`; it never executes it. */
 export interface RuntimeResult {
   runtime: RuntimeClass;
@@ -1097,6 +1132,8 @@ export interface SeatResult {
    * by its ledger digest.
    */
   appended: LedgerHash[];
+  /** Set only on a runtime-declined seat, for the terminal of the process that confirmed Yu. */
+  decline?: DeclineView;
 }
 
 export interface TickResult {
@@ -1311,6 +1348,16 @@ export interface Config {
      * letter or Yu's summons, as KS-004 v0.2 section 7.3 reads.
      */
     wake_confirm_seat: boolean;
+  };
+  /** What a seat's prompt offers the model that voices the citizen (KS-004 5.4, 5.5). */
+  voicer: {
+    /** The summon class offers the runtime's own decline. True by default; false restores the reply form without it. */
+    decline_summon: boolean;
+    /**
+     * Model digests (sha256:<64 hex>) for which the free lane offers it too,
+     * each listed only after a rehearsal on that model. Empty by default.
+     */
+    decline_free_digests: string[];
   };
   ceilings: Ceilings;
   timing: Timing;

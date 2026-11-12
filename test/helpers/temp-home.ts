@@ -139,6 +139,7 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
     beacons: opts.beacons ?? [],
     halt: { allow_no_beacons: opts.allowNoBeacons ?? (opts.beacons === undefined), raise_beacons_argv: null, also_files: [] },
     schedule: { wake_confirm_seat: true },
+    voicer: { decline_summon: true, decline_free_digests: [] },
     ceilings: { ...DEFAULT_CEILINGS },
     timing: { ...DEFAULT_TIMING },
     self_authorship: { approved_model_digests: [] },
@@ -148,10 +149,13 @@ export function testConfig(root: string, homesRoot: string, opts: { beacons?: Be
 
 const HOST_RECORDS = new Set(["host.jsonl", "host.jsonl.started", "spend.jsonl", "spend.jsonl.started", "status.json", TEST_HALT_FILE]);
 
-/** A snapshot without the host's own records (its log, status, seat files, last-seat records and HALT): what is left is what a citizen's voice could reach. */
+/**
+ * A snapshot without the host's own records (its log, status, seat files, last-seat records, decline records and
+ * HALT): what is left is what a citizen's voice could reach.
+ */
 export async function citizenSnapshot(h: TempHost): Promise<Map<string, string>> {
   const snap = await h.snapshot();
-  for (const k of [...snap.keys()]) if (HOST_RECORDS.has(k) || k.startsWith("seats/") || k.startsWith("last-seat/")) snap.delete(k);
+  for (const k of [...snap.keys()]) if (HOST_RECORDS.has(k) || k.startsWith("seats/") || k.startsWith("last-seat/") || k.startsWith("declines/")) snap.delete(k);
   return snap;
 }
 

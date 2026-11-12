@@ -451,6 +451,27 @@ describe("status", () => {
     expect(renderStatus(d)).toContain(`last refused ${NOW.toISOString()} (keychain-locked): seat ${seatId} on free: before inference: refused (keychain-locked)`);
   });
 
+  test("[KS-004 5.8, 5.10] a runtime-declined note reads as the last outcome and not as a refusal", async () => {
+    host = await makeTempHost();
+    const cfg = host.config;
+    const signer = fakeSigner();
+    await host.addCitizen("glossame");
+    await host.seatLedger("glossame", signer.signEntry);
+    const seatId = "12345678-1234-4123-8123-123456789abc";
+    const add = (n: Partial<HostNote>) => appendHostNote(cfg, { ts: NOW.toISOString(), host: "test-host", kind: "seat", word: "glossame", outcome: "beat", refusal: null, detail: "x", ...n });
+    await add({ outcome: "runtime-declined", detail: `seat ${seatId} on summon: runtime-declined; why=none; acts-unread=0; fields-unread=0; record=written` });
+    await add({ kind: "seat", outcome: "runtime-declined", detail: `seat ${seatId} ended: exit 0, 5 ms` });
+    // The log stays readable with the new outcome in it.
+    expect((await readHostNotes(cfg, new Date(0)))!.map((n) => n.outcome)).toEqual(["runtime-declined", "runtime-declined"]);
+    const s = await buildStatus({ config: cfg, now: NOW, halt: LOWERED, signerState: "ready" });
+    const c = s.citizens[0]!;
+    expect(c.last_outcome).toBe("runtime-declined");
+    expect(c.last_refusal).toBeNull();
+    expect(c.last_dropped).toBeNull();
+    expect(renderStatus(s)).toContain("last runtime-declined");
+    expect(renderStatus(s)).not.toContain("last refused");
+  });
+
   test("[KS-004 4.5, 5.10; review C M1, M2, M6] status publishes the host key's public half, and a registered citizen's expression lag, deferred backups and quiet", async () => {
     host = await makeTempHost();
     const signer = fakeSigner();

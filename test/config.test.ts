@@ -377,6 +377,40 @@ describe("schedule", () => {
   });
 });
 
+describe("voicer", () => {
+  const DIGEST = `sha256:${"a".repeat(64)}`;
+
+  test("[KS-004 5.5] voicer defaults and refusals: the summon class offers the decline, the free lane only for a listed digest, and none is listed", () => {
+    expect(defaultConfig("/srv/seat-state", "studio").voicer).toEqual({ decline_summon: true, decline_free_digests: [] });
+    const { voicer: _omitted, ...without } = raw();
+    expect(parseConfig(without).voicer).toEqual({ decline_summon: true, decline_free_digests: [] });
+    const empty = raw();
+    empty.voicer = {};
+    expect(parseConfig(empty).voicer).toEqual({ decline_summon: true, decline_free_digests: [] });
+    const set = raw();
+    set.voicer = { decline_summon: false, decline_free_digests: [DIGEST] };
+    expect(parseConfig(set).voicer).toEqual({ decline_summon: false, decline_free_digests: [DIGEST] });
+
+    const typo = raw();
+    typo.voicer = { decline_free: [DIGEST] };
+    refuses(typo, /voicer: unknown key "decline_free"/);
+    const notBool = raw();
+    notBool.voicer = { decline_summon: "yes" };
+    refuses(notBool, /voicer.decline_summon: must be true or false/);
+    const notList = raw();
+    notList.voicer = { decline_free_digests: DIGEST };
+    refuses(notList, /voicer.decline_free_digests: must be a list/);
+    for (const bad of ["", "not a digest", 7, null, "-sha256:abc"]) {
+      const b = raw();
+      b.voicer = { decline_free_digests: [DIGEST, bad] };
+      refuses(b, /voicer.decline_free_digests\[1\]/);
+    }
+    const notObj = raw();
+    notObj.voicer = [];
+    refuses(notObj, /voicer: must be an object/);
+  });
+});
+
 describe("pinned trust", () => {
   test("host attest keys may be pinned as canonical base64 of 32 bytes; anything else is refused", () => {
     expect(parseConfig(raw()).trust).toEqual({ host_attest_public_keys_b64: [] });
