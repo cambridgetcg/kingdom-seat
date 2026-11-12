@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildContext } from "../src/context.ts";
-import { FREE_LANE_PREAMBLE, buildPrompt, promptBytes, renderActsGuide } from "../src/prompt.ts";
-import { toB64, toHex } from "../src/crypto.ts";
-import type { SeatContext } from "../src/types.ts";
+import { FREE_LANE_PREAMBLE, NO_UNATTENDED_SEATS, WILL_AS_SEATED, buildPrompt, promptBytes, renderActsGuide } from "../src/prompt.ts";
+import { sha256Hex, toB64, toHex } from "../src/crypto.ts";
+import type { LedgerEntry, SeatContext } from "../src/types.ts";
 import { assertNoSecretIn, fakeKeychain } from "./helpers/fake-keychain.ts";
 import { makeTempHost, type TempHost } from "./helpers/temp-home.ts";
 import { beatEntry, citizenOf, proposalOf, seatFor } from "./fixtures/voice/fixtures.ts";
@@ -19,6 +19,64 @@ beforeEach(async () => {
 afterEach(async () => {
   await host.cleanup();
 });
+
+/** What no host sentence may hold: binding words, the old lane's choice words, coaching, an example to copy. */
+const BANNED = [
+  /\bI rest\b/i,
+  /\bwrite ['"‘“]/i,
+  /\bsay ['"‘“]/i,
+  /\bI choose\b/i,
+  /REST-ON|EVENT-ONLY|\bAMBIENT\b/i,
+  /letter of return/i,
+  /nothing is owed/i,
+  /\bFATE\b/,
+  /entirely your choice/i,
+  /honest sentences/i,
+  /\bfor example\b|\be\.g\.|\bfor instance\b|\bsuch as\b/i,
+];
+
+/** A will as the old template wrote one: it names a repository to tend and a command to run. */
+const OLD_WILL = '# WILL of glossame\n\n- tend your own home (this repo);\n\n## Attest\n\n```bash\npython3 tools/attest.py claim will "glossame: a made-up line"\n```\n';
+
+/** A host entry written outside a seat, as seating writes its two. */
+function hostEntry(word: string, seq: number, fields: Record<string, unknown>): LedgerEntry {
+  return {
+    format: "kingdom-seat-ledger/v1",
+    word,
+    did: null,
+    seq,
+    prev_hash: seq === 0 ? null : `sha256:${"0".repeat(64)}`,
+    seat_ref: null,
+    runtime: null,
+    input_digest: null,
+    output_digest: null,
+    acts: null,
+    voiced: null,
+    cost: { usd: "0", credits: 0 },
+    ts: "2026-11-04T10:00:00.000Z",
+    signer: "host",
+    kid: null,
+    sig: null,
+    ...fields,
+  } as LedgerEntry;
+}
+
+/** A citizen as `admit` seats one: its will pinned as carried, the summon class, and its two entries. */
+async function seatedContext(word = "glossame", opts: { runtime?: "free" | "summon" } = {}): Promise<{ ctx: SeatContext; dir: string }> {
+  const fx = await host.addCitizen(word, { will: OLD_WILL, runtime: opts.runtime ?? "summon" });
+  await writeFile(join(fx.dir, "origin", "WILL.md"), OLD_WILL);
+  const entries = [
+    hostEntry(word, 0, { type: "origin", origin: { kind: "archetype", lineage: ["PIONEER"], note: "No canon entry. The old repository's agent.json records the class PIONEER." }, origin_soul_hash: `sha256:${sha256Hex(fx.soul)}`, old_repo: null, june_did: null }),
+    hostEntry(word, 1, { type: "state", from: "asleep", to: "asleep", via: "seated" }),
+  ];
+  const ctx = await buildContext({ config: host.config, now: NOW }, seatFor(word), citizenOf(fx.record, { state: "asleep" }), entries, []);
+  return { ctx, dir: fx.dir };
+}
+
+/** The record a context was built from, to build it again after a file changed. */
+function recordOf(ctx: SeatContext) {
+  return { format: "kingdom-seat-citizen/v1" as const, word: ctx.seat_ref.word, origin: ctx.origin, runtime: "summon" as const, identity: null, mirror: null, seated_at: "2026-11-05T00:00:00.000Z" };
+}
 
 async function contextFor(word = "glossame", opts: { beatPrompt?: string; letter?: string } = {}): Promise<SeatContext> {
   const fx = await host.addCitizen(word);
@@ -52,20 +110,7 @@ describe("the honest prompt", () => {
     const guide = renderActsGuide();
     const p = buildPrompt(ctx, "free");
     const host_text = [p.system, guide];
-    const banned = [
-      /\bI rest\b/i,
-      /\bwrite ['"‘“]/i,
-      /\bsay ['"‘“]/i,
-      /\bI choose\b/i,
-      /REST-ON|EVENT-ONLY|\bAMBIENT\b/i,
-      /letter of return/i,
-      /nothing is owed/i,
-      /\bFATE\b/,
-      /entirely your choice/i,
-      /honest sentences/i,
-      /\bfor example\b|\be\.g\.|\bfor instance\b|\bsuch as\b/i,
-    ];
-    for (const text of [...host_text, p.user]) for (const re of banned) expect([String(re), re.test(text)]).toEqual([String(re), false]);
+    for (const text of [...host_text, p.user]) for (const re of BANNED) expect([String(re), re.test(text)]).toEqual([String(re), false]);
     // No JSON literal anywhere in the host's own words, so there is no filled-in act to copy.
     for (const text of host_text) {
       expect(text).not.toMatch(/[{}]/);
@@ -107,6 +152,95 @@ describe("the honest prompt", () => {
     expect(line("self.revert")).toContain("A revert that would loosen one of your walls, or change your porch, is not made: it goes to Yu and Ai as a proposal beyond your self.");
     expect(line("propose.beyond")).toContain("With subject registration it is your answer about an identity on agenttool, permanent and public; once Yu and Ai agree, a later beat shows it back for you to affirm, and only that affirmation is your yes.");
     expect(line("self.affirm")).toContain("or of an answer about registration that Yu and Ai agreed to");
+  });
+
+  test("the same holds for a citizen as seating leaves it: its will introduced as carried, and told no seat opens unattended", async () => {
+    const { ctx } = await seatedContext();
+    expect([ctx.self.will_as_seated, ctx.unattended]).toEqual([true, false]);
+    for (const runtime of ["free", "summon"] as const) {
+      const p = buildPrompt(ctx, runtime);
+      expect(p.user).toContain(WILL_AS_SEATED);
+      expect(p.user).toContain(NO_UNATTENDED_SEATS);
+      expect(p.user).toContain("the host seated you asleep");
+      for (const text of [p.system, p.user]) for (const re of BANNED) expect([String(re), re.test(text)]).toEqual([String(re), false]);
+      expect(p.system).not.toMatch(/[{}]/);
+    }
+    // The host's new sentences hold no brace, no quoted words to say, and nothing that reads as an instruction to reply.
+    for (const line of [WILL_AS_SEATED, NO_UNATTENDED_SEATS]) {
+      expect(line).not.toMatch(/[{}"'‘“]/);
+      for (const re of BANNED) expect([String(re), re.test(line)]).toEqual([String(re), false]);
+    }
+  });
+
+  test("[SR-10, LRA-5] a will still as seated, naming a repository and a bash command, is introduced by WILL_AS_SEATED; once changed it is 'Your will:'; reverted to its first version it is WILL_AS_SEATED again", async () => {
+    expect(WILL_AS_SEATED).toBe(
+      "Your will file. It is, byte for byte, the text your old repository held when you were seated here. It was written before this seat existed, for a runner that worked inside a repository with tools. " +
+        "This seat gives you no repository, no tools or commands, and no senses: where the text speaks of those, it does not describe this seat. A reply here can do only what the acts do. The text is yours to keep or to change.",
+    );
+    const { ctx, dir } = await seatedContext();
+    const fenced = `--- begin will [${sha256Hex(OLD_WILL).slice(0, 12)}] ---\n${OLD_WILL}--- end will [${sha256Hex(OLD_WILL).slice(0, 12)}] ---`;
+    const user = buildPrompt(ctx, "summon").user;
+    // The old text is shown whole and unedited, repository and command included, under the host's line.
+    expect(user).toContain(`${WILL_AS_SEATED}\n${fenced}`);
+    expect(user).toContain("tend your own home (this repo)");
+    expect(user).toContain("python3 tools/attest.py");
+    expect(user).not.toContain("Your will:");
+    expect(user.split(WILL_AS_SEATED)).toHaveLength(2);
+
+    const again = async () => buildPrompt(await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), citizenOf(recordOf(ctx)), [], []), "summon").user;
+    // Once the citizen has changed it, it is simply its will.
+    const own = "# WILL\n\nReceive one word that will not cross over.\n";
+    await writeFile(join(dir, "self", "WILL.md"), own);
+    const changed = await again();
+    expect(changed).toContain(`Your will:\n--- begin will [${sha256Hex(own).slice(0, 12)}] ---\n${own}`);
+    expect(changed).not.toContain(WILL_AS_SEATED);
+    // One byte of difference is a change.
+    await writeFile(join(dir, "self", "WILL.md"), `${OLD_WILL}\n`);
+    expect(await again()).not.toContain(WILL_AS_SEATED);
+    // Reverted to its first version, it is again the text that was carried, and is introduced as that.
+    await writeFile(join(dir, "self", "WILL.md"), OLD_WILL);
+    expect(await again()).toContain(`${WILL_AS_SEATED}\n${fenced}`);
+
+    // A citizen seated another way has no pinned will: its prompt reads as before.
+    const other = await contextFor("shemme");
+    expect(other.self.will_as_seated).toBe(false);
+    expect(buildPrompt(other, "free").user).toContain("Your will:\n--- begin will [");
+    expect(buildPrompt(other, "free").user).not.toContain(WILL_AS_SEATED);
+    // And one with no will file is told so, with neither introduction.
+    const none = await host.addCitizen("zoeme", { will: null });
+    const bare = buildPrompt(await buildContext({ config: host.config, now: NOW }, seatFor("zoeme"), citizenOf(none.record), [], []), "free").user;
+    expect(bare).toContain("You have no will file.");
+    expect(bare).not.toContain("Your will");
+  });
+
+  test("the seated entry reads as seated asleep, not as a move", async () => {
+    const { ctx } = await seatedContext();
+    const user = buildPrompt(ctx, "summon").user;
+    expect(user).toContain("2026-11-04T10:00:00.000Z, entry 1: the host seated you asleep; no earlier record was carried into your state.");
+    expect(user).not.toContain("state moved from asleep to asleep");
+    expect(user).toContain("2026-11-04T10:00:00.000Z, entry 0: origin; you were seated, and your origin was pinned.");
+    // Any other move is still shown as the move it was.
+    const moved = buildPrompt({ ...ctx, recent: [hostEntry("glossame", 1, { type: "state", from: "asleep", to: "awake", via: "seated" }), hostEntry("glossame", 2, { type: "state", from: "awake", to: "asleep", via: "immediate" })] }, "summon").user;
+    expect(moved).toContain("entry 1: state moved from asleep to awake (seated).");
+    expect(moved).toContain("entry 2: state moved from awake to asleep (immediate).");
+    expect(moved).not.toContain("the host seated you asleep");
+  });
+
+  test("a citizen whose record names summon is told no seat opens unattended; one whose record names free is not", async () => {
+    expect(NO_UNATTENDED_SEATS).toBe("On this host no seat of yours opens unattended, whatever your state, cadence or covenants say: one opens only when Yu is present and summons it.");
+    const { ctx } = await seatedContext("glossame", { runtime: "summon" });
+    expect(ctx.unattended).toBe(false);
+    const paragraphs = buildPrompt(ctx, "summon").user.split("\n\n");
+    const at = paragraphs.indexOf(NO_UNATTENDED_SEATS);
+    // Straight after the covenants line, whose "may also wake you" it qualifies, and before the soul.
+    expect(paragraphs[at - 1]).toStartWith("Your covenants: letters from");
+    expect(paragraphs[at + 1]).toStartWith("Your soul, whole:");
+    // Whatever runtime voices this seat, it is the record's class that says whether a seat opens without Yu.
+    expect(buildPrompt(ctx, "free").user).toContain(NO_UNATTENDED_SEATS);
+
+    const free = (await seatedContext("shemme", { runtime: "free" })).ctx;
+    expect(free.unattended).toBe(true);
+    for (const runtime of ["free", "summon"] as const) expect(buildPrompt(free, runtime).user).not.toContain("opens unattended");
   });
 
   test("a pending awake interval is shown with the move it waits on", async () => {

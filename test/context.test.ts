@@ -288,6 +288,58 @@ describe("what the citizen is shown", () => {
   });
 });
 
+describe("what seating left is told apart from what the citizen made of it", () => {
+  test("will_as_seated is true only while self/WILL.md equals origin/WILL.md; a symlinked origin/WILL.md refuses the seat; unattended follows the record's runtime", async () => {
+    const will = "# WILL\n\n- tend your own home (this repo);\n";
+    const fx = await host.addCitizen("glossame", { will, runtime: "summon" });
+    const c = citizenOf(fx.record);
+    const pinned = join(fx.dir, "origin", "WILL.md");
+    const self = async () => (await readSelf(host.config, c)).will_as_seated;
+
+    // A citizen seated before wills were pinned has none in origin/: its will is simply its will.
+    expect(await self()).toBe(false);
+    await writeFile(pinned, will);
+    expect(await self()).toBe(true);
+    // Any difference, down to one byte or a byte-order mark, is a change; the same bytes again are not.
+    for (const changed of [`${will}\n`, will.slice(0, -1), `\ufeff${will}`, will.replace("tend", "Tend"), ""]) {
+      await writeFile(join(fx.dir, "self", "WILL.md"), changed);
+      expect([changed, await self()]).toEqual([changed, false]);
+    }
+    await writeFile(join(fx.dir, "self", "WILL.md"), will);
+    expect(await self()).toBe(true);
+    // No will file: nothing to introduce, whatever origin/ holds.
+    await rm(join(fx.dir, "self", "WILL.md"));
+    expect(await readSelf(host.config, c)).toMatchObject({ will: null, will_as_seated: false });
+    await writeFile(join(fx.dir, "self", "WILL.md"), will);
+
+    // A link where the pinned will belongs refuses the seat, as a linked self file does: it is never followed.
+    const outside = join(host.root, "outside-will.md");
+    await writeFile(outside, will);
+    await rm(pinned);
+    await symlink(outside, pinned);
+    expect(await refusalCode(readSelf(host.config, c))).toBe("symlink");
+    expect(await refusalCode(buildContext({ config: host.config, now: NOW }, seatFor("glossame"), c, [], []))).toBe("symlink");
+    await rm(pinned);
+    // So does a link where origin/ belongs.
+    await rm(join(fx.dir, "origin"), { recursive: true });
+    await symlink(join(host.root), join(fx.dir, "origin"));
+    expect(await refusalCode(readSelf(host.config, c))).toBe("symlink");
+    await rm(join(fx.dir, "origin"));
+    // With no origin/ at all there is no pin to compare with.
+    expect(await self()).toBe(false);
+
+    // unattended is the record's runtime class, not the runtime that voices this seat.
+    await mkdir(join(fx.dir, "origin"));
+    await writeFile(join(fx.dir, "origin", "canon.md"), "canon text for glossame");
+    const summon = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), c, [], []);
+    expect(summon.unattended).toBe(false);
+    const free = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), { ...c, runtime: "free" }, [], []);
+    expect(free.unattended).toBe(true);
+    const hermes = await buildContext({ config: host.config, now: NOW }, seatFor("glossame"), { ...c, runtime: "hermes" }, [], []);
+    expect(hermes.unattended).toBe(false);
+  });
+});
+
 describe("what the citizen may change is in view", () => {
   test("cadence, covenants, the seat's limits and every other self text it may edit reach the context and the prompt", async () => {
     const fx = await host.addCitizen("glossame");

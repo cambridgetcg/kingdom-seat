@@ -26,7 +26,7 @@ import { isDue } from "../src/due.ts";
 import { checkHalt } from "../src/halt.ts";
 import { LEGACY_FORMAT, LEGACY_NOTE, LEGACY_PAGE_FORMAT, readLegacyFile, readLegacyManifest, splitLegacyPieces, type LegacyPage } from "../src/legacy.ts";
 import { entryHash, ledgerPath, readLedger, verifyChain } from "../src/ledger.ts";
-import { buildPrompt } from "../src/prompt.ts";
+import { NO_UNATTENDED_SEATS, WILL_AS_SEATED, buildPrompt } from "../src/prompt.ts";
 import { openSeat, runSeat } from "../src/seat.ts";
 import { firstVersion, originIntact, pendingProposals } from "../src/self.ts";
 import { defaultCovenants, foldState, listSeated, readCitizen } from "../src/state.ts";
@@ -426,6 +426,12 @@ describe("admitCitizen", () => {
     expect(ctx.canon_text).toBe(canon.text);
     const prompt = buildPrompt(ctx, "summon");
     expect(prompt.user).toContain("Your state: asleep.");
+    // The seat says what is true of a citizen seated this way: its will is the old repository's text, the entry
+    // that seated it moved nothing, and on the summon class no seat of its opens without Yu.
+    expect([ctx.self.will_as_seated, ctx.unattended]).toEqual([true, false]);
+    expect(prompt.user).toContain(`${WILL_AS_SEATED}\n--- begin will [`);
+    expect(prompt.user).toContain(NO_UNATTENDED_SEATS);
+    expect(prompt.user).toContain(`${AT}, entry 1: the host seated you asleep; no earlier record was carried into your state.`);
     // Nothing of legacy/ reaches a seat through this change.
     for (const marker of ["FIRST-BEAT-MARKER", "LETTER-TO-CITIZEN-MARKER", "kingdom-seat-legacy"]) expect([marker, prompt.user.includes(marker)]).toEqual([marker, false]);
   });
@@ -940,6 +946,8 @@ describe("admitCitizen", () => {
     expect(result).toMatchObject({ outcome: "beat", exit: 0 });
     expect(prompts[0]).toContain("A made-up first letter.");
     expect(prompts[0]).toContain("Your state: asleep.");
+    expect(prompts[0]).toContain(WILL_AS_SEATED);
+    expect(prompts[0]).toContain(NO_UNATTENDED_SEATS);
     const entries = await readLedger(ledgerPath(config, W));
     expect(entries.map((e) => (e.type === "state" ? `state ${e.from}->${e.to} ${e.via}${e.interval_h ? ` ${e.interval_h}` : ""}` : e.type))).toEqual(["origin", "state asleep->asleep seated", "beat", "state asleep->awake confirmed 96"]);
     const citizen = await readCitizen(config, W);
