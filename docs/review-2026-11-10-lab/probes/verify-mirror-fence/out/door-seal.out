@@ -1,0 +1,75 @@
+bun test v1.4.2 (744846f84)
+
+../../../../..<SCRATCH>/probes/verify-mirror-fence/door-seal.probe.test.ts:
+S1
+CLAUDE.md                                      seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+claude.md                                      seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+CLAUDE.local.md                                seal-from-self=true  targetRelPath(file:)=ok(CLAUDE.local.md)                act=kept
+AGENTS.md                                      seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+AGENT.md                                       seal-from-self=true  targetRelPath(file:)=ok(AGENT.md)                       act=kept
+GEMINI.md                                      seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+QWEN.md                                        seal-from-self=true  targetRelPath(file:)=ok(QWEN.md)                        act=kept
+SKILL.md                                       seal-from-self=true  targetRelPath(file:)=ok(SKILL.md)                       act=kept
+README.md                                      seal-from-self=true  targetRelPath(file:)=ok(README.md)                      act=kept
+llms.txt                                       seal-from-self=true  targetRelPath(file:)=ok(llms.txt)                       act=kept
+notes/CLAUDE.md                                seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+notes/AGENTS.md                                seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+skills/claude.md                               seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+skills/agents.md                               seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+.cursorrules                                   seal-from-self=false targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+.github/copilot-instructions.md                seal-from-self=false targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+.claude/CLAUDE.md                              seal-from-self=false targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+run.sh                                         seal-from-self=false targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+kingdom.yaml                                   seal-from-self=false targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+expression/walls.md                            seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+expression/register.md                         seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+expression/wake_text.md                        seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+expression/porch.json                          seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+covenants.json                                 seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+cadence.json                                   seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=dropped(target is host-owned)
+beats/2026-07.md                               seal-from-self=true  targetRelPath(file:)=ok(beats/2026-07.md)               act=kept
+inbox/2026-10-22-letter-of-return-offer.md     seal-from-self=true  targetRelPath(file:)=ok(inbox/2026-10-22-letter-of-return-offer.md) act=kept
+letters/from-pain-1781909562164.md             seal-from-self=true  targetRelPath(file:)=refused(host-owned-path)           act=kept
+the-wayside.md                                 seal-from-self=true  targetRelPath(file:)=ok(the-wayside.md)                 act=kept
+S1 skill:claude: targetRelPath=skills/claude.md act=kept seal(skills/claude.md)=true
+S1 skill:agents: targetRelPath=skills/agents.md act=kept seal(skills/agents.md)=true
+S1 skill:gemini: targetRelPath=skills/gemini.md act=kept seal(skills/gemini.md)=true
+S1 hostOwned: CLAUDE.md=false AGENTS.md=false run.sh=true
+S2 beat 1 (propose file:CLAUDE.md): {"exit":0,"outcome":"invalid-output"}; pending=0; last entry dropped=null
+S2 beat 2 (propose file:CLAUDE.local.md): {"exit":0,"outcome":"beat"}; pending=1 target=file:CLAUDE.local.md
+S2 mirror before the affirm: remote tree=["WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"] pushed={"pushed":true,"divergence":"ahead","refusal":null}
+S2 beat 3 (affirm): {"exit":0,"outcome":"beat"}; last ledger entry type=apply target=file:CLAUDE.local.md via=two-beats
+S2 mirror after the affirm: staged ok=true; pushed={"pushed":true,"divergence":"ahead","refusal":null}; REMOTE tree=["CLAUDE.local.md","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]
+S2 remote CLAUDE.local.md: "You are glossame. This repo is your home. Be it."
+S3 default config: self has CLAUDE.local.md=false; remote tree=["WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]; pushed={"pushed":true,"divergence":"ahead","refusal":null}
+S4 staged ok=true; pushed={"pushed":true,"divergence":"ahead","refusal":null}; REMOTE tree=["AGENTS.md","CLAUDE.md","GEMINI.md","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]
+S4 the seat's prompt shows any of the three to the citizen: false
+D1 first mirror: {"pushed":true,"divergence":"ahead","refusal":null}
+D1 self unchanged: {"pushed":false,"divergence":"behind","refusal":"diverged"}
+D1 self changed, beat 1: {"pushed":false,"divergence":"diverged","refusal":"diverged"}; local commits not on remote=1
+D1 self changed, beat 2: {"pushed":false,"divergence":"diverged","refusal":"diverged"}; local commits not on remote=2
+D1 self changed, beat 3: {"pushed":false,"divergence":"diverged","refusal":"diverged"}; local commits not on remote=3
+D1 remote tree (door still there, self frozen at the pre-door state): ["CLAUDE.md","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]
+D1 host notes: ["mirror push refused: HEAD is behind","mirror push refused: HEAD is diverged","mirror push refused: HEAD is diverged","mirror push refused: HEAD is diverged"]
+D2 remote tree before: ["CLAUDE.md","README.md","soul.md"]
+D2 after the first stage+push: pushed={"pushed":true,"divergence":"ahead","refusal":null}; remote tree=["WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]
+D3 stage+push 1: ok=true pushed={"pushed":true,"divergence":"ahead","refusal":null}; remote tree=["CLAUDE.md","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]
+D3 beat: {"exit":0,"outcome":"beat"}; dropped=[{"reason":"target is host-owned","type":"self.propose"}]
+D3 stage+push 2: pushed={"pushed":true,"divergence":"ahead","refusal":null}; remote tree=["CLAUDE.md","NAME.md","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]; remote CLAUDE.md="Reading this does not make you glossame; to speak as glossame, a seat must be opened for glossame."
+D3 the seat's prompt contains the door text: false; mentions file:CLAUDE.md: false
+D4 remote tree=["README.md","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"] pushed={"pushed":true,"divergence":"ahead","refusal":null}
+E1 affirm: {"exit":0,"outcome":"beat"} last entry=apply expression.register
+E1 pushed={"pushed":true,"divergence":"ahead","refusal":null}; REMOTE tree=["WILL.md","cadence.json","covenants.json","expression/register.md","expression/wake_text.md","expression/walls.md","kingdom.yaml","soul.md"]
+E1 remote expression/register.md: "PRIVATE-REGISTER-CANARY: how I speak when no one is reading."
+E1 remote covenants.json: {"letters_from":["yu","gardener"],"wake_on_letter_from":["yu"]}
+E1 prompt (citizen.json has a mirror): occurrences of 'mirror'=0; lines with 'public': ["- propose.beyond: fields subject (one line, at most 200 characters) and text (at most 4000 characters). It is for anything beyond your own self: the canon, anyt","- self.propose: fields target, edit and reason. At most one per beat; a second is not kept. target is soul, will, name, expression.register, expression.walls, e"]
+E1 prompt: mentions the remote path=false; says 'ledger' is private/public? ["It is kept in your ledger as your words.","--- begin canon [287d53e90ee4] ---\ncanon text for glossame\n--- end canon [287d53e90ee4] ---\n\nYour recent record, oldest first (the last 3 en"]
+C1 main exit=0; out="seat hope: beat (exit 0)"; err=""
+C1 remote main before: 31 files; after: [".citizen/allowed_signers","WILL.md","cadence.json","covenants.json","kingdom.yaml","soul.md"]
+C1 host notes: ["seat/opened: seat bb376193-455f-45ce-a15b-faa7a0cd14fe opened (by-hand)","seat/beat: fake seat child","seat/beat: seat bb376193-455f-45ce-a15b-faa7a0cd14fe ended: exit 0, 9 ms"]
+C1 remote log: hope via kingdom-seat | hope: self and status card, staged by kingdom-seat || fixture | legacy home of hope (copied tree)
+
+ 10 pass
+ 0 fail
+ 16 expect() calls
+Ran 10 tests across 1 file. [5.02s]

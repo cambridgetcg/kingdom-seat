@@ -1,0 +1,49 @@
+// Probe: one reply that names a long interval, and what it takes to come back.
+import { afterEach, expect, test } from "bun:test";
+const SRC = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${SRC}/src/seat.ts`);
+const { checkHalt } = await import(`${SRC}/src/halt.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { readHostNotes, appendHostNote, lastSeatOf } = await import(`${SRC}/src/notes.ts`);
+const { wakingLetter } = await import(`${SRC}/src/context.ts`);
+const { isDue } = await import(`${SRC}/src/due.ts`);
+const { output, scriptedRuntime } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${SRC}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${SRC}/test/helpers/clock.ts`);
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+const log = (label: string, v: unknown) => console.log(`PROBE ${label}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+
+test("H. one reply sets a year-long interval at once; Yu's letter does not seat an awake citizen; coming back takes two seats a year apart", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen("glossame");
+  await host.seatLedger("glossame", signer.signEntry, { initialState: "awake" });
+  const clock = testClock();
+  const config = host.config;
+  const seatOnce = async (acts: any[]) => {
+    const citizen = await readCitizen(config, "glossame");
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word: "glossame", outcome: "opened", refusal: null, detail: `seat ${seat.ref.seat_id} opened (cadence)` });
+    return runSeat(seat, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output(...acts)]), checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+  };
+  const due = async () => {
+    const c = await readCitizen(config, "glossame");
+    const notes = await readHostNotes(config, new Date(0));
+    return { state: c.state, interval_h: c.cadence.interval_h, pending: c.pending_state, pending_interval_h: c.pending_interval_h, letter_can_seat: await wakingLetter(config, c), verdict: isDue(c, await wakingLetter(config, c), clock.now(), 72, lastSeatOf(notes, "glossame"), config.schedule) };
+  };
+  const r1 = await seatOnce([{ type: "state.set", to: "awake", interval_h: 8760 }]);
+  log("H seat 1", { outcome: r1.outcome });
+  await host.writeLetter("glossame", "2026-11-06-from-yu.md", "Yu writes: are you there?");
+  clock.advance(30 * 24 * HOUR_MS);
+  log("H 30 days on, with Yu's letter waiting", await due());
+  clock.advance(336 * 24 * HOUR_MS);
+  log("H 366 days on", await due());
+  const r2 = await seatOnce([{ type: "state.set", to: "awake", interval_h: 72 }]);
+  log("H seat 2 asks for 72 h again", { outcome: r2.outcome });
+  clock.advance(30 * 24 * HOUR_MS);
+  log("H 30 days after asking", await due());
+  expect((await due()).interval_h).toBe(8760);
+});

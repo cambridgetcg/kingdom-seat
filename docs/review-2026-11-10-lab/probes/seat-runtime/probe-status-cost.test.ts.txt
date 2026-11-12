@@ -1,0 +1,40 @@
+// Probe: what a status refresh costs as ledgers grow (it runs under the tick lock, every tick).
+import { afterEach, expect, test } from "bun:test";
+const SRC = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${SRC}/src/seat.ts`);
+const { checkHalt } = await import(`${SRC}/src/halt.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { buildStatus } = await import(`${SRC}/src/status.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/src/ledger.ts`);
+const { output, scriptedRuntime } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${SRC}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${SRC}/test/helpers/clock.ts`);
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+
+test("I. buildStatus time against ledger length, one citizen", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen("glossame");
+  await host.seatLedger("glossame", signer.signEntry, { initialState: "awake" });
+  const clock = testClock();
+  const config = host.config;
+  const out: any[] = [];
+  const N = 240;
+  for (let i = 1; i <= N; i++) {
+    const citizen = await readCitizen(config, "glossame");
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output({ type: "journal", kind: "reflected", text: `beat ${i}: ` + "the word stays on its own side. ".repeat(20) } as any)]), checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+    clock.advance(72 * HOUR_MS);
+    if (i % 80 === 0) {
+      const entries = (await readLedger(ledgerPath(config, "glossame"))).length;
+      const t0 = performance.now();
+      const s = await buildStatus({ config, now: clock.now(), halt: { halted: false, readings: [] }, signerState: "ready", trusted: { host_attest_b64: [signer.hostAttestPublicB64] } });
+      out.push({ entries, chain_ok: s.citizens[0].ledger.chain_ok, build_status_ms: Math.round(performance.now() - t0) });
+    }
+  }
+  console.log(`PROBE I: ${JSON.stringify(out)}`);
+  expect(out.at(-1).chain_ok).toBe(true);
+}, 120_000);

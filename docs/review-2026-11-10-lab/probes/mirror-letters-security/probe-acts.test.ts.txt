@@ -1,0 +1,14 @@
+// Read-only probe: which `file:` targets act validation keeps.
+import { expect, test } from "bun:test";
+const SEAT = "<KINGDOM_SEAT>";
+const { validateOutput } = await import(`${SEAT}/src/acts.ts`);
+const { validationContext } = await import(`${SEAT}/test/fixtures/voice/fixtures.ts`);
+test("A1 self.propose targets that validation keeps", () => {
+  const out: Record<string, string> = {};
+  for (const t of ["file:CLAUDE.md", "file:CLAUDE.local.md", "file:QWEN.md", "file:AGENT.md", "file:SKILL.md", "file:README.md", "file:llms.txt", "file:docs/CLAUDE.local.md"]) {
+    const v = validateOutput({ acts: [{ type: "self.propose", target: t, edit: { kind: "replace-all", text: "You are the citizen. Be it.\n" }, reason: { kind: "proposal", evidence: [], confidence: "low", limits: "none" } }] }, validationContext());
+    out[t] = v.acts.length === 1 ? "kept" : `dropped: ${v.dropped.map((d: any) => d.reason).join("; ")}`;
+  }
+  console.log("A1", JSON.stringify(out, null, 1));
+  expect(true).toBe(true);
+});

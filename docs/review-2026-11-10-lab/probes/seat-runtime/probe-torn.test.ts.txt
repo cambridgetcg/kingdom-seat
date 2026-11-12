@@ -1,0 +1,55 @@
+// Probe: HALT raised while a seat is recording. What the ledger holds, and what the watcher reports.
+import { afterEach, expect, test } from "bun:test";
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>";
+const { superviseChild, seatEnv } = await import(`${SRC}/src/seat.ts`);
+const { readHaltFile } = await import(`${SRC}/src/halt.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/src/ledger.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { readHostNotes } = await import(`${SRC}/src/notes.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { waitFor } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+
+test("K. TERM during the record phase: the beat stays in the ledger, the watcher reports halted", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen("glossame");
+  await host.seatLedger("glossame", signer.signEntry, { initialState: "awake" });
+  const config = host.config;
+  const configPath = join(host.root, "config-for-child.json");
+  writeFileSync(configPath, JSON.stringify(config));
+  const seatId = "11111111-1111-4111-8111-111111111111";
+  await mkdir(join(config.paths.seats_dir, seatId));
+  const marker = join(host.root, "marker");
+  const run = superviseChild({
+    argv: [process.execPath, "<SCRATCH>/probes/seat-runtime/torn-child.ts", configPath, "glossame", seatId, marker],
+    cwd: config.paths.seats_dir,
+    env: { ...seatEnv(config, process.env), PATH: process.env.PATH ?? "" },
+    deadline_ms: 30_000, term_grace_ms: 1_000, halt_file_poll_ms: 100, beacon_poll_min_ms: 60_000, beacon_poll_max_ms: 60_000,
+    readHaltFile: () => readHaltFile(config.paths.halt_file, new Date()),
+    readBeacons: async () => [],
+  });
+  await waitFor(() => existsSync(marker), 15_000);
+  await host.raiseHaltFile();
+  const sup = await run;
+  await host.clearHaltFile();
+  const entries = await readLedger(ledgerPath(config, "glossame"));
+  const beat = entries.find((e: any) => e.type === "beat");
+  const outboxDir = join(config.paths.citizens_dir, "glossame", "outbox");
+  const c = await readCitizen(config, "glossame");
+  console.log(`PROBE K: ${JSON.stringify({
+    watcher: { exit: sup.exit, outcome: sup.outcome, signal: sup.signal, stopped_by: sup.stopped_by },
+    ledger_types: entries.map((e: any) => e.type + (e.via ? `(${e.via})` : "")),
+    beat_acts: beat?.acts?.map((a: any) => a.type),
+    outbox_files: existsSync(outboxDir) ? readdirSync(outboxDir).length : 0,
+    folded_state: c.state,
+    child_notes: ((await readHostNotes(config, new Date(0))) ?? []).map((n: any) => `${n.kind}/${n.outcome}`),
+  })}`);
+  expect(sup.exit).toBe(143);
+  expect(beat).toBeDefined();
+}, 40_000);

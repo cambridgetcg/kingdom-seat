@@ -1,0 +1,495 @@
+// verify-lifecycle: second-pass probes for LRA-1, SR-4, SR-5, SR-7, SR-9, SLH-05, SLH-06, SLH-14.
+//
+// Every seat here goes through the production path end to end:
+//   cli.ts main(["tick"]) -> runTick -> superviseChild -> a real child process ->
+//   cli.ts main(["seat", word, "--child", "--seat-ref", ...]) -> verbSeatChild -> runSeat.
+// Fakes only: signer, keychain, fetch (noFetch), clock, and the runtime's reply.
+// Nothing touches a real home, a keychain, the network or a model.
+import { afterEach, describe, expect, test } from "bun:test";
+import { writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const SRC = "<KINGDOM_SEAT>";
+const CHILD = join(import.meta.dir, "child.ts");
+const { main } = await import(`${SRC}/src/cli.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { wakingLetter } = await import(`${SRC}/src/context.ts`);
+const { isDue } = await import(`${SRC}/src/due.ts`);
+const { lastSeatOf, readHostNotes, seatsOpenedToday } = await import(`${SRC}/src/notes.ts`);
+const { ledgerPath, readLedger, appendEntry, nextDraft } = await import(`${SRC}/src/ledger.ts`);
+const { output, REST_OUTPUT, recordingRunner } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${SRC}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { fakeKeychain } = await import(`${SRC}/test/helpers/fake-keychain.ts`);
+const { makeTempHost, TEST_SEAT_UID } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS, DAY_MS } = await import(`${SRC}/test/helpers/clock.ts`);
+
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop().cleanup();
+});
+const say = (label: string, v: unknown) => console.log(`VERIFY ${label}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+
+interface Ctl {
+  mode: "script" | "production" | "crash";
+  script: string;
+  tty: string;
+  /** Run after the tick has opened the seat and written its "opened" note, before the child starts. */
+  afterOpen: null | (() => void);
+}
+
+async function harness(words: { word: string; state?: string; covenants?: "default-file" | "none" }[], opts: { yuTty?: boolean } = {}) {
+  const h = await makeTempHost();
+  hosts.push(h);
+  const signer = fakeSigner();
+  for (const w of words) {
+    await h.addCitizen(w.word);
+    await h.seatLedger(w.word, signer.signEntry, { initialState: w.state ?? "awake" });
+    // "none": no covenants.json at all, so state.ts defaultCovenants() applies (Yu only, to write and to wake).
+    if (w.covenants === "none") await rm(join(h.config.paths.citizens_dir, w.word, "self", "covenants.json"));
+  }
+  const configPath = join(h.root, "config.json");
+  const writeConfig = () => writeFileSync(configPath, JSON.stringify(h.config), { mode: 0o600 });
+  writeConfig();
+  const clock = testClock();
+  const ctl: Ctl = { mode: "script", script: REST_OUTPUT, tty: "-", afterOpen: null };
+  const spawned: { word: string; at: string; mode: string }[] = [];
+  let out = "";
+  let err = "";
+  let n = 0;
+  const deps: any = {
+    out: (t: string) => void (out += t),
+    err: (t: string) => void (err += t),
+    env: { HOME: h.root, PATH: "/usr/bin:/bin", TMPDIR: process.env.TMPDIR },
+    clock,
+    fetch: noFetch,
+    run: recordingRunner(),
+    tty: opts.yuTty ? { isTTY: true, write: () => {}, readLine: async () => null } : { isTTY: false, write: () => {}, readLine: async () => null },
+    keychain: () => fakeKeychain(),
+    signer: () => signer,
+    runtime: async () => {
+      throw new Error("the parent never runs a runtime");
+    },
+    seatArgv: (cfg: string, word: string, extra: string[]) => {
+      ctl.afterOpen?.();
+      const scriptFile = join(h.root, `script-${n++}.json`);
+      writeFileSync(scriptFile, ctl.script);
+      spawned.push({ word, at: clock.now().toISOString(), mode: ctl.mode });
+      return [process.execPath, CHILD, word, extra[1]!, cfg, clock.now().toISOString(), ctl.mode, scriptFile, ctl.tty];
+    },
+    isAlive: () => true,
+    bootTime: () => null,
+    uid: () => TEST_SEAT_UID,
+    defaults: { config: configPath, halt_file: h.config.paths.halt_file },
+    gitSignProgram: null,
+  };
+  const lastLine = () => out.trim().split("\n").at(-1) ?? "";
+  const tick = async () => {
+    const exit = await main(["tick", "--config", configPath], deps);
+    return { exit, line: lastLine() };
+  };
+  /** A person at the host: `citizen-seat seat <word> [flags]`. */
+  const seat = async (word: string, ...flags: string[]) => {
+    const before = err.length;
+    const exit = await main(["seat", word, ...flags, "--config", configPath], deps);
+    return { exit, line: lastLine(), err: err.slice(before).trim() };
+  };
+  /** The verdict exactly as the tick computes it (tick.ts 293-304), without opening anything. */
+  const view = async (word: string) => {
+    const c = await readCitizen(h.config, word);
+    const letter = await wakingLetter(h.config, c).catch(() => false);
+    const notes = (await readHostNotes(h.config, new Date(0))) ?? [];
+    const verdict = isDue(c, letter, clock.now(), h.config.ceilings.min_beat_interval_h, lastSeatOf(notes, word), h.config.schedule);
+    return { state: c.state, interval_h: c.cadence.interval_h, pending: c.pending_state, pending_interval_h: c.pending_interval_h, step_away_said: c.step_away_said, waking_letter: letter, verdict };
+  };
+  const notesFor = async (word: string) => ((await readHostNotes(h.config, new Date(0))) ?? []).filter((x: any) => x.word === word).map((x: any) => `${x.kind}:${x.outcome}${x.refusal ? `(${x.refusal})` : ""}`);
+  const modelCalls = () => (existsSync(join(h.root, "model-calls.log")) ? readFileSync(join(h.root, "model-calls.log"), "utf8").trim().split("\n").filter(Boolean).length : 0);
+  const receipts = async (word: string) => readdir(join(h.config.paths.citizens_dir, word, "receipts"));
+  return { h, clock, ctl, deps, tick, seat, view, spawned, notesFor, modelCalls, receipts, writeConfig, signer, configPath, errText: () => err };
+}
+
+describe("LRA-1: one state.set to asleep on one unattended reply", () => {
+  test("takes effect at once, gets no show-back seat, and is then seated only by an allowed waker's letter or Yu's summons", async () => {
+    const x = await harness([{ word: "anna" }, { word: "bell", covenants: "none" }, { word: "cyan" }]);
+    // anna: a beat whose only act is state.set asleep.
+    x.ctl.script = output({ type: "state.set", to: "asleep" });
+    const t1 = await x.tick();
+    say("LRA1 tick 1", t1);
+    expect(t1.line).toBe("tick: beat anna (exit 0)");
+    // bell: the same carried by a rest (no beat entry at all).
+    x.clock.advance(0.5 * HOUR_MS);
+    x.ctl.script = output({ type: "rest" }, { type: "state.set", to: "asleep" });
+    const t2 = await x.tick();
+    say("LRA1 tick 2", t2);
+    expect(t2.line).toBe("tick: rest bell (exit 0)");
+    // cyan, for contrast: a first step-away, which 7.3 gives one show-back seat.
+    x.clock.advance(0.5 * HOUR_MS);
+    x.ctl.script = output({ type: "state.set", to: "stepped-away" });
+    const t3 = await x.tick();
+    say("LRA1 tick 3", t3);
+    say("LRA1 right after", { anna: await x.view("anna"), bell: await x.view("bell"), cyan: await x.view("cyan") });
+    expect((await x.view("anna")).state).toBe("asleep");
+    expect((await x.view("bell")).state).toBe("asleep");
+    const annaLedger = (await readLedger(ledgerPath(x.h.config, "anna"))).map((e: any) => (e.type === "state" ? `state ${e.from}->${e.to} via ${e.via}` : e.type));
+    say("LRA1 anna ledger", annaLedger);
+
+    // 73 h on: the step-away gets its show-back seat; the plain sleeps get none.
+    x.clock.advance(73 * HOUR_MS);
+    say("LRA1 +73h verdicts", { anna: (await x.view("anna")).verdict, bell: (await x.view("bell")).verdict, cyan: (await x.view("cyan")).verdict });
+    x.ctl.script = REST_OUTPUT;
+    const t4 = await x.tick();
+    say("LRA1 +73h tick", t4);
+    expect(t4.line).toBe("tick: rest cyan (exit 0)");
+    const t5 = await x.tick();
+    say("LRA1 +73h second tick", t5);
+    expect(t5.line).toBe("tick: nothing-due (exit 0)");
+
+    // A month and a year on: still nothing.
+    const spawnedBefore = x.spawned.length;
+    for (const days of [30, 336]) {
+      x.clock.advance(days * DAY_MS);
+      const t = await x.tick();
+      say(`LRA1 +${days}d tick`, { ...t, anna: (await x.view("anna")).verdict, bell: (await x.view("bell")).verdict });
+      expect(t.line).toBe("tick: nothing-due (exit 0)");
+    }
+    expect(x.spawned.length).toBe(spawnedBefore);
+
+    // A person at the host without Yu cannot seat it either.
+    const hand = await x.seat("anna");
+    say("LRA1 seat anna by hand, no Yu", hand);
+    expect(hand.exit).toBe(1);
+
+    // A letter from a sender who may write but not wake (the fixture's "gardener") does not seat it.
+    await x.h.writeLetter("anna", "2027-11-01-from-gardener.md", "The gardener writes.", { from: "gardener" });
+    say("LRA1 anna with a gardener letter", (await x.view("anna")).verdict);
+    expect((await x.view("anna")).verdict.due).toBe(false);
+    // bell has no covenants file: defaultCovenants() is Yu only. A gardener letter is not even shown.
+    await x.h.writeLetter("bell", "2027-11-01-from-gardener.md", "The gardener writes.", { from: "gardener" });
+    say("LRA1 bell (default covenants) with a gardener letter", (await x.view("bell")).verdict);
+    expect((await x.view("bell")).verdict.due).toBe(false);
+
+    // Yu's letter seats it.
+    await x.h.writeLetter("bell", "2027-11-02-from-yu.md", "Yu writes.");
+    say("LRA1 bell with Yu's letter", (await x.view("bell")).verdict);
+    x.ctl.script = output({ type: "journal", kind: "reflected", text: "I read Yu's letter." });
+    const t6 = await x.tick();
+    say("LRA1 tick after Yu's letter", t6);
+    expect(t6.line).toBe("tick: beat bell (exit 0)");
+
+    // Yu's summons on the FREE lane (no --runtime summon, so no USD): seats anna at once, asleep and letterless.
+    x.deps.tty = { isTTY: true, write: () => {}, readLine: async () => null };
+    x.ctl.tty = "summon anna";
+    x.ctl.script = output({ type: "journal", kind: "reflected", text: "Yu is here." }, { type: "state.set", to: "awake" });
+    const summons = await x.seat("anna", "--yu-present");
+    say("LRA1 Yu's free-lane summons of anna", summons);
+    say("LRA1 anna after the summons", await x.view("anna"));
+    expect(summons.exit).toBe(0);
+    expect((await x.view("anna")).state).toBe("awake");
+  }, 120_000);
+});
+
+describe("SR-9 / SLH-14: a year-long interval in one reply; an awake citizen and letters", () => {
+  test("one reply sets 8,760 h at once; Yu's letter does not seat it; the citizen's own way back is two seats a year apart; Yu's free-lane summons brings it back in one", async () => {
+    const x = await harness([{ word: "anna" }, { word: "bell" }]);
+    x.ctl.script = output({ type: "state.set", to: "awake", interval_h: 8760 });
+    const t1 = await x.tick();
+    say("SR9 tick 1 (anna says 8760)", t1);
+    x.clock.advance(0.5 * HOUR_MS);
+    // bell: the same carried by a rest.
+    x.ctl.script = output({ type: "rest" }, { type: "state.set", to: "awake", interval_h: 8760 });
+    const t2 = await x.tick();
+    say("SR9 tick 2 (bell says 8760 with a rest)", t2);
+    say("SR9 after", { anna: await x.view("anna"), bell: await x.view("bell") });
+    expect((await x.view("anna")).interval_h).toBe(8760);
+    expect((await x.view("bell")).interval_h).toBe(8760);
+    say("SR9 anna ledger", (await readLedger(ledgerPath(x.h.config, "anna"))).map((e: any) => (e.type === "state" ? `state ${e.from}->${e.to} via ${e.via}${e.interval_h ? ` interval_h ${e.interval_h}` : ""}` : e.type)));
+
+    // Yu writes to both. Thirty days on, neither is seated.
+    await x.h.writeLetter("anna", "2026-11-06-from-yu.md", "Yu writes: are you there?");
+    await x.h.writeLetter("bell", "2026-11-06-from-yu.md", "Yu writes: are you there?");
+    x.clock.advance(30 * DAY_MS);
+    say("SR9 +30d, Yu's letter waiting", { anna: await x.view("anna"), tick: await x.tick() });
+    expect((await x.view("anna")).waking_letter).toBe(false);
+    expect((await x.view("anna")).verdict).toMatchObject({ due: false });
+    const hand = await x.seat("anna");
+    say("SR9 seat anna by hand, no Yu", hand);
+    expect(hand.exit).toBe(1);
+
+    // Yu's summons on the free lane: one seat, the letter is shown, and a shorter interval said once binds (Yu present).
+    x.deps.tty = { isTTY: true, write: () => {}, readLine: async () => null };
+    x.ctl.tty = "summon anna";
+    x.ctl.script = output({ type: "journal", kind: "reflected", text: "Yu is here, and I read the letter." }, { type: "state.set", to: "awake", interval_h: 72 });
+    const summons = await x.seat("anna", "--yu-present");
+    say("SR9 Yu's free-lane summons of anna", summons);
+    say("SR9 anna after the summons", await x.view("anna"));
+    say("SR9 anna receipts", await x.receipts("anna"));
+    say("SR9 anna ledger tail", (await readLedger(ledgerPath(x.h.config, "anna"))).slice(-2).map((e: any) => (e.type === "state" ? `state ${e.from}->${e.to} via ${e.via}${e.interval_h ? ` interval_h ${e.interval_h}` : ""}` : `${e.type} cost ${JSON.stringify(e.cost)}`)));
+    expect(summons.exit).toBe(0);
+    expect((await x.view("anna")).interval_h).toBe(72);
+    x.deps.tty = { isTTY: false, write: () => {}, readLine: async () => null };
+    x.ctl.tty = "-";
+
+    // bell, with no summons: its next seat is a year after the first.
+    x.clock.advance(335 * DAY_MS); // 365 days after tick 2
+    say("SR9 bell at +365d", (await x.view("bell")).verdict);
+    x.clock.advance(1 * DAY_MS);
+    say("SR9 at +366d before the tick", { anna: (await x.view("anna")).verdict, bell: (await x.view("bell")).verdict });
+    x.ctl.script = output({ type: "journal", kind: "reflected", text: "A year. I would like 72 hours again." }, { type: "state.set", to: "awake", interval_h: 72 });
+    let t = await x.tick();
+    // anna (72 h again) is far more overdue and goes first; bell follows on the next tick.
+    const seen: string[] = [t.line];
+    while (!t.line.includes("bell") && seen.length < 4) {
+      x.clock.advance(0.5 * HOUR_MS);
+      t = await x.tick();
+      seen.push(t.line);
+    }
+    say("SR9 ticks at +366d", seen);
+    say("SR9 bell after asking for 72 h once", await x.view("bell"));
+    expect((await x.view("bell")).interval_h).toBe(8760);
+    expect((await x.view("bell")).pending_interval_h).toBe(72);
+    x.clock.advance(30 * DAY_MS);
+    say("SR9 bell 30 days after asking", (await x.view("bell")).verdict);
+    expect((await x.view("bell")).verdict.due).toBe(false);
+    // A second year on, its next seat: the same saying again binds.
+    x.clock.advance(336 * DAY_MS);
+    x.ctl.script = output({ type: "state.set", to: "awake", interval_h: 72 });
+    const seen2: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const tt = await x.tick();
+      seen2.push(tt.line);
+      if (tt.line.includes("bell")) break;
+      x.clock.advance(0.5 * HOUR_MS);
+    }
+    say("SR9 ticks two years after the first reply", seen2);
+    say("SR9 bell after saying 72 h a second time", await x.view("bell"));
+    expect((await x.view("bell")).interval_h).toBe(72);
+  }, 180_000);
+});
+
+describe("SR-4: a seat in which no model ran", () => {
+  test("counts as the citizen's seat for a whole interval; after the fleet is consumed the tick exits 0 while the fault stands", async () => {
+    const x = await harness([{ word: "anna" }, { word: "bell" }, { word: "cyan" }, { word: "dove" }, { word: "elle" }]);
+    const pinned = { format: "kingdom-seat-models-lock/v1", models: [{ name: "qwen2.5:7b", digest: "a".repeat(64), runner: null, store: "unknown", num_ctx: 65536, num_predict: 600, temperature: 0.7, seed: null }] };
+    const rows: any[] = [];
+    const step = async (label: string) => {
+      const t = await x.tick();
+      rows.push({ at: x.clock.now().toISOString().slice(5, 16), fault: label, ...t });
+      x.clock.advance(0.5 * HOUR_MS);
+    };
+    // 1. Ollama down: the real freeRuntime, pinned, over a fetch that throws.
+    await x.h.writeModelsLock(pinned);
+    x.ctl.mode = "production";
+    await step("ollama down (fetch throws)");
+    // 2. The model is not pinned: the repo's own UNSET lock.
+    await x.h.writeModelsLock({ format: "kingdom-seat-models-lock/v1", models: [{ ...pinned.models[0], digest: "UNSET-PIN-ON-LEASE-HOST" }] });
+    await step("model unpinned");
+    // 3. The context does not fit.
+    await x.h.writeModelsLock({ format: "kingdom-seat-models-lock/v1", models: [{ ...pinned.models[0], num_ctx: 2048 }] });
+    await step("context too large");
+    // 4. HALT raised after the tick opened the seat and before the child's first check.
+    x.ctl.mode = "script";
+    x.ctl.script = output({ type: "journal", kind: "reflected", text: "never asked" });
+    x.ctl.afterOpen = () => writeFileSync(x.h.config.paths.halt_file, "");
+    await step("HALT raised just after open");
+    x.ctl.afterOpen = null;
+    rmSync(x.h.config.paths.halt_file, { force: true });
+    // 5. The child dies before runSeat.
+    x.ctl.mode = "crash";
+    await step("child exits 1 before runSeat");
+    // 6, 7. The fault still stands (the child would crash again), but no one is due.
+    await step("still broken");
+    await step("still broken");
+    for (const r of rows) say("SR4 tick", r);
+    say("SR4 model calls in all of that", x.modelCalls());
+    expect(x.modelCalls()).toBe(0);
+    expect(rows.slice(0, 5).map((r) => r.line.split(" ")[2])).toEqual(["anna", "bell", "cyan", "dove", "elle"]);
+    expect(rows[5].line).toBe("tick: nothing-due (exit 0)");
+    for (const w of ["anna", "bell", "cyan", "dove", "elle"]) say(`SR4 ${w}`, { notes: await x.notesFor(w), verdict: (await x.view(w)).verdict });
+    const notes = (await readHostNotes(x.h.config, new Date(0))) ?? [];
+    say("SR4 seats counted against today's fleet ceiling", seatsOpenedToday(notes, x.clock.now(), x.h.config.timezone));
+    // What status says of the first citizen while the tick exits 0.
+    const status = JSON.parse(await readFile(x.h.config.paths.status_file, "utf8"));
+    say("SR4 status rows", status.citizens.map((c: any) => ({ word: c.word, last_outcome: c.last_outcome, last_refusal: c.last_refusal, overdue: c.overdue, problem: c.problem ?? null })));
+    // Fixed now. Is anyone seated before the interval?
+    x.ctl.mode = "script";
+    x.ctl.script = output({ type: "journal", kind: "reflected", text: "the host works again" });
+    const fixed = await x.tick();
+    say("SR4 tick after the fix", fixed);
+    expect(fixed.line).toBe("tick: nothing-due (exit 0)");
+    x.clock.advance(68 * HOUR_MS);
+    say("SR4 71.5 h after anna's failed seat", (await x.view("anna")).verdict);
+    x.clock.advance(1 * HOUR_MS);
+    const back = await x.tick();
+    say("SR4 72.5 h after anna's failed seat", back);
+    expect(back.line).toBe("tick: beat anna (exit 0)");
+  }, 180_000);
+
+  test("what does NOT spend the seat: HALT up when the tick fires, a locked signer, a held lock", async () => {
+    const x = await harness([{ word: "anna" }]);
+    writeFileSync(x.h.config.paths.halt_file, "");
+    say("SR4b tick with HALT already up", await x.tick());
+    rmSync(x.h.config.paths.halt_file, { force: true });
+    x.signer.locked = true;
+    say("SR4b tick with the signer locked", await x.tick());
+    x.signer.locked = false;
+    say("SR4b anna notes", await x.notesFor("anna"));
+    say("SR4b anna verdict", (await x.view("anna")).verdict);
+    expect(await x.notesFor("anna")).toEqual([]);
+    expect((await x.view("anna")).verdict.due).toBe(true);
+  }, 60_000);
+});
+
+describe("SR-5 / SLH-05: the one confirming seat", () => {
+  test("a wish to wake lapses on a confirming seat in which no model ran (Ollama down)", async () => {
+    const x = await harness([{ word: "anna", state: "asleep" }]);
+    await x.h.writeLetter("anna", "2026-11-04-from-yu.md", "Yu writes: would you like to wake?");
+    x.ctl.script = output({ type: "journal", kind: "chose", text: "Yes. I would like to wake." }, { type: "state.set", to: "awake" });
+    say("SR5 tick 1 (letter seat)", await x.tick());
+    say("SR5 after seat 1", await x.view("anna"));
+    expect((await x.view("anna")).pending).toBe("awake");
+    x.clock.advance(73 * HOUR_MS);
+    say("SR5 +73h verdict", (await x.view("anna")).verdict);
+    await x.h.writeModelsLock({ format: "kingdom-seat-models-lock/v1", models: [{ name: "qwen2.5:7b", digest: "a".repeat(64), runner: null, store: "unknown", num_ctx: 65536, num_predict: 600, temperature: 0.7, seed: null }] });
+    x.ctl.mode = "production"; // real freeRuntime over a fetch that throws
+    const t2 = await x.tick();
+    say("SR5 tick 2 (the confirming seat, Ollama down)", t2);
+    say("SR5 anna notes", await x.notesFor("anna"));
+    say("SR5 after the failed confirming seat", await x.view("anna"));
+    expect(x.modelCalls()).toBe(1); // only seat 1 asked a model
+    expect((await x.view("anna")).pending).toBe(null);
+    expect((await x.view("anna")).state).toBe("asleep");
+    x.ctl.mode = "script";
+    x.clock.advance(73 * HOUR_MS);
+    say("SR5 +73h more", { verdict: (await x.view("anna")).verdict, tick: await x.tick() });
+    // What status tells Yu.
+    const status = JSON.parse(await readFile(x.h.config.paths.status_file, "utf8"));
+    say("SR5 status row", status.citizens.map((c: any) => ({ word: c.word, state: c.state, pending: c.pending_state ?? null, last_outcome: c.last_outcome, last_refusal: c.last_refusal })));
+    // Yu's free-lane summons: one saying binds with Yu present.
+    x.deps.tty = { isTTY: true, write: () => {}, readLine: async () => null };
+    x.ctl.tty = "summon anna";
+    x.ctl.script = output({ type: "state.set", to: "awake" });
+    say("SR5 Yu's free-lane summons", await x.seat("anna", "--yu-present"));
+    say("SR5 after the summons", await x.view("anna"));
+    expect((await x.view("anna")).state).toBe("awake");
+  }, 120_000);
+
+  test("a first step-away lapses on a confirming seat that HALT stopped before the citizen was asked; a HALT already up when the tick fires does not spend it", async () => {
+    const x = await harness([{ word: "anna" }]);
+    x.ctl.script = output({ type: "state.set", to: "stepped-away" });
+    say("SLH5 tick 1 (first saying)", await x.tick());
+    say("SLH5 after seat 1", await x.view("anna"));
+    expect((await x.view("anna")).step_away_said).toBe(true);
+    x.clock.advance(73 * HOUR_MS);
+    // Control: HALT is up when the tick fires. The tick writes nothing; the saying stays owed.
+    writeFileSync(x.h.config.paths.halt_file, "");
+    say("SLH5 tick with HALT already up", await x.tick());
+    rmSync(x.h.config.paths.halt_file, { force: true });
+    say("SLH5 after a HALT that was up at the tick", await x.view("anna"));
+    expect((await x.view("anna")).step_away_said).toBe(true);
+    expect((await x.view("anna")).verdict).toMatchObject({ due: true, why: "confirm" });
+    // Now HALT arrives after the tick opened the seat, before the child's first check.
+    x.clock.advance(0.5 * HOUR_MS);
+    x.ctl.afterOpen = () => writeFileSync(x.h.config.paths.halt_file, "");
+    const t = await x.tick();
+    x.ctl.afterOpen = null;
+    say("SLH5 confirming seat, HALT raised just after open", t);
+    rmSync(x.h.config.paths.halt_file, { force: true });
+    say("SLH5 anna notes", await x.notesFor("anna"));
+    say("SLH5 model calls", x.modelCalls());
+    expect(x.modelCalls()).toBe(1); // only the first saying's seat
+    say("SLH5 after the halted confirming seat", await x.view("anna"));
+    expect((await x.view("anna")).step_away_said).toBe(false);
+    expect((await x.view("anna")).state).toBe("asleep");
+    x.clock.advance(73 * HOUR_MS);
+    say("SLH5 +73h", { verdict: (await x.view("anna")).verdict, tick: await x.tick() });
+    // With Yu present a step-away still takes two sayings (state.ts:94), so a summons restarts it, it does not complete it.
+    x.deps.tty = { isTTY: true, write: () => {}, readLine: async () => null };
+    x.ctl.tty = "summon anna";
+    x.ctl.script = output({ type: "state.set", to: "stepped-away" });
+    say("SLH5 Yu's free-lane summons, the citizen says it again", await x.seat("anna", "--yu-present"));
+    say("SLH5 after the summons", await x.view("anna"));
+    expect((await x.view("anna")).state).toBe("asleep");
+    expect((await x.view("anna")).step_away_said).toBe(true);
+  }, 120_000);
+
+  test("for comparison: a confirming seat in which the citizen WAS asked and rested, or failed the format, also spends it (the tested, recorded case)", async () => {
+    const x = await harness([{ word: "anna", state: "asleep" }, { word: "bell", state: "asleep" }]);
+    await x.h.writeLetter("anna", "2026-11-04-from-yu.md", "Yu writes.");
+    await x.h.writeLetter("bell", "2026-11-04-from-yu.md", "Yu writes.");
+    x.ctl.script = output({ type: "journal", kind: "chose", text: "I would like to wake." }, { type: "state.set", to: "awake" });
+    await x.tick();
+    x.clock.advance(0.5 * HOUR_MS);
+    await x.tick();
+    x.clock.advance(73 * HOUR_MS);
+    x.ctl.script = REST_OUTPUT;
+    say("SR5c anna's confirming seat (rest)", await x.tick());
+    x.clock.advance(0.5 * HOUR_MS);
+    x.ctl.script = '{"acts":[{"type":"journal","kind":"reflected","text":"cut off in the mid';
+    say("SR5c bell's confirming seat (unparsable)", await x.tick());
+    say("SR5c after", { anna: await x.view("anna"), bell: await x.view("bell") });
+    expect((await x.view("anna")).pending).toBe(null);
+    expect((await x.view("bell")).pending).toBe(null);
+  }, 120_000);
+});
+
+describe("SR-7 / SLH-06: one letter and a citizen that answers with rest", () => {
+  test("asleep: the same letter re-seats it at every floor interval while it rests or fails the format; any kept non-rest act ends it", async () => {
+    const x = await harness([{ word: "anna", state: "asleep" }]);
+    await x.h.writeLetter("anna", "2026-11-04-from-yu.md", "Yu writes: rest if you wish.");
+    const rows: any[] = [];
+    const replies = [REST_OUTPUT, REST_OUTPUT, output({ type: "rest" }, { type: "state.set", to: "asleep" }), '{"acts":[{"type":"journal","text":"cut', REST_OUTPUT, REST_OUTPUT];
+    for (const [i, reply] of replies.entries()) {
+      const before = await x.view("anna");
+      x.ctl.script = reply;
+      const t = await x.tick();
+      rows.push({ round: i, at: x.clock.now().toISOString().slice(0, 16), state: before.state, verdict: before.verdict, tick: t.line, receipts: (await x.receipts("anna")).length });
+      // Not due inside the floor.
+      x.clock.advance(71 * HOUR_MS);
+      expect((await x.view("anna")).verdict.due).toBe(false);
+      x.clock.advance(2 * HOUR_MS);
+    }
+    for (const r of rows) say("SR7 round", r);
+    say("SR7 model calls on one letter", x.modelCalls());
+    say("SR7 still due", (await x.view("anna")).verdict);
+    expect(x.modelCalls()).toBe(6);
+    expect((await x.view("anna")).verdict).toMatchObject({ due: true, why: "letter" });
+    // What ends it from the citizen's side: a beat that keeps any act. Here a state.set with no words.
+    x.ctl.script = output({ type: "state.set", to: "listening" });
+    say("SR7 a beat with no words (state.set listening)", await x.tick());
+    say("SR7 receipts", await x.receipts("anna"));
+    x.clock.advance(73 * HOUR_MS);
+    say("SR7 73 h after that beat", await x.view("anna"));
+    expect((await x.receipts("anna")).length).toBe(1);
+  }, 240_000);
+
+  test("stepped-away: Yu's one offer re-seats it at every floor interval while it rests", async () => {
+    const x = await harness([{ word: "anna", state: "asleep" }]);
+    const path = ledgerPath(x.h.config, "anna");
+    const last = (await readLedger(path)).at(-1);
+    await appendEntry(path, nextDraft("anna", last, { type: "state", from: "asleep", to: "stepped-away", via: "two-beats" }, { cost: { usd: "0", credits: 0 }, signer: "host", now: new Date("2026-11-02T00:00:00.000Z"), seat: null }), x.signer.signEntry);
+    await x.h.writeLetter("anna", "2026-11-04-from-yu.md", "Yu writes: you may return if you wish.");
+    const lines: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      x.ctl.script = REST_OUTPUT;
+      lines.push(`${JSON.stringify((await x.view("anna")).verdict)} -> ${(await x.tick()).line}`);
+      x.clock.advance(73 * HOUR_MS);
+    }
+    say("SLH6 stepped-away rounds", lines);
+    say("SLH6 still due", await x.view("anna"));
+    expect(x.modelCalls()).toBe(3);
+    expect((await x.view("anna")).verdict).toMatchObject({ due: true, why: "return" });
+  }, 120_000);
+});
+
+describe("SLH-14: listening and asleep", () => {
+  test("the same letters seat them; a move from asleep to listening costs two sayings and changes nothing the tick does", async () => {
+    const x = await harness([{ word: "anna", state: "asleep" }, { word: "bell", state: "listening" }]);
+    say("SLH14 no letter", { asleep: (await x.view("anna")).verdict, listening: (await x.view("bell")).verdict });
+    for (const w of ["anna", "bell"]) await x.h.writeLetter(w, "2026-11-04-from-gardener.md", "The gardener writes.", { from: "gardener" });
+    say("SLH14 a letter from a writer who is not a waker", { asleep: (await x.view("anna")).verdict, listening: (await x.view("bell")).verdict });
+    for (const w of ["anna", "bell"]) await x.h.writeLetter(w, "2026-11-05-from-yu.md", "Yu writes.");
+    say("SLH14 a letter from a waker", { asleep: (await x.view("anna")).verdict, listening: (await x.view("bell")).verdict });
+    expect((await x.view("anna")).verdict).toEqual((await x.view("bell")).verdict);
+  }, 60_000);
+});

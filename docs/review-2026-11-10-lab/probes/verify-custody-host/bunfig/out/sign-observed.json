@@ -1,0 +1,1 @@
+{"sign_program":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/wt-evil","preload_marker":"ran from <cwd>/bunfig.toml preload","argv":["-Y","sign","-n","git","-f","<path>","-U","<path>"]}

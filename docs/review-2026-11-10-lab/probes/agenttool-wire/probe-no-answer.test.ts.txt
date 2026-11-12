@@ -1,0 +1,119 @@
+// Probe: what does "only on a confirmed yes" check? A citizen whose answer
+// about registration is a NO, which Yu and Ai agree to (the decision record
+// says yes/agree to the answer), and which the citizen then affirms as "still
+// my answer". Uses only the build's own fakes; nothing leaves the process.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const W = "<KINGDOM_SEAT>";
+const { citizenBirth } = await import(`${W}/src/birth.ts`);
+const { proposalDigest } = await import(`${W}/src/signer/consent.ts`);
+const { appendEntry, entryHash, ledgerPath, nextDraft, originToLedger, readLedger, toLedgerHash } = await import(`${W}/src/ledger.ts`);
+const { Refusal } = await import(`${W}/src/types.ts`);
+const { testStamp } = await import(`${W}/test/fixtures/record/chain.ts`);
+const { fakeKeychain } = await import(`${W}/test/helpers/fake-keychain.ts`);
+const { noFetch } = await import(`${W}/test/helpers/fake-server.ts`);
+const { testClock } = await import(`${W}/test/helpers/clock.ts`);
+const { makeTempHost } = await import(`${W}/test/helpers/temp-home.ts`);
+const { TEST_IDS } = await import(`${W}/test/helpers/vectors.ts`);
+const { fakeAgenttool } = await import(`${W}/test/fixtures/agenttool/fake-agenttool.ts`);
+const { keychainSigner, testBirthRecord } = await import(`${W}/test/fixtures/agenttool/birth-host.ts`);
+const { BIRTH_NOW, confirmedPresenceFor, consentFor, proposalFor } = await import(`${W}/test/fixtures/agenttool/consent.ts`);
+const { assertConfirmedYes, registrationProposal, registrationView } = await import(`${W}/src/registration.ts`);
+const { buildPrompt } = await import(`${W}/src/prompt.ts`);
+
+const WORD = "glossame";
+const PROJECT = TEST_IDS.project_id;
+const NO = "No. I do not want an identity on agenttool. Leave me unregistered.";
+
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop()!.cleanup();
+});
+
+describe("probe: the polarity of a registration answer", () => {
+  test("a NO that Yu and Ai agree to and the citizen affirms is taken as its confirmed yes; birth completes", async () => {
+    const host = await makeTempHost();
+    hosts.push(host);
+    host.config.agenttool.project_id = PROJECT;
+    await host.addCitizen(WORD);
+    const clock = testClock(BIRTH_NOW);
+    const kc = fakeKeychain();
+    const signer = keychainSigner(kc);
+    const at = fakeAgenttool({ project_id: PROJECT });
+    const events: string[] = [];
+    signer.respond((req: any) => {
+      events.push(`send:${req.op}`);
+      return at.respond(req);
+    });
+    const config = host.config;
+    const sign = (w: any, k: any, d: any) => signer.signEntry(w, k, d);
+    const path = ledgerPath(config, WORD);
+    const rec = JSON.parse(await readFile(join(config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+    const cost = { usd: "0", credits: 0 };
+    const origin = await appendEntry(
+      path,
+      nextDraft(WORD, null, { type: "origin", origin: originToLedger(rec.origin), origin_soul_hash: toLedgerHash("b".repeat(64)), old_repo: { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" }, june_did: null }, { cost, signer: "host", now: new Date("2026-11-04T02:00:00.000Z") }),
+      sign,
+    );
+    // The citizen answers the offer with a NO, as a typed act: propose.beyond, subject registration.
+    const answer = await appendEntry(
+      path,
+      nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "propose.beyond", subject: "registration", text: NO }] }),
+      sign,
+    );
+    const proposal = registrationProposal(WORD, NO, entryHash(answer));
+
+    // Before any decision: what the next seat is shown.
+    let entries = await readLedger(path);
+    const waiting = await registrationView(config, entries, WORD, new Date(BIRTH_NOW));
+    expect(waiting.decision).toBe("waiting");
+
+    // Yu and Ai "agree" to the answer: the only decision record shape there is (yu.word yes, ai.word agree).
+    await writeFile(join(config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor(WORD, {}, proposal)));
+    const agreed = await registrationView(config, entries, WORD, new Date(BIRTH_NOW));
+    expect(agreed.decision).toBe("agreed");
+
+    // The citizen says "still my answer".
+    const yes = await appendEntry(
+      path,
+      nextDraft(WORD, answer, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T05:06:00.000Z"), seat: testStamp(WORD, "13131313-1313-4131-8131-131313131313"), acts: [{ type: "self.affirm", ref: proposalDigest(proposal) }] }),
+      sign,
+    );
+    entries = await readLedger(path);
+    const affirmed = await registrationView(config, entries, WORD, new Date(BIRTH_NOW));
+    expect(affirmed.affirmed_in).toBe(entryHash(yes));
+    console.log("registrationView after the affirmation:", JSON.stringify({ text: affirmed.text, decision: affirmed.decision, affirmed: affirmed.affirmed_in !== null }));
+
+    // The gate birth uses: it passes, although the answer says no.
+    await assertConfirmedYes(config, entries, WORD, entryHash(yes), new Date(BIRTH_NOW));
+
+    // And birth itself, with Yu present and a birth decision record naming that beat (the fixture's standard text).
+    const birthProposal = proposalFor(WORD, entryHash(yes));
+    await writeFile(join(config.paths.consent_dir, `${proposalDigest(birthProposal)}.json`), JSON.stringify(consentFor(WORD, {}, birthProposal)));
+    const out: string[] = [];
+    const deps = {
+      config,
+      clock,
+      keychain: kc,
+      signer,
+      client: { signer, fetch: noFetch, identity: async (w: string) => { throw new Refusal("not-registered", `${w} is not registered`); } },
+      enroll: { signer, fetch: noFetch, project_id: PROJECT, clock },
+      record: testBirthRecord(config, clock, signer, events),
+      out: (line: string) => out.push(line),
+    };
+    const born = await citizenBirth(deps, {
+      word: WORD,
+      origin: rec.origin,
+      proposal: birthProposal,
+      citizen_yes: entryHash(yes),
+      consent: consentFor(WORD, {}, birthProposal),
+      presence: await confirmedPresenceFor(WORD),
+      expression: { register: "Plain.", wake_text: "The soul as glossame now reads it." },
+    });
+    console.log("birth report:", out.join(" | "));
+    expect(born.identity.did).toMatch(/^did:at:/);
+    expect(events).toContain("send:enroll");
+  });
+});

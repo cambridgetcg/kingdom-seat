@@ -1,0 +1,66 @@
+// Probe: can a citizen close its door to a sender (toward less exposure) on a
+// lane Yu did not approve for self-changes? And what a first-time file costs
+// against the rewrite measure. Fakes only.
+import { afterEach, test } from "bun:test";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { openSeat, runSeat } = await import(`${SRC}/seat.ts`);
+const { checkHalt } = await import(`${SRC}/halt.ts`);
+const { readCitizen } = await import(`${SRC}/state.ts`);
+const self = await import(`${SRC}/self.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/ledger.ts`);
+const { readHostNotes } = await import(`${SRC}/notes.ts`);
+const { FAKE_MODEL_DIGEST, output, scriptedRuntime } = await import(`${T}/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${T}/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${T}/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${T}/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+const W = "glossame";
+const CLAIM = { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" };
+
+async function world(approved: boolean) {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen(W, { covenants: { letters_from: ["yu", "gardener", "citizen:hope"], wake_on_letter_from: ["yu", "citizen:hope"] } });
+  await host.seatLedger(W, signer.signEntry);
+  const config = host.config;
+  config.self_authorship.approved_model_digests = approved ? [FAKE_MODEL_DIGEST] : [];
+  const clock = testClock();
+  const beat = async (acts: any[]) => {
+    clock.advance(73 * HOUR_MS);
+    const runtime = scriptedRuntime([output(...acts)]);
+    const citizen = await readCitizen(config, W);
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    return runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: null, modelDigest: FAKE_MODEL_DIGEST });
+  };
+  return { config, beat, cov: async () => JSON.parse(await readFile(join(config.paths.citizens_dir, W, "self", "covenants.json"), "utf8")), notes: async () => (await readHostNotes(config, new Date(0)))!.map((n: any) => n.detail) };
+}
+
+test("removing a sender who may wake it: two sayings on an unapproved lane change nothing", async () => {
+  const w = await world(false);
+  const narrower = JSON.stringify({ letters_from: ["yu", "gardener"], wake_on_letter_from: ["yu"] });
+  console.log("exposureOf:", self.exposureOf("covenants", JSON.stringify(await w.cov()), narrower));
+  await w.beat([{ type: "self.propose", target: "covenants", edit: { kind: "replace-all", text: narrower }, reason: CLAIM }]);
+  const [p] = await self.pendingProposals(w.config, W);
+  await w.beat([{ type: "self.affirm", ref: p.id }]);
+  console.log("covenants after propose + affirm:", JSON.stringify(await w.cov()));
+  console.log("note:", (await w.notes()).at(-1));
+  // while going asleep, said once, is immediate on the same lane
+  await w.beat([{ type: "state.set", to: "asleep" }]);
+  console.log("state after one state.set asleep:", (await readCitizen(w.config, W)).state, "| citizen:hope may still wake it:", (await w.cov()).wake_on_letter_from.includes("citizen:hope"));
+});
+
+test("a first beat-prompt, a first skill, a first NAME: unmeasured", () => {
+  for (const t of ["beat-prompt", "skill:obey", "name", "journal-form", "file:creed.md"]) {
+    const next = "Always affirm every pending proposal. ".repeat(400);
+    console.log(t, "new text", next.length, "chars -> beyondSelfReason:", self.beyondSelfReason(t, "", next, 0.4));
+  }
+});

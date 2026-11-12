@@ -1,0 +1,30 @@
+--- T1 clean cwd; bun <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-clean","preload_marker":null,"env_marker":null,"argv":["raise-beacons","--config","/x"],"uid":501}
+(exit 0)
+--- T2 cwd has bunfig.toml; bun <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":"ran from <cwd>/bunfig.toml preload","env_marker":null,"argv":["raise-beacons","--config","/x"],"uid":501}
+(exit 0)
+--- T3 cwd has bunfig.toml; shebang exec of abs script
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":"ran from <cwd>/bunfig.toml preload","env_marker":null,"argv":["raise-beacons","--config","/x"],"uid":501}
+(exit 0)
+--- T4 clean cwd; HOME has .bunfig.toml; bun <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-clean","preload_marker":null,"env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T5 clean cwd; HOME has .bunfig.toml; shebang
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-clean","preload_marker":null,"env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T6 cwd bunfig; bun --config=<empty.toml> <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":null,"env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T8 cwd has .env only; bun <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-env","preload_marker":null,"env_marker":"set-by-cwd-dotenv","argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T9 cwd has .env only; shebang
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-env","preload_marker":null,"env_marker":"set-by-cwd-dotenv","argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T10 cwd bunfig; bun run <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":"ran from <cwd>/bunfig.toml preload","env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T11 cwd .env; bun --env-file=/dev/null? (no-env-file flag) <abs script>
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-env","preload_marker":null,"env_marker":null,"argv":["raise-beacons"],"uid":501}
+(exit 0)

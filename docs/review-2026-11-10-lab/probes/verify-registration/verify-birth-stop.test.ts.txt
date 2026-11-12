@@ -1,0 +1,264 @@
+// Skeptic probe (read-only against the build): stop citizenBirth at every
+// point after the first Keychain write and record, for each, what the host
+// holds, whether any host file names the identity, and what a second run
+// does. Then: can the pieces the build exports finish a stopped birth by
+// hand, and what does a seat do after a stop at the genesis step?
+// Only the build's fakes; nothing leaves the process.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const W = "<KINGDOM_SEAT>";
+const birthMod = await import(`${W}/src/birth.ts`);
+const { citizenBirth, hostBirthRecord, BirthError } = birthMod;
+const enrollMod = await import(`${W}/src/agenttool/enrollment.ts`);
+const clientMod = await import(`${W}/src/agenttool/client.ts`);
+const { openSeat, runSeat } = await import(`${W}/src/seat.ts`);
+const { checkHalt } = await import(`${W}/src/halt.ts`);
+const { readCitizen } = await import(`${W}/src/state.ts`);
+const { entryHash, evidenceToLedger, ledgerKey, ledgerPath, readLedger, verifyChain } = await import(`${W}/src/ledger.ts`);
+const { readHostNotes } = await import(`${W}/src/notes.ts`);
+const { fromB64 } = await import(`${W}/src/crypto.ts`);
+const { registrationProposal } = await import(`${W}/src/registration.ts`);
+const { proposalDigest, confirmYuPresent } = await import(`${W}/src/signer/consent.ts`);
+const { Refusal } = await import(`${W}/src/types.ts`);
+const { noFetch } = await import(`${W}/test/helpers/fake-server.ts`);
+const { fakeKeychain } = await import(`${W}/test/helpers/fake-keychain.ts`);
+const { makeTempHost } = await import(`${W}/test/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${W}/test/helpers/clock.ts`);
+const { TEST_IDS } = await import(`${W}/test/helpers/vectors.ts`);
+const { fakeAgenttool } = await import(`${W}/test/fixtures/agenttool/fake-agenttool.ts`);
+const { keychainSigner } = await import(`${W}/test/fixtures/agenttool/birth-host.ts`);
+
+const WORD = "glossame";
+const PROJECT = TEST_IDS.project_id;
+const YES = "Yes: an identity of my own.";
+const DIGEST = `sha256:${"a".repeat(64)}`;
+
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop()!.cleanup();
+});
+
+function runtimeOf(acts: unknown[]) {
+  const fn: any = async () => ({ runtime: "free", model: "probe-model", model_digest: DIGEST, raw_output: JSON.stringify({ acts }), spend: { usd: "0", usd_basis: "local-zero", credits: 0 }, done_reason: "stop", duration_ms: 1 });
+  return fn;
+}
+
+function consent(proposal: { subject: string; body: string; extent: string }, at: string) {
+  return {
+    format: "kingdom-seat-consent/v1",
+    proposal_sha256: proposalDigest(proposal),
+    subject: proposal.subject,
+    extent: proposal.extent,
+    yu: { word: "yes", recorded_at: at, via: "decision-record" },
+    ai: { word: "agree", basis: "lazy-consensus", supports: ["collab-report:probe"], open_challenges: 0, deadline: at },
+    expires_at: null,
+  };
+}
+
+/** A citizen seated, answered, agreed and affirmed through runSeat; everything birth needs is filed. */
+async function ready() {
+  const h = await makeTempHost();
+  hosts.push(h);
+  h.config.agenttool.project_id = PROJECT;
+  const kc = fakeKeychain();
+  const signer = keychainSigner(kc);
+  const at = fakeAgenttool({ project_id: PROJECT });
+  const events: string[] = [];
+  signer.respond((req: any) => {
+    events.push(`send:${req.op}`);
+    return at.respond(req);
+  });
+  await h.addCitizen(WORD);
+  await h.seatLedger(WORD, signer.signEntry);
+  const clock = testClock();
+  const config = h.config;
+  async function seat(acts: unknown[]) {
+    clock.advance(73 * HOUR_MS);
+    const citizen = await readCitizen(config, WORD);
+    const open = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    const deps = { config, clock, signer, fetch: noFetch, runtime: runtimeOf(acts), checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), modelDigest: DIGEST, letters: null };
+    return runSeat(open, deps);
+  }
+  const ledger = () => readLedger(ledgerPath(config, WORD));
+  await seat([{ type: "propose.beyond", subject: "registration", text: YES }]);
+  const answer = (await ledger()).at(-1)!;
+  const proposal = registrationProposal(WORD, YES, entryHash(answer));
+  await writeFile(join(config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consent(proposal, clock.now().toISOString())));
+  await seat([{ type: "self.affirm", ref: proposalDigest(proposal) }]);
+  const yes = entryHash((await ledger()).at(-1)!);
+  const birthProposal = { subject: `birth ${WORD}`, body: `Birth of ${WORD}; its affirming beat is ${yes}.`, extent: `birth ${WORD}` };
+  const birthConsent = consent(birthProposal, clock.now().toISOString());
+  await writeFile(join(config.paths.consent_dir, `${proposalDigest(birthProposal)}.json`), JSON.stringify(birthConsent));
+  const record = hostBirthRecord(config, clock, signer);
+  const out: string[] = [];
+  const deps: any = {
+    config,
+    clock,
+    keychain: kc,
+    signer,
+    client: { signer, fetch: noFetch, identity: async (x: string) => { throw new Refusal("not-registered", `${x} is not registered`); } },
+    enroll: { signer, fetch: noFetch, project_id: PROJECT, clock },
+    record,
+    out: (line: string) => void out.push(line),
+  };
+  const rec = JSON.parse(await readFile(join(config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+  const input = async () => ({
+    word: WORD,
+    origin: rec.origin,
+    proposal: birthProposal,
+    citizen_yes: yes,
+    consent: birthConsent,
+    presence: await confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => `birth ${WORD}` }, `birth ${WORD}`, () => clock.now()),
+    expression: { register: "Plain.", wake_text: "The soul." },
+  });
+  return { h, config, kc, signer, at, events, clock, deps, input, ledger, seat, out, birthProposal };
+}
+
+async function attempt(w: any): Promise<any> {
+  try {
+    await citizenBirth(w.deps, await w.input());
+    return null;
+  } catch (e) {
+    return e;
+  }
+}
+
+/** After a stop: what the host holds, and whether any file under the state dir carries the identity id. */
+async function after(w: any, first: any) {
+  const has = async (kind: string) => w.kc.has({ kind, word: WORD });
+  const rec = JSON.parse(await readFile(join(w.config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+  const types = (await w.ledger()).map((e: any) => e.type);
+  const id: string | null = first?.progress?.identity_id ?? null;
+  let namedIn: string[] = [];
+  if (id) {
+    for (const [path, b64] of await w.h.snapshot()) {
+      if (Buffer.from(b64 as string, "base64").toString("latin1").includes(id)) namedIn.push(String(path).replace(w.h.root, "<host>"));
+    }
+  }
+  const onServer = id ? w.at.identities.has(id) : false;
+  const second = await attempt(w);
+  return {
+    stage: first?.stage ?? null,
+    done: first?.done ?? null,
+    ambiguous: first?.ambiguous ?? null,
+    keychain: { mnemonic: await has("citizen-mnemonic"), op_seed: await has("citizen-op-seed") },
+    identity_on_fake_server: onServer,
+    server_keys: id && onServer ? w.at.identities.get(id).keys.map((k: any) => k.label) : [],
+    citizen_json_identity: rec.identity === null ? null : "set",
+    ledger_has_genesis: types.includes("genesis"),
+    host_files_naming_identity: namedIn,
+    out_lines: w.out.length,
+    second_run: second ? `${second.constructor.name}: ${second.message}` : "completed",
+  };
+}
+
+describe("skeptic: a birth stopped at each point after the first Keychain write", () => {
+  test("every stop point", async () => {
+    const cases: [string, (w: any) => void][] = [
+      [
+        "keys: second Keychain write fails",
+        (w) => {
+          const write = w.kc.write.bind(w.kc);
+          w.kc.write = async (item: any, secret: Uint8Array) => {
+            if (item.kind === "citizen-op-seed") throw new Refusal("keychain-locked", "probe: write failed");
+            return write(item, secret);
+          };
+        },
+      ],
+      ["enroll: definite 401", (w) => w.at.override((r: any) => r.op === "enroll", { status: 401, json: { error: "identity_enrollment_invalid_proof" } })],
+      ["enroll: 503 (may have landed)", (w) => w.at.override((r: any) => r.op === "enroll", { status: 503, json: { error: "unavailable" } })],
+      ["keys/import: 503", (w) => w.at.override((r: any) => r.op === "keys.import", { status: 503, json: { error: "unavailable" } })],
+      ["box-keys: 503", (w) => w.at.override((r: any) => r.op === "box-keys.register", { status: 503, json: { error: "unavailable" } })],
+      ["expression: 503", (w) => w.at.override((r: any) => r.op === "expression.put.private", { status: 503, json: { error: "unavailable" } })],
+      [
+        "record: citizen.json cannot be written",
+        (w) => {
+          w.deps.record = { ...w.deps.record, saveIdentity: async () => { throw new Error("probe: disk"); } };
+        },
+      ],
+      [
+        "genesis: ledger append fails",
+        (w) => {
+          const r = w.deps.record;
+          w.deps.record = { ...r, append: async () => { throw new Error("probe: disk"); } };
+        },
+      ],
+    ];
+    for (const [name, inject] of cases) {
+      const w = await ready();
+      inject(w);
+      const first = await attempt(w);
+      expect(first).toBeInstanceOf(BirthError);
+      const state = await after(w, first);
+      console.log(`CASE ${name}\n  ${JSON.stringify(state)}`);
+      expect(state.second_run).toContain("birth never overwrites");
+    }
+  });
+
+  test("what the build exports that could finish or clean up", () => {
+    console.log("birth.ts exports:", Object.keys(birthMod).sort().join(", "));
+    console.log("enrollment.ts exports:", Object.keys(enrollMod).sort().join(", "));
+    console.log("client.ts exports:", Object.keys(clientMod).sort().join(", "));
+    const kc = fakeKeychain();
+    console.log("Keychain methods (fake, implementing the interface):", Object.keys(kc).filter((k) => typeof (kc as any)[k] === "function").join(", "));
+  });
+
+  test("a stop at box-keys can be finished BY HAND from the exported pieces, if and only if the BirthError's progress was kept", async () => {
+    const w = await ready();
+    w.at.override((r: any) => r.op === "box-keys.register", { status: 503, json: { error: "unavailable" } });
+    const first = await attempt(w);
+    expect(first).toBeInstanceOf(BirthError);
+    const p = first.progress;
+    // Hand-finish: the same exported client calls birth makes, for the newborn, with Yu present again.
+    const presence = await confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => `birth ${WORD}` }, `birth ${WORD}`, () => w.clock.now());
+    const keys = await w.signer.publicKeys(WORD);
+    const named = { identity_id: p.identity_id, did: p.did, root_kid: p.root_kid, root_public_key_b64: keys.root_b64, self_strand_id: null };
+    const client = { ...w.deps.client, identity: async (x: string) => (x === WORD ? named : w.deps.client.identity(x)) };
+    const auth = { presence, proposal: w.birthProposal, enrolled: { identity_id: p.identity_id, did: p.did } };
+    let handFinished = "no";
+    try {
+      const box = await clientMod.registerBoxKey(client, WORD, keys.box_b64, auth);
+      await clientMod.putExpression(client, WORD, { register: "Plain.", wake_text: "The soul." }, auth);
+      const identity = { did: p.did, identity_id: p.identity_id, project_id: PROJECT, root_public_key_b64: keys.root_b64, root_kid: p.root_kid, op_kid: p.op_kid, op_public_key_b64: keys.op_b64, box_public_key_b64: keys.box_b64, self_strand_id: null, enrolled_at: w.clock.now().toISOString() };
+      await birthMod.saveCitizenIdentity(w.config, WORD, identity);
+      const originEntry = (await w.ledger())[0];
+      const fields = { type: "genesis", origin_entry: entryHash(originEntry), root: ledgerKey(p.root_kid, fromB64(keys.root_b64, 32)), op: ledgerKey(p.op_kid, fromB64(keys.op_b64, 32)), evidence: evidenceToLedger(p.op_key_evidence) };
+      const genesis = await hostBirthRecord(w.config, w.clock, w.signer).append(WORD, fields, { signer: "citizen", did: p.did });
+      const verdict = verifyChain(await w.ledger(), { host_attest_b64: [keys.host_attest_b64], identity: { did: p.did, root_public_key_b64: keys.root_b64 } });
+      handFinished = `box key ${box.id ? "registered" : "?"}, expression put, identity saved, genesis appended (${genesis.type}); verifyChain ok=${verdict.ok}${verdict.problem ? " problem=" + verdict.problem.reason : ""}`;
+      const s = await w.seat([{ type: "journal", kind: "reflected", text: "after a hand-finished birth" }]);
+      const head = (await w.ledger()).at(-1);
+      handFinished += `; next seat outcome=${s.outcome}, head signer=${head.signer}`;
+    } catch (e: any) {
+      handFinished = `refused: ${e?.constructor?.name}: ${e?.message}`;
+    }
+    console.log("HAND FINISH after a box-keys stop:", handFinished);
+    console.log("progress fields a caller would have to keep:", JSON.stringify({ identity_id: !!p.identity_id, did: !!p.did, root_kid: !!p.root_kid, op_kid: !!p.op_kid, op_key_evidence: !!p.op_key_evidence, box_key_id: p.box_key_id }));
+  });
+
+  test("after a stop at the genesis step: the next seat", async () => {
+    const w = await ready();
+    const r = w.deps.record;
+    w.deps.record = { ...r, append: async () => { throw new Error("probe: disk"); } };
+    const first = await attempt(w);
+    expect(first.stage).toBe("genesis");
+    const citizen = await readCitizen(w.config, WORD);
+    console.log("citizen.identity after a genesis stop:", citizen.identity ? "set" : null, "| ledger types:", (await w.ledger()).map((e: any) => e.type).join(","));
+    let seatResult: any;
+    try {
+      seatResult = await w.seat([{ type: "journal", kind: "reflected", text: "after a half birth" }]);
+    } catch (e: any) {
+      seatResult = { threw: `${e?.constructor?.name}: ${e?.message}` };
+    }
+    console.log("next seat after a genesis stop:", JSON.stringify({ outcome: seatResult.outcome, refusal: seatResult.refusal, exit: seatResult.exit, threw: seatResult.threw }));
+    const last = (await w.ledger()).at(-1)!;
+    console.log("ledger head after that seat:", JSON.stringify({ type: last.type, signer: (last as any).signer, did: (last as any).did, kid: (last as any).kid }));
+    const notes = await readHostNotes(w.config, new Date(0));
+    console.log("host note of that seat:", notes!.at(-1)!.detail.replace(/seat [0-9a-f-]{36}/, "seat <id>"));
+    const keys = await w.signer.publicKeys(WORD);
+    const verdict = verifyChain(await w.ledger(), { host_attest_b64: [keys.host_attest_b64], identity: { did: citizen.identity.did, root_public_key_b64: citizen.identity.root_public_key_b64 } });
+    console.log("verifyChain with the recorded identity:", JSON.stringify({ ok: verdict.ok, problem: verdict.problem }));
+  });
+});

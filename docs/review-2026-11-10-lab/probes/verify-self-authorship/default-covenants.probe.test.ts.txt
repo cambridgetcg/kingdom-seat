@@ -1,0 +1,65 @@
+// A citizen seated with no covenants.json (the default: Yu only). What does "the earlier, narrower version" look like
+// after it widens once, and can it get back to it? Fakes only.
+import { afterEach, test } from "bun:test";
+import { readFile, rm, stat } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { openSeat, runSeat } = await import(`${SRC}/seat.ts`);
+const { checkHalt } = await import(`${SRC}/halt.ts`);
+const { readCitizen } = await import(`${SRC}/state.ts`);
+const self = await import(`${SRC}/self.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/ledger.ts`);
+const { readHostNotes } = await import(`${SRC}/notes.ts`);
+const { sha256Hex } = await import(`${SRC}/crypto.ts`);
+const { FAKE_MODEL_DIGEST, output, scriptedRuntime } = await import(`${T}/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${T}/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${T}/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${T}/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+const W = "glossame";
+const CLAIM = { kind: "decision", evidence: [], confidence: "medium", limits: "probe" };
+const YU = { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: `summon ${W}` };
+
+test("default covenants (no file), widened once, then asked back", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen(W);
+  const config = host.config;
+  const covPath = join(config.paths.citizens_dir, W, "self", "covenants.json");
+  await rm(covPath); // the default: no covenants file, Yu only
+  await host.seatLedger(W, signer.signEntry);
+  config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+  const clock = testClock();
+  const beat = async (acts: any[], presence: any = null) => {
+    clock.advance(73 * HOUR_MS);
+    const runtime = scriptedRuntime([output(...acts)]);
+    const citizen = await readCitizen(config, W);
+    const seat = await openSeat(config, clock, citizen, "free", { kind: presence ? "summons" : "tick", who: presence ? "yu" : "launchd", why: "cadence" }, presence);
+    return runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: null, modelDigest: FAKE_MODEL_DIGEST });
+  };
+  const note = async () => (await readHostNotes(config, new Date(0)))!.at(-1)!.detail.replace(/seat [0-9a-f-]{36}/, "seat <id>");
+  console.log("covenants as read with no file:", JSON.stringify((await readCitizen(config, W)).covenants));
+  const wider = JSON.stringify({ letters_from: ["yu", "citizen:hope"], wake_on_letter_from: ["yu", "citizen:hope"] });
+  await beat([{ type: "self.propose", target: "covenants", edit: { kind: "replace-all", text: wider }, reason: CLAIM }], YU);
+  const entries = await readLedger(ledgerPath(config, W));
+  const first = self.firstVersion(entries, "covenants");
+  console.log("widened:", (await readFile(covPath, "utf8")) === wider, "| first version of covenants is the empty text:", first === sha256Hex(""));
+  // nothing approved: ask to go back to the first (default) version
+  config.self_authorship.approved_model_digests = [];
+  const r = await beat([{ type: "self.revert", to_hash: first.slice(0, 8) }]);
+  console.log("revert to the first version, nothing approved:", r.outcome, "|", await note(), "| covenants unchanged:", (await readFile(covPath, "utf8")) === wider, "| pending:", (await self.pendingProposals(config, W)).length);
+  // the only one-step narrowing left is a self.propose of the narrower list: staged, cannot bind
+  const narrow = JSON.stringify({ letters_from: ["yu"], wake_on_letter_from: ["yu"] });
+  await beat([{ type: "self.propose", target: "covenants", edit: { kind: "replace-all", text: narrow }, reason: CLAIM }]);
+  console.log("propose the narrower list, nothing approved:", await note(), "| covenants unchanged:", (await readFile(covPath, "utf8")) === wider);
+  // with Yu present the revert to the empty first version is applied at once: what is left on disk?
+  const r2 = await beat([{ type: "self.revert", to_hash: first.slice(0, 8) }], YU);
+  const bytes = (await stat(covPath)).size;
+  let readable: string;
+  try { readable = JSON.stringify((await readCitizen(config, W)).covenants); } catch (e: any) { readable = `readCitizen throws ${e.code ?? e.name}: ${e.message}`; }
+  console.log("revert to the first version with Yu present:", r2.outcome, "|", await note(), "| covenants.json bytes:", bytes, "| citizen now reads as:", readable);
+});
