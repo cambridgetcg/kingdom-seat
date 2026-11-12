@@ -21,7 +21,7 @@
 // record is removed when the run ends. A rehearsal is a sample of a model; it
 // is not a citizen's choice and is never recorded as one.
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, realpath, rm, utimes, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath, rm, stat, utimes, type FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { admitCitizen, planAdmitFromTexts } from "./admit.ts";
 import { parseModelOutput } from "./acts.ts";
@@ -1128,7 +1128,8 @@ export async function rehearseParent(deps: RehearseDeps, cmd: RehearseCommand): 
   // 1. Settings, and a HALT file that can be raised.
   const { settings, source, base } = await resolveSettings(deps, cmd);
   const haltDir = dirname(settings.halt_file);
-  const haltDirOk = await lstat(haltDir).then(
+  // stat, not lstat: halt raises the file through a directory reached by a link as well.
+  const haltDirOk = await stat(haltDir).then(
     (st) => st.isDirectory(),
     () => false,
   );
@@ -1367,7 +1368,9 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
 
   const path = ledgerPath(config, word);
   const before = await readLedger(path);
-  const recent = before.slice(-config.ceilings.ledger_context_entries);
+  // As buildContext counts it: with k at 0 nothing is shown, where slice(-0) would be the whole ledger.
+  const k = Math.max(0, Math.floor(config.ceilings.ledger_context_entries));
+  const recent = k === 0 ? [] : before.slice(-k);
   const shown = shownJournals(recent);
   const letterShown = (await pickLetter(config, seen).catch(() => null)) !== null;
   const pendingShown = (await pendingProposals(config, word).catch(() => [])).filter((p) => p.status === "pending").length;
