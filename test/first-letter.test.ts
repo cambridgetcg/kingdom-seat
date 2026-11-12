@@ -157,14 +157,14 @@ describe("draftFirstLetter", () => {
     const s7 = (commit: string) => commit.slice(0, 7);
     const got = blocks(parts);
     const want: [string, string][] = [
-      [`CADENCE.md 1 of 5: commit ${s7(c.choseAmbient)}, 2026-10-23T05:15:40Z, author name ${W}`, std.versions[0]!],
+      [`CADENCE.md 1 of 5: commit ${s7(c.choseAmbient)}, ${std.dates.choseAmbient}, author name ${W}`, std.versions[0]!],
       [`the beat commit ${s7(c.choseAmbient)} added to beats/2026-10.md`, std.beats.choseAmbient],
-      [`CADENCE.md 2 of 5: commit ${s7(c.minuteOff)}, 2026-10-24T19:59:10Z, author name ${W}`, std.versions[1]!],
+      [`CADENCE.md 2 of 5: commit ${s7(c.minuteOff)}, ${std.dates.minuteOff}, author name ${W}`, std.versions[1]!],
       [`the beat commit ${s7(c.minuteOff)} added to beats/2026-10.md`, std.beats.minuteOff],
-      [`CADENCE.md 3 of 5: commit ${s7(c.handCorrection)}, 2026-10-25T09:00:00Z, author name ${PERSON.name}`, std.versions[2]!],
+      [`CADENCE.md 3 of 5: commit ${s7(c.handCorrection)}, ${std.dates.handCorrection}, author name ${PERSON.name}`, std.versions[2]!],
       [`the subject line of commit ${s7(c.handCorrection)}`, "tend: correct the cadence record\n"],
-      [`CADENCE.md 4 of 5: commit ${s7(c.rewritten)}, 2026-10-26T08:00:00Z, author name ${PERSON.name}`, std.versions[3]!],
-      [`CADENCE.md 5 of 5: commit ${s7(c.rested)}, 2026-10-27T11:12:20Z, author name ${W}`, std.versions[4]!],
+      [`CADENCE.md 4 of 5: commit ${s7(c.rewritten)}, ${std.dates.rewritten}, author name ${PERSON.name}`, std.versions[3]!],
+      [`CADENCE.md 5 of 5: commit ${s7(c.rested)}, ${std.dates.rested}, author name ${W}`, std.versions[4]!],
       [`the beat commit ${s7(c.rested)} added to beats/2026-10.md`, std.beats.rested],
       ["REST", "REST-MARKER a made-up marker line\n"],
     ];
@@ -186,7 +186,7 @@ describe("draftFirstLetter", () => {
     expect(lines).toContain(
       "How a version that came with a beat was made: a script read the reply that became that beat; no person did. It looked for a few fixed words at the start of a line, and a reply in which it found none was recorded as undecided. Nothing else in the reply was read.",
     );
-    expect(lines).toContain(`It also holds a file named REST, last changed in commit ${s7(c.rested)}, 2026-10-27T11:12:20Z, author name ${W}:`);
+    expect(lines).toContain(`It also holds a file named REST, last changed in commit ${s7(c.rested)}, ${std.dates.rested}, author name ${W}:`);
     // The letter put to the citizen and its other texts are not in the draft; they are in legacy/tree/.
     const text = (await draftFirstLetter(x.h.config, W)).text;
     for (const marker of ["LETTER-TO-CITIZEN-MARKER", "MADE-TEXT-MARKER", "FIRST-BEAT-MARKER"]) expect([marker, text.includes(marker)]).toEqual([marker, false]);

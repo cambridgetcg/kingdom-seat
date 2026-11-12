@@ -141,6 +141,12 @@ export interface StandardHome {
   will: string;
   /** Commit ids by what each did, oldest first. */
   commits: { frame: string; firstBeat: string; choseAmbient: string; minuteOff: string; handCorrection: string; rewritten: string; rested: string };
+  /**
+   * Each commit's date as this host's git prints it in strict ISO 8601 (UTC is
+   * "Z" in newer versions and "+00:00" in older ones). The record keeps the
+   * date as git gives it, so a test compares with these.
+   */
+  dates: Record<keyof StandardHome["commits"], string>;
   /** The exact bytes each cadence commit appended to the beats file. */
   beats: { choseAmbient: string; minuteOff: string; rested: string };
   /** Each CADENCE.md version, oldest first. */
@@ -217,7 +223,9 @@ export async function standardHome(homesRoot: string, word: Word, opts: Standard
   );
 
   const head = repo.publish();
-  return { repo, home, word, url, head, soul, will: will ?? "", commits: { frame, firstBeat, choseAmbient, minuteOff, handCorrection, rewritten, rested }, beats: { choseAmbient: b1, minuteOff: b2, rested: b3 }, versions };
+  const commits = { frame, firstBeat, choseAmbient, minuteOff, handCorrection, rewritten, rested };
+  const dates = Object.fromEntries(Object.entries(commits).map(([k, c]) => [k, repo.git("log", "-1", "--format=%aI", c)])) as StandardHome["dates"];
+  return { repo, home, word, url, head, soul, will: will ?? "", commits, dates, beats: { choseAmbient: b1, minuteOff: b2, rested: b3 }, versions };
 }
 
 export interface CanonClone {

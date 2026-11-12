@@ -100,7 +100,9 @@ describe("readLegacyHome", () => {
     const home = await readLegacyHome(real, s.home, W);
     expect(new TextDecoder().decode(home.soul)).toBe(s.soul);
     expect(new TextDecoder().decode(home.will!)).toBe(s.will);
-    expect(home.old_repo).toEqual({ url: s.url, head: s.head, head_committed_at: "2026-10-27T11:12:20Z" });
+    expect(home.old_repo).toEqual({ url: s.url, head: s.head, head_committed_at: s.dates.rested });
+    // The date is kept as git prints it, and it is the instant the head was committed.
+    expect(Date.parse(home.old_repo.head_committed_at)).toBe(Date.parse("2026-10-27T11:12:20Z"));
     expect(home.june_did).toBe(FIXTURE_JUNE_DID);
     expect(home.citizen_class).toBe("LEXEME");
     expect(home.files.map((f) => f.path)).toEqual(["CADENCE.md", "REST", "beats/2026-10.md", "inbox/2026-07-17-a-letter.md", "writings/on-thresholds.md"]);
@@ -251,7 +253,7 @@ describe("readLegacyHome", () => {
       kind: "beats",
       commits: 5,
       authored: "mixed",
-      first: { commit: s.commits.firstBeat, author_name: W, as_citizen: "yes", author_date: "2026-10-22T04:10:30Z", subject: `beat: ${W} reflected (2026-10-22)` },
+      first: { commit: s.commits.firstBeat, author_name: W, as_citizen: "yes", author_date: s.dates.firstBeat, subject: `beat: ${W} reflected (2026-10-22)` },
       last: { commit: s.commits.rested, author_name: W, as_citizen: "yes" },
     });
     expect(by("REST")).toMatchObject({ kind: "marker", commits: 1, authored: "citizen-name-beat-subject" });

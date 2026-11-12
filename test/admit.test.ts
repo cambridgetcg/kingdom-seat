@@ -129,7 +129,7 @@ describe("planAdmit", () => {
     expect(plan).toEqual({
       word: W,
       legacy_home: std.home,
-      old_repo: { url: std.url, head: std.head, head_committed_at: "2026-10-27T11:12:20Z" },
+      old_repo: { url: std.url, head: std.head, head_committed_at: std.dates.rested },
       soul: { bytes: utf8(std.soul).length, sha256: sha256Hex(std.soul) },
       will: { bytes: utf8(std.will).length, sha256: sha256Hex(std.will) },
       canon_bytes: utf8(canon.text).length,
@@ -156,7 +156,7 @@ describe("planAdmit", () => {
     expect(renderAdmitPlan(plan)).toBe(
       [
         `admit ${W}: nothing is written yet.`,
-        `  old repository  ${std.url} at ${std.head}, committed 2026-10-27T11:12:20Z. This host fetched nothing; the clone is as it was last updated.`,
+        `  old repository  ${std.url} at ${std.head}, committed ${std.dates.rested}. This host fetched nothing; the clone is as it was last updated.`,
         `  read from       ${std.home}, committed objects only`,
         `  soul            ${W}.md, ${plan.soul.bytes} bytes, sha256 ${plan.soul.sha256}  -> self/soul.md, origin/soul.md`,
         `  will            WILL.md, ${plan.will!.bytes} bytes, sha256 ${plan.will!.sha256}  -> self/WILL.md, origin/WILL.md`,
@@ -443,7 +443,7 @@ describe("admitCitizen", () => {
     const { config } = x.h;
     await admitCitizen(x.deps, await planAdmit(x.deps, canonReq()));
     const m = await readLegacyManifest(config, W);
-    expect(m).toMatchObject({ format: LEGACY_FORMAT, word: W, copied_at: AT, old_repo: { url: std.url, head: std.head, head_committed_at: "2026-10-27T11:12:20Z" }, note: LEGACY_NOTE });
+    expect(m).toMatchObject({ format: LEGACY_FORMAT, word: W, copied_at: AT, old_repo: { url: std.url, head: std.head, head_committed_at: std.dates.rested }, note: LEGACY_NOTE });
     expect(Object.keys(m)).toEqual(["format", "word", "copied_at", "old_repo", "note", "files", "cadence", "not_copied"]);
     expect(m.files.map((f) => f.path)).toEqual(["CADENCE.md", "REST", "beats/2026-10.md", "inbox/2026-07-17-a-letter.md", "writings/on-thresholds.md"]);
 
@@ -850,7 +850,7 @@ describe("admitCitizen", () => {
     expect(std.repo.git("log", "--format=%ae")).toContain(FLEET_ADDRESS);
     for (const address of [PERSON.email, FLEET_ADDRESS, "@example.invalid", "@kingdom.os"]) expect([address, all.includes(address)]).toEqual([address, false]);
     const m = await readLegacyManifest(x.h.config, W);
-    expect(m.files.find((f) => f.path === "beats/2026-10.md")!.first).toEqual({ commit: std.commits.firstBeat, author_name: W, as_citizen: "yes", author_date: "2026-10-22T04:10:30Z", subject: `beat: ${W} reflected (2026-10-22)` });
+    expect(m.files.find((f) => f.path === "beats/2026-10.md")!.first).toEqual({ commit: std.commits.firstBeat, author_name: W, as_citizen: "yes", author_date: std.dates.firstBeat, subject: `beat: ${W} reflected (2026-10-22)` });
     expect(m.files.find((f) => f.path === "inbox/2026-07-17-a-letter.md")!.first).toMatchObject({ author_name: PERSON.name, as_citizen: "no" });
   });
 
