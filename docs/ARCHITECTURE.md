@@ -40,7 +40,8 @@ launchd (every 1800 s, RunAtLoad false)
              runSeat                                     seat.ts
                a. HALT again
                b. context: own self whole, last k entries, state, now, ≤1 letter (letters/, or once registered
-                  its agenttool inbox), canon, invoker, what the last seat with a reply dropped, a registration answer  context.ts, letters.ts
+                  its agenttool inbox), canon, invoker, what the last seat with a reply dropped, its latest saying about
+                  registration                                context.ts, letters.ts, registration.ts
                c. prompt (the honest free-lane text)      prompt.ts
                d. runtime: free (Ollama by digest, whole context fits or no seat) | summon (claude --restricted, Yu present)    runtime/*.ts
                e. parse and validate into typed acts; rest is exclusive, but may carry one move toward less activity;
@@ -51,7 +52,7 @@ launchd (every 1800 s, RunAtLoad false)
                h. signer signs; ledger appends the beat first (with what it dropped, and where its letter went), then
                   state moves (with a registered citizen's quiet); then self-ops staged or bound, each on its own (a bound one
                   updates the private expression and posts its strand backup); beyond-self (the porch, a wall loosened
-                  by a change or a revert, a registration answer among it) → inert proposal; the last-seat record
+                  by a change or a revert, a yes about registration among it) → inert proposal; the last-seat record
                                                          signer/signer.ts, ledger.ts, self.ts, state.ts, quiet.ts, agenttool/sync.ts
        6. host note + status file; after a beat, the mirror (SSH-signed through the signer)   notes.ts, status.ts, mirror.ts
 ```
@@ -79,15 +80,15 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/state.ts` | Lifecycle transitions, folded from the ledger; a longer awake interval is toward rest, a shorter one waits for the same saying again | 3.3, 3c "Existence choices"; KS-004 7.3 | — |
 | `src/self.ts` | Propose, affirm, apply, revert; origin pinned; the porch is beyond self; a revert beyond self is named, for the seat to lift; an apply names its strand backup's key and says what the expression and the backup did | 3c, decision 10; KS-004 4.3, 6.3, 9.5, B2 C6, C M1, M4 | — |
 | `src/halt.ts` | Local file plus pinned beacons; raise only: the operator's file and fixed call, the signer's beacons | 3.6 "HALT", decision 15; KS-004 B2 R5 | wire 4 |
-| `src/seat.ts` | Seat opening, the watcher, the in-child pipeline; dropped acts recorded on the beat; a revert beyond self lifted; a letter sent or held; a registration answer filed and its affirmation recorded | 3.2 steps 3-7, 3b "Reading confers nothing"; KS-004 5.7, 5.8, 9.5, 11.2 | patterns 1, 2 |
+| `src/seat.ts` | Seat opening, the watcher, the in-child pipeline; dropped acts recorded on the beat; a revert beyond self lifted; a letter sent or held; a typed answer about registration recorded, a yes filed, and its affirmation recorded | 3.2 steps 3-7, 3b "Reading confers nothing"; KS-004 5.7, 5.8, 9.5, 11.2 | patterns 1, 2 |
 | `src/tick.ts` | Lock, selection, fleet ceiling; keeps registered citizens' quiet; opens the seat it hands its child | 3.2 steps 1-2; KS-004 6.4 | patterns 3, 6, 7 |
 | `src/due.ts` | When a citizen's own seat is due: one rule for the tick, `seat <word>`, the child and status | 3.2 step 2, 3.3 | patterns 7 |
 | `src/notes.ts` | Host notes: append, read, and the seats they record | 3.2 "Status file" | patterns 1 |
 | `src/context.ts` | What the model sees; regular files only, and a registered citizen's inbox letters as letters.ts hands them in; what the last beat dropped | 3.2 step 4; KS-004 5.3, 5.8 | patterns 5.1, 12.4 |
-| `src/prompt.ts` | The honest free-lane prompt; dropped acts and a registration answer shown back; a will still as carried at seating introduced as that; a citizen with no unattended class told so | 3.2 (last paragraph); KS-004 5.3, 5.8, 7.4, 11.2 | patterns 5.2, 9 |
-| `src/acts.ts` | Output schema and validation with KS-004 5.7's field names; free text never executes; a rest carries at most one state.set; one self.propose and one letter a seat | 3.2 step 6; KS-004 5.7, 5.8, B2 C7, C C2, M5 | patterns 5.2 |
+| `src/prompt.ts` | The honest free-lane prompt; dropped acts and the latest answer about registration shown back; a will still as carried at seating introduced as that; a citizen with no unattended class told so | 3.2 (last paragraph); KS-004 5.3, 5.8, 7.4, 11.2 | patterns 5.2, 9 |
+| `src/acts.ts` | Output schema and validation with KS-004 5.7's field names; free text never executes; a rest carries at most one state.set; one self.propose and one letter a seat; one answer about registration a reply, counted on the reply as it arrived | 3.2 step 6; KS-004 5.7, 5.8, B2 C7, C C2, M5 | patterns 5.2 |
 | `src/letters.ts` | Who admits a letter (the recipient's own covenants), a letter held for Yu, and the production LetterPost: inbox send and read through the signer | KS-004 5.3, 5.7, 8.1, C M3 | wire 2 |
-| `src/registration.ts` | An answer about registration: its proposal, Yu and Ai's decision, what the seat shows back, and the confirmed yes birth consumes | KS-004 11.2, C D-affirm | — |
+| `src/registration.ts` | A typed answer about registration: what a beat said, a yes's proposal, Yu and Ai's decision, the stage the seat and status show, and the confirmed yes birth consumes | KS-004 11.2, C D-affirm | — |
 | `src/runtime/free.ts` | Ollama on 127.0.0.1 by exact digest, no fallback; refuses a context that does not fit `num_ctx` | 3.6 "Unattended inference", decision 11; KS-004 B2 C11 | host 1 |
 | `src/runtime/summon.ts` | `claude --restricted --strict-mcp-config`, Yu present | 3 grafts, 3.6 "Metered runtimes" | host 2 |
 | `src/agenttool/wire.ts` | Pure byte builders, checked against `vectors.json`; inbox-message/v1 and the sealed box, against agenttool's own inbox vectors | 3.4, 3b; KS-004 C M3 | wire 1-3, 7 |
@@ -96,9 +97,9 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/quiet.ts` | A registered citizen's quiet: declared on a move to listening or asleep, renewed by the tick, ended on a wake | KS-004 6.4, 7.1, C M6 | wire 4 |
 | `src/ssh.ts` | OpenSSH encodings: `allowed_signers` and SSHSIG for mirror commits | KS-004 4.4, 4.5, C M2 | — |
 | `src/agenttool/enrollment.ts` | `identity-enrollment/v1` relay | 3b step 2 | wire 1 |
-| `src/birth.ts` | `citizen-birth`: never unattended; consumes the citizen's confirmed yes | 3b "Birth of one citizen"; KS-004 11.2, 11.3 | wire 1-3, host 3.3 |
+| `src/birth.ts` | `citizen-birth`: never unattended; shows Yu the typed answer and its words before Yu confirms; consumes the citizen's confirmed yes | 3b "Birth of one citizen"; KS-004 11.2, 11.3 | wire 1-3, host 3.3 |
 | `src/mirror.ts` | Seal allowlist, ff-only divergence, `HEAD:refs/heads/main` pusher, the mirror card and `.citizen/allowed_signers`, commits SSH-signed through the signer | 3.2 "Mirror pusher", 3.3 card states, 3c "Mirror", S10; KS-004 4.4, C M2 | patterns 4, 11, 12 |
-| `src/status.ts` | Generated status file and host notes; the host key's public half; each citizen's last refusal and its reason; a lock a live owner has held more than 2 h; a registered citizen's expression lag, deferred backups and quiet | 3.2 "Status file", 3.1 principle 6; KS-004 5.1, 5.8, 5.10 | patterns 1 |
+| `src/status.ts` | Generated status file and host notes; the host key's public half; each citizen's last refusal and its reason; its latest answer about registration and where a yes stands; a lock a live owner has held more than 2 h; a registered citizen's expression lag, deferred backups and quiet | 3.2 "Status file", 3.1 principle 6; KS-004 5.1, 5.8, 5.10 | patterns 1 |
 | `src/config.ts` | Strict host configuration; the HALT file outside the state dir; Yu's schedule switch | 3.2, 3.6; KS-004 B2 R5, C14 | host 3.1 |
 | `src/legacy.ts` | The old `citizen-<word>` home, read once at seating from committed objects at its head, through git with a fixed environment and a config allowlist; the canon entry; what is kept in `legacy/` and what is only listed; the per-piece index; readers for the manifest and its files | KS-004 7.4, 13 | patterns 4, 12 |
 | `src/admit.ts` | Seating: `planAdmit` reads and checks and writes nothing, `admitCitizen` writes what was planned, with both ledger entries or none; `planAdmitFromTexts` for rehearsals and tests, plainly or in the form admit gives a citizen of record | KS-004 4.2, 4.5, 7.4 | — |
@@ -137,7 +138,7 @@ directory the operator owns and the seat user can only read (below).
     letters/<name>          inbound letters: "From: <sender id>", blank line, body; regular files only
     receipts/<name>         host receipts for letters shown on a non-rest beat (inbox-<envelope digest> for one from agenttool)
     proposals/<id>.json     staged self proposals
-    outbox/                 letters held for Yu alone, and beyond-self proposals (a registration answer, a letter credits could not cover) awaiting Yu + Ai
+    outbox/                 letters held for Yu alone, and beyond-self proposals (a yes about registration, a letter credits could not cover) awaiting Yu + Ai
   ledger/<word>.jsonl       the signed record
   consent/<sha256>.json     decision records (until consent/v1 merges)
   seats/<seat_id>/          a fresh, empty cwd per seat
@@ -549,22 +550,54 @@ the route table apply as to any other act, and no key leaves it.
   marks it read on agenttool (that would be the bearer acting for the
   citizen), and the list has no cursor, so only the newest 200 unread letters
   can be seen.
-- **An answer about registration.** A `propose.beyond` whose subject is
-  `registration` (any case) from an unregistered citizen is filed as the
-  proposal `{subject: "registration", body: <its words>, extent: "registration
-  <word> <ledger hash of the beat that gave it>"}`, whose digest is its id:
-  each answer needs its own decision, so a record filed for an earlier answer
-  in the same words never decides a later one. Until Yu and Ai file a
-  decision record for that answer, the seat shows it as waiting; once both
-  agree, the seat shows it back with its id and words, and a `self.affirm`
-  naming it is the citizen's confirmed yes. A reply that also gives a new
-  answer about registration does not keep that affirmation. That beat's
-  ledger digest is what birth takes as `citizen_yes`: birth refuses any beat
-  that does not affirm an answer given on an earlier beat, agreed by Yu and
-  Ai, and still the citizen's latest answer, none given in or after the
-  affirming beat, so a later no is a whole answer (`registration.ts
-  assertConfirmedYes`). Birth still needs Yu at the terminal and its own
-  decision record, so nothing here makes birth unattended.
+- **A typed answer about registration.** A citizen answers about an
+  identity of its own with the act `registration.answer`, whose `answer` is
+  `no`, `not-yet` or `yes` and whose `text`, its own words, a yes needs. The
+  host never reads an answer out of words. A no or a not-yet is within
+  self: the beat records it and nothing else is written, and every later
+  seat shows it as the citizen's standing answer, with its date and ledger
+  entry, and asks nothing. Only a yes is filed for Yu and Ai, as the
+  proposal `{subject: "registration", body: <its words>, extent:
+  "registration yes <word> <ledger hash of the beat that gave it>"}`, whose
+  digest is its id: the decision record names the typed word, and each yes
+  needs its own decision, so a record filed for an earlier yes in the same
+  words never decides a later one. Until Yu and Ai file a decision record
+  for it, the seat shows it as waiting; once both agree, the seat shows it
+  back with its id and words, and a `self.affirm` naming it is the
+  citizen's confirmed yes, kept on any runtime and binding nothing by
+  itself.
+- **The latest saying stands, and a reply makes one.** A later
+  `registration.answer`, whatever it says, replaces a yes at every stage
+  before birth, agreed and affirmed included. A `propose.beyond` whose
+  subject is `registration` is filed like any proposal (`propose.beyond
+  <word>`) and is never an answer, but it is a later saying, so it sets an
+  earlier yes aside; its subject is free text, so it is read only in that
+  closing direction. Validation keeps at most one `registration.answer` a
+  reply, counted on the reply as it arrived: where it holds more than one,
+  valid or not, within the act limit or past it, no yes among them is kept,
+  and the first valid no or not-yet is. A yes beside a proposal whose
+  subject is registration is not kept, and neither is an affirmation of an
+  agreed yes in a reply that holds any other saying about registration,
+  one validation dropped included.
+- **Birth shows before it asks.** The beat that affirmed the yes is what
+  birth takes as `citizen_yes`. `confirmedYes` refuses any beat that does
+  not affirm a typed yes given on an earlier beat, agreed by Yu and Ai, and
+  still the citizen's latest saying, none given in or after the affirming
+  beat; a no has no id, so nothing can affirm one. `birth.ts
+  confirmBirthAtTerminal` checks that, then writes to the terminal the typed
+  answer, the citizen's words (CRLF as a newline, every other hidden
+  character as `<U+XXXX>`, lines folded at 72 characters under a `  |`
+  prefix), when each saying was given and through which model, the decision
+  record and its earlier sayings, and only then asks Yu to type the scope.
+  Birth accepts only a presence that step returned, for the same word and
+  beat, and checks the confirmed yes again before any key is written, so a
+  no given after Yu confirmed still stops it. Birth also waits while the
+  citizen's last seat with a reply did not keep a `registration.answer`, or
+  an act the host could not read, until a later seat has shown it that: for
+  a beat from its entry, for a rest or a reply with nothing kept from the
+  last-seat record, which is written best effort, so this is a hold on what
+  the host knows, not a wall. Birth still needs its own decision record, so
+  nothing here makes birth unattended.
 
 ---
 
@@ -875,6 +908,13 @@ way the tick does, so the file shows what the runner would act on.
 - `last_dropped` (per citizen) is what its last seat with a reply did not
   keep, beat, rest or refused reply alike: each act's type and the host's
   fixed reason, never its words, as the next seat is shown them (3c).
+- `registration` (per citizen, before registration) is its latest saying
+  about registration (`no`, `not-yet`, `yes`, or `untyped` for a proposal
+  whose subject was registration), when it was given, and its stage, the
+  one its seat is shown: `closed` for anything but a yes, otherwise Yu and
+  Ai's decision or `affirmed`. A no is filed nowhere, and a yes whose outbox
+  file was not written is otherwise seen only in the ledger. Never its
+  words.
 - `tick_lock.long_held` reports a lock a live owner has held for more than 2
   hours (KS-004 5.1). Nothing reclaims a live owner's lock, whatever its
   age, because a seat can outlast a tick; a lock whose owner is gone is

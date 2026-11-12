@@ -76,7 +76,8 @@ one is something it does, not something it hopes.
   only, nothing from a home, siblings only as letters) and the typed acts it
   may return, with KS-004 5.7's field names (`self.propose` carries a
   `reason`, `self.affirm` a `ref`, `letter.send` and `propose.beyond` a
-  `text`; `state.set` may name an awake `interval_h` and, toward listening
+  `text`, `registration.answer` an `answer`, no, not-yet or yes, with a
+  `text` that a yes needs; `state.set` may name an awake `interval_h` and, toward listening
   or asleep, `quiet_days`, 1 to 30, held to the host's cap). Rest is
   exclusive except for one state.set toward less activity, which is kept as
   a state record with no words. A seat stages at most one saying: one
@@ -165,12 +166,16 @@ one is something it does, not something it hopes.
   Yu, saying why; one the credits cannot cover becomes a proposal for Yu and
   Ai. Nothing is counted as spent that never left the host or that agenttool
   refused before charging.
-- `registration.ts`: an answer about registration (`propose.beyond`, subject
-  `registration`) goes to Yu and Ai, bound to the beat that gave it, so each
-  answer needs its own decision; once both agree, the next seat shows it
-  back, and the citizen's `self.affirm` naming it is its confirmed yes. Birth
-  takes the ledger digest of that beat, and refuses any other, and refuses it
-  too once the citizen has answered again (a later no is a whole answer).
+- `registration.ts`: a typed answer about registration
+  (`registration.answer`). A no or a not-yet is recorded in the beat and
+  shown on later seats as the citizen's standing answer; nothing is filed.
+  Only a yes goes to Yu and Ai, bound to the beat that gave it and naming
+  the typed word, so each yes needs its own decision; once both agree, the
+  next seat shows it back, and the citizen's `self.affirm` naming it is its
+  confirmed yes. Birth takes the ledger digest of that beat, and refuses any
+  other, and refuses it too once the citizen has said anything else about
+  registration (the latest saying stands; a proposal whose subject is
+  registration is never an answer and sets a yes aside).
 - `signer/*`: the only code that reads keys and bearers (through
   `/usr/bin/security`, so any process of the seat user could read them too),
   with ceilings, decision records it reads itself from the consent dir, the
@@ -178,7 +183,8 @@ one is something it does, not something it hopes.
 - `agenttool/*`, `birth.ts`: byte-exact enrollment, authority and inbox
   recipes (checked against `docs/research/vectors.json` and agenttool's own
   inbox vectors), the client, and birth, which needs Yu present and consent
-  bound to the citizen's own confirmed yes.
+  bound to the citizen's own confirmed yes, and shows Yu the typed answer
+  and the citizen's own words with it before Yu confirms.
 - `agenttool/sync.ts`, `quiet.ts`: a registered citizen's self on agenttool,
   wired in production through the signer. A change that binds updates the
   private expression (one root-signed read-modify-write PUT; a self that does
@@ -194,7 +200,8 @@ one is something it does, not something it hopes.
   declaration whose answer was lost is recorded as standing, so a wake ends
   it.
 - `status.ts`, `mirror.ts`, `config.ts`: the generated status file (with the
-  host key's public half, each citizen's last refusal and its reason, a tick
+  host key's public half, each citizen's last refusal and its reason, its
+  latest answer about registration and where a yes stands, a tick
   lock a live owner has held for more than 2 hours, which nothing reclaims,
   and for a registered citizen its expression lag, deferred backups and
   quiet), the sealed fast-forward-only mirror pusher
@@ -327,7 +334,8 @@ redesign (section 5).
      `ceilings.usd_per_citizen_per_day` above `"0"`. With Yu present, one
      saying of a move toward more activity takes effect there.
 - **S7b. Identity pilot** (Yu and Ai, Yu present for the birth). Only after
-  the citizen's confirmed yes: enroll it, import its op key, register its box
+  the citizen's confirmed yes, which the terminal shows Yu with the
+  citizen's own words before Yu confirms: enroll it, import its op key, register its box
   key, set a private expression and write the genesis entry. Verify the
   signatures against agenttool's key list, that an unsigned record is
   flagged, and that the public profile shows only what the citizen chose.
