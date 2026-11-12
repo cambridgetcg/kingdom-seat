@@ -51,7 +51,7 @@ one is something it does, not something it hopes.
 **Built and tested offline** (`src/`):
 
 - `cli.ts`: `citizen-seat tick | seat <word> | halt | raise-beacons | status |
-  verify <word> | admit <word> | draft-first-letter <word>`. There is no verb
+  verify <word> | admit <word> | draft-first-letter <word> | rehearse <word>`. There is no verb
   or flag that lowers HALT; only Yu lowers it, by hand. `halt` runs as the operator: it writes the HALT file, which
   lives outside the state dir where the seat user cannot remove it (by
   default `/Users/Shared/kingdom-seat/HALT`), then makes one fixed call (a
@@ -139,6 +139,11 @@ one is something it does, not something it hopes.
   order. The host's sentences are marked `[host] ` until Yu keeps, changes
   or removes them. It says when the draft is over the letter limit, and it
   writes and delivers nothing.
+- `rehearse.ts`, `measures.ts`: `citizen-seat rehearse <word>` runs the
+  seat's own prompt on a pinned local model for a throwaway copy seated from
+  texts, and keeps counts, codes and sizes; no citizen is seated, asked or
+  recorded (`docs/REHEARSAL.md`). Tested against a fake Ollama only; it has
+  not been run on a model.
 - `letters.ts`: a letter goes where its recipient's own covenants admit it,
   never by the sender's list; a citizen with no covenants file admits only
   Yu, who may also wake it. An unregistered citizen's letter, any letter to

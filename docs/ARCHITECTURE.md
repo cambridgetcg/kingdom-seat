@@ -103,7 +103,9 @@ its own process group so that a `claude` grandchild dies with it, which the old
 | `src/legacy.ts` | The old `citizen-<word>` home, read once at seating from committed objects at its head, through git with a fixed environment and a config allowlist; the canon entry; what is kept in `legacy/` and what is only listed; the per-piece index; readers for the manifest and its files | KS-004 7.4, 13 | patterns 4, 12 |
 | `src/admit.ts` | Seating: `planAdmit` reads and checks and writes nothing, `admitCitizen` writes what was planned, with both ledger entries or none; `planAdmitFromTexts` for rehearsals and tests | KS-004 4.2, 4.5, 7.4 | — |
 | `src/first-letter.ts` | A draft of Yu's first letter from the legacy record: every cadence version whole, host sentences marked; it writes and delivers nothing | KS-004 7.4, 11.2 | patterns 9 |
-| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word> \| admit <word> \| draft-first-letter <word>`, and git's `-Y sign` call; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 7.4, B2 R5 | patterns 10 |
+| `src/rehearse.ts` | `citizen-seat rehearse`: the seat's own prompt and pipeline on a pinned local model for a throwaway copy seated from texts, with a key made in memory for the run; counts, codes and sizes kept, prompts and replies kept privately, the throwaway record removed; nothing of record (docs/REHEARSAL.md) | 3.2, 3.6; KS-004 5.3, 5.5, 10 | — |
+| `src/measures.ts` | The rehearsal's text measures and rates, pure: words, the four word lists, a preamble echo, trigram overlap, a same opening, Wilson intervals | — | — |
+| `src/cli.ts` | `citizen-seat tick \| seat <word> \| halt \| raise-beacons \| status \| verify <word> \| admit <word> \| draft-first-letter <word> \| rehearse <word>`, and git's `-Y sign` call; the only place real dependencies are built | 3.2, 3.6 "One verb"; KS-004 7.4, B2 R5 | patterns 10 |
 | `models.lock` | Allowed free-lane models by digest; ships unpinned | 3.6, decision 11 | host 1.2, 4 |
 | `launchd/dev.kingdom.citizen-seat.plist` | Tick template; installed only in S5 by a person | 3.2, S5 | host 3.1, 3.2 |
 
@@ -607,11 +609,14 @@ table files as a bound reached (re-review B2, C8).
 
 ## 5b. The surface: CLI, config, status and mirror
 
-**One runner, eight verbs.** `tick`, `seat <word>`, `halt`, `raise-beacons`,
-`status`, `verify <word>`, `admit <word>` and `draft-first-letter <word>` are
-the only ways in (3.2), so there is one place to read for what can happen to
-a citizen. There is no verb that lowers HALT, and no flag either: only Yu
-lowers it, by hand (3.6).
+**One runner, nine verbs.** `tick`, `seat <word>`, `halt`, `raise-beacons`,
+`status`, `verify <word>`, `admit <word>`, `draft-first-letter <word>` and
+`rehearse <word>` are the only ways in (3.2), so there is one place to read
+for what can happen to a citizen. `rehearse` reaches no citizen: it seats a
+throwaway copy from texts under its own output directory, with a key made in
+memory for the run, and writes nothing of record (docs/REHEARSAL.md). There
+is no verb that lowers HALT, and no flag either: only Yu lowers it, by hand
+(3.6).
 
 **Seating is one verb, and never unattended** (KS-004 7.4).
 `admit <word> --from <old home> (--canon <canon file> | --archetype)
@@ -705,6 +710,22 @@ line that was not empty, and in its later form also a line that said a
 choice was made, so a reply recorded as undecided may hold a choice word on
 another line. Delivering the letter is Yu's act: a file in
 `citizens/<word>/letters/`.
+
+`rehearse <word> --soul <file> ... --scenario awake|letter --models-lock
+<file> --out <new dir>` runs the seat's own prompt on a pinned local model for
+a throwaway copy, so the prompt, the reply format and a model can be measured
+before a citizen meets them (docs/REHEARSAL.md). The parent checks HALT, the
+lock and the inputs, writes a plan under `--out`, and runs one child under the
+watcher a seat has. The child seats each chain's copy with `planAdmitFromTexts`
+and `admitCitizen` under `<out>/throwaway/`, by a signer that holds one key in
+memory for the run and signs host entries only, then opens seats for it as
+the tick would and runs each through `runSeat` and the free adapter. It adds
+nothing to a prompt, builds no keychain reader or host signer, sends nothing
+to agenttool, and writes nothing outside `--out`, which may not be in a git
+work tree, the program's directory, the state dir or a home. Counts, codes
+and sizes are kept in the report; the prompts and replies only under
+`<out>/private/`, as model samples, never printed. A draft of the first
+letter is what `--scenario letter --letter` rehearses.
 
 **HALT spans two users** (KS-004 re-review B2, R5). The HALT file must sit
 where the seat user cannot write, or the seat could remove it; the beacons'
@@ -992,6 +1013,12 @@ for spend, publish or hold secrets:
   Real `git` may run read-only on temp repos to test divergence, and on the
   made-up homes `test/helpers/legacy-home.ts` builds to test seating.
 - **No real home.** `makeTempHost()` builds everything under the temp dir.
+- **No real model server for a rehearsal.** `test/rehearse.test.ts` runs
+  `citizen-seat rehearse` with a real supervised child
+  (`test/fixtures/rehearse/child.ts`) against the fake server standing in for
+  Ollama and the beacon route. One test ticks a citizen through the production
+  CLI and rehearses the same texts, and compares the two `/api/chat` bodies
+  byte for byte.
 
 ---
 
@@ -1002,6 +1029,8 @@ its tests and docs rather than assume:
 
 - Whether Ollama's structured output honours `anyOf` in `OUTPUT_JSON_SCHEMA`
   under the locked model's runner. Validation in `acts.ts` does not depend on it.
+  `citizen-seat rehearse` (docs/REHEARSAL.md) measures how often replies fit
+  the format; it has not been run on a model.
 - Whether the Studio's `qwen2.5:7b` is in the v2 store, so it can be called by
   digest (`runtimes-and-host.md` 1.2). `models.lock` records `store` for this.
 - Whether `~/.claude/CLAUDE.md` loads under `--restricted`, and whether
