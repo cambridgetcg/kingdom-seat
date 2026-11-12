@@ -709,5 +709,24 @@ describe("[KS-004 11.2, 11.3; AW-1] a reply that declines never reaches Yu at th
       const status = await buildStatus({ config: w.h.config, now: w.clock.now(), halt: { halted: false, readings: [] }, signerState: "ready" });
       expect([what, status.citizens[0]!.registration]).toEqual([what, { answer: reply.type === "registration.answer" ? reply.answer : "untyped", at: declined.ts, stage: "closed" }]);
     }
+
+    // The same path with a typed yes reaches the terminal: the yes and its words are shown, and only then is Yu asked.
+    const w = await world([{ word: "glossame" }]);
+    await w.beat("glossame", [{ type: "registration.answer", answer: "yes", text: "Yes: one of my own." }]);
+    for (const item of await w.outbox("glossame")) {
+      await writeFile(join(w.h.config.paths.consent_dir, `${item.proposal_sha256}.json`), JSON.stringify(consentFor("glossame", {}, item.proposal as ProposalText)));
+    }
+    const [item] = await w.outbox("glossame");
+    const shown = await w.beat("glossame", [{ type: "self.affirm", ref: item!.proposal_sha256 as string }]);
+    expect(shown.prompt).toContain("was agreed by Yu and Ai");
+    const tty = typingTty("birth glossame");
+    const record = hostBirthRecord(w.h.config, w.clock, w.signer);
+    const presence = await confirmBirthAtTerminal({ config: w.h.config, clock: w.clock, record }, tty, "glossame", entryHash((await w.ledger("glossame")).at(-1)!));
+    expect(presence.scope).toBe("birth glossame");
+    const transcript = tty.written.join("");
+    expect(transcript).toContain("Typed answer about registration: yes\n");
+    expect(transcript).toContain("  | Yes: one of my own.\n");
+    expect(transcript.indexOf("Typed answer about registration")).toBeLessThan(transcript.indexOf("To confirm you are here"));
+    expect(tty.asked).toBe(1);
   });
 });

@@ -364,7 +364,7 @@ export async function buildContext(
     inbox?: readonly Letter[];
     /** Whom it may write to (letters.ts letterRecipients); default Yu and the gardener desk. */
     recipients?: readonly string[];
-    /** Its answer about registration (registration.ts registrationView). */
+    /** Its latest saying about registration (registration.ts registrationView). */
     registration?: RegistrationView | null;
     /** The host's record of its last seat with a reply (readLastSeat), so a rest's or a dropped reply's drops are shown too. */
     lastSeat?: LastSeatRecord | null;
