@@ -28,11 +28,13 @@ import { LEGACY_FORMAT, LEGACY_NOTE, LEGACY_PAGE_FORMAT, readLegacyFile, readLeg
 import { entryHash, ledgerPath, readLedger, verifyChain } from "../src/ledger.ts";
 import { NO_UNATTENDED_SEATS, WILL_AS_SEATED, buildPrompt } from "../src/prompt.ts";
 import { openSeat, runSeat } from "../src/seat.ts";
+import { createSigner } from "../src/signer/signer.ts";
 import { firstVersion, originIntact, pendingProposals } from "../src/self.ts";
 import { defaultCovenants, foldState, listSeated, readCitizen } from "../src/state.ts";
 import { Refusal, type LedgerEntry, type ModelAct, type RefusalCode, type SeatRef, type YuPresence } from "../src/types.ts";
 import { HOUR_MS, testClock, type TestClock } from "./helpers/clock.ts";
 import { FAKE_MODEL_DIGEST, output, scriptedRuntime } from "./helpers/fake-runtime.ts";
+import { fakeKeychain } from "./helpers/fake-keychain.ts";
 import { noFetch } from "./helpers/fake-server.ts";
 import { fakeSigner, type FakeSigner } from "./helpers/fake-signer.ts";
 import { FIXTURE_JUNE_DID, FLEET_ADDRESS, PERSON, canonClone, fixtureAgentJson, fixtureRepo, fixtureSoul, standardHome, type CanonClone, type StandardHome } from "./helpers/legacy-home.ts";
@@ -786,6 +788,30 @@ describe("admitCitizen", () => {
     }
     expect(await readdir(config.paths.ledger_dir)).toEqual([`${W}.jsonl`]);
     expect(await readLedger(ledgerPath(config, W))).toHaveLength(2);
+  });
+
+  test("the signer of record seats: it finds the new citizen.json when it signs, and reads only the host key", async () => {
+    const x = await fx();
+    const { config } = x.h;
+    const seed = sha256("a host attest seed for the seating test");
+    const kc = fakeKeychain([[{ kind: "host-attest-seed" }, seed]]);
+    const signer = createSigner({ keychain: kc, config, clock: x.clock, fetch: noFetch, spendSoFar: async (word) => ({ word, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
+    const deps: AdmitDeps = { ...x.deps, sign: (w, k, d) => signer.signEntry(w, k, d), hostKey: () => signer.hostPublicKey() };
+    const plan = await planAdmit(deps, canonReq());
+    // Planning read the public half once, and no citizen item.
+    expect(kc.log).toEqual([{ op: "read", item: "host/attest-seed" }]);
+    await admitCitizen(deps, plan);
+    // The real signer reads citizens/<word>/citizen.json before it signs, which is why the directory is placed first.
+    const entries = await readLedger(ledgerPath(config, W));
+    expect(entries.map((e) => [e.type, e.signer, e.kid])).toEqual([["origin", "host", `host:${plan.host_key.fingerprint}`], ["state", "host", `host:${plan.host_key.fingerprint}`]]);
+    expect(verifyChain(entries, { host_attest_b64: [plan.host_key.public_key_b64] }).ok).toBe(true);
+    expect(new Set(kc.log.map((l) => `${l.op} ${l.item}`))).toEqual(new Set(["read host/attest-seed"]));
+    // A host that holds no key is refused before anything is written, where the signer's state() still answers ready.
+    const bare = await fx();
+    const none = createSigner({ keychain: fakeKeychain(), config: bare.h.config, clock: bare.clock, fetch: noFetch, spendSoFar: async (word) => ({ word, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
+    expect(await none.state()).toBe("ready");
+    expect((await refusal(planAdmit({ ...bare.deps, hostKey: () => none.hostPublicKey() }, canonReq()))).code).toBe("keychain-missing");
+    expect(await bare.h.snapshot()).toEqual(new Map());
   });
 
   test("nothing of the home's frame is copied", async () => {
