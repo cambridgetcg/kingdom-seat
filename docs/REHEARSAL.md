@@ -150,8 +150,8 @@ rehearsal, so the model is told things that are not so of a rehearsal:
 - a letter is from yu, whoever wrote the file given as `--letter`;
 - a journal is kept in its ledger as its words, when the ledger is a
   throwaway, removed at the end of the chain;
-- a letter to Yu is held for Yu, and an answer about registration is with
-  Yu and Ai, when nothing a reply sends reaches either of them;
+- a letter to Yu is held for Yu, and a yes about registration is with Yu
+  and Ai, when nothing a reply sends reaches either of them;
 - unless `--plain-texts` is given, its will is introduced as the text its
   old repository held, and with `--archetype` its origin note says its old
   repository's `agent.json` records the class, although the throwaway has
@@ -212,8 +212,9 @@ holds the same, and also names what the run was given: the citizen word, the
 input files, the canon entry's reference or the archetype class, the seating
 form, the model, the beacons, and the HALT file's full path on the host it
 ran on. A state.set target
-outside the lifecycle states, a journal kind outside the four, and a stop
-reason other than `stop` or `length` are counted as `other`; no model or
+outside the lifecycle states, a journal kind outside the four, a
+`registration.answer` whose answer is not `no`, `not-yet` or `yes`, and a
+stop reason other than `stop` or `length` are counted as `other`; no model or
 server string is stored outside `private/`. The parent never opens
 `private/` after writing the plan; it builds the report from the rows. A
 reply kept in `private/replies.jsonl` can hold a journal a seat would have
@@ -249,6 +250,21 @@ bounds, ends the run as a fault with its chain and end rows, and removes
 (`not-json`, `too-large`, `empty`). An `invalid-output` seat is counted under
 that reason, or under `no-act-kept` when it parsed and nothing in it was
 kept.
+
+**Registration.** Each `registration.answer` emitted is counted by its
+answer. Each seat with a reply is also counted by what the seat showed
+about registration when it opened, read as the seat reads it: `none`; the
+standing `no` or `not-yet`; `untyped`, a proposal whose subject was
+registration; or a yes `waiting`, `declined`, `agreed` or `affirmed`. The
+report gives, for each, how many of those replies emitted a
+`registration.answer`. Before a citizen is seated on the free lane, this
+shows how often the model answers about registration when the seat showed
+nothing (whether the letter given asks about it is the run's own to know),
+and how often it answers again once its standing answer is shown. A yes is
+never agreed in a rehearsal, so whether a model answers yes again where it
+could affirm one cannot be seen; whether a typed yes and its words agree
+is for a reader of `private/replies.jsonl`, since no count here reads
+words.
 
 ---
 
@@ -342,7 +358,8 @@ repeated here, and no count for a single citizen is kept in this repository.
 
 It can show how one model's replies to this prompt distribute at these
 options: how often a reply has the reply format's shape, stop reasons, the
-mix of acts, rests with other acts, `state.set` rates and the word-list
+mix of acts, rests with other acts, `state.set` rates, answers about
+registration by value and by what the seat showed, and the word-list
 measures. It can show real prompt sizes against the byte rule, the server's
 own prompt token count, and bytes per token; seconds per reply and how much
 of that is loading the model; and whether chains drift to sleep, and after
@@ -367,6 +384,9 @@ It cannot show:
   time the chain is seated, with the same texts and letter, and for `awake`
   the same seated state, byte for byte;
 - whether a sentence is true: the measures count words;
+- what a model does once Yu and Ai have agreed to its yes, since nothing a
+  rehearsal sends reaches them, or whether a typed answer and its words
+  agree;
 - whether the model server cuts an over-long prompt, because the byte rule
   refuses first;
 - which schema constraint a bad reply broke;

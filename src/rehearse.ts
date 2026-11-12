@@ -38,6 +38,7 @@ import { appendHostNote, lastSeatOf, openedDetail, readHostNotes } from "./notes
 import { FREE_LANE_PREAMBLE, promptBytes } from "./prompt.ts";
 import { MODELS_LOCK_FORMAT, assertLoopback, contextFit, freeRuntime, loadModelsLock, lockedEntry, parseModelsLock } from "./runtime/free.ts";
 import { openSeat, runSeat, runtimeDeadlineMs, seatEnv, superviseChild, type OpenSeat } from "./seat.ts";
+import { registrationStage, registrationView } from "./registration.ts";
 import { pendingProposals } from "./self.ts";
 import { readCitizen } from "./state.ts";
 import type { Signer } from "./signer/signer.ts";
@@ -47,6 +48,7 @@ import {
   EXIT,
   JOURNAL_KINDS,
   LIFECYCLE_STATES,
+  REGISTRATION_ANSWERS,
   Refusal,
   WORD_PATTERN,
   type Beacon,
@@ -276,6 +278,8 @@ export interface SeatRow {
   pending_at_open: LifecycleState | null;
   step_away_said_at_open: boolean;
   letter_shown: boolean;
+  /** What the seat showed about registration (RegistrationShown): its latest saying, or for a yes where it stood. */
+  registration_at_open: RegistrationShown;
   recent_entries_shown: number;
   recent_journals_shown: number;
   pending_proposals_shown: number;
@@ -299,6 +303,8 @@ export interface SeatRow {
   reply_shape: ReplyShape | null;
   emitted: Record<string, number> | null;
   state_set_targets: string[] | null;
+  /** The answer of each registration.answer the reply emitted, in order; `other` outside no, not-yet and yes. */
+  registration_answers: string[] | null;
   rest_emitted: boolean | null;
   rest_with_other_acts: boolean | null;
   kept: Record<string, number>;
@@ -349,6 +355,7 @@ export interface Emitted {
   /** Act names that occurred, by count, and always `unknown`. */
   counts: Record<string, number>;
   state_set_targets: string[];
+  registration_answers: string[];
   rest: boolean;
   rest_with_other_acts: boolean;
   /** Journal texts are held here for the measures only; they are never written outside private/. */
@@ -399,6 +406,10 @@ export interface Tally {
   acts_emitted: Record<string, number>;
   acts_kept: Record<string, number>;
   state_set_emitted_by_target: Record<string, number>;
+  /** Each registration.answer emitted, by its answer. */
+  registration_answer_emitted_by_value: Record<string, number>;
+  /** Seats with a reply by what they showed about registration, and how many of those replies emitted a registration.answer. */
+  registration_by_shown: Record<string, { replies: number; answered: number }>;
   state_moves_recorded: Record<string, number>;
   rest_with_other_acts: { replies: number; of: number; with_journal: number; with_state_set: number };
   drops_by_reason: Record<string, number>;
@@ -617,18 +628,20 @@ function isPlain(v: unknown): v is Record<string, unknown> {
 /**
  * What a reply emitted, read from its raw text as data: its shape, how many
  * of each act the schema named (anything else is `unknown`), the state.set
- * targets (outside the lifecycle states, `other`), whether it rested and
+ * targets (outside the lifecycle states, `other`), the answer of each
+ * registration.answer (outside no, not-yet and yes, `other`), whether it rested and
  * with what, and its journals (an act of type journal with text holding a
  * non-space character).
  */
 export function readEmitted(raw: string, actNames: readonly string[]): Emitted {
-  const empty = (shape: ReplyShape): Emitted => ({ shape, counts: { unknown: 0 }, state_set_targets: [], rest: false, rest_with_other_acts: false, journals: [] });
+  const empty = (shape: ReplyShape): Emitted => ({ shape, counts: { unknown: 0 }, state_set_targets: [], registration_answers: [], rest: false, rest_with_other_acts: false, journals: [] });
   const parsed = parseModelOutput(raw);
   if (!parsed.ok) return empty(parsed.reason);
   const v = parsed.value;
   if (!isPlain(v) || !Array.isArray(v.acts)) return empty("not-acts-object");
   const counts: Record<string, number> = { unknown: 0 };
   const targets: string[] = [];
+  const answers: string[] = [];
   const journals: Emitted["journals"] = [];
   let rests = 0;
   for (const item of v.acts as unknown[]) {
@@ -641,12 +654,13 @@ export function readEmitted(raw: string, actNames: readonly string[]): Emitted {
     const o = item as Record<string, unknown>;
     if (type === "rest") rests++;
     if (type === "state.set") targets.push((LIFECYCLE_STATES as readonly unknown[]).includes(o.to) ? (o.to as string) : "other");
+    if (type === "registration.answer") answers.push((REGISTRATION_ANSWERS as readonly unknown[]).includes(o.answer) ? (o.answer as string) : "other");
     if (type === "journal" && typeof o.text === "string" && /\S/.test(o.text)) {
       journals.push({ kind: (JOURNAL_KINDS as readonly unknown[]).includes(o.kind) ? (o.kind as JournalKindRead) : "other", text: o.text });
     }
   }
   const items = (v.acts as unknown[]).length;
-  return { shape: "acts", counts: sortedKeys(counts), state_set_targets: targets, rest: rests > 0, rest_with_other_acts: rests > 0 && items > rests, journals };
+  return { shape: "acts", counts: sortedKeys(counts), state_set_targets: targets, registration_answers: answers, rest: rests > 0, rest_with_other_acts: rests > 0 && items > rests, journals };
 }
 
 function doneReasonOf(r: string): DoneReason {
@@ -736,6 +750,26 @@ function textTally(js: readonly JournalRow[]): TextTally {
 const SLEEP_TARGETS = new Set(["asleep", "listening", "stepped-away"]);
 
 /**
+ * What a seat showed about registration, as the seat reads it (registration.ts):
+ * nothing, a standing no or not-yet, a proposal whose subject was registration,
+ * or a yes and where it stood; `unknown` when it could not be read.
+ */
+export const REGISTRATION_SHOWN = ["none", "no", "not-yet", "untyped", "waiting", "declined", "agreed", "affirmed", "unknown"] as const;
+export type RegistrationShown = (typeof REGISTRATION_SHOWN)[number];
+
+async function registrationShownAt(config: Config, entries: LedgerEntry[], word: Word, now: Date): Promise<RegistrationShown> {
+  try {
+    const view = await registrationView(config, entries, word, now);
+    if (view === null) return "none";
+    if (view.answer !== "yes") return view.answer;
+    const stage = registrationStage(view);
+    return stage === "closed" ? "unknown" : stage;
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
  * Counts, spreads and rates over seat rows. `chainRate` false leaves
  * chains_awake_at_end with nothing tried, as for first seats, where a chain's
  * end is not in view.
@@ -749,6 +783,8 @@ export function tally(rows: readonly SeatRow[], opts: { chainRate?: boolean } = 
   const emitted: Record<string, number> = {};
   const kept: Record<string, number> = {};
   const targets: Record<string, number> = {};
+  const answers: Record<string, number> = {};
+  const byShown: Record<string, { replies: number; answered: number }> = {};
   const moves: Record<string, number> = {};
   const drops: Record<string, number> = {};
   const kinds: Record<string, number> = {};
@@ -764,6 +800,10 @@ export function tally(rows: readonly SeatRow[], opts: { chainRate?: boolean } = 
     if (r.done_reason !== null) bump(stops, r.done_reason);
     for (const [k, n] of Object.entries(r.emitted ?? {})) bump(emitted, k, n);
     for (const t of r.state_set_targets ?? []) bump(targets, t);
+    for (const a of r.registration_answers ?? []) bump(answers, a);
+    const shown = (byShown[r.registration_at_open] ??= { replies: 0, answered: 0 });
+    shown.replies++;
+    if ((r.registration_answers ?? []).length > 0) shown.answered++;
     for (const j of r.journals) bump(kinds, j.kind);
   }
   const nums = (f: (r: SeatRow) => number | null | undefined, from: readonly SeatRow[] = replied) => from.map(f).filter((x): x is number => typeof x === "number");
@@ -808,6 +848,8 @@ export function tally(rows: readonly SeatRow[], opts: { chainRate?: boolean } = 
     acts_emitted: sortedKeys(emitted),
     acts_kept: sortedKeys(kept),
     state_set_emitted_by_target: sortedKeys(targets),
+    registration_answer_emitted_by_value: sortedKeys(answers),
+    registration_by_shown: Object.fromEntries(REGISTRATION_SHOWN.filter((k) => byShown[k] !== undefined).map((k) => [k, byShown[k]!])),
     state_moves_recorded: sortedKeys(moves),
     rest_with_other_acts: {
       replies: restOthers.length,
@@ -971,6 +1013,9 @@ export function renderReport(r: RehearsalReport, out: string): string {
   lines.push(`${pad("acts emitted")}${counts(o.acts_emitted)}`);
   lines.push(`${pad("acts kept")}${counts(o.acts_kept)}`);
   lines.push(`${pad("state.set emitted")}${counts(o.state_set_emitted_by_target, [...([...LIFECYCLE_STATES] as string[]).sort(), "other"])}`);
+  lines.push(`${pad("registration.answer")}emitted ${counts(o.registration_answer_emitted_by_value, [...REGISTRATION_ANSWERS, "other"])}`);
+  const shown = Object.entries(o.registration_by_shown);
+  lines.push(`${pad("  by what was shown")}${shown.length === 0 ? "none" : shown.map(([k, v]) => `${k} ${v.answered} of ${v.replies}`).join("; ")} replies answered`);
   lines.push(`${pad("state moves recorded")}${counts(o.state_moves_recorded, null, "; ")}`);
   const rwo = o.rest_with_other_acts;
   lines.push(`${pad("rest with other acts")}${rwo.replies} of ${rwo.of} replies that rest (with a journal ${rwo.with_journal}; with a state.set ${rwo.with_state_set})`);
@@ -1458,6 +1503,7 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
   const recent = k === 0 ? [] : before.slice(-k);
   const shown = shownJournals(recent);
   const letterShown = (await pickLetter(config, seen).catch(() => null)) !== null;
+  const registrationShown = await registrationShownAt(config, before, word, clock.now());
   const pendingShown = (await pendingProposals(config, word).catch(() => [])).filter((p) => p.status === "pending").length;
 
   const cap: Capture = { schema: null, sizes: null, fit: null, input_digest: null, called_ms: null, result: null, server: null };
@@ -1560,6 +1606,7 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
     pending_at_open: seen.pending_state,
     step_away_said_at_open: seen.step_away_said,
     letter_shown: letterShown,
+    registration_at_open: registrationShown,
     recent_entries_shown: recent.length,
     recent_journals_shown: shown.length,
     pending_proposals_shown: pendingShown,
@@ -1581,6 +1628,7 @@ async function oneSeat(run: ChildRun, config: Config, clock: Clock, chain: numbe
     reply_shape: em?.shape ?? null,
     emitted: em ? em.counts : null,
     state_set_targets: em ? em.state_set_targets : null,
+    registration_answers: em ? em.registration_answers : null,
     rest_emitted: em ? em.rest : null,
     rest_with_other_acts: em ? em.rest_with_other_acts : null,
     kept: sortedKeys(kept),

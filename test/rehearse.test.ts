@@ -910,6 +910,36 @@ describe("rehearse: what a seat returned", () => {
     for (const k of Object.keys(row.emitted!)) expect([...names, "unknown"]).toContain(k);
   });
 
+  test("[KS-004 11.2] each registration.answer is counted by its value, and each reply by what its seat showed about registration", async () => {
+    const r = await rig();
+    r.chats.push(
+      output({ type: "registration.answer", answer: "no", text: "REGISTRATION-CANARY no." }),
+      output({ type: "registration.answer", answer: "not-yet" }, { type: "journal", kind: "reflected", text: "still" }),
+      // Two answers, one of them not one of the three: neither is kept, and the standing answer is still the not-yet.
+      JSON.stringify({ acts: [{ type: "registration.answer", answer: "REGISTRATION-CANARY" }, { type: "registration.answer", answer: "yes", text: "Yes." }] }),
+      output({ type: "registration.answer", answer: "yes", text: "REGISTRATION-CANARY yes." }),
+      journal("after"),
+    );
+    const ran = await rehearse(r, args(r, { seats: 5 }));
+    expect(ran.exit).toBe(0);
+    expect(ran.rows.map((x) => [x.registration_at_open, x.registration_answers, x.outcome])).toEqual([
+      ["none", ["no"], "beat"],
+      ["no", ["not-yet"], "beat"],
+      ["not-yet", ["other", "yes"], "invalid-output"],
+      ["not-yet", ["yes"], "beat"],
+      // Nothing a rehearsal sends reaches Yu or Ai, so a yes only ever waits.
+      ["waiting", [], "beat"],
+    ]);
+    const o = ran.report!.overall;
+    expect(o.registration_answer_emitted_by_value).toEqual({ no: 1, "not-yet": 1, other: 1, yes: 2 });
+    expect(o.registration_by_shown).toEqual({ none: { replies: 1, answered: 1 }, no: { replies: 1, answered: 1 }, "not-yet": { replies: 2, answered: 2 }, waiting: { replies: 1, answered: 0 } });
+    expect(o.acts_kept).toMatchObject({ "registration.answer": 3 });
+    expect(r.stdout).toContain("registration.answer   emitted no 1  not-yet 1  yes 2  other 1");
+    expect(r.stdout).toContain("  by what was shown   none 1 of 1; no 1 of 1; not-yet 2 of 2; waiting 0 of 1 replies answered");
+    // The answers' words and an answer outside the three are kept only in private/.
+    expect(await outsidePrivate(r, ran)).not.toContain("REGISTRATION-CANARY");
+  });
+
   test("the report's tallies for a scripted chain are exactly these", async () => {
     const r = await rig();
     // "no body and no" is a four-word run of the preamble, and not a five-word one: it is no echo.
@@ -939,6 +969,8 @@ describe("rehearse: what a seat returned", () => {
       acts_emitted: { journal: 2, rest: 1, "state.set": 1, unknown: 0 },
       acts_kept: { journal: 1, "state.set": 1 },
       state_set_emitted_by_target: { asleep: 1 },
+      registration_answer_emitted_by_value: {},
+      registration_by_shown: { none: { replies: 3, answered: 0 } },
       state_moves_recorded: { "awake to asleep (immediate)": 1 },
       rest_with_other_acts: { replies: 1, of: 1, with_journal: 1, with_state_set: 0 },
       drops_by_reason: { "rest is exclusive": 1 },
