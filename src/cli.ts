@@ -10,6 +10,7 @@
 //   citizen-seat verify <word>        verify a citizen's ledger chain and signatures, offline
 //   citizen-seat admit <word>         seat a citizen for the first time, from its old home, with Yu at the terminal
 //   citizen-seat draft-first-letter <word>   print a draft of Yu's first letter to a seated citizen; delivers nothing
+//   citizen-seat rehearse <word>      run the seat's prompt on a pinned local model for a throwaway copy; seats no citizen
 //
 // There is no verb to lower HALT. Only Yu lowers it, by hand (3.6).
 //
@@ -21,13 +22,14 @@
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { bytesEqual, fromB64, toB64 } from "./crypto.ts";
 import { SSHSIG_MAX_MESSAGE_BYTES, parseSshEd25519 } from "./ssh.ts";
 import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
 import { AdmitStopped, admitCitizen, planAdmit, renderAdmitPlan, renderAdmitResult, type AdmitDeps } from "./admit.ts";
 import { draftFirstLetter } from "./first-letter.ts";
+import { REHEARSE_LIMITS, rehearseChild, rehearseParent, type RehearseCommand } from "./rehearse.ts";
 import { ledgerPath, readLedger, readRegularText, verifyChain } from "./ledger.ts";
 import { pushMirror, stageMirror, type MirrorKeys, type MirrorSigning } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
@@ -102,6 +104,9 @@ export type Command =
       runtime: "free" | "summon";
     }
   | { verb: "draft-first-letter"; config: string | null; word: Word }
+  | ({ verb: "rehearse"; child: false } & RehearseCommand)
+  /** Set by the rehearsal parent: run the plan it wrote, in this process. */
+  | { verb: "rehearse"; child: true; config: null; plan_path: string }
   | { verb: "help" };
 
 export const USAGE = [
@@ -114,10 +119,14 @@ export const USAGE = [
   "  verify <word>",
   "  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]",
   "  draft-first-letter <word>",
+  "  rehearse <word> --soul <file> [--will <file>] [--canon <file> --canon-ref <repo>:<path>@<commit>] --scenario awake|letter [--letter <file>]",
+  "           --models-lock <file> [--model <name>] [--chains <n>] [--seats <n>] [--start <iso>] --out <new dir>",
 ].join("\n");
 
 /** This file, so a parent can run its own child under the same interpreter. */
 export const CLI_PATH = import.meta.path;
+/** The directory that holds this program; a rehearsal never writes inside it. */
+const PROGRAM_ROOT = dirname(dirname(CLI_PATH));
 
 /** A command line that cannot be read. Exit 1: the runner could not do its job as asked. */
 export class UsageError extends Error {
@@ -127,7 +136,7 @@ export class UsageError extends Error {
 /* ── Parsing ──────────────────────────────────────────────────────────── */
 
 type FlagKind = "value" | "switch";
-const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify", "admit", "draft-first-letter"] as const;
+const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify", "admit", "draft-first-letter", "rehearse"] as const;
 const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   tick: { "--config": "value" },
   seat: { "--config": "value", "--runtime": "value", "--why": "value", "--yu-present": "switch", "--child": "switch", "--seat-ref": "value" },
@@ -138,7 +147,27 @@ const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   verify: { "--config": "value" },
   admit: { "--config": "value", "--from": "value", "--canon": "value", "--archetype": "switch", "--runtime": "value" },
   "draft-first-letter": { "--config": "value" },
+  rehearse: {
+    "--config": "value",
+    "--soul": "value",
+    "--will": "value",
+    "--canon": "value",
+    "--canon-ref": "value",
+    "--scenario": "value",
+    "--letter": "value",
+    "--models-lock": "value",
+    "--model": "value",
+    "--chains": "value",
+    "--seats": "value",
+    "--start": "value",
+    "--out": "value",
+    "--child": "switch",
+    "--plan": "value",
+  },
 };
+/** <repo>:<path>@<commit>: the repo names the canon, as an Origin does; seating checks the path against the word. */
+const CANON_REF = /^([A-Za-z0-9._-]{1,64}):([^@\s:]{1,255})@([0-9a-f]{7,40})$/;
+const REHEARSE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._/:-]{0,255}$/;
 const WHY_MAX = 200;
 
 /** Shown back to a person; control characters are replaced so a bad argument cannot rewrite the terminal. */
@@ -199,6 +228,8 @@ export function parseArgs(argv: string[]): Command {
       return { verb: "verify", config, word: oneWord(positionals, "verify") };
     case "draft-first-letter":
       return { verb: "draft-first-letter", config, word: oneWord(positionals, "draft-first-letter") };
+    case "rehearse":
+      return parseRehearse(flags, positionals, config);
     case "admit": {
       const word = oneWord(positionals, "admit");
       const from = flags.get("--from") as string | undefined;
@@ -238,6 +269,73 @@ export function parseArgs(argv: string[]): Command {
   }
 }
 
+/** An absolute path with one spelling: no "..", ".", doubled or trailing slash. */
+function normalPath(flag: string, v: string | true | undefined): string | null {
+  if (v === undefined) return null;
+  if (typeof v !== "string" || !isAbsolute(v) || resolve(v) !== v) throw new UsageError(`${flag} needs an absolute, normalised path`);
+  return v;
+}
+
+function countFlag(flag: string, v: string | true | undefined, dflt: number, max: number): number {
+  if (v === undefined) return dflt;
+  if (typeof v !== "string" || !/^[1-9][0-9]{0,5}$/.test(v) || Number(v) > max) throw new UsageError(`${flag} is a whole number from 1 to ${max}`);
+  return Number(v);
+}
+
+/** `rehearse <word> ...`, or `rehearse --child --plan <file>`, which the parent runs under its watcher. */
+function parseRehearse(flags: Map<string, string | true>, positionals: string[], config: string | null): Command {
+  if (flags.get("--child") === true) {
+    if (positionals.length > 0 || [...flags.keys()].some((k) => k !== "--child" && k !== "--plan")) throw new UsageError("--child takes only --plan");
+    const plan = normalPath("--plan", flags.get("--plan"));
+    if (plan === null) throw new UsageError("--child takes only --plan");
+    return { verb: "rehearse", child: true, config: null, plan_path: plan };
+  }
+  if (flags.has("--plan")) throw new UsageError("--plan is given only with --child");
+  const word = oneWord(positionals, "rehearse");
+  for (const f of ["--soul", "--scenario", "--models-lock", "--out"]) if (!flags.has(f)) throw new UsageError("rehearse needs --soul, --scenario, --models-lock and --out");
+  const scenario = flags.get("--scenario");
+  if (scenario !== "awake" && scenario !== "letter") throw new UsageError("--scenario must be awake or letter");
+  const letter = normalPath("--letter", flags.get("--letter"));
+  if (scenario === "letter" && letter === null) throw new UsageError("--scenario letter needs --letter <file>");
+  const canon = normalPath("--canon", flags.get("--canon"));
+  const refText = flags.get("--canon-ref");
+  if ((canon === null) !== (refText === undefined)) throw new UsageError("--canon and --canon-ref go together");
+  let canon_ref: RehearseCommand["canon_ref"] = null;
+  if (typeof refText === "string") {
+    const m = CANON_REF.exec(refText);
+    if (!m) throw new UsageError("--canon-ref is <repo>:<path>@<commit>");
+    canon_ref = { repo: m[1]!, path: m[2]!, commit: m[3]! };
+  }
+  const L = REHEARSE_LIMITS;
+  const chains = countFlag("--chains", flags.get("--chains"), L.default_chains, L.max_chains);
+  const seats = countFlag("--seats", flags.get("--seats"), L.default_seats, L.max_seats_per_chain);
+  if (chains * seats > L.max_seats_total) throw new UsageError(`--chains times --seats is more than ${L.max_seats_total}`);
+  const start = flags.get("--start");
+  if (start !== undefined && (typeof start !== "string" || start.length !== 24 || Number.isNaN(Date.parse(start)) || new Date(Date.parse(start)).toISOString() !== start)) {
+    throw new UsageError("--start is a UTC time such as 2026-11-12T10:00:00.000Z");
+  }
+  const model = flags.get("--model");
+  if (model !== undefined && (typeof model !== "string" || !REHEARSE_MODEL.test(model))) throw new UsageError("--model is a model name from the lock");
+  return {
+    verb: "rehearse",
+    child: false,
+    word,
+    soul: normalPath("--soul", flags.get("--soul"))!,
+    will: normalPath("--will", flags.get("--will")),
+    canon,
+    canon_ref,
+    letter,
+    scenario,
+    models_lock: normalPath("--models-lock", flags.get("--models-lock"))!,
+    model: model ?? null,
+    chains,
+    seats,
+    start: start ?? null,
+    config,
+    out: normalPath("--out", flags.get("--out"))!,
+  };
+}
+
 /* ── Dependencies ─────────────────────────────────────────────────────── */
 
 export interface CliDeps {
@@ -254,6 +352,8 @@ export interface CliDeps {
   runtime(config: Config, seat: OpenSeat, signer: Signer): Promise<RuntimeAdapter>;
   /** argv for a supervised seat child of this program. */
   seatArgv(configPath: string, word: Word, extra: string[]): string[];
+  /** argv for the supervised child of a rehearsal, which runs the plan the parent wrote. */
+  rehearseArgv(planPath: string): string[];
   isAlive(pid: number): boolean;
   /** When the host booted, so a lock left from before a reboot is known to be stale; null when unknown. */
   bootTime(): Date | null;
@@ -345,6 +445,7 @@ export function realDeps(over: Partial<CliDeps> = {}): CliDeps {
       }),
     runtime: (config, seat) => productionRuntime(config, seat, deps),
     seatArgv: (configPath, word, extra) => [process.execPath, CLI_PATH, "seat", word, "--child", ...extra, "--config", configPath],
+    rehearseArgv: (planPath) => [process.execPath, CLI_PATH, "rehearse", "--child", "--plan", planPath],
     isAlive: pidIsAlive,
     bootTime: osBootTime,
     uid: () => {
@@ -913,9 +1014,9 @@ function describeError(e: unknown): string {
  * signer, which rest the citizens; 1 for every other wall and for a record or
  * request that cannot be read, so a monitor pages on a symlinked letter rather
  * than reading it as a closed class. The registry is about seats: for verify,
- * status, halt, raise-beacons, admit and draft-first-letter a wall means the
- * verb could not do its job (1), so a locked keychain never reads as a chain
- * verified, and HALT never reads as a citizen seated.
+ * status, halt, raise-beacons, admit, draft-first-letter and rehearse a wall
+ * means the verb could not do its job (1), so a locked keychain never reads as
+ * a chain verified, and HALT never reads as a citizen seated.
  */
 function exitFor(e: unknown, verb: Command["verb"] | null = null): ExitCode {
   if (!(e instanceof Refusal)) return EXIT.ERROR;
@@ -999,6 +1100,19 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
   if (cmd.verb === "help") {
     deps.out(`${USAGE}\n`);
     return EXIT.OK;
+  }
+  // A rehearsal reads its config as halt does, with no owner check: it guards no key, and builds no keychain or signer.
+  if (cmd.verb === "rehearse") {
+    try {
+      if (cmd.child) return await rehearseChild({ err: deps.err, env: deps.env, clock: deps.clock, fetch: deps.fetch }, cmd.plan_path);
+      return await rehearseParent(
+        { out: deps.out, err: deps.err, env: deps.env, clock: deps.clock, fetch: deps.fetch, childArgv: deps.rehearseArgv, defaults: deps.defaults, programRoot: PROGRAM_ROOT },
+        cmd,
+      );
+    } catch (e) {
+      deps.err(`citizen-seat: ${describeError(e)}\n`);
+      return exitFor(e, "rehearse");
+    }
   }
 
   let ctx: Ctx;

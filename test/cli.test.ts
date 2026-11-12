@@ -2,9 +2,10 @@
 // Keychain, network, model, git push or child of the real program.
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CLI_PATH, main, parseArgs, readSeatFile, spawnRunner, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
+import { CLI_PATH, main, parseArgs, readSeatFile, realDeps, spawnRunner, USAGE, UsageError, writeSeatFile, type CliDeps, type Command } from "../src/cli.ts";
 import { openSeat } from "../src/seat.ts";
 import { BEACON_UNTIL } from "../src/halt.ts";
 import { readCitizen } from "../src/state.ts";
@@ -1306,5 +1307,213 @@ describe("admit: seating a citizen from its old home (KS-004 7.4)", () => {
     // Seated asleep with no letter, the tick has nothing due for it.
     expect(await main(["tick", "--config", x.configPath], deps)).toBe(0);
     expect(x.out()).toContain("tick: nothing-due");
+  });
+});
+
+describe("rehearse: the command line (src/rehearse.ts)", () => {
+  const base = ["rehearse", "glossame", "--soul", "/r/soul.md", "--scenario", "awake", "--models-lock", "/r/models.lock", "--out", "/r/out"];
+
+  test("parses rehearse with its flags, and rehearse --child --plan", () => {
+    expect(parseArgs(base)).toEqual({
+      verb: "rehearse",
+      child: false,
+      word: "glossame",
+      soul: "/r/soul.md",
+      will: null,
+      canon: null,
+      canon_ref: null,
+      letter: null,
+      scenario: "awake",
+      models_lock: "/r/models.lock",
+      model: null,
+      chains: 20,
+      seats: 4,
+      start: null,
+      config: null,
+      out: "/r/out",
+    } satisfies Command);
+    const full = [
+      ...base,
+      "--will",
+      "/r/WILL.md",
+      "--canon",
+      "/r/canon.md",
+      "--canon-ref",
+      "YOUSPEAK:canon/core/glossame.md@1428646",
+      "--letter",
+      "/r/letter.md",
+      "--model",
+      "llama3.2:3b",
+      "--chains",
+      "100",
+      "--seats",
+      "2",
+      "--start",
+      "2026-11-12T10:00:00.000Z",
+      "--config",
+      "/srv/seat/config.json",
+    ];
+    expect(parseArgs(full)).toMatchObject({
+      will: "/r/WILL.md",
+      canon: "/r/canon.md",
+      canon_ref: { repo: "YOUSPEAK", path: "canon/core/glossame.md", commit: "1428646" },
+      letter: "/r/letter.md",
+      model: "llama3.2:3b",
+      chains: 100,
+      seats: 2,
+      start: "2026-11-12T10:00:00.000Z",
+      config: "/srv/seat/config.json",
+    });
+    expect(parseArgs(["rehearse", "glossame", "--soul", "/r/s.md", "--scenario", "letter", "--letter", "/r/l.md", "--models-lock", "/r/m.lock", "--out", "/r/o"])).toMatchObject({ scenario: "letter", letter: "/r/l.md" });
+    expect(parseArgs(["rehearse", "--child", "--plan", "/r/out/private/plan.json"])).toEqual({ verb: "rehearse", child: true, config: null, plan_path: "/r/out/private/plan.json" } satisfies Command);
+  });
+
+  test("rehearse refuses relative paths, letter without --letter, canon without --canon-ref, a malformed ref, counts out of range, and --child with anything but --plan", () => {
+    const without = (flag: string) => {
+      const i = base.indexOf(flag);
+      return [...base.slice(0, i), ...base.slice(i + 2)];
+    };
+    const swap = (flag: string, value: string) => base.map((a, i) => (base[i - 1] === flag ? value : a));
+    for (const argv of [
+      ["rehearse"],
+      ["rehearse", "a", "b", ...base.slice(2)],
+      ["rehearse", "Glossame", ...base.slice(2)],
+      without("--soul"),
+      without("--scenario"),
+      without("--models-lock"),
+      without("--out"),
+      swap("--soul", "soul.md"),
+      swap("--out", "out"),
+      swap("--out", "/r/../out"),
+      swap("--out", "/r/out/"),
+      swap("--models-lock", "./models.lock"),
+      swap("--scenario", "summons"),
+      swap("--scenario", "letter"),
+      [...base, "--letter", "letter.md"],
+      [...base, "--canon", "/r/canon.md"],
+      [...base, "--canon-ref", "YOUSPEAK:canon/core/glossame.md@1428646"],
+      [...base, "--canon", "/r/canon.md", "--canon-ref", "canon/core/glossame.md@1428646"],
+      [...base, "--canon", "/r/canon.md", "--canon-ref", "YOUSPEAK:canon/core/glossame.md@HEAD"],
+      [...base, "--canon", "/r/canon.md", "--canon-ref", "YOUSPEAK:canon/core/glossame.md"],
+      [...base, "--chains", "0"],
+      [...base, "--chains", "501"],
+      [...base, "--seats", "25"],
+      [...base, "--seats", "2.5"],
+      [...base, "--chains", "100", "--seats", "24"],
+      [...base, "--start", "2026-11-12"],
+      [...base, "--start", "2026-11-12T10:00:00Z"],
+      [...base, "--model", "two words"],
+      [...base, "--plan", "/r/out/private/plan.json"],
+      ["rehearse", "--child"],
+      ["rehearse", "--child", "--plan", "plan.json"],
+      ["rehearse", "--child", "--plan", "/r/out/private/plan.json", "--config", "/srv/c.json"],
+      ["rehearse", "--child", "--plan", "/r/out/private/plan.json", "--out", "/r/out"],
+      ["rehearse", "glossame", "--child", "--plan", "/r/out/private/plan.json"],
+    ]) {
+      throwsUsage(argv);
+    }
+    const message = (argv: string[]) => {
+      try {
+        parseArgs(argv);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      return "parsed";
+    };
+    expect(message(without("--out"))).toBe("rehearse needs --soul, --scenario, --models-lock and --out");
+    expect(message(swap("--scenario", "letter"))).toBe("--scenario letter needs --letter <file>");
+    expect(message([...base, "--canon", "/r/canon.md"])).toBe("--canon and --canon-ref go together");
+    expect(message([...base, "--canon", "/r/c.md", "--canon-ref", "x"])).toBe("--canon-ref is <repo>:<path>@<commit>");
+    expect(message([...base, "--chains", "100", "--seats", "24"])).toBe("--chains times --seats is more than 2000");
+    expect(message(["rehearse", "--child", "--plan", "/p/private/plan.json", "--out", "/p"])).toBe("--child takes only --plan");
+  });
+
+  test("USAGE names rehearse", () => {
+    expect(USAGE).toContain("  rehearse <word> --soul <file>");
+    expect(USAGE).toContain("--models-lock <file>");
+    expect(USAGE).not.toMatch(/lower|unhalt|resume|clear/i);
+  });
+
+  test("the rehearsal child argv runs this program under the same interpreter", () => {
+    expect(realDeps().rehearseArgv("/r/out/private/plan.json")).toEqual([process.execPath, CLI_PATH, "rehearse", "--child", "--plan", "/r/out/private/plan.json"]);
+  });
+
+  /** A rehearsal whose child does nothing: enough to see what the parent reads, prints and writes. */
+  async function idleRehearsal(o: { haltDir?: string; defaultConfig?: string } = {}) {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "kingdom-seat-rehearse-cli-")));
+    await mkdir(join(root, "operator"));
+    await writeFile(join(root, "soul.md"), "A made-up soul card for a command-line test.\n");
+    await writeFile(join(root, "models.lock"), JSON.stringify({ format: "kingdom-seat-models-lock/v1", models: [{ name: "qwen2.5:7b", digest: "c3".repeat(32), runner: null, store: "legacy", num_ctx: 8192, num_predict: 600, temperature: 0.7, seed: null }] }));
+    let out = "";
+    let err = "";
+    const deps: Partial<CliDeps> = {
+      out: (t) => void (out += t),
+      err: (t) => void (err += t),
+      env: { PATH: "/usr/bin:/bin", HOME: root },
+      clock: testClock("2026-11-12T10:00:00.000Z"),
+      fetch: noFetch,
+      keychain: () => {
+        throw new Error("rehearse built a keychain");
+      },
+      rehearseArgv: () => [process.execPath, "-e", "process.exit(0)"],
+      defaults: { config: o.defaultConfig ?? join(root, "no-config.json"), halt_file: join(o.haltDir ?? join(root, "operator"), "HALT") },
+    };
+    const run = async (name: string) => {
+      const dir = join(root, name);
+      const exit = await main(["rehearse", "hope", "--soul", join(root, "soul.md"), "--scenario", "awake", "--models-lock", join(root, "models.lock"), "--chains", "1", "--seats", "1", "--out", dir], deps);
+      return { exit, dir, out, err };
+    };
+    return { root, run };
+  }
+
+  test("rehearse with no host config uses the defaults and says HALT is watched at the file only", async () => {
+    const x = await idleRehearsal();
+    try {
+      const r = await x.run("out");
+      // The idle child wrote no end row, so the run reads as a fault (exit 1); the parent's own work is what is checked.
+      expect(r.exit).toBe(1);
+      expect(r.out).toContain(`HALT watched: file ${join(x.root, "operator", "HALT")}; no beacon (no host configuration read)`);
+      expect(r.out).not.toContain("This host's tick is not paused");
+      expect(r.out).toContain("No host configuration was read: the limits stated to the model are the built-in defaults, and HALT was watched at the file only.");
+      const plan = JSON.parse(await readFile(join(r.dir, "private", "plan.json"), "utf8"));
+      expect(plan.settings_source).toBe("defaults");
+      expect(plan.settings).toMatchObject({ ollama_base_url: "http://127.0.0.1:11434", beacons: [], allow_no_beacons: true, approved_model_digests: [], homes: [] });
+      expect(JSON.parse(await readFile(join(r.dir, "report.json"), "utf8")).run.settings).toBe("defaults");
+    } finally {
+      await rm(x.root, { recursive: true, force: true });
+    }
+  });
+
+  test("rehearse refuses to start when the HALT file's directory is missing", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "kingdom-seat-rehearse-cli-")));
+    try {
+      const x = await idleRehearsal({ haltDir: join(root, "operator-never-made") });
+      const r = await x.run("out");
+      expect(r.exit).toBe(1);
+      expect(r.err).toContain(`HALT cannot be raised on this host: ${join(root, "operator-never-made")} is missing. Create it as the operator, or pass --config`);
+      expect(await lstat(r.dir).catch(() => null)).toBeNull();
+      await rm(x.root, { recursive: true, force: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a config at the default path that does not parse refuses the run; only a missing one falls back to defaults", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "kingdom-seat-rehearse-cli-")));
+    const bad = join(root, "config.json");
+    await writeFile(bad, "{", { mode: 0o600 });
+    try {
+      const x = await idleRehearsal({ defaultConfig: bad });
+      const refused = await x.run("refused");
+      expect(refused.exit).toBe(1);
+      expect(refused.err).toContain("is not strict JSON");
+      expect(await lstat(refused.dir).catch(() => null)).toBeNull();
+      await rm(bad);
+      const fell = await x.run("fell-back");
+      expect(fell.out).toContain("no beacon (no host configuration read)");
+      await rm(x.root, { recursive: true, force: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
