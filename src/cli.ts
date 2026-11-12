@@ -8,6 +8,7 @@
 //   citizen-seat raise-beacons        the signer's half of halt, as the seat user (that fixed call)
 //   citizen-seat status               regenerate and print the status file
 //   citizen-seat verify <word>        verify a citizen's ledger chain and signatures, offline
+//   citizen-seat admit <word>         seat a citizen for the first time, from its old home, with Yu at the terminal
 //
 // There is no verb to lower HALT. Only Yu lowers it, by hand (3.6).
 //
@@ -24,6 +25,7 @@ import { bytesEqual, fromB64, toB64 } from "./crypto.ts";
 import { SSHSIG_MAX_MESSAGE_BYTES, parseSshEd25519 } from "./ssh.ts";
 import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
+import { AdmitStopped, admitCitizen, planAdmit, renderAdmitPlan, renderAdmitResult, type AdmitDeps } from "./admit.ts";
 import { ledgerPath, readLedger, readRegularText, verifyChain } from "./ledger.ts";
 import { pushMirror, stageMirror, type MirrorKeys, type MirrorSigning } from "./mirror.ts";
 import { openSeat, readSeatFile, runSeat, seatEnv, superviseChild, writeSeatFile, type OpenSeat } from "./seat.ts";
@@ -86,6 +88,17 @@ export type Command =
   | { verb: "raise-beacons"; config: string | null }
   | { verb: "status"; config: string | null; json: boolean }
   | { verb: "verify"; config: string | null; word: Word }
+  | {
+      verb: "admit";
+      config: string | null;
+      word: Word;
+      /** The old `citizen-<word>` clone to read, by absolute path. */
+      from: string;
+      /** The canon file in a clone of the canon, or null with `archetype`. Exactly one of the two names the origin. */
+      canon: string | null;
+      archetype: boolean;
+      runtime: "free" | "summon";
+    }
   | { verb: "help" };
 
 export const USAGE = [
@@ -96,6 +109,7 @@ export const USAGE = [
   "  raise-beacons",
   "  status [--json]",
   "  verify <word>",
+  "  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]",
 ].join("\n");
 
 /** This file, so a parent can run its own child under the same interpreter. */
@@ -109,7 +123,7 @@ export class UsageError extends Error {
 /* ── Parsing ──────────────────────────────────────────────────────────── */
 
 type FlagKind = "value" | "switch";
-const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify"] as const;
+const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify", "admit"] as const;
 const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   tick: { "--config": "value" },
   seat: { "--config": "value", "--runtime": "value", "--why": "value", "--yu-present": "switch", "--child": "switch", "--seat-ref": "value" },
@@ -118,6 +132,7 @@ const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   "raise-beacons": { "--config": "value" },
   status: { "--config": "value", "--json": "switch" },
   verify: { "--config": "value" },
+  admit: { "--config": "value", "--from": "value", "--canon": "value", "--archetype": "switch", "--runtime": "value" },
 };
 const WHY_MAX = 200;
 
@@ -177,6 +192,20 @@ export function parseArgs(argv: string[]): Command {
       return { verb: "status", config, json: flags.get("--json") === true };
     case "verify":
       return { verb: "verify", config, word: oneWord(positionals, "verify") };
+    case "admit": {
+      const word = oneWord(positionals, "admit");
+      const from = flags.get("--from") as string | undefined;
+      if (from === undefined || !isAbsolute(from)) throw new UsageError("admit needs --from, the absolute path of the old home");
+      const canon = (flags.get("--canon") as string | undefined) ?? null;
+      const archetype = flags.get("--archetype") === true;
+      // The host cannot guess an origin: some words have two canon entries, and some have none.
+      if ((canon !== null) === archetype) throw new UsageError("admit names the origin with exactly one of --canon <canon file> and --archetype");
+      if (canon !== null && !isAbsolute(canon)) throw new UsageError("--canon needs an absolute path");
+      // summon unless Yu names free: no unattended class is approved for a citizen until one is agreed.
+      const rt = (flags.get("--runtime") as string | undefined) ?? "summon";
+      if (rt !== "free" && rt !== "summon") throw new UsageError(`--runtime must be summon or free, not ${shown(rt)}`);
+      return { verb: "admit", config, word, from, canon, archetype, runtime: rt };
+    }
     case "seat": {
       const word = oneWord(positionals, "seat");
       const rt = (flags.get("--runtime") as string | undefined) ?? "free";
@@ -525,6 +554,61 @@ async function verbVerify(ctx: Ctx, word: Word): Promise<ExitCode> {
 }
 
 /**
+ * Seat a citizen for the first time (KS-004 7.4; admit.ts). Never unattended:
+ * it needs a terminal, shows Yu the whole plan, and asks for the scope typed
+ * back before anything is written. The plan is made, and read, with no lock
+ * held, so no tick yields for as long as Yu takes; the lock is taken only
+ * around the writes, where the checks are made again. There is no dry run:
+ * declining the confirmation writes nothing. Exit 0 only when this run
+ * seated the citizen.
+ */
+async function verbAdmit(ctx: Ctx, cmd: Extract<Command, { verb: "admit" }>): Promise<ExitCode> {
+  const { config } = ctx;
+  const halt = await haltNow(ctx);
+  if (!halt || halt.halted) throw new Refusal("halted", "HALT is raised or cannot be read; nothing was written");
+  // Before any git or signer call: with no terminal there is no one to show the plan to.
+  if (!ctx.deps.tty.isTTY) throw new Refusal("yu-not-present", "stdin is not a terminal, so Yu cannot be confirmed present; admit never runs unattended; nothing was written");
+  const signer = makeSigner(ctx);
+  const deps: AdmitDeps = {
+    config,
+    clock: ctx.deps.clock,
+    run: ctx.deps.run,
+    sign: (w, k, draft) => signer.signEntry(w, k, draft),
+    hostKey: () => signer.hostPublicKey(),
+    checkHalt: () => checkHalt({ config, fetch: ctx.deps.fetch, now: () => now(ctx) }),
+  };
+  const plan = await planAdmit(deps, { word: cmd.word, legacy_home: cmd.from, origin: cmd.canon !== null ? { kind: "canon", file: cmd.canon } : { kind: "archetype" }, runtime: cmd.runtime });
+  ctx.deps.out(renderAdmitPlan(plan));
+  await confirmYuPresent(ctx.deps.tty, `admit ${cmd.word}`, () => now(ctx));
+
+  let lock;
+  try {
+    lock = await acquireTickLock(config.paths.lock_dir, ctx.deps.clock, ctx.deps.isAlive, lockOptionsFor(config, ctx.deps.bootTime()));
+  } catch (e) {
+    if (e instanceof LockStuck) await note(ctx, "error", null, "error", null, `tick lock stuck since ${e.since}; a person must remove it`);
+    throw e;
+  }
+  if (!lock) {
+    ctx.deps.out(`admit ${cmd.word}: a tick or a seat holds the lock. Try again shortly; nothing was written\n`);
+    return EXIT.ERROR;
+  }
+  let result;
+  try {
+    result = await admitCitizen(deps, plan);
+  } catch (e) {
+    if (!(e instanceof AdmitStopped)) throw e;
+    // Its own line says what was removed and what, if anything, is left to look at.
+    ctx.deps.err(`citizen-seat: ${e.message}\n`);
+    return EXIT.ERROR;
+  } finally {
+    await releaseTickLock(lock);
+  }
+  ctx.deps.out(renderAdmitResult(result));
+  await refreshStatus(ctx, signer).catch(() => {});
+  return EXIT.OK;
+}
+
+/**
  * After a seat, stage and push the mirror when the seat changed what it
  * shows: any beat, or a rest that kept a move of state (KS-004 B2 C7), which
  * would otherwise leave the card's old state up until the next beat. A rest
@@ -812,8 +896,9 @@ function describeError(e: unknown): string {
  * signer, which rest the citizens; 1 for every other wall and for a record or
  * request that cannot be read, so a monitor pages on a symlinked letter rather
  * than reading it as a closed class. The registry is about seats: for verify,
- * status, halt and raise-beacons a wall means the verb could not do its job
- * (1), so a locked keychain never reads as a chain verified.
+ * status, halt, raise-beacons and admit a wall means the verb could not do
+ * its job (1), so a locked keychain never reads as a chain verified, and HALT
+ * never reads as a citizen seated.
  */
 function exitFor(e: unknown, verb: Command["verb"] | null = null): ExitCode {
   if (!(e instanceof Refusal)) return EXIT.ERROR;
@@ -923,6 +1008,8 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
         return await verbStatus(ctx, cmd.json);
       case "verify":
         return await verbVerify(ctx, cmd.word);
+      case "admit":
+        return await verbAdmit(ctx, cmd);
       case "seat":
         return cmd.child ? await verbSeatChild(ctx, cmd) : await verbSeatParent(ctx, cmd);
     }
