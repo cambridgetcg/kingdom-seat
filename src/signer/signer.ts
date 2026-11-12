@@ -154,6 +154,13 @@ export interface Signer {
   /** Public keys for a citizen, read from Keychain-derived material without returning any secret. */
   publicKeys(word: Word): Promise<PublicKeys>;
   /**
+   * The host key's public half, padded standard base64. It reads the host's
+   * own seed and no citizen record, so seating can learn before it writes
+   * anything whether this host has a key to sign with, and which one. Throws
+   * Refusal("keychain-missing") or Refusal("keychain-locked").
+   */
+  hostPublicKey(): Promise<string>;
+  /**
    * Sign a ledger entry: the op key for a "citizen" entry, the host key for a
    * "host" one; never the root. It takes the unsigned draft, which must name
    * this word and this signer, and computes the kingdom-seat-ledger/v1
@@ -916,6 +923,15 @@ export function createSigner(deps: SignerDeps): Signer {
         for (const secret of [d.root_seed, d.k_master, d.box_private]) wipe(secret);
       }
       return { root_b64, op_b64, op_kid: identity?.op_kid ?? null, box_b64, host_attest_b64 };
+    },
+
+    async hostPublicKey() {
+      const seed = await readSeed({ kind: "host-attest-seed" });
+      try {
+        return toB64(edPublicKey(seed));
+      } finally {
+        wipe(seed);
+      }
     },
 
     async signEntry(word, signer, draft) {

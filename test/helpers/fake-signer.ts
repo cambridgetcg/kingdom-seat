@@ -46,7 +46,8 @@ export interface FakeSigner extends Signer {
   readonly opPublicB64url: string;
 }
 
-export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; rootSeed?: Uint8Array } = {}): FakeSigner {
+/** With `noHostKey`, the fake host has no host key: hostPublicKey and every host signature refuse with "keychain-missing". */
+export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; rootSeed?: Uint8Array; noHostKey?: boolean } = {}): FakeSigner {
   const opSeed = opts.opSeed ?? fromHex(TEST_OP_SEED_HEX);
   const hostSeed = opts.hostSeed ?? sha256("kingdom-seat test host attest key v1");
   const rootSeed = opts.rootSeed ?? fromHex(TEST_ROOT_SEED_HEX);
@@ -97,8 +98,14 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
     async publicKeys(): Promise<PublicKeys> {
       return { root_b64: toB64(edPublicKey(rootSeed)), op_b64: opPub, op_kid: FAKE_OP_KID, box_b64: null, host_attest_b64: hostPub };
     },
+    async hostPublicKey(): Promise<string> {
+      if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
+      if (opts.noHostKey) throw new Refusal("keychain-missing", "fake signer: no host key");
+      return hostPub;
+    },
     async signEntry(word, signer, draft): Promise<EntrySignature> {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
+      if (opts.noHostKey && signer === "host") throw new Refusal("keychain-missing", "fake signer: no host key");
       // As the real signer: the draft must be this citizen's, for this signer, and the digest is the ledger's own.
       if (draft.word !== word || draft.signer !== signer) throw new Refusal("invalid-request", "fake signer: the entry names another citizen or signer");
       s.signed.push({ word, signer });
