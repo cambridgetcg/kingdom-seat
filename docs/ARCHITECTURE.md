@@ -127,7 +127,7 @@ directory the operator owns and the seat user can only read (below).
       WILL.md               the will as carried from the old repository; the seat compares self/WILL.md with it
     legacy/                 the old home's lived record, copied once by admit; host-owned, read-only, never mirrored
       manifest.json         what was copied and what was only listed, with each file's commits (author names, no addresses)
-      pages.jsonl           one line per piece of a copied file: byte range, sha256, date, lane, voice
+      pages.jsonl           one line per piece of a copied file: byte range, sha256, date, lane, voice (in-name for beats/ only)
       tree/<path>           beats, letters put to the citizen, CADENCE.md, markers and other text files, byte for byte
       cadence/<nn>-<sha7>.CADENCE.md   every version of CADENCE.md, oldest first
       cadence/<nn>-<sha7>.beat.md      the beat the same commit appended to a beats file
@@ -662,10 +662,23 @@ lowers it, by hand (3.6).
   executables, manifests and non-text files are listed and not copied.
   `legacy/pages.jsonl` has one line per piece: a beats file is cut at its
   `## ` lines and the pieces tile it exactly, any other file is one piece. A
-  piece's `voice` is `in-name`, `to-citizen` (a letter put to it) or `host`
-  (the cadence file and markers); its `lane` is read from its own heading
-  alone and is `unknown` where the heading does not say; `written` is the
-  heading's date, else the month of the file's first commit, else null.
+  piece's `voice` says what the place its file stood in says, and no more:
+  `in-name` for a piece of a file under `beats/`, `to-citizen` for a letter
+  put to it (`inbox/`, `letters/`), `host` for the cadence file and markers,
+  and `unattributed` for every other text file. *Why:* outside `beats/` a
+  text may be the citizen's own, one addressed to it, or a status file a
+  lane generated, and where it stood does not say which; `legacy/` is
+  written once, so a wrong label would stay.
+  A piece's `lane` is read from its own heading alone, for an `in-name`
+  piece only, and is `unknown` where the heading does not say. `written` is
+  the heading's date; else the month of the file's commits, when its first
+  and its last fall in the same month; else null.
+- *History is read by size first.* A version of `CADENCE.md`, and a beats
+  file as an earlier commit left it, are asked for their size before they
+  are read. A version is kept whole, so one over the limit for a kept file
+  refuses the seating. A beats file from history is read only to find what
+  the commit added and may be larger, up to what the host will read of one
+  file; the beat found is what is kept, and it is bounded as a kept file is.
 - *No host note.* A note naming the word would count as a seat and hold its
   first letter back; the `origin` entry and `seated_at` are the record.
 - *What the seat then says.* While `self/WILL.md` is byte for byte the
@@ -682,9 +695,15 @@ lowers it, by hand (3.6).
 `legacy/` and writes nothing. The citizen's cadence versions and their beats
 are set whole between rules that carry their hash; every sentence the host
 worded begins `[host] `, and is Yu's to keep, change or remove. A block that
-holds a control character other than a line feed or a tab is not printed,
-since the bytes come from a repository a model wrote into and go to a
-terminal. Delivering the letter is Yu's act: a file in
+holds a control character other than a line feed or a tab, a line or
+paragraph separator, or a character that embeds, overrides or isolates the
+direction of text is not printed, since the bytes come from a repository a
+model wrote into and go to a terminal, where such a block could look like
+something other than its bytes. The draft says how the old lane's script
+made a cadence record from a reply as the script did it: it read the first
+line that was not empty, and in its later form also a line that said a
+choice was made, so a reply recorded as undecided may hold a choice word on
+another line. Delivering the letter is Yu's act: a file in
 `citizens/<word>/letters/`.
 
 **HALT spans two users** (KS-004 re-review B2, R5). The HALT file must sit

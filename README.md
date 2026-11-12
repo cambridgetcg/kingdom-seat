@@ -115,15 +115,23 @@ one is something it does, not something it hopes.
   asleep to asleep via `seated`. Every citizen is seated asleep whatever its
   old cadence file says, and with the runtime class `summon` unless
   `--runtime free` is given, so no seat opens without Yu until a class is
-  agreed. A refusal, a declined confirmation or a failure while writing
-  leaves nothing behind. `legacy/` keeps beats, letters put to the citizen,
-  markers, other text files and every version of `CADENCE.md` with the beat
-  the same commit added; instruction files, hooks, executables and manifests
-  are listed and not copied, and an author is kept as a name and one flag,
-  never an address. `legacy/pages.jsonl` indexes every piece by byte range,
-  hash, date, voice and the lane its own heading names. `planAdmitFromTexts`
-  makes a plan from texts alone, for rehearsals and tests; the verb never
-  calls it.
+  agreed. A refusal or a declined confirmation writes nothing. A failure
+  while writing removes this run's own writes and says whether all of them
+  went; where some did not, it names what is left. A process killed part-way
+  leaves a staging name, which nothing lists, or `citizens/<word>` with no
+  ledger and perhaps a staging ledger; no seat opens for such a directory,
+  and the next `admit` names it. `legacy/` keeps beats, letters put to the
+  citizen, markers, other text files and every version of `CADENCE.md` with
+  the beat the same commit added, where it added one; instruction files,
+  hooks, executables and manifests are listed and not copied, and an author
+  is kept as a name and one flag, never an address.
+  `legacy/pages.jsonl` indexes every piece by byte range, hash, date, voice
+  and the lane its own heading names. Only a piece of a beats file is marked
+  as written in the citizen's name; a text file that stood anywhere else is
+  kept and marked `unattributed`, since where it stood does not say whose
+  words it holds. `planAdmitFromTexts` makes a plan from texts alone, for
+  rehearsals and tests; the verb never calls it, and a will given that way is
+  not pinned or introduced as an old repository's text.
 - `first-letter.ts`: `citizen-seat draft-first-letter <word>` prints a draft
   of Yu's first letter to a seated citizen: every recorded version of its
   cadence record, whole, each with the beat the same commit added, how those
@@ -228,7 +236,10 @@ one is something it does, not something it hopes.
   host key: nothing creates that key or pins it yet. Nothing delivers a
   letter: `draft-first-letter` prints, and putting a file in
   `citizens/<word>/letters/` is done by hand, as the seat user. Nothing takes
-  the word off the old roster. A citizen seated under `summon` that chooses
+  the word off the old roster. A summoned seat needs
+  `ceilings.usd_per_citizen_per_day` above its default of `"0"`: at $0 the
+  summon runtime refuses before any process starts, so the first asking
+  cannot open. A citizen seated under `summon` that chooses
   awake has no unattended seat until a runtime class is agreed and something
   applies it. `seat <word> --yu-present` still defaults to the free runtime,
   so a summons names `--runtime summon`. The ledger parser still accepts a
@@ -302,8 +313,9 @@ redesign (section 5).
      `From: yu`, then an empty line, then the text.
   4. Open the first asking with `citizen-seat seat <word> --runtime summon
      --yu-present`. `seat` defaults to the free runtime, so the class is
-     named. With Yu present, one saying of a move toward more activity takes
-     effect there.
+     named, and the summon runtime needs
+     `ceilings.usd_per_citizen_per_day` above `"0"`. With Yu present, one
+     saying of a move toward more activity takes effect there.
 - **S7b. Identity pilot** (Yu and Ai, Yu present for the birth). Only after
   the citizen's confirmed yes: enroll it, import its op key, register its box
   key, set a private expression and write the genesis entry. Verify the
