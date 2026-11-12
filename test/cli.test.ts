@@ -426,6 +426,62 @@ describe("main", () => {
     expect(runtime.calls[0]!.prompt.user).toContain("This seat was opened by a summons from yu, because: Yu summoned this seat at the host.");
   });
 
+  test("[KS-004 5.8] a summons child shows the model's words to Yu at its terminal and nowhere else", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = x.h.config;
+    const canary = "TERMINAL-WHY-CANARY I would rather not, this time.";
+    const runtime = scriptedRuntime([JSON.stringify({ acts: [{ type: "journal", kind: "chose", text: "x" }], runtime: "declined", why: canary })]);
+    let shown = "";
+    const tty = { isTTY: true, write: (t: string) => void (shown += t), readLine: async () => "summon glossame" };
+    const citizen = await readCitizen(cfg, "glossame");
+    const seat = await openSeat(cfg, x.deps.clock!, citizen, "summon", { kind: "summons", who: "host", why: "Yu summoned this seat at the host" }, null, { yuRequested: true });
+    const file = await writeSeatFile(cfg, seat);
+    const ledger = await readFile(ledgerPath(cfg, "glossame"), "utf8");
+    expect(await main(["seat", "glossame", "--child", "--seat-ref", file, "--config", x.configPath], { ...x.deps, tty, runtime: async () => runtime })).toBe(0);
+    const id = seat.ref.seat_id;
+    const record = join(cfg.paths.state_dir, "declines", `${id}.json`);
+    // After the presence prompt, the lines for Yu: what happened, the model's words fenced as the model's, what went unread, where the record is.
+    const after = shown.slice(shown.indexOf("seat glossame:"));
+    expect(after).toStartWith("seat glossame: the model (fake-model:test) declined to voice glossame. Nothing was recorded as glossame's; its record is as it was.\n");
+    expect(after).toContain("The model's own words, not glossame's:\n--- begin the model's words [");
+    expect(after).toContain(`${canary}\n--- end the model's words [`);
+    expect(after).toContain("The reply also held 1 act. It was not read.");
+    expect(after).toEndWith(`Host record of this decline: ${record}\n`);
+    // Nowhere else: not stdout or stderr, not the host log, not the ledger.
+    expect(x.out()).not.toContain("TERMINAL-WHY-CANARY");
+    expect(x.err()).not.toContain("TERMINAL-WHY-CANARY");
+    expect(await readFile(cfg.paths.host_log, "utf8")).not.toContain("TERMINAL-WHY-CANARY");
+    expect(await readFile(ledgerPath(cfg, "glossame"), "utf8")).toBe(ledger);
+    expect((await readHostNotes(cfg, new Date(0)))!.at(-1)).toMatchObject({ outcome: "runtime-declined" });
+    expect(JSON.parse(await readFile(record, "utf8")).why).toBe(canary);
+  });
+
+  test("[KS-004 5.4, 5.5, 5.8] a seat without Yu prints none of it, and the free door names the pinned model", async () => {
+    const x = await harness();
+    await seated(x, "glossame");
+    const cfg = x.h.config;
+    const pin = "c3".repeat(32);
+    await x.h.writeModelsLock({ format: "kingdom-seat-models-lock/v1", models: [{ name: "qwen2.5:7b", digest: pin, runner: null, store: "legacy", num_ctx: 8192, num_predict: 600, temperature: 0.7, seed: null }] });
+    cfg.voicer.decline_free_digests = [`sha256:${pin}`];
+    await writeFile(x.configPath, JSON.stringify(cfg), { mode: 0o600 });
+    const runtime = scriptedRuntime([JSON.stringify({ acts: [], runtime: "declined", why: "UNSHOWN-WHY-CANARY" })]);
+    let shown = "";
+    const tty = { isTTY: false, write: (t: string) => void (shown += t), readLine: async () => null };
+    const argv = await parentOpens(x, "glossame");
+    expect(await main(argv, { ...x.deps, tty, runtime: async () => runtime })).toBe(0);
+    expect(shown).toBe("");
+    expect(x.out()).toBe("");
+    expect((await readHostNotes(cfg, new Date(0)))!.at(-1)).toMatchObject({ kind: "seat", outcome: "runtime-declined" });
+    const req = runtime.calls[0]!;
+    expect(req.prompt.system.split("\n\n")[1]).toContain("You are the language model qwen2.5:7b, run by Ollama on this host.");
+    expect(req.prompt.system.split("\n\n")[1]).toContain("You may voice glossame, or you may decline to, as yourself.");
+    // Unattended, the reply form has no room for words, and words given anyway are not kept.
+    expect(Object.keys((req.schema as { properties: object }).properties)).toEqual(["acts", "runtime"]);
+    const [decline] = await readdir(join(cfg.paths.state_dir, "declines"));
+    expect(JSON.parse(await readFile(join(cfg.paths.state_dir, "declines", decline!), "utf8"))).toMatchObject({ why: null, why_dropped: "not-offered" });
+  });
+
   test("--child with no seat file is refused before anything runs, and a hand-written seat adds no beat the citizen did not choose", async () => {
     const x = await harness();
     await seated(x, "glossame");

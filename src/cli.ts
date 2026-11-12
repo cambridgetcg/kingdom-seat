@@ -37,7 +37,7 @@ import { createSigner, type Signer } from "./signer/signer.ts";
 import { macosKeychain } from "./signer/keychain.ts";
 import { checkFleet, creditsFromLedger, usdRemaining } from "./signer/ceilings.ts";
 import { hostSpendRecorder, usdSpentToday } from "./spend.ts";
-import { confirmYuPresent, readStandingAgreements, type TtyIO } from "./signer/consent.ts";
+import { confirmYuPresent, presenceConfirmedHere, readStandingAgreements, type TtyIO } from "./signer/consent.ts";
 import { agenttoolSync, hostClient } from "./agenttool/sync.ts";
 import { agenttoolQuiet, keepQuiet } from "./quiet.ts";
 import { agenttoolLetters } from "./letters.ts";
@@ -49,6 +49,8 @@ import { appendHostNote, isResultNote, lastSeatOf, openedDetail, readHostNotes, 
 import { LockStuck, acquireTickLock, lockOptionsFor, osBootTime, pidIsAlive, releaseTickLock, runTick } from "./tick.ts";
 import { isDue } from "./due.ts";
 import { wakingLetter } from "./context.ts";
+import { ACT_LIMITS } from "./acts.ts";
+import { fence } from "./prompt.ts";
 import { driftFromOrigin, originIntact } from "./self.ts";
 import {
   EXIT,
@@ -59,6 +61,7 @@ import {
   type Clock,
   type CommandRunner,
   type Config,
+  type DeclineView,
   type ExitCode,
   type FetchLike,
   type HaltStatus,
@@ -69,6 +72,7 @@ import {
   type Outcome,
   type RuntimeAdapter,
   type RuntimeClass,
+  type WhyDropped,
   type Word,
   type YuPresence,
 } from "./types.ts";
@@ -990,9 +994,11 @@ async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>):
   const seat: OpenSeat = { ref, citizen, cwd: join(config.paths.seats_dir, ref.seat_id), presence };
   const signer = makeSigner(ctx);
   const runtime = await ctx.deps.runtime(config, seat, signer);
-  // The free lane is pinned by digest, so the prompt can say before the reply whether a self-change could bind.
+  // The free lane is pinned by digest, so the prompt can say before the reply whether a self-change could bind,
+  // whether the decline is offered, and which model the voicer's door speaks to.
   const lock = ref.runtime === "free" ? await loadModelsLock(config.paths.models_lock).catch(() => null) : null;
   const pinned = lock?.models[0]?.digest;
+  const known = pinned !== undefined && /^[0-9a-f]{64}$/.test(pinned);
   // A registered citizen's self lives on agenttool too: its expression and strand backups, and its quiet, all
   // through this signer (KS-004 4.3, 6.4, 9.3). An unregistered one has nothing there to send to.
   const client = citizen.identity ? hostClient(config, signer, ctx.deps.fetch) : null;
@@ -1007,9 +1013,45 @@ async function verbSeatChild(ctx: Ctx, cmd: Extract<Command, { verb: "seat" }>):
     quiet: client ? agenttoolQuiet(client) : null,
     // Its letters to another registered citizen go through the inbox, and its own inbox is read beside letters/ (KS-004 5.3, 5.7).
     letters: client ? agenttoolLetters({ config, client }) : null,
-    modelDigest: pinned && /^[0-9a-f]{64}$/.test(pinned) ? `sha256:${pinned}` : null,
+    modelDigest: known ? `sha256:${pinned}` : null,
+    modelName: known ? (lock?.models[0]?.name ?? null) : null,
   });
+  // A decline's words are shown only at the terminal where Yu was confirmed, by this process; never on stdout,
+  // which a seat child does not have, and never in a note (KS-004 5.8).
+  if (result.outcome === "runtime-declined" && result.decline !== undefined && presenceConfirmedHere(presence)) {
+    ctx.deps.tty.write(declineLines(cmd.word, result.decline));
+  }
   return result.exit;
+}
+
+/** A model id as the terminal shows it: at most 120 characters, anything outside printable ASCII replaced. */
+function modelShown(model: string): string {
+  const s = model.length > 120 ? `${model.slice(0, 120)}...` : model;
+  return s.replace(/[^\x20-\x7e]/g, "?");
+}
+
+const WHY_DROPPED_PHRASES: Record<WhyDropped, string> = {
+  "not-text": "it was not text",
+  "too-long": `it was over ${ACT_LIMITS.max_decline_why_chars} characters`,
+  "control-chars": "it held control characters",
+  "not-offered": "this seat did not offer the field",
+};
+
+/**
+ * What Yu reads at the terminal when the model declined (KS-004 5.8): that
+ * the model declined and nothing was recorded as the citizen's, its own
+ * words fenced and labelled as the model's, or that it gave none or gave
+ * some the host did not keep, any acts beside it that went unread, and where
+ * the host's record of it is.
+ */
+function declineLines(word: Word, d: DeclineView): string {
+  const lines = [`seat ${word}: the model (${modelShown(d.model)}) declined to voice ${word}. Nothing was recorded as ${word}'s; its record is as it was.`];
+  if (d.why !== null) lines.push(`The model's own words, not ${word}'s:`, fence("the model's words", d.why));
+  else if (d.why_dropped !== null) lines.push(`It gave a reason that the host did not keep (${WHY_DROPPED_PHRASES[d.why_dropped]}).`);
+  else lines.push("It gave no reason. None is needed.");
+  if (d.acts_beside > 0) lines.push(`The reply also held ${d.acts_beside} ${d.acts_beside === 1 ? "act" : "acts"}. ${d.acts_beside === 1 ? "It was" : "They were"} not read.`);
+  lines.push(d.record !== null ? `Host record of this decline: ${d.record}` : "The host could not write its record of this decline.");
+  return `${lines.join("\n")}\n`;
 }
 
 /* ── main ─────────────────────────────────────────────────────────────── */
