@@ -27,7 +27,7 @@ import { bytesEqual, fromB64, toB64 } from "./crypto.ts";
 import { SSHSIG_MAX_MESSAGE_BYTES, parseSshEd25519 } from "./ssh.ts";
 import { checkHalt, describeHalt, raiseBeacons, raiseHalt, raiseHaltFileAt, readBeacons, readHaltFile } from "./halt.ts";
 import { ConfigError, DEFAULT_CONFIG_PATH, DEFAULT_HALT_FILE, loadConfig } from "./config.ts";
-import { AdmitStopped, admitCitizen, planAdmit, renderAdmitPlan, renderAdmitResult, type AdmitDeps } from "./admit.ts";
+import { ARCHETYPE_CLASS, AdmitStopped, CANON_WORD_CLASS, admitCitizen, planAdmit, renderAdmitPlan, renderAdmitResult, type AdmitDeps } from "./admit.ts";
 import { draftFirstLetter } from "./first-letter.ts";
 import { REHEARSE_LIMITS, rehearseChild, rehearseParent, type RehearseCommand } from "./rehearse.ts";
 import { ledgerPath, readLedger, readRegularText, verifyChain } from "./ledger.ts";
@@ -119,8 +119,8 @@ export const USAGE = [
   "  verify <word>",
   "  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]",
   "  draft-first-letter <word>",
-  "  rehearse <word> --soul <file> [--will <file>] [--canon <file> --canon-ref <repo>:<path>@<commit>] --scenario awake|letter [--letter <file>]",
-  "           --models-lock <file> [--model <name>] [--chains <n>] [--seats <n>] [--start <iso>] --out <new dir>",
+  "  rehearse <word> --soul <file> [--will <file>] [--canon <file> --canon-ref <repo>:<path>@<commit> | --archetype <CLASS>] [--plain-texts]",
+  "           --scenario awake|letter [--letter <file>] --models-lock <file> [--model <name>] [--chains <n>] [--seats <n>] [--start <iso>] --out <new dir>",
 ].join("\n");
 
 /** This file, so a parent can run its own child under the same interpreter. */
@@ -153,6 +153,8 @@ const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
     "--will": "value",
     "--canon": "value",
     "--canon-ref": "value",
+    "--archetype": "value",
+    "--plain-texts": "switch",
     "--scenario": "value",
     "--letter": "value",
     "--models-lock": "value",
@@ -306,6 +308,13 @@ function parseRehearse(flags: Map<string, string | true>, positionals: string[],
     if (!m) throw new UsageError("--canon-ref is <repo>:<path>@<commit>");
     canon_ref = { repo: m[1]!, path: m[2]!, commit: m[3]! };
   }
+  // The class rule admit applies to what an old agent.json records.
+  const archetype = flags.get("--archetype");
+  if (archetype !== undefined) {
+    if (canon !== null) throw new UsageError("--archetype is given only without --canon");
+    if (typeof archetype !== "string" || !ARCHETYPE_CLASS.test(archetype)) throw new UsageError("--archetype is a class of capital letters, digits and hyphens, as admit reads one from agent.json");
+    if (archetype === CANON_WORD_CLASS) throw new UsageError("LEXEME is the class of a canon word, which admit seats on its canon entry: rehearse it with --canon and --canon-ref");
+  }
   const L = REHEARSE_LIMITS;
   const chains = countFlag("--chains", flags.get("--chains"), L.default_chains, L.max_chains);
   const seats = countFlag("--seats", flags.get("--seats"), L.default_seats, L.max_seats_per_chain);
@@ -324,6 +333,8 @@ function parseRehearse(flags: Map<string, string | true>, positionals: string[],
     will: normalPath("--will", flags.get("--will")),
     canon,
     canon_ref,
+    archetype_class: typeof archetype === "string" ? archetype : null,
+    plain_texts: flags.get("--plain-texts") === true,
     letter,
     scenario,
     models_lock: normalPath("--models-lock", flags.get("--models-lock"))!,

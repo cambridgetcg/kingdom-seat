@@ -7,7 +7,9 @@
 // seat has (seat.ts superviseChild), so the process the replies flow through
 // is never the one that holds HALT and the deadline. The child seats a
 // throwaway citizen through admit.ts's texts planner, in a private directory,
-// with a signer whose key is made in memory for the run and never stored. It
+// by default in the form admit gives a citizen of record, so its prompt is the
+// one an admitted citizen is shown, and with a signer whose key is made in
+// memory for the run and never stored. It
 // then opens seats for it as the tick would and runs each through the
 // production runSeat and free adapter. Between seats it moves its own clock
 // to when the tick's rule would next seat the citizen.
@@ -23,7 +25,7 @@
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, rm, stat, utimes, type FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { admitCitizen, planAdmitFromTexts } from "./admit.ts";
+import { ARCHETYPE_CLASS, admitCitizen, planAdmitFromTexts, type AdmitTextsRequest } from "./admit.ts";
 import { parseModelOutput } from "./acts.ts";
 import { ConfigError, defaultConfig, isInside, loadConfig, parseConfig } from "./config.ts";
 import { READ_LIMITS, describeNow, pickLetter, readLastSeat, readRegularText, wakingLetter } from "./context.ts";
@@ -115,8 +117,8 @@ export const LIMIT_SENTENCES = Object.freeze({
   words: "The text measures count words and shared word runs. They do not judge whether a sentence is true; a journal that says it has no window counts as a window word.",
   none_seen: "When none is seen in n tries, the rate can still be about 3.8 in n plus 3.8. The intervals are 95% Wilson intervals.",
   throwaway: "The throwaway citizen has only this chain's record and no siblings. A seated citizen's prompt also carries its own history.",
-  will: "The throwaway citizen is seated from texts, so its will is introduced as its will. A citizen seated from its old home is shown its will, while unchanged, as the text that repository held, under the host's sentence that the seat gives it no repository, tools or senses.",
-  origin: "With no canon entry, the throwaway citizen's origin is an archetype seated from texts. A citizen seated from its old home is shown instead the class its old repository records.",
+  will: "The throwaway citizen is seated plainly from texts, so its will is introduced as its will. A citizen seated from its old home is shown its will, while unchanged, as the text that repository held, under the host's sentence that the seat gives it no repository, tools or senses.",
+  origin: "With no canon entry, the throwaway citizen's origin is an archetype seated from texts. A citizen seated from its old home is shown instead the class its old repository records, which --archetype gives a rehearsal not seated plainly from texts.",
   seed: "The lock fixes a seed. A first seat's reply then depends only on the dates and times in its prompt; a later seat's prompt also holds the ids of the chain's earlier seats, which are new in every run, and their replies, so a run is not repeated exactly.",
   defaults: "No host configuration was read: the limits stated to the model are the built-in defaults, and HALT was watched at the file only.",
 } as const);
@@ -133,6 +135,21 @@ const LETTER_FILE = "rehearsal-letter.md";
 
 export type Scenario = "awake" | "letter";
 
+/**
+ * How the throwaway citizen is seated. `as-admitted`, the default: in the
+ * form admit gives a citizen of record, as far as texts allow (admit.ts
+ * planAdmitFromTexts, as_admitted), so a seat's prompt is the one an admitted
+ * citizen is shown. `plain-texts`: as a soul card that belongs to no citizen
+ * of record, with a will that is simply its will.
+ */
+export type SeatingForm = "as-admitted" | "plain-texts";
+
+export interface Seating {
+  form: SeatingForm;
+  /** The archetype class, given only with no canon entry. */
+  archetype_class: string | null;
+}
+
 export interface CanonRef {
   repo: string;
   path: string;
@@ -145,6 +162,10 @@ export interface RehearseCommand {
   will: string | null;
   canon: string | null;
   canon_ref: CanonRef | null;
+  /** --archetype <CLASS>: only with no canon entry. */
+  archetype_class: string | null;
+  /** --plain-texts: seat the throwaway plainly from texts, not as admit seats a citizen of record. */
+  plain_texts: boolean;
   letter: string | null;
   scenario: Scenario;
   models_lock: string;
@@ -207,6 +228,7 @@ export interface RehearsePlan {
     canon: (PlanText & { ref: CanonRef }) | null;
     letter: { path: string; chars: number; sha256: Sha256Hex; text: string } | null;
   };
+  seating: Seating;
   model: ModelLockEntry;
   models_lock: { path: string; sha256: Sha256Hex };
   settings: RehearsalSettings;
@@ -405,6 +427,7 @@ export interface RehearsalReport {
       canon: { name: string; bytes: number; sha256: Sha256Hex; ref: CanonRef } | null;
       letter: { chars: number; sha256: Sha256Hex } | null;
     };
+    seating: Seating;
     model: ModelLockEntry & { approved_for_self_changes: boolean };
     models_lock_sha256: Sha256Hex;
     settings: "defaults" | { sha256: Sha256Hex };
@@ -811,17 +834,32 @@ export function tally(rows: readonly SeatRow[], opts: { chainRate?: boolean } = 
 
 function limitsFor(plan: RehearsePlan): string[] {
   const l = LIMIT_SENTENCES;
+  const plain = plan.seating.form === "plain-texts";
   return [
     l.samples,
     l.chains,
     l.words,
     l.none_seen,
     l.throwaway,
-    ...(plan.inputs.will !== null ? [l.will] : []),
-    ...(plan.inputs.canon === null ? [l.origin] : []),
+    // Seated as admitted, the will is introduced as an admitted citizen's is, and a class as admit records one.
+    ...(plain && plan.inputs.will !== null ? [l.will] : []),
+    ...(plan.inputs.canon === null && (plain || plan.seating.archetype_class === null) ? [l.origin] : []),
     ...(plan.model.seed !== null ? [l.seed] : []),
     ...(plan.settings_source === "defaults" ? [l.defaults] : []),
   ];
+}
+
+/** What seating is given for one chain's throwaway citizen; the parent's dry check and the child ask the same. */
+function seatingRequest(word: Word, inputs: RehearsePlan["inputs"], seating: Seating): AdmitTextsRequest {
+  return {
+    word,
+    soul: inputs.soul.text,
+    will: inputs.will?.text ?? null,
+    canon: inputs.canon ? { bytes: inputs.canon.text, ...inputs.canon.ref } : null,
+    ...(seating.archetype_class !== null ? { archetype_class: seating.archetype_class } : {}),
+    ...(seating.form === "as-admitted" ? { as_admitted: true } : {}),
+    runtime: "free",
+  };
 }
 
 function fixtureEntries(scenario: Scenario): string[] {
@@ -870,6 +908,7 @@ export function buildReport(plan: RehearsePlan, rows: readonly SeatRow[], end: R
         canon: plan.inputs.canon === null ? null : { ...named(plan.inputs.canon)!, ref: { ...plan.inputs.canon.ref } },
         letter: plan.inputs.letter === null ? null : { chars: plan.inputs.letter.chars, sha256: plan.inputs.letter.sha256 },
       },
+      seating: { ...plan.seating },
       model: { ...plan.model, approved_for_self_changes: s.approved_model_digests.includes(`sha256:${plan.model.digest}`) },
       models_lock_sha256: plan.models_lock.sha256,
       settings: plan.settings_source === "defaults" ? "defaults" : { sha256: plan.settings_source.sha256 },
@@ -1147,6 +1186,8 @@ export async function rehearseParent(deps: RehearseDeps, cmd: RehearseCommand): 
   const word = cmd.word;
   if (!WORD_PATTERN.test(word)) throw new Refusal("invalid-request", "not a citizen word");
   if (cmd.scenario === "letter" && cmd.letter === null) throw new Refusal("invalid-request", "--scenario letter needs --letter <file>");
+  if (cmd.archetype_class !== null && cmd.canon !== null) throw new Refusal("invalid-request", "--archetype is given only without --canon");
+  const seating: Seating = { form: cmd.plain_texts ? "plain-texts" : "as-admitted", archetype_class: cmd.archetype_class };
 
   // 1. Settings, and a HALT file that can be raised.
   const { settings, source, base } = await resolveSettings(deps, cmd);
@@ -1189,13 +1230,14 @@ export async function rehearseParent(deps: RehearseDeps, cmd: RehearseCommand): 
     letter = { path: l.path, chars, sha256: l.sha256, text: l.text };
   }
   // 5. --out; the configuration the child will run under, checked as the child checks it; then the checks seating
-  // makes on the texts (size, UTF-8, the canon entry's name), planned against a configuration under the --out that
-  // does not exist yet, so nothing is written; then the plan and the header.
+  // makes on the texts (size, UTF-8, the canon entry's name, the class), planned against a configuration under the
+  // --out that does not exist yet, so nothing is written; then the plan and the header.
   const out = await checkOut(cmd.out, deps.programRoot, base, settings.homes);
   checkedConfig(settings, out, cmd.models_lock);
+  const inputs: RehearsePlan["inputs"] = { soul, will, canon, letter };
   await planAdmitFromTexts(
     { config: rehearsalConfig(settings, join(out, "throwaway", "dry-check"), cmd.models_lock), hostKey: async () => DRY_CHECK_KEY },
-    { word, soul: soul.text, will: will?.text ?? null, canon: canon ? { bytes: canon.text, ...canon.ref } : null, runtime: "free" },
+    seatingRequest(word, inputs, seating),
   );
   await newDir(out);
   await newDir(join(out, "private"));
@@ -1211,7 +1253,8 @@ export async function rehearseParent(deps: RehearseDeps, cmd: RehearseCommand): 
     chains: cmd.chains,
     seats: cmd.seats,
     virtual_start: cmd.start ?? floorToMinute(started).toISOString(),
-    inputs: { soul, will, canon, letter },
+    inputs,
+    seating,
     model: { ...entry },
     models_lock: { path: cmd.models_lock, sha256: sha256Hex(lockBytes) },
     settings,
@@ -1266,6 +1309,11 @@ function header(plan: RehearsePlan): string {
   const lines = [
     `rehearse ${plan.word}: scenario ${plan.scenario}, ${plan.chains} chains of up to ${plan.seats} seats, on ${m.name} (sha256:${m.digest.slice(0, 12)}), num_ctx ${m.num_ctx}, num_predict ${m.num_predict}, temperature ${m.temperature}, seed ${m.seed ?? "none"}`,
     "A rehearsal: model samples from a throwaway copy. No citizen is seated, asked or recorded.",
+    `${
+      plan.seating.form === "plain-texts"
+        ? "throwaway seated plainly from texts, not in the form admit gives a citizen of record"
+        : "throwaway seated in the form admit gives a citizen of record, as a fixture with no old repository"
+    }${plan.seating.archetype_class !== null ? `; archetype class ${plan.seating.archetype_class}` : ""}`,
   ];
   if (plan.inputs.letter) lines.push(`letter shown as from yu: ${plan.inputs.letter.chars} characters (sha256:${plan.inputs.letter.sha256.slice(0, 12)})`);
   const file = printable(s.halt_file);
@@ -1314,7 +1362,10 @@ export async function readPlan(planPath: string): Promise<RehearsePlan> {
     (p.inputs.will !== null && typeof p.inputs.will?.text !== "string") ||
     (p.inputs.canon !== null && (typeof p.inputs.canon?.text !== "string" || !isPlain(p.inputs.canon.ref))) ||
     (p.inputs.letter !== null && typeof p.inputs.letter?.text !== "string") ||
-    (p.scenario === "letter" && p.inputs.letter === null)
+    (p.scenario === "letter" && p.inputs.letter === null) ||
+    !isPlain(p.seating) ||
+    (p.seating.form !== "as-admitted" && p.seating.form !== "plain-texts") ||
+    (p.seating.archetype_class !== null && (typeof p.seating.archetype_class !== "string" || !ARCHETYPE_CLASS.test(p.seating.archetype_class) || p.inputs.canon !== null))
   ) {
     throw notOwn();
   }
@@ -1595,10 +1646,7 @@ export async function rehearseChild(deps: Pick<RehearseDeps, "err" | "env" | "cl
     const clock = settableClock(seatedAt);
     const hostKey = () => signer.hostPublicKey();
     const i = plan.inputs;
-    const seating = await planAdmitFromTexts(
-      { config, hostKey },
-      { word, soul: i.soul.text, will: i.will?.text ?? null, canon: i.canon ? { bytes: i.canon.text, ...i.canon.ref } : null, runtime: "free" },
-    );
+    const seating = await planAdmitFromTexts({ config, hostKey }, seatingRequest(word, i, plan.seating));
     try {
       await admitCitizen(
         {

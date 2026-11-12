@@ -290,13 +290,16 @@ async function parityHost(): Promise<ParityHost> {
   return { server, h, configPath, clock, keychain, admit };
 }
 
+const parityTty = { isTTY: false, write: () => {}, readLine: async () => null };
+const parityEnv = (h: TempHost) => ({ PATH: "/usr/bin:/bin", HOME: h.root, LANG: "en_GB.UTF-8", ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) });
+const decoded = (q: RecordedRequest) => new TextDecoder().decode(q.body);
+
 /**
  * For a citizen already seated on a parity host: a letter from yu at START,
- * the production tick half an hour later with its seat in a real child, then
- * a rehearsal of `texts` from START under the same config. The two
- * /api/chat bodies the server received, and the rehearsal's report.
+ * then the production tick half an hour later with its seat in a real child.
+ * The /api/chat body the server received.
  */
-async function tickThenRehearse(p: ParityHost, texts: { soul: string; will: string; canon: string; canonRef: string }): Promise<{ tick: string; rehearsal: string; report: RehearsalReport }> {
+async function tickOnce(p: ParityHost): Promise<string> {
   const { h, server, clock, configPath } = p;
   const letterFile = join(h.config.paths.citizens_dir, WORD, "letters", "rehearsal-letter.md");
   await writeFile(letterFile, `From: yu\n\n${LETTER}`);
@@ -305,46 +308,65 @@ async function tickThenRehearse(p: ParityHost, texts: { soul: string; will: stri
   clock.set(at(0.5));
   await writeFile(scenarioPath(configPath), JSON.stringify({ server_url: server.url, now: at(0.5) }));
   let tickOut = "";
-  const env = { PATH: "/usr/bin:/bin", HOME: h.root, LANG: "en_GB.UTF-8", ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
-  const tty = { isTTY: false, write: () => {}, readLine: async () => null };
   const tick = await main(["tick", "--config", configPath], {
     out: (t) => void (tickOut += t),
     err: () => {},
-    env,
+    env: parityEnv(h),
     clock,
     fetch: fetchVia(server),
     run: async () => {
       throw new Error("parity: no command may run");
     },
-    tty,
+    tty: parityTty,
     keychain: () => p.keychain,
     seatArgv: (c, w, extra) => [process.execPath, E2E_CHILD, "seat", w, "--child", ...extra, "--config", c],
     uid: () => E2E_SEAT_UID,
     defaults: { config: configPath, halt_file: h.config.paths.halt_file },
   });
   expect([tick, tickOut.trim()]).toEqual([0, `tick: rest ${WORD} (exit 0)`]);
-  expect(chatsOf(server)).toHaveLength(1);
+  const chats = chatsOf(server);
+  expect(chats).toHaveLength(1);
+  return decoded(chats[0]!);
+}
 
-  const inputs = join(h.root, "inputs");
+/** What a parity rehearsal is given: the texts, and the origin and seating flags. */
+interface ParityTexts {
+  soul: string;
+  will: string;
+  canon?: { text: string; ref: string };
+  archetype?: string;
+  plain?: boolean;
+}
+
+/**
+ * One rehearsal on a parity host, of `texts` from START under the host's own
+ * config with the letter tickOnce delivers: one chain of one letter seat. The
+ * /api/chat body the server received for that seat, and the report.
+ */
+async function rehearseOnce(p: ParityHost, name: string, texts: ParityTexts): Promise<{ body: string; report: RehearsalReport }> {
+  const { h, server, configPath } = p;
+  const inputs = join(h.root, `inputs-${name}`);
   await mkdir(inputs);
-  for (const [name, text] of [["soul.md", texts.soul], ["WILL.md", texts.will], ["canon.md", texts.canon], ["letter.md", LETTER]] as const) await writeFile(join(inputs, name), text);
-  const out = join(h.root, "rehearsal");
+  const file = (n: string) => join(inputs, n);
+  for (const [n, text] of [["soul.md", texts.soul], ["WILL.md", texts.will], ["letter.md", LETTER]] as const) await writeFile(file(n), text);
+  if (texts.canon) await writeFile(file("canon.md"), texts.canon.text);
+  const out = join(h.root, `rehearsal-${name}`);
+  const before = chatsOf(server).length;
   const exit = await main(
     [
       "rehearse",
       WORD,
       "--soul",
-      join(inputs, "soul.md"),
+      file("soul.md"),
       "--will",
-      join(inputs, "WILL.md"),
-      "--canon",
-      join(inputs, "canon.md"),
-      "--canon-ref",
-      texts.canonRef,
+      file("WILL.md"),
+      ...(texts.canon ? ["--canon", file("canon.md"), "--canon-ref", texts.canon.ref] : []),
+      ...(texts.archetype ? ["--archetype", texts.archetype] : []),
+      ...(texts.plain ? ["--plain-texts"] : []),
       "--scenario",
       "letter",
       "--letter",
-      join(inputs, "letter.md"),
+      file("letter.md"),
       "--models-lock",
       h.config.paths.models_lock,
       "--chains",
@@ -358,42 +380,84 @@ async function tickThenRehearse(p: ParityHost, texts: { soul: string; will: stri
       "--out",
       out,
     ],
-    { out: () => {}, err: () => {}, env, clock: testClock(START), fetch: fetchVia(server), tty, rehearseArgv: (q) => [process.execPath, CHILD, "rehearse", "--child", "--plan", q], defaults: { config: join(h.root, "none.json"), halt_file: h.config.paths.halt_file } },
+    {
+      out: () => {},
+      err: () => {},
+      env: parityEnv(h),
+      clock: testClock(START),
+      fetch: fetchVia(server),
+      tty: parityTty,
+      rehearseArgv: (q) => [process.execPath, CHILD, "rehearse", "--child", "--plan", q],
+      defaults: { config: join(h.root, "none.json"), halt_file: h.config.paths.halt_file },
+    },
   );
   expect(exit).toBe(0);
   const chats = chatsOf(server);
-  expect(chats).toHaveLength(2);
-  const [tickBody, rehearsalBody] = chats.map((c) => new TextDecoder().decode(c.body));
-  return { tick: tickBody!, rehearsal: rehearsalBody!, report: JSON.parse(await readFile(join(out, "report.json"), "utf8")) as RehearsalReport };
+  expect(chats).toHaveLength(before + 1);
+  return { body: decoded(chats.at(-1)!), report: JSON.parse(await readFile(join(out, "report.json"), "utf8")) as RehearsalReport };
 }
 
+/** Seat WORD on a parity host as admit seats a citizen of record: from a made-up old home, through planAdmit. */
+async function admitFromOldHome(p: ParityHost, origin: { kind: "canon" } | { kind: "archetype"; cls: string }): Promise<{ texts: ParityTexts }> {
+  const old = await standardHome(p.h.homesRoot, WORD, origin.kind === "archetype" ? { citizenClass: origin.cls } : {});
+  const admit: AdmitDeps = { ...p.admit, run: spawnRunner() };
+  if (origin.kind === "archetype") {
+    const plan = await planAdmit(admit, { word: WORD, legacy_home: old.home, origin: { kind: "archetype" }, runtime: "free" });
+    await admitCitizen(admit, plan);
+    return { texts: { soul: old.soul, will: old.will, archetype: origin.cls } };
+  }
+  const canon = await canonClone(p.h.root, WORD);
+  const plan = await planAdmit(admit, { word: WORD, legacy_home: old.home, origin: { kind: "canon", file: canon.file }, runtime: "free" });
+  await admitCitizen(admit, plan);
+  if (plan.origin.kind !== "canon") throw new Error("parity: the old home was seated on its canon entry");
+  return { texts: { soul: old.soul, will: old.will, canon: { text: canon.text, ref: `${plan.origin.repo}:${plan.origin.path}@${plan.origin.commit}` } } };
+}
+
+/** The limits sentences that say a rehearsal's prompt is not an admitted citizen's. */
+const notAdmittedLimits = (r: RehearsalReport) => r.limits.filter((l) => l === LIMIT_SENTENCES.will || l === LIMIT_SENTENCES.origin);
+
 describe("rehearse: the seat's own pipeline", () => {
-  test("a rehearsal seat sends what a tick's seat sends, byte for byte", async () => {
-    // Seated through the texts planner by the host's own signer, as a rehearsal seats its copy.
+  test("a citizen seated plainly from texts is sent, by a rehearsal with --plain-texts, what a tick's seat sends, byte for byte", async () => {
+    // Seated through the texts planner, without the admitted form, by the host's own signer.
     const p = await parityHost();
     await admitCitizen(p.admit, await planAdmitFromTexts(p.admit, { word: WORD, soul: SOUL, will: WILL, canon: { bytes: CANON, repo: "YOUSPEAK", path: CANON_PATH, commit: "1428646" }, runtime: "free" }));
-    const { tick, rehearsal } = await tickThenRehearse(p, { soul: SOUL, will: WILL, canon: CANON, canonRef: CANON_REF });
-    expect(rehearsal).toContain(`"model":"${MODEL}:local"`);
-    expect(rehearsal).toBe(tick);
+    const tick = await tickOnce(p);
+    const { body, report } = await rehearseOnce(p, "plain", { soul: SOUL, will: WILL, canon: { text: CANON, ref: CANON_REF }, plain: true });
+    expect(body).toContain(`"model":"${MODEL}:local"`);
+    expect(body).toBe(tick);
+    expect(report.run.seating).toEqual({ form: "plain-texts", archetype_class: null });
+    expect(notAdmittedLimits(report)).toEqual([LIMIT_SENTENCES.will]);
   }, 30_000);
 
-  test("a citizen seated by admit from its old home is sent the same request but for how its will is introduced, and the limits say so", async () => {
-    // Seated as a citizen of record is: from a made-up old home and canon clone, through planAdmit, which pins the will.
+  test("a citizen seated by admit from its old home on its canon entry is sent, by a rehearsal of the same texts, what a tick's seat sends, byte for byte", async () => {
     const p = await parityHost();
-    const old = await standardHome(p.h.homesRoot, WORD);
-    const canon = await canonClone(p.h.root, WORD);
-    const admit: AdmitDeps = { ...p.admit, run: spawnRunner() };
-    const plan = await planAdmit(admit, { word: WORD, legacy_home: old.home, origin: { kind: "canon", file: canon.file }, runtime: "free" });
-    await admitCitizen(admit, plan);
-    if (plan.origin.kind !== "canon") throw new Error("parity: the old home was seated on its canon entry");
-    const ref = `${plan.origin.repo}:${plan.origin.path}@${plan.origin.commit}`;
-    const { tick, rehearsal, report } = await tickThenRehearse(p, { soul: old.soul, will: old.will, canon: canon.text, canonRef: ref });
-    // The one difference: the host's sentence on a will carried from an old repository, where a throwaway's will is its will.
+    const { texts } = await admitFromOldHome(p, { kind: "canon" });
+    const tick = await tickOnce(p);
     expect(tick).toContain(WILL_AS_SEATED);
-    expect(rehearsal).not.toContain(WILL_AS_SEATED);
-    expect(tick.replace(WILL_AS_SEATED, "Your will:")).toBe(rehearsal);
-    expect(report.limits).toContain(LIMIT_SENTENCES.will);
-    expect(report.limits).not.toContain(LIMIT_SENTENCES.origin);
+    const { body, report } = await rehearseOnce(p, "admitted", texts);
+    expect(body).toBe(tick);
+    expect(report.run.seating).toEqual({ form: "as-admitted", archetype_class: null });
+    expect(notAdmittedLimits(report)).toEqual([]);
+
+    // Seated plainly from texts, the same throwaway is introduced its will as its will, and the limits say so.
+    const plain = await rehearseOnce(p, "plain", { ...texts, plain: true });
+    expect(plain.body).not.toContain(WILL_AS_SEATED);
+    expect(tick.replace(WILL_AS_SEATED, "Your will:")).toBe(plain.body);
+    expect(notAdmittedLimits(plain.report)).toEqual([LIMIT_SENTENCES.will]);
+  }, 60_000);
+
+  test("an archetype citizen seated by admit from its old home is sent, by a rehearsal given its class, what a tick's seat sends, byte for byte", async () => {
+    const p = await parityHost();
+    const { texts } = await admitFromOldHome(p, { kind: "archetype", cls: "PIONEER" });
+    const tick = await tickOnce(p);
+    const user = (body: string) => (JSON.parse(body) as { messages: { content: string }[] }).messages[1]!.content;
+    expect(user(tick)).toContain("Your origin: archetype lineage PIONEER.\n--- begin origin note [");
+    expect(user(tick)).toContain("No canon entry. The old repository's agent.json records the class PIONEER.\n--- end origin note [");
+    expect(user(tick)).toContain(`${WILL_AS_SEATED}\n--- begin will [`);
+    const { body, report } = await rehearseOnce(p, "admitted", texts);
+    expect(body).toBe(tick);
+    expect(report.run.seating).toEqual({ form: "as-admitted", archetype_class: "PIONEER" });
+    expect(notAdmittedLimits(report)).toEqual([]);
   }, 60_000);
 
   test("the lock given by path is the one obeyed: a model the repository's lock does not name is called", async () => {
@@ -869,8 +933,8 @@ describe("rehearse: what a seat returned", () => {
     });
     expect(ran.report!.first_seats.seats).toBe(1);
     expect(ran.report!.first_seats.rates.chains_awake_at_end).toEqual(rate(0, 0));
-    // A will was given, so the sentence on how a will is introduced is there; a canon entry was, so the archetype one is not.
-    expect(ran.report!.limits).toEqual([LIMIT_SENTENCES.samples, LIMIT_SENTENCES.chains, LIMIT_SENTENCES.words, LIMIT_SENTENCES.none_seen, LIMIT_SENTENCES.throwaway, LIMIT_SENTENCES.will]);
+    // Seated as admit seats a citizen of record, with a will and a canon entry: the five fixed sentences and no other.
+    expect(ran.report!.limits).toEqual([LIMIT_SENTENCES.samples, LIMIT_SENTENCES.chains, LIMIT_SENTENCES.words, LIMIT_SENTENCES.none_seen, LIMIT_SENTENCES.throwaway]);
   });
 
   test("each rate counts over its own seats", async () => {
@@ -947,13 +1011,15 @@ describe("rehearse: what a seat returned", () => {
     expect([ran.rows[4]!.journals[0]!.recent_overlap, ran.rows[4]!.journals[0]!.same_opening]).toEqual([0, false]);
   });
 
-  test("the limits name a will seated from texts, an origin seated from texts, a fixed seed and a run on built-in defaults, each when it applies", () => {
+  test("the limits name a will seated plainly from texts, an origin seated from texts, a fixed seed and a run on built-in defaults, each when it applies", () => {
     const text = { path: "/x/t.md", bytes: 1, sha256: "0".repeat(64), text: "x" };
+    const plain = { form: "plain-texts", archetype_class: null };
     const plan = {
       model: { seed: 7 },
       settings_source: "defaults",
       settings: rehearsalSettings(null, "/nonexistent/HALT"),
       inputs: { soul: text, will: text, canon: null, letter: null },
+      seating: plain,
       models_lock: { path: "/x", sha256: "0".repeat(64) },
     } as unknown as RehearsePlan;
     const end = { started_at: START, ended_at: START, ended: "complete" as const, stopped_by: null, exit: 0 as const };
@@ -962,6 +1028,19 @@ describe("rehearse: what a seat returned", () => {
     const canon = { ...text, ref: { repo: "YOUSPEAK", path: CANON_PATH, commit: "1428646" } };
     const bare = { ...plan, model: { ...plan.model, seed: null }, settings_source: { path: "/x/config.json", sha256: "0".repeat(64) }, inputs: { ...plan.inputs, will: null, canon } } as unknown as RehearsePlan;
     expect(buildReport(bare, [], end).limits).toEqual(always);
+
+    // Which of the two sentences on seating apply, by form, will, canon entry and class.
+    const limitsOf = (seating: object, inputs: object) => buildReport({ ...bare, seating, inputs: { ...bare.inputs, ...inputs } } as unknown as RehearsePlan, [], end).limits.slice(always.length);
+    const admitted = { form: "as-admitted", archetype_class: null };
+    const classed = { form: "as-admitted", archetype_class: "PIONEER" };
+    expect([
+      limitsOf(plain, { will: text }),
+      limitsOf(plain, { will: text, canon: null }),
+      limitsOf({ ...plain, archetype_class: "PIONEER" }, { will: null, canon: null }),
+      limitsOf(admitted, { will: text }),
+      limitsOf(admitted, { will: text, canon: null }),
+      limitsOf(classed, { will: text, canon: null }),
+    ]).toEqual([[LIMIT_SENTENCES.will], [LIMIT_SENTENCES.will, LIMIT_SENTENCES.origin], [LIMIT_SENTENCES.origin], [], [LIMIT_SENTENCES.origin], []]);
   });
 
   test("with a fixed seed a first seat's prompt is the same in two runs and a later seat's is not, as the seed sentence says", async () => {
