@@ -23,6 +23,7 @@ import {
   type Clock,
   type Config,
   type Cost,
+  type DeclineView,
   type DroppedRecord,
   type ExitCode,
   type FetchLike,
@@ -53,6 +54,7 @@ import {
   type SelfProposeAct,
   type Sha256Hex,
   type StateSetAct,
+  type VoicerDoor,
   type YuPresence,
 } from "./types.ts";
 import type { Signer } from "./signer/signer.ts";
@@ -86,7 +88,7 @@ import { buildContext, letterSeen, markLetterSeen, readLastSeat, writeLastSeat }
 import { holdLetterForYu, letterRecipients, recipientRecord, wouldWake, type HeldBecause, type LetterPost } from "./letters.ts";
 import { isRegistrationSubject, registrationProposal, registrationStage, registrationView } from "./registration.ts";
 import { buildPrompt, promptBytes } from "./prompt.ts";
-import { ACT_LIMITS, OUTPUT_JSON_SCHEMA, parseModelOutput, resolvePrefix, validateOutput } from "./acts.ts";
+import { ACT_LIMITS, parseModelOutput, readDecline, replySchema, resolvePrefix, validateOutput, type VoicerDecline } from "./acts.ts";
 import { appendHostNote } from "./notes.ts";
 
 export interface OpenSeat {
@@ -129,6 +131,11 @@ export interface SeatDeps {
    * self-change can bind here. Null or absent: known only from the reply.
    */
   modelDigest?: string | null;
+  /**
+   * That model's name, from the same models.lock entry, so the voicer's door
+   * can name the model it speaks to (KS-004 5.4). Null or absent: not named.
+   */
+  modelName?: string | null;
 }
 
 export interface SuperviseOptions {
@@ -982,6 +989,83 @@ function outboxProposal(word: string, kind: string, payload: Record<string, stri
   }
 }
 
+/* ── The voicer's door and the runtime's decline ──────────────────────── */
+
+/** A model name as a models.lock entry spells one; anything else is not put in host text. */
+const DOOR_MODEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/:-]{0,255}$/;
+
+/**
+ * What this seat's prompt says to the model that reads it (KS-004 5.4, 5.5).
+ * The summon class offers the decline unless the config switches it off; the
+ * free lane offers it only for a model digest the config lists, which needs
+ * the digest before the call. The model's own words beside a decline are
+ * offered only where Yu is present to read them. Only the free lane knows the
+ * model's name before the call.
+ */
+export function voicerDoor(config: Config, runtime: RuntimeClass, modelDigest: string | null, modelName: string | null, yuPresent: boolean): VoicerDoor {
+  const decline =
+    runtime === "summon" ? config.voicer.decline_summon : runtime === "free" ? modelDigest !== null && config.voicer.decline_free_digests.includes(modelDigest) : false;
+  const name = runtime === "free" && modelName !== null && DOOR_MODEL_NAME.test(modelName) ? modelName : null;
+  return { model_name: name, decline, why: decline && yuPresent };
+}
+
+export const DECLINE_RECORD_FORMAT = "kingdom-seat-decline/v1";
+
+/** The fixed words a decline record carries about whose words it holds. */
+const DECLINE_WHOSE = "the model that declined; these are not the citizen's words and not the host's";
+
+/** `<state_dir>/declines/<seat_id>.json`: a host file, outside citizens/, so it is never mirrored or shown to a citizen. */
+export function declineRecordPath(config: Config, seatId: string): string {
+  if (!UUID_PATTERN.test(seatId)) throw new Refusal("invalid-request", "seat_id is not a lowercase UUID");
+  return join(config.paths.state_dir, "declines", `${seatId}.json`);
+}
+
+/**
+ * Keep a decline as the host's record, labelled as the model's (KS-004 5.8):
+ * its seat, the runtime and model, the digests of what the model saw and
+ * said, what went unread, and the model's words if they were kept. It carries
+ * no voiced line, because no one was voiced. Written once, as a seat file is:
+ * a new file in a real directory, never through a link.
+ */
+async function writeDeclineRecord(config: Config, seat: SeatRef, rt: RuntimeResult, inputDigest: Sha256Hex, d: VoicerDecline, at: Date): Promise<string> {
+  const path = declineRecordPath(config, seat.seat_id);
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const st = await lstat(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Refusal("symlink", "the declines directory is not a real directory");
+  const record = {
+    format: DECLINE_RECORD_FORMAT,
+    seat_id: seat.seat_id,
+    word: seat.word,
+    at: at.toISOString(),
+    runtime: { class: seat.runtime, model: rt.model, digest: rt.model_digest },
+    input_digest: toLedgerHash(inputDigest),
+    output_digest: toLedgerHash(sha256Hex(rt.raw_output)),
+    acts_beside: d.acts_beside,
+    other_fields: d.other_fields,
+    why: d.why,
+    why_dropped: d.why_dropped,
+    whose: DECLINE_WHOSE,
+  };
+  const fh = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    await fh.writeFile(`${JSON.stringify(record, null, 2)}\n`);
+  } finally {
+    await fh.close();
+  }
+  return path;
+}
+
+/**
+ * A declined seat's host note detail: codes and counts only, so no run of it
+ * reads as words a model might also have written (each 20 characters of it
+ * hold one of = ; : -), and never the model's words themselves.
+ */
+function declinedDetail(d: VoicerDecline, recordWritten: boolean): string {
+  const why = d.why !== null ? "kept" : d.why_dropped !== null ? `dropped:${d.why_dropped}` : "none";
+  return `runtime-declined; why=${why}; acts-unread=${d.acts_beside}; fields-unread=${d.other_fields}; record=${recordWritten ? "written" : "failed"}`;
+}
+
 /** The in-child pipeline for one open seat: HALT, context, prompt, runtime, validate, HALT again, sign, record. */
 export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResult> {
   const { config, clock, signer } = deps;
@@ -1058,6 +1142,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   let letter: Awaited<ReturnType<typeof buildContext>>["letter"];
   let recipients: string[];
   let registration: RegistrationView | null;
+  let door: VoicerDoor;
   let inboxUnread = false;
   try {
     entries = await readLedger(path);
@@ -1084,13 +1169,15 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     });
     letter = ctx.letter;
 
-    // c. The prompt; its exact bytes are what input_digest names.
-    const prompt = buildPrompt(ctx, ref.runtime);
+    // c. The prompt; its exact bytes are what input_digest names. Its door speaks to the model that reads it, and
+    // says whether this seat offers a decline of its own; the schema carries that reply form only where it does.
+    door = voicerDoor(config, ref.runtime, deps.modelDigest ?? null, deps.modelName ?? null, seat.presence?.present === true);
+    const prompt = buildPrompt(ctx, ref.runtime, door);
     inputDigest = sha256Hex(promptBytes(prompt));
 
     // d. The runtime, under a deadline inside the watcher's, so a reply that arrives in time can still be recorded whole.
     const deadline = runtimeDeadlineMs(config.timing);
-    rt = await deps.runtime({ prompt, schema: OUTPUT_JSON_SCHEMA, seat_ref: ref, deadline_ms: deadline, signal: AbortSignal.timeout(deadline) });
+    rt = await deps.runtime({ prompt, schema: replySchema(door), seat_ref: ref, deadline_ms: deadline, signal: AbortSignal.timeout(deadline) });
   } catch (e) {
     if (e instanceof Refusal) return refused(e, "before a reply");
     // The seat's own deadline is a bound reached, not a failure (KS-003: 124).
@@ -1102,13 +1189,25 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     return result(EXIT.ERROR, "error");
   }
 
-  // e. Parse and validate. The reply is data; nothing in it executes.
+  // e. Parse and validate. The reply is data; nothing in it executes. On a seat that offered the decline the marker
+  // is read first and decides: a reply that carries it is the runtime's, and no act in it is read (KS-004 5.8).
   modelText.push(rt.raw_output);
   const parsed = parseModelOutput(rt.raw_output);
-  const validated = parsed.ok ? validateOutput(parsed.value, { ceilings: config.ceilings, allowed_recipients: recipients }) : null;
+  const declined = parsed.ok && door.decline ? readDecline(parsed.value, door) : null;
+  const validated = parsed.ok && declined === null ? validateOutput(parsed.value, { ceilings: config.ceilings, allowed_recipients: recipients }) : null;
 
   // f. HALT again after inference: a raised or unreadable HALT discards the reply whole.
   if (await halted()) return result(EXIT.OK, "halted");
+
+  if (declined !== null) {
+    // The runtime's decline: nothing is written as the citizen's, no ledger entry, no last-seat record, no letter
+    // marked seen. The seat was opened, so it counts as the host's; its spend is already settled. The model's words,
+    // if kept, go only to the host's record of the decline and, through the result, to Yu's terminal.
+    const record = await writeDeclineRecord(config, ref, rt, inputDigest, declined, clock.now()).catch(() => null);
+    await note("seat", "runtime-declined", null, declinedDetail(declined, record !== null));
+    const decline: DeclineView = { model: rt.model, why: declined.why, why_dropped: declined.why_dropped, acts_beside: declined.acts_beside, record };
+    return { ...result(EXIT.OK, "runtime-declined"), decline };
+  }
 
   if (!validated) {
     const why = parsed.ok ? "invalid" : parsed.reason;

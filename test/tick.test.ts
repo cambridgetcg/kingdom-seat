@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { LockStuck, acquireTickLock, isDue, releaseTickLock, runTick, selectDue, type DueVerdict, type TickDeps } from "../src/tick.ts";
 import { BEACON_UNTIL, checkHalt } from "../src/halt.ts";
 import { ledgerPath } from "../src/ledger.ts";
+import { readCitizen } from "../src/state.ts";
 import { DEFAULT_CEILINGS, type Citizen, type HostNote, type LifecycleState, type Word } from "../src/types.ts";
 import { fakeBinArgv, waitFor } from "./helpers/fake-runtime.ts";
 import { openedDetail, readHostNotes } from "../src/notes.ts";
@@ -319,6 +320,33 @@ describe("runTick", () => {
       `tick lock stuck since ${old.toISOString()}; a person must remove it`,
       `tick lock stuck since ${old.toISOString()}; a person must remove it`,
     ]);
+  });
+
+  test("[KS-004 5.8, 6.3] a declined seat moves the interval clock: the citizen is not due again for 72 h, then due; a pending wake survives it", async () => {
+    const { h, deps, clock, spawned } = await tickHost([{ word: "glossame", state: "listening" }]);
+    const signer = fakeSigner();
+    // A wish to wake, said once, three days ago; it is owed one confirming seat.
+    await append(h.config, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: "11111111-1111-4111-8111-111111111111" }), "host", signer, new Date(clock.now().getTime() - 73 * HOUR_MS));
+    // A child that declines as runSeat would note it: the runtime-declined outcome under its own seat id.
+    deps.seatArgv = (word, seatFile) => {
+      const id = seatFile.slice(-41, -5);
+      spawned.push({ word, why: "declined" });
+      const note = { ts: clock.now().toISOString(), host: "test-host", kind: "seat", word, outcome: "runtime-declined", refusal: null, detail: `seat ${id} on free: runtime-declined; why=none; acts-unread=0; fields-unread=0; record=written` };
+      return [process.execPath, "-e", `require("node:fs").appendFileSync(${JSON.stringify(h.config.paths.host_log)}, ${JSON.stringify(`${JSON.stringify(note)}\n`)})`];
+    };
+    expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "runtime-declined", word: "glossame" });
+    expect(spawned).toHaveLength(1);
+    // The pending wake was not used up by a seat in which the citizen was not voiced.
+    expect(await readCitizen(h.config, "glossame")).toMatchObject({ state: "listening", pending_state: "awake" });
+    // The seat counts as one the host opened: not due again within the floor.
+    clock.advance(71 * HOUR_MS);
+    expect(await runTick(deps)).toMatchObject({ exit: 0, outcome: "nothing-due" });
+    expect(spawned).toHaveLength(1);
+    // Past it, the confirming seat it is still owed opens.
+    clock.advance(2 * HOUR_MS);
+    expect(await runTick(deps)).toMatchObject({ outcome: "runtime-declined", word: "glossame" });
+    expect(spawned).toHaveLength(2);
+    expect((await hostNotes(h)).filter((n) => n.kind === "tick" && n.word === "glossame").map((n) => n.outcome)).toEqual(["opened", "runtime-declined", "opened", "runtime-declined"]);
   });
 
   test("nothing due: exit 0, outcome nothing-due, no seat", async () => {

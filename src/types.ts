@@ -1086,7 +1086,7 @@ export interface RuntimeResult {
 
 export interface RuntimeRequest {
   prompt: Prompt;
-  /** The JSON schema the output must follow (acts.OUTPUT_JSON_SCHEMA). */
+  /** The JSON schema the output must follow (acts.replySchema: OUTPUT_JSON_SCHEMA, with the decline where the seat offers it). */
   schema: object;
   seat_ref: SeatRef;
   /** A duration in milliseconds from the call, not a clock time; adapters refuse anything outside 1..2^31-1. */

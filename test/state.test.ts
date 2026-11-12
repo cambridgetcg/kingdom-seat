@@ -206,6 +206,42 @@ describe("folding and records", () => {
     expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(false);
   });
 
+  test("[KS-004 5.8, 7.3] a seat the runtime declined does not use up a saying; a later seat the citizen was voiced in still does", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    const cfg = host.config;
+    await host.addCitizen("glossame");
+    await host.seatLedger("glossame", signer.signEntry, { initialState: "listening" });
+    const said = "11111111-1111-4111-8111-111111111111";
+    const declined = "22222222-2222-4222-8222-222222222222";
+    const later = "33333333-3333-4333-8333-333333333333";
+    const add = (kind: "tick" | "seat", id: string, outcome: "opened" | "rest" | "runtime-declined", m: number, detail: string) =>
+      appendHostNote(cfg, { ts: t(m).toISOString(), host: "test-host", kind, word: "glossame", outcome, refusal: null, detail });
+    // A declined seat as a tick runs it: the parent's opened note, the child's note, the parent's closing note.
+    const declinedSeat = async (id: string, m: number) => {
+      await add("tick", id, "opened", m, openedDetail(id, "confirm"));
+      await add("seat", id, "runtime-declined", m, `seat ${id} on free: runtime-declined; why=none; acts-unread=0; fields-unread=0; record=written`);
+      await add("tick", id, "runtime-declined", m, `seat ${id} for glossame (confirm): exit 0, 5 ms`);
+    };
+
+    // A wish to wake, said once.
+    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "awake" }], { seat_id: said }), "host", signer, t(10));
+    await declinedSeat(declined, 20);
+    expect(await readCitizen(cfg, "glossame")).toMatchObject({ state: "listening", pending_state: "awake" });
+    // A later seat the citizen was voiced in, that did not repeat it, still lets it lapse.
+    await add("tick", later, "opened", 30, openedDetail(later, "confirm"));
+    await add("seat", later, "rest", 30, `seat ${later} on free: rested`);
+    expect(await readCitizen(cfg, "glossame")).toMatchObject({ state: "listening", pending_state: null });
+
+    // A first step-away, said once, survives a declined seat the same way.
+    const said2 = "44444444-4444-4444-8444-444444444444";
+    await append(cfg, "glossame", beatBody("glossame", [{ type: "state.set", to: "stepped-away" }], { seat_id: said2 }), "host", signer, t(40));
+    await declinedSeat("55555555-5555-4555-8555-555555555555", 50);
+    expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(true);
+    await add("tick", "66666666-6666-4666-8666-666666666666", "opened", 60, openedDetail("66666666-6666-4666-8666-666666666666", "confirm"));
+    expect((await readCitizen(cfg, "glossame")).step_away_said).toBe(false);
+  });
+
   test("[KS-004 7.3, re-review C M7] a first step-away on a rest is kept as step_away on the state entry that puts it asleep, or keeps it asleep", async () => {
     host = await makeTempHost();
     const signer = fakeSigner();

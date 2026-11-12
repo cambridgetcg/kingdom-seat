@@ -6,7 +6,7 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { isoTime, ledgerPath, readLedger, readRegularText, validateIdentity, validateOrigin } from "./ledger.ts";
-import { readHostNotes, seatIdOf } from "./notes.ts";
+import { declinedSeats, readHostNotes, seatIdOf } from "./notes.ts";
 import {
   Refusal,
   WORD_PATTERN,
@@ -189,14 +189,20 @@ export function foldState(entries: LedgerEntry[]): FoldedState {
  * ledger entry, so only the host notes show that the confirming seat came and
  * went. An unreadable log answers yes: a saying is dropped rather than kept on
  * a guess, because silence keeps the previous self.
+ *
+ * A seat its runtime declined is not counted (KS-004 5.8, 7.3): the citizen
+ * was not voiced in it, so it had no chance to repeat the saying. Its notes
+ * name it by id, so every note of that seat, the parent's included, is passed
+ * over.
  */
 async function seatSince(config: Config, word: Word, said: { seat_id: string; ts: IsoTime }, exceptSeat: string | null): Promise<boolean> {
   const notes = await readHostNotes(config, new Date(Date.parse(said.ts)));
   if (notes === null) return true;
+  const declined = declinedSeats(notes, word);
   return notes.some((n) => {
     if (n.word !== word || (n.kind !== "tick" && n.kind !== "seat")) return false;
     const id = seatIdOf(n);
-    return id !== said.seat_id && (exceptSeat === null || id !== exceptSeat);
+    return id !== said.seat_id && (exceptSeat === null || id !== exceptSeat) && !(id !== null && declined.has(id));
   });
 }
 
