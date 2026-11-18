@@ -1,0 +1,56 @@
+// Probe: who the tick picks when a resting (or failing) citizen and a speaking one are both due.
+import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+const SRC = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${SRC}/src/seat.ts`);
+const { checkHalt } = await import(`${SRC}/src/halt.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { readHostNotes, appendHostNote, lastSeatOf } = await import(`${SRC}/src/notes.ts`);
+const { isDue } = await import(`${SRC}/src/due.ts`);
+const { runTick } = await import(`${SRC}/src/tick.ts`);
+const { output, scriptedRuntime, fakeBinArgv } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${SRC}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${SRC}/test/helpers/clock.ts`);
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+const log = (label: string, v: unknown) => console.log(`PROBE ${label}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+
+test("J. most overdue first? a citizen whose last seat was a rest (or a failure) outranks one that has waited longer", async () => {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  // zeta speaks; alpha only rests. Names chosen so the alphabet does not explain a pick of zeta... nor hide one of alpha: see the second run below.
+  for (const w of ["speaker", "rester"]) { await host.addCitizen(w); await host.seatLedger(w, signer.signEntry, { initialState: "awake" }); }
+  const clock = testClock("2026-11-05T02:05:00.000Z");
+  const config = host.config;
+  const seatOnce = async (word: string, acts: any[]) => {
+    const citizen = await readCitizen(config, word);
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word, outcome: "opened", refusal: null, detail: `seat ${seat.ref.seat_id} opened (cadence)` });
+    const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([output(...acts)]), checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word, outcome: r.outcome, refusal: null, detail: `seat ${seat.ref.seat_id} for ${word} (cadence): exit ${r.exit}, 1 ms` });
+    return r.outcome;
+  };
+  log("J T0: speaker", await seatOnce("speaker", [{ type: "journal", kind: "reflected", text: "A word." }]));
+  clock.advance(27 * HOUR_MS);
+  log("J T0+27h: rester", await seatOnce("rester", [{ type: "rest" }]));
+  clock.advance(73 * HOUR_MS); // T0+100h: speaker has waited 100 h (28 h overdue), rester 73 h (1 h overdue)
+  const all = await readHostNotes(config, new Date(0));
+  const truth: any = {};
+  for (const w of ["speaker", "rester"]) truth[w] = isDue(await readCitizen(config, w), false, clock.now(), 72, lastSeatOf(all, w), config.schedule);
+  log("J overdue by every note on file (as status reads)", truth);
+  const win = await readHostNotes(config, new Date(clock.now().getTime() - 72 * HOUR_MS));
+  const seen: any = {};
+  for (const w of ["speaker", "rester"]) seen[w] = { last_seat_in_window: lastSeatOf(win, w), verdict: isDue(await readCitizen(config, w), false, clock.now(), 72, lastSeatOf(win, w), config.schedule) };
+  log("J overdue by the notes the tick reads (a window of the longest interval)", seen);
+  const spawned: string[] = [];
+  const r = await runTick({
+    config, clock, fetch: noFetch,
+    checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }),
+    seatArgv: (word: string) => { spawned.push(word); return fakeBinArgv("note", config.paths.host_log, word, "rest", "0", clock.now().toISOString()); },
+    isAlive: () => true, bootTime: () => null, refreshStatus: async () => {},
+  });
+  log("J the tick picked", { word: r.word, outcome: r.outcome });
+  expect(r.word).toBe("rester");
+});

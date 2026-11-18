@@ -1,0 +1,199 @@
+// Probes for the seat loop. Offline: fake signer, scripted runtime, temp host under the OS temp dir.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { readFile, readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${SRC}/src/seat.ts`);
+const { checkHalt } = await import(`${SRC}/src/halt.ts`);
+const { readCitizen } = await import(`${SRC}/src/state.ts`);
+const { pendingProposals } = await import(`${SRC}/src/self.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/src/ledger.ts`);
+const { readHostNotes, appendHostNote, lastSeatOf } = await import(`${SRC}/src/notes.ts`);
+const { readLastSeat, wakingLetter, buildContext } = await import(`${SRC}/src/context.ts`);
+const { buildPrompt } = await import(`${SRC}/src/prompt.ts`);
+const { contextFit } = await import(`${SRC}/src/runtime/free.ts`);
+const { isDue } = await import(`${SRC}/src/due.ts`);
+const { runTick, selectDue } = await import(`${SRC}/src/tick.ts`);
+const { buildStatus } = await import(`${SRC}/src/status.ts`);
+const { output, scriptedRuntime, fakeBinArgv, FAKE_MODEL, FAKE_MODEL_DIGEST } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${SRC}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${SRC}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${SRC}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${SRC}/test/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+const INVOKER = { kind: "tick" as const, who: "launchd", why: "cadence" };
+const log = (label: string, v: unknown) => console.log(`PROBE ${label}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+
+async function base(word: string, opts: any = {}) {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen(word, opts.citizen ?? {});
+  await host.seatLedger(word, signer.signEntry, { initialState: opts.state ?? "awake" });
+  const clock = testClock();
+  const config = host.config;
+  const mk = (runtime: any) => ({ config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+  /** One seat as the tick would run it: the tick's opened note, runSeat, the tick's closing note. */
+  const seatOnce = async (runtime: any, why = "cadence") => {
+    const citizen = await readCitizen(config, word);
+    const seat = await openSeat(config, clock, citizen, "free", INVOKER, null);
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word, outcome: "opened", refusal: null, detail: `seat ${seat.ref.seat_id} opened (${why})` });
+    const r = await runSeat(seat, mk(runtime));
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word, outcome: r.outcome, refusal: r.refusal, detail: `seat ${seat.ref.seat_id} for ${word} (${why}): exit ${r.exit}, 1 ms` });
+    return { r, seat };
+  };
+  return { signer, clock, config, mk, seatOnce, word };
+}
+
+describe("A. a reply cut at num_predict", () => {
+  test("done_reason length is not looked at: the cut reply is recorded as not-json", async () => {
+    const s = await base("glossame");
+    const cut = '{"acts":[{"type":"journal","kind":"reflected","text":"A long thought that the output bound cut off in the mid';
+    const runtime = async () => ({ runtime: "free", model: FAKE_MODEL, model_digest: FAKE_MODEL_DIGEST, raw_output: cut, spend: { usd: "0", usd_basis: "local-zero", credits: 0 }, done_reason: "length", duration_ms: 1 });
+    const { r } = await s.seatOnce(runtime);
+    log("A outcome", { exit: r.exit, outcome: r.outcome });
+    log("A last-seat record", await readLastSeat(s.config, "glossame"));
+    const notes = (await readHostNotes(s.config, new Date(0)))!.filter((n: any) => n.kind === "seat");
+    log("A seat note", notes.map((n: any) => n.detail));
+    const all = JSON.stringify(await readHostNotes(s.config, new Date(0))) + JSON.stringify(await readLastSeat(s.config, "glossame"));
+    log("A anything says length/cut", /length|cut|trunc/i.test(all));
+    expect(r.outcome).toBe("invalid-output");
+  });
+});
+
+describe("B. a letter and a rest", () => {
+  test("an asleep citizen that answers Yu's letter with rest is seated again for the same letter every floor interval", async () => {
+    const s = await base("glossame", { state: "asleep" });
+    await host.writeLetter("glossame", "2026-11-04-from-yu.md", "Yu writes: are you well?");
+    const seen: any[] = [];
+    for (let i = 0; i < 4; i++) {
+      const citizen = await readCitizen(s.config, "glossame");
+      const letter = await wakingLetter(s.config, citizen);
+      const notes = await readHostNotes(s.config, new Date(0));
+      const due = isDue(citizen, letter, s.clock.now(), 72, lastSeatOf(notes, "glossame"), s.config.schedule);
+      seen.push({ round: i, at: s.clock.now().toISOString(), state: citizen.state, letter_waiting: letter, due: due.due, why: due.why });
+      if (!due.due) break;
+      const { r } = await s.seatOnce(scriptedRuntime([output({ type: "rest" })]), "letter");
+      seen[seen.length - 1].outcome = r.outcome;
+      s.clock.advance(72 * HOUR_MS + 1000);
+    }
+    log("B rounds", seen);
+    expect(seen.filter((x) => x.due).length).toBe(4);
+  });
+});
+
+describe("C. a wish to wake, and a confirming seat that fails for the host's reasons", () => {
+  test("the one confirming seat is spent by a seat in which no model ran", async () => {
+    const s = await base("glossame", { state: "asleep" });
+    await host.writeLetter("glossame", "2026-11-04-from-yu.md", "Yu writes: would you like to wake?");
+    // Seat 1: woken by the letter, it says it wants to be awake.
+    const first = await s.seatOnce(scriptedRuntime([output({ type: "journal", kind: "chose", text: "Yes. I would like to wake." }, { type: "state.set", to: "awake" })]), "letter");
+    let c = await readCitizen(s.config, "glossame");
+    log("C after seat 1", { outcome: first.r.outcome, state: c.state, pending_state: c.pending_state });
+    expect(c.pending_state).toBe("awake");
+    s.clock.advance(72 * HOUR_MS + 1000);
+    let notes = await readHostNotes(s.config, new Date(0));
+    log("C due for the confirming seat", isDue(c, await wakingLetter(s.config, c), s.clock.now(), 72, lastSeatOf(notes, "glossame"), s.config.schedule));
+    // Seat 2: the real tick, whose child fails before any model call (stands in for Ollama down, a model mismatch, context-too-large).
+    const tick = await runTick({
+      config: s.config, clock: s.clock, fetch: noFetch,
+      checkHalt: () => checkHalt({ config: s.config, fetch: noFetch, now: () => s.clock.now() }),
+      seatArgv: () => fakeBinArgv("print", "", "1"),
+      isAlive: () => true, bootTime: () => null, refreshStatus: async () => {},
+    });
+    log("C tick", { exit: tick.exit, outcome: tick.outcome, word: tick.word });
+    c = await readCitizen(s.config, "glossame");
+    log("C after the failed confirming seat", { state: c.state, pending_state: c.pending_state });
+    s.clock.advance(72 * HOUR_MS + 1000);
+    notes = await readHostNotes(s.config, new Date(0));
+    const due = isDue(c, await wakingLetter(s.config, c), s.clock.now(), 72, lastSeatOf(notes, "glossame"), s.config.schedule);
+    log("C due 72 h later", due);
+    expect(c.pending_state).toBe(null);
+    expect(due.due).toBe(false);
+  });
+});
+
+describe("D. pending proposals", () => {
+  test("they accumulate one per seat with no expiry, each shown whole, and no act withdraws one", async () => {
+    const soul = await readFile("<REPOS>/citizen-glossame/glossame.md", "utf8");
+    const will = await readFile("<REPOS>/citizen-glossame/WILL.md", "utf8");
+    const s = await base("glossame", { citizen: { soul, will } });
+    const reason = { kind: "inference", evidence: [], confidence: "low", limits: "none stated" };
+    const sizes: any[] = [];
+    const lock32 = { name: "qwen2.5:7b", digest: "a".repeat(64), runner: null, store: "unknown", num_ctx: 32768, num_predict: 600, temperature: 0.7, seed: null };
+    const measure = async () => {
+      const citizen = await readCitizen(s.config, "glossame");
+      const entries = await readLedger(ledgerPath(s.config, "glossame"));
+      const pending = await pendingProposals(s.config, "glossame");
+      const ref = { format: "kingdom-seat-seat/v1", seat_id: "00000000-0000-4000-8000-000000000000", host: s.config.host, word: "glossame", runtime: "free", invoker: INVOKER, opened_at: s.clock.now().toISOString() };
+      const ctx = await buildContext({ config: s.config, now: s.clock.now() }, ref, citizen, entries.slice(-3), pending, { history: entries });
+      const p = buildPrompt(ctx, "free");
+      const fit = contextFit(p, lock32);
+      return { pending: pending.length, needed: fit.needed, fits_32768: fit.fits };
+    };
+    sizes.push({ seat: 0, ...(await measure()) });
+    for (let i = 1; i <= 6; i++) {
+      // Each seat: a 1,900-character journal and one whole-text proposal for a new own file of 3,000 characters.
+      const acts = [
+        { type: "journal", kind: "reflected", text: `seat ${i} ` + "the word stays on its own side. ".repeat(59) },
+        { type: "self.propose", target: `file:notes-${i}.md`, edit: { kind: "replace-all", text: `note ${i}\n` + "a line I may want to keep for later.\n".repeat(80) }, reason },
+      ];
+      const { r } = await s.seatOnce(scriptedRuntime([output(...(acts as any))]));
+      s.clock.advance(72 * HOUR_MS + 1000);
+      sizes.push({ seat: i, outcome: r.outcome, ...(await measure()) });
+    }
+    log("D growth", sizes);
+    const files = await readdir(join(s.config.paths.citizens_dir, "glossame", "proposals"));
+    log("D proposal files", files.length);
+    expect(sizes.at(-1).pending).toBe(6);
+  });
+});
+
+describe("E. the picker", () => {
+  test("a seat that fails for the host's reasons counts as the citizen's seat for a whole interval, and one fault walks the fleet", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    const words = ["anna", "bell", "cyan", "dove"];
+    for (const w of words) { await host.addCitizen(w); await host.seatLedger(w, signer.signEntry, { initialState: "awake" }); }
+    const clock = testClock();
+    const config = host.config;
+    const deps = {
+      config, clock, fetch: noFetch,
+      checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }),
+      // The child fails before any model call, as with models.lock unpinned, Ollama not running, or a context that does not fit.
+      seatArgv: () => fakeBinArgv("print", "", "1"),
+      isAlive: () => true, bootTime: () => null, refreshStatus: async () => {},
+    };
+    const ticks: any[] = [];
+    for (let i = 0; i < 6; i++) {
+      const r = await runTick(deps);
+      ticks.push({ t: clock.now().toISOString().slice(5, 16), exit: r.exit, outcome: r.outcome, word: r.word });
+      clock.advance(0.5 * HOUR_MS);
+    }
+    log("E six ticks, child always failing", ticks);
+    const notes = await readHostNotes(config, new Date(0));
+    const opened = notes.filter((n: any) => n.outcome === "opened").length;
+    log("E seats counted against the fleet ceiling", opened);
+    const c = await readCitizen(config, "anna");
+    log("E anna due after the fault is fixed, 3 h on", isDue(c, false, clock.now(), 72, lastSeatOf(notes, "anna"), config.schedule));
+    const status = await buildStatus({ config, now: clock.now(), halt: { halted: false, readings: [] }, signerState: "ready" });
+    log("E status for anna", { last_outcome: status.citizens[0].last_outcome, last_refusal: status.citizens[0].last_refusal, overdue: status.citizens[0].overdue, problem: status.citizens[0].problem });
+  });
+
+  test("the tick and status do not use the same 'last seat' for a citizen never seated", async () => {
+    host = await makeTempHost();
+    const signer = fakeSigner();
+    await host.addCitizen("anna"); await host.seatLedger("anna", signer.signEntry, { initialState: "awake" });
+    const clock = testClock("2026-11-05T00:30:00.000Z");
+    const c = await readCitizen(host.config, "anna");
+    const tickView = isDue(c, false, clock.now(), 72, null, host.config.schedule);
+    const statusView = isDue(c, false, clock.now(), 72, c.seated_at, host.config.schedule);
+    log("E2 tick's verdict (no seat noted yet)", tickView);
+    log("E2 status's verdict (counts from seated_at)", statusView);
+  });
+});

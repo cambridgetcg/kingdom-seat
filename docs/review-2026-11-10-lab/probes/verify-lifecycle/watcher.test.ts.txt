@@ -1,0 +1,43 @@
+// verify-lifecycle: does ONE unreadable beacon read stop a running seat (no retry)?
+// The production watcher (seat.ts superviseChild) over a child that only sleeps; the beacon
+// read is the production readBeacons over a fake fetch that answers 503 exactly once.
+import { expect, test } from "bun:test";
+const SRC = "<KINGDOM_SEAT>";
+const { superviseChild } = await import(`${SRC}/src/seat.ts`);
+const { readBeacons } = await import(`${SRC}/src/halt.ts`);
+const { fakeBinArgv } = await import(`${SRC}/test/helpers/fake-runtime.ts`);
+const { testBeacons, testConfig } = await import(`${SRC}/test/helpers/temp-home.ts`);
+
+test("one 503 from one beacon, once, ends the seat with TERM; the next read would have been fine", async () => {
+  const config = testConfig("/nonexistent-root", "/nonexistent-homes", { beacons: testBeacons() });
+  let reads = 0;
+  let failed = 0;
+  const fetch = async (input: unknown) => {
+    reads++;
+    const url = String(input);
+    const did = url.split("/public/agents/")[1]!;
+    // The second beacon's first read fails once; every other read says lowered.
+    if (did.includes("2222") && failed === 0) {
+      failed++;
+      return new Response("upstream hiccup", { status: 503 });
+    }
+    return Response.json({ did, status: "active", quiet_until: null });
+  };
+  const r = await superviseChild({
+    argv: fakeBinArgv("sleep", "20000"),
+    cwd: import.meta.dir,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    deadline_ms: 15_000,
+    term_grace_ms: 500,
+    halt_file_poll_ms: 60_000,
+    beacon_poll_min_ms: 100,
+    beacon_poll_max_ms: 150,
+    readHaltFile: () => ({ source: "file", id: "x", state: "lowered", quiet_until: null, detail: "absent", checked_at: new Date().toISOString() }),
+    readBeacons: (signal: AbortSignal) => readBeacons({ config, fetch: fetch as never, now: () => new Date() }, signal),
+  });
+  console.log("VERIFY watcher:", JSON.stringify({ exit: r.exit, outcome: r.outcome, signal: r.signal, stopped_by: r.stopped_by, beacon_requests: reads, failed_reads: failed, duration_ms: r.duration_ms }));
+  expect(r.outcome).toBe("halted");
+  expect(r.stopped_by).toBe("halt-herald");
+  expect(failed).toBe(1);
+  expect(reads).toBe(2); // one poll of the two beacons, and no second look
+}, 30_000);

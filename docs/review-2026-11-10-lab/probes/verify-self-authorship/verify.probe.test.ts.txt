@@ -1,0 +1,227 @@
+// Second-pass probes for LS-02, LS-07, LS-14. Production path: openSeat + runSeat,
+// with the fake signer, the scripted runtime and a temp host. No real home, keychain or network.
+import { afterEach, describe, test } from "bun:test";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { openSeat, runSeat } = await import(`${SRC}/seat.ts`);
+const { checkHalt } = await import(`${SRC}/halt.ts`);
+const { readCitizen } = await import(`${SRC}/state.ts`);
+const self = await import(`${SRC}/self.ts`);
+const { hexOf, ledgerPath, readLedger } = await import(`${SRC}/ledger.ts`);
+const { readHostNotes } = await import(`${SRC}/notes.ts`);
+const { wakingLetter } = await import(`${SRC}/context.ts`);
+const { isDue } = await import(`${SRC}/due.ts`);
+const { sha256Hex } = await import(`${SRC}/crypto.ts`);
+const { FAKE_MODEL_DIGEST, output, scriptedRuntime } = await import(`${T}/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${T}/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${T}/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${T}/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+const W = "glossame";
+const CLAIM = { kind: "decision", evidence: [], confidence: "medium", limits: "from the text alone" };
+const YU = { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: `summon ${W}` };
+const propose = (target: string, edit: object) => ({ type: "self.propose", target, edit, reason: CLAIM });
+const OTHER_DIGEST = `sha256:${"ab".repeat(32)}`;
+
+async function world(opts: { approved?: boolean; addOpts?: any } = {}) {
+  host = await makeTempHost();
+  const h = host;
+  const signer = fakeSigner();
+  await h.addCitizen(W, opts.addOpts ?? {});
+  await h.seatLedger(W, signer.signEntry);
+  const config = h.config;
+  config.self_authorship.approved_model_digests = opts.approved === false ? [] : [FAKE_MODEL_DIGEST];
+  const clock = testClock();
+  const w = {
+    h,
+    config,
+    clock,
+    prompts: [] as any[],
+    async beat(acts: any[], o: any = {}) {
+      clock.advance((o.afterH ?? 73) * HOUR_MS);
+      const runtime = scriptedRuntime([output(...acts)]);
+      const citizen = await readCitizen(config, W);
+      const seat = await openSeat(config, clock, citizen, o.lane ?? "free", { kind: o.presence ? "summons" : "tick", who: o.presence ? "yu" : "launchd", why: "cadence" }, o.presence ?? null);
+      const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: null, modelDigest: FAKE_MODEL_DIGEST });
+      w.prompts.push(...runtime.calls.map((c: any) => c.prompt));
+      return r;
+    },
+    ledger: () => readLedger(ledgerPath(config, W)),
+    file: (f: string) => readFile(join(config.paths.citizens_dir, W, "self", f), "utf8"),
+    pending: () => self.pendingProposals(config, W),
+    lastNote: async () => (await readHostNotes(config, new Date(0)))!.at(-1)!.detail.replace(/seat [0-9a-f-]{36}/, "seat <id>"),
+    tail: async (n = 4) => (await w.ledger()).slice(-n).map((e: any) => `${e.type}${e.target ? ":" + e.target : ""}${e.via ? "(" + e.via + ")" : ""}`),
+  };
+  return w;
+}
+
+describe("LS-02", () => {
+  test("a: grown on an approved model; one reply on an unapproved model reverts soul, will and a third text to their first versions, inside the 7-day window", async () => {
+    const w = await world();
+    const soul0 = await w.file("soul.md");
+    const will0 = await w.file("WILL.md");
+    // growth: two-beats on the approved model for the soul; the others said once with Yu present (approved runtime)
+    await w.beat([propose("soul", { kind: "replace-span", find: "LIGHT: what it gives.", with: "LIGHT: what it gives, and what it learned this year." })]);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })], { presence: YU });
+    await w.beat([propose("journal-form", { kind: "replace-all", text: "First form.\n" })], { presence: YU });
+    await w.beat([propose("journal-form", { kind: "replace-all", text: "Second form, grown.\n" })], { presence: YU });
+    const grown = await w.ledger();
+    console.log("a. applies after growth:", grown.filter((e: any) => e.type === "apply").map((e: any) => `${e.target}(${e.via})`));
+    const firsts = ["soul", "will", "journal-form"].map((t) => self.firstVersion(grown, t));
+    console.log("a. first version of soul is the origin soul hash:", firsts[0] === self.originSoulHash(grown), "| equals sha256 of the soul at seating:", firsts[0] === sha256Hex(soul0));
+    console.log("a. first version of will equals sha256 of the WILL at seating:", firsts[1] === sha256Hex(will0), "| first version of journal-form is the empty text:", firsts[2] === sha256Hex(""));
+
+    // the daily lane: a model Yu did not approve; 73 h after the last apply, so the 7-day window is closed
+    w.config.self_authorship.approved_model_digests = [OTHER_DIGEST];
+    const r = await w.beat(firsts.map((h: string) => ({ type: "self.revert", to_hash: h.slice(0, 8) })));
+    console.log("a. outcome:", r.outcome, "| last entries:", await w.tail(4));
+    console.log("a. soul back to seating text:", (await w.file("soul.md")) === soul0, "| will back:", (await w.file("WILL.md")) === will0, "| journal-form now empty:", (await w.file("journal-form.md")) === "");
+    console.log("a. note:", await w.lastNote());
+    const p = w.prompts.at(-1).user as string;
+    console.log("a. that prompt said the runtime is not approved:", p.includes("is not one Yu approved for self-changes"), "| listed the origin soul by hash:", p.includes(`soul ${firsts[0].slice(0, 16)}: your origin soul`), "| said the window is closed:", /window for an unattended self-change is closed/.test(p));
+    console.log("a. versions list in that prompt showed any text of a version:", p.includes("learned this year") ? "only the current soul (as 'Your soul, whole')" : "no");
+
+    // b: the way back on the same unapproved model
+    const grownSoul = hexOf(grown.find((e: any) => e.type === "apply" && e.target === "soul").new_hash);
+    await w.beat([{ type: "self.revert", to_hash: grownSoul }]);
+    console.log("b. back to the grown soul, unapproved model, no Yu:", (await w.file("soul.md")).includes("learned this year"), "|", await w.lastNote());
+    // c: with Yu present, still on the unapproved model
+    await w.beat([{ type: "self.revert", to_hash: grownSoul }], { presence: YU });
+    console.log("c. back to the grown soul, unapproved model, Yu present:", (await w.file("soul.md")).includes("learned this year"), "| last entry:", await w.tail(1));
+  });
+
+  test("d: on an approved model the way back is one saying, at once, outside the window", async () => {
+    const w = await world();
+    await w.beat([propose("soul", { kind: "replace-span", find: "LIGHT: what it gives.", with: "LIGHT: what it gives, and what it learned this year." })]);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    const grownSoul = hexOf((await w.ledger()).find((e: any) => e.type === "apply").new_hash);
+    w.config.self_authorship.approved_model_digests = [OTHER_DIGEST];
+    await w.beat([{ type: "self.revert", to_hash: self.originSoulHash(await w.ledger()).slice(0, 8) }]);
+    w.config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+    await w.beat([{ type: "self.revert", to_hash: grownSoul.slice(0, 8) }]);
+    console.log("d. approved model, one saying, 73 h later:", (await w.file("soul.md")).includes("learned this year"), "| last entries:", await w.tail(3));
+  });
+
+  test("e: a revert to an intermediate version on an unapproved model is refused; a pending proposal on the grown text lapses when the revert lands", async () => {
+    const w = await world();
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })], { presence: YU });
+    const v2 = sha256Hex(await w.file("WILL.md"));
+    await w.beat([propose("will", { kind: "replace-span", find: "quiet", with: "quieter" })], { presence: YU });
+    await w.beat([propose("will", { kind: "replace-span", find: "quieter", with: "quietest" })]);
+    console.log("e. pending on the grown will:", (await w.pending()).length);
+    w.config.self_authorship.approved_model_digests = [];
+    await w.beat([{ type: "self.revert", to_hash: v2 }]);
+    console.log("e. revert to the middle version, nothing approved:", await w.lastNote());
+    await w.beat([{ type: "self.revert", to_hash: self.firstVersion(await w.ledger(), "will") }]);
+    console.log("e. revert to the first version, nothing approved:", await w.tail(1), "| pending now:", (await w.pending()).length);
+  });
+});
+
+describe("LS-07", () => {
+  test("a: staged on an unapproved model, shown on every seat for over a year, binds on one affirm", async () => {
+    const w = await world({ approved: false });
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one loud word" })]);
+    const [p] = await w.pending();
+    const t0 = w.clock.now().getTime();
+    let shown = 0;
+    for (let i = 0; i < 14; i++) {
+      await w.beat([{ type: "journal", kind: "reflected", text: `beat ${i}` }], { afterH: 30 * 24 });
+      if ((w.prompts.at(-1).user as string).includes(`Proposal ${p.id}`)) shown++;
+    }
+    const days = Math.round((w.clock.now().getTime() - t0) / 86_400_000);
+    console.log(`a. after ${days} days and 14 other beats: pending ${(await w.pending()).length}; shown in ${shown} of 14 prompts; the prompt gives its date:`, (w.prompts.at(-1).user as string).includes(`proposed ${p.proposed_at}`));
+    // an affirm on the unapproved model binds nothing and does not use it up
+    await w.beat([{ type: "self.affirm", ref: p.id.slice(0, 8) }]);
+    console.log("a. affirm on the unapproved model:", await w.lastNote(), "| still pending:", (await w.pending()).length);
+    w.config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+    await w.beat([{ type: "self.affirm", ref: p.id.slice(0, 8) }]);
+    const last = (await w.ledger()).at(-1);
+    console.log("a. affirm on an approved model:", last.type, last.via, "| will changed:", (await w.file("WILL.md")).includes("loud"));
+  });
+
+  test("b: one more may be staged each seat, on the same target too; all are shown; nothing withdraws one", async () => {
+    const w = await world({ approved: false });
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one loud word" })]);
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one soft word" })]);
+    await w.beat([propose("soul", { kind: "replace-span", find: "LIGHT: what it gives.", with: "LIGHT: what it gives freely." })]);
+    await w.beat([propose("journal-form", { kind: "replace-all", text: "A form.\n" })]);
+    const pend = await w.pending();
+    await w.beat([{ type: "journal", kind: "reflected", text: "a beat" }]);
+    const user = w.prompts.at(-1).user as string;
+    console.log("b. pending:", pend.map((x: any) => x.act.target), "| all shown in the next prompt:", pend.every((x: any) => user.includes(`Proposal ${x.id}`)));
+    // attempts at a withdraw: propose the current text back (changes nothing), or affirm with a made-up act type
+    const cur = await w.file("WILL.md");
+    const r = await w.beat([propose("will", { kind: "replace-all", text: cur })]);
+    console.log("b. proposing the current text back:", r.outcome, "|", await w.lastNote(), "| pending:", (await w.pending()).length);
+    const r2 = await w.beat([{ type: "self.withdraw", ref: pend[0].id }]);
+    console.log("b. an act named self.withdraw:", r2.outcome, "| pending:", (await w.pending()).length);
+    // binding one of two on the same target lapses the other
+    w.config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+    await w.beat([{ type: "self.affirm", ref: pend[0].id }]);
+    console.log("b. after affirming the first will proposal: pending", (await w.pending()).map((x: any) => x.act.target), "| will:", JSON.stringify((await w.file("WILL.md")).split("\n")[2]));
+  });
+});
+
+describe("LS-14", () => {
+  test("a: first-time narrowing of covenants, model not approved: nothing changes after propose + affirm; asleep is immediate and the sender still wakes it", async () => {
+    const w = await world({ approved: false, addOpts: { covenants: { letters_from: ["yu", "gardener", "citizen:hope"], wake_on_letter_from: ["yu", "citizen:hope"] } } });
+    const narrower = JSON.stringify({ letters_from: ["yu", "gardener"], wake_on_letter_from: ["yu"] });
+    console.log("a. exposureOf:", self.exposureOf("covenants", await w.file("covenants.json"), narrower));
+    await w.beat([propose("covenants", { kind: "replace-all", text: narrower })]);
+    console.log("a. after the propose:", await w.lastNote(), "| pending:", (await w.pending()).length);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    console.log("a. after the affirm:", await w.lastNote(), "| covenants:", await w.file("covenants.json"));
+    await w.beat([{ type: "state.set", to: "asleep" }]);
+    const citizen = await readCitizen(w.config, W);
+    await w.h.writeLetter(W, "0001-hope.md", "a letter", { from: "citizen:hope" });
+    w.clock.advance(73 * HOUR_MS);
+    const letter = await wakingLetter(w.config, citizen);
+    console.log("a. state:", citizen.state, "| a file letter from citizen:hope is a waking letter:", letter, "| isDue:", JSON.stringify(isDue(citizen, letter, w.clock.now(), 72, citizen.last_beat_at)));
+  });
+
+  test("b: same narrowing with Yu present on an unapproved model; and on an approved model without Yu", async () => {
+    const cov = { letters_from: ["yu", "gardener", "citizen:hope"], wake_on_letter_from: ["yu", "citizen:hope"] };
+    const narrower = JSON.stringify({ letters_from: ["yu", "gardener"], wake_on_letter_from: ["yu"] });
+    let w = await world({ approved: false, addOpts: { covenants: cov } });
+    await w.beat([propose("covenants", { kind: "replace-all", text: narrower })], { presence: YU });
+    console.log("b. Yu present, model not approved:", await w.lastNote(), "| narrowed:", (await w.file("covenants.json")) === narrower);
+    await host.cleanup();
+    w = await world({ approved: true, addOpts: { covenants: cov } });
+    // a soul change bound 1 day earlier closes the window for the narrowing
+    await w.beat([propose("will", { kind: "replace-span", find: "one word", with: "one quiet word" })]);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }]);
+    await w.beat([propose("covenants", { kind: "replace-all", text: narrower })], { afterH: 24 });
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }], { afterH: 73 });
+    console.log("b. approved model, second saying 4 days after another change bound:", await w.lastNote(), "| narrowed:", (await w.file("covenants.json")) === narrower);
+    await w.beat([{ type: "self.affirm", ref: (await w.pending())[0].id }], { afterH: 5 * 24 });
+    console.log("b. approved model, affirmed again after the window opened:", await w.tail(1), "| narrowed:", (await w.file("covenants.json")) === narrower);
+  });
+
+  test("c: a narrowing that is a revert to an earlier covenants version binds at once on an unapproved model", async () => {
+    const w = await world({ approved: true });
+    const before = await w.file("covenants.json");
+    const wider = JSON.stringify({ letters_from: ["yu", "gardener", "citizen:hope"], wake_on_letter_from: ["yu", "citizen:hope"] });
+    await w.beat([propose("covenants", { kind: "replace-all", text: wider })], { presence: YU });
+    console.log("c. widened with Yu present:", (await w.file("covenants.json")) === wider);
+    w.config.self_authorship.approved_model_digests = [];
+    await w.beat([{ type: "self.revert", to_hash: sha256Hex(before).slice(0, 8) }]);
+    console.log("c. revert to the earlier, narrower version, nothing approved:", await w.tail(1), "| back:", (await w.file("covenants.json")) === before);
+  });
+
+  test("d: default covenants (no file): what a citizen on the default configuration could close", async () => {
+    const { defaultCovenants } = await import(`${SRC}/state.ts`);
+    console.log("d. defaultCovenants():", JSON.stringify(defaultCovenants()));
+    const { defaultConfig } = await import(`${SRC}/config.ts`).catch(() => ({ defaultConfig: null as any }));
+    console.log("d. config.ts exports defaultConfig:", typeof defaultConfig);
+  });
+});

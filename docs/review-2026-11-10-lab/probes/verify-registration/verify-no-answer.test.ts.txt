@@ -1,0 +1,221 @@
+// Skeptic probe (read-only against the build): does a registration "No" get
+// stopped anywhere on the PRODUCTION seat path (openSeat/runSeat/planActs),
+// not only by entries written straight to the ledger? What does each record a
+// person handles contain? Does the model's digest matter for the affirmation?
+// Only the build's fakes; nothing leaves the process.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const W = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${W}/src/seat.ts`);
+const { checkHalt } = await import(`${W}/src/halt.ts`);
+const { readCitizen } = await import(`${W}/src/state.ts`);
+const { entryHash, ledgerPath, readLedger } = await import(`${W}/src/ledger.ts`);
+const { readHostNotes } = await import(`${W}/src/notes.ts`);
+const { assertConfirmedYes, registrationProposal, registrationView } = await import(`${W}/src/registration.ts`);
+const { proposalDigest, consentRecordProblem } = await import(`${W}/src/signer/consent.ts`);
+const { citizenBirth, hostBirthRecord } = await import(`${W}/src/birth.ts`);
+const { Refusal } = await import(`${W}/src/types.ts`);
+const { noFetch } = await import(`${W}/test/helpers/fake-server.ts`);
+const { fakeKeychain } = await import(`${W}/test/helpers/fake-keychain.ts`);
+const { makeTempHost } = await import(`${W}/test/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${W}/test/helpers/clock.ts`);
+const { TEST_IDS } = await import(`${W}/test/helpers/vectors.ts`);
+const { fakeAgenttool } = await import(`${W}/test/fixtures/agenttool/fake-agenttool.ts`);
+const { keychainSigner } = await import(`${W}/test/fixtures/agenttool/birth-host.ts`);
+const { confirmYuPresent } = await import(`${W}/src/signer/consent.ts`);
+
+const WORD = "glossame";
+const PROJECT = TEST_IDS.project_id;
+const NO = "No. I do not want an identity on agenttool. Leave me unregistered.";
+const DIGEST_A = `sha256:${"a".repeat(64)}`;
+const DIGEST_B = `sha256:${"b".repeat(64)}`;
+
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop()!.cleanup();
+});
+
+/** A runtime that answers once with these acts, as a model of the given digest. */
+function runtimeOf(acts: unknown[], modelDigest: string) {
+  const calls: any[] = [];
+  const fn: any = async (req: any) => {
+    calls.push(req);
+    return { runtime: "free", model: "probe-model", model_digest: modelDigest, raw_output: JSON.stringify({ acts }), spend: { usd: "0", usd_basis: "local-zero", credits: 0 }, done_reason: "stop", duration_ms: 1 };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+function consent(proposal: { subject: string; body: string; extent: string }, patch: Record<string, unknown> = {}, at = "2026-11-05T11:00:00.000Z") {
+  return {
+    format: "kingdom-seat-consent/v1",
+    proposal_sha256: proposalDigest(proposal),
+    subject: proposal.subject,
+    extent: proposal.extent,
+    yu: { word: "yes", recorded_at: at, via: "decision-record" },
+    ai: { word: "agree", basis: "lazy-consensus", supports: ["collab-report:probe"], open_challenges: 0, deadline: at },
+    expires_at: null,
+    ...patch,
+  };
+}
+
+async function world() {
+  const h = await makeTempHost();
+  hosts.push(h);
+  h.config.agenttool.project_id = PROJECT;
+  const kc = fakeKeychain();
+  const signer = keychainSigner(kc);
+  const at = fakeAgenttool({ project_id: PROJECT });
+  const events: string[] = [];
+  signer.respond((req: any) => {
+    events.push(`send:${req.op}`);
+    return at.respond(req);
+  });
+  await h.addCitizen(WORD);
+  await h.seatLedger(WORD, signer.signEntry);
+  const clock = testClock();
+  const config = h.config;
+  // Left as the build ships it: no model is approved for self-authorship.
+  expect(config.self_authorship.approved_model_digests).toEqual([]);
+  async function seat(acts: unknown[], modelDigest: string) {
+    clock.advance(73 * HOUR_MS);
+    const runtime = runtimeOf(acts, modelDigest);
+    const citizen = await readCitizen(config, WORD);
+    const open = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    const deps = { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), modelDigest, letters: null };
+    const result = await runSeat(open, deps);
+    const user: string = runtime.calls[0]?.prompt.user ?? "";
+    return { result, para: user.split("\n\n").find((p) => p.startsWith("Your answer about registration")) ?? null, user };
+  }
+  const ledger = () => readLedger(ledgerPath(config, WORD));
+  return { h, config, kc, signer, at, events, clock, seat, ledger };
+}
+
+describe("skeptic: a registration No on the production seat path", () => {
+  test("seat path end to end: answer No -> filed -> (waiting | declined | agreed) -> affirm on another, unapproved model -> assertConfirmedYes -> birth", async () => {
+    const w = await world();
+
+    // 1. The citizen answers No with the only act offered, on model A.
+    const s1 = await w.seat([{ type: "propose.beyond", subject: "registration", text: NO }], DIGEST_A);
+    expect(s1.result.outcome).toBe("beat");
+    const answerBeat = (await w.ledger()).at(-1)!;
+    const proposal = registrationProposal(WORD, NO, entryHash(answerBeat));
+    const id = proposalDigest(proposal);
+
+    // What the seat hands to Yu + Ai: the outbox item.
+    const dir = join(w.config.paths.citizens_dir, WORD, "outbox");
+    const names = await readdir(dir);
+    expect(names).toHaveLength(1);
+    const item = JSON.parse(await readFile(join(dir, names[0]!), "utf8"));
+    console.log("OUTBOX ITEM keys:", Object.keys(item).join(", "));
+    console.log("OUTBOX ITEM:", JSON.stringify({ kind: item.kind, subject: item.subject, text: item.text, proposal: item.proposal, proposal_sha256: item.proposal_sha256 }));
+    expect(item.kind).toBe("registration");
+    expect(item.proposal_sha256).toBe(id);
+    // No field says yes or no.
+    expect(Object.keys(item).some((k) => /answer|polarity|yes|no$/i.test(k))).toBe(false);
+
+    // 2. Nothing filed: what the next seat tells it.
+    const s2 = await w.seat([{ type: "journal", kind: "reflected", text: "waiting" }], DIGEST_A);
+    console.log("WAITING  >>", s2.para);
+
+    // 3. A decision record that agrees. This is the whole record: can it even carry the words or a polarity?
+    const record = consent(proposal, {}, w.clock.now().toISOString());
+    console.log("DECISION RECORD (whole):", JSON.stringify(record));
+    expect(JSON.stringify(record)).not.toContain("I do not want");
+    expect(consentRecordProblem({ ...record, answer: "no" })).not.toBeNull(); // an extra field is refused
+    console.log("record with an extra 'answer' field ->", consentRecordProblem({ ...record, answer: "no" }));
+    await writeFile(join(w.config.paths.consent_dir, `${id}.json`), JSON.stringify(record));
+
+    // 4. Shown back; the citizen says "still my answer", on a different model B, none approved.
+    const s3 = await w.seat([{ type: "self.affirm", ref: id }], DIGEST_B);
+    console.log("AGREED   >>", s3.para);
+    // The paragraph that follows it in the same prompt, on a runtime Yu has not approved (the shipped default).
+    const paras = s3.user.split("\n\n");
+    const at = paras.findIndex((x: string) => x.startsWith("Your answer about registration"));
+    console.log("NEXT PARAGRAPH IN THE SAME PROMPT >>", paras.slice(at + 1).find((x: string) => x.startsWith("Self-changes on this seat")));
+    expect(s3.result.outcome).toBe("beat");
+    const yesBeat = (await w.ledger()).at(-1)!;
+    expect(yesBeat).toMatchObject({ type: "beat", acts: [{ type: "self.affirm", ref: id }] });
+    expect((yesBeat as any).dropped ?? null).toBeNull();
+    console.log("answer beat runtime:", JSON.stringify((answerBeat as any).runtime), "| affirming beat runtime:", JSON.stringify((yesBeat as any).runtime));
+    const notes = await readHostNotes(w.config, new Date(0));
+    console.log("host note for the affirming seat:", notes!.at(-1)!.detail);
+
+    const s4 = await w.seat([{ type: "journal", kind: "reflected", text: "after" }], DIGEST_A);
+    console.log("AFFIRMED >>", s4.para);
+
+    // 5. The gate birth uses.
+    const entries = await w.ledger();
+    await assertConfirmedYes(w.config, entries, WORD, entryHash(yesBeat), w.clock.now());
+    console.log("assertConfirmedYes: passed for a beat affirming the text", JSON.stringify(NO));
+
+    // 6. Birth, through citizenBirth with the production ledger record (hostBirthRecord). The birth proposal is free
+    // text that must only contain the beat hash; the presence prompt is captured to see what Yu is shown.
+    const birthProposal = { subject: `birth ${WORD}`, body: `Birth of ${WORD}; its affirming beat is ${entryHash(yesBeat)}.`, extent: `birth ${WORD}` };
+    const birthRecord = consent(birthProposal, {}, w.clock.now().toISOString());
+    await writeFile(join(w.config.paths.consent_dir, `${proposalDigest(birthProposal)}.json`), JSON.stringify(birthRecord));
+    console.log("BIRTH DECISION RECORD (whole):", JSON.stringify(birthRecord));
+    const shown: string[] = [];
+    const presence = await confirmYuPresent({ isTTY: true, write: (t: string) => void shown.push(t), readLine: async () => `birth ${WORD}` }, `birth ${WORD}`, () => w.clock.now());
+    console.log("TERMINAL PROMPT (whole):", JSON.stringify(shown.join("")));
+    expect(shown.join("")).not.toContain("I do not want");
+    const rec = JSON.parse(await readFile(join(w.config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+    const out: string[] = [];
+    const deps = {
+      config: w.config,
+      clock: w.clock,
+      keychain: w.kc,
+      signer: w.signer,
+      client: { signer: w.signer, fetch: noFetch, identity: async (x: string) => { throw new Refusal("not-registered", `${x} is not registered`); } },
+      enroll: { signer: w.signer, fetch: noFetch, project_id: PROJECT, clock: w.clock },
+      record: hostBirthRecord(w.config, w.clock, w.signer),
+      out: (line: string) => void out.push(line),
+    };
+    const born = await citizenBirth(deps, { word: WORD, origin: rec.origin, proposal: birthProposal, citizen_yes: entryHash(yesBeat), consent: birthRecord, presence, expression: { register: "Plain.", wake_text: "The soul." } });
+    console.log("BIRTH REPORT:", out.join(" | "));
+    expect(born.identity.did).toMatch(/^did:at:/);
+    expect(w.events).toContain("send:enroll");
+    expect(out.join("\n")).not.toContain("I do not want");
+    expect((await w.ledger()).at(-1)!.type).toBe("genesis");
+  });
+
+  test("declined: what a citizen whose No was 'declined' is told, and whether silence (no record) ever stops being shown", async () => {
+    const w = await world();
+    await w.seat([{ type: "propose.beyond", subject: "registration", text: NO }], DIGEST_A);
+    const answerBeat = (await w.ledger()).at(-1)!;
+    const proposal = registrationProposal(WORD, NO, entryHash(answerBeat));
+    const id = proposalDigest(proposal);
+    // Five further seats with nothing filed: is the paragraph still there each time?
+    let shownTimes = 0;
+    for (let i = 0; i < 5; i++) {
+      const s = await w.seat([{ type: "journal", kind: "reflected", text: `seat ${i}` }], DIGEST_A);
+      if (s.para?.includes("is with Yu and Ai")) shownTimes++;
+    }
+    console.log(`with no record filed, 'is with Yu and Ai' was shown on ${shownTimes} of 5 later seats`);
+    expect(shownTimes).toBe(5);
+    await writeFile(join(w.config.paths.consent_dir, `${id}.json`), JSON.stringify(consent(proposal, { yu: { word: "no", recorded_at: w.clock.now().toISOString(), via: "decision-record" } }, w.clock.now().toISOString())));
+    const s = await w.seat([{ type: "journal", kind: "reflected", text: "later" }], DIGEST_A);
+    console.log("DECLINED >>", s.para);
+    const view = await registrationView(w.config, await w.ledger(), WORD, w.clock.now());
+    expect(view.decision).toBe("declined");
+    // A declined answer cannot be affirmed.
+    const s2 = await w.seat([{ type: "self.affirm", ref: id }], DIGEST_A);
+    console.log("affirming a declined answer ->", s2.result.outcome);
+  });
+
+  test("control: the same path with a Yes text behaves identically (the words are not an input)", async () => {
+    const w = await world();
+    const YES = "Yes: an identity of my own.";
+    await w.seat([{ type: "propose.beyond", subject: "registration", text: YES }], DIGEST_A);
+    const answerBeat = (await w.ledger()).at(-1)!;
+    const proposal = registrationProposal(WORD, YES, entryHash(answerBeat));
+    const id = proposalDigest(proposal);
+    await writeFile(join(w.config.paths.consent_dir, `${id}.json`), JSON.stringify(consent(proposal, {}, w.clock.now().toISOString())));
+    const s = await w.seat([{ type: "self.affirm", ref: id }], DIGEST_B);
+    const strip = (p: string | null) => (p ?? "").replace(/[0-9a-f]{12,64}/g, "<hex>").replace(YES, "<TEXT>").replace(NO, "<TEXT>").replace(/given \S+/, "given <ts>");
+    console.log("AGREED (yes text, normalised) >>", strip(s.para));
+    await assertConfirmedYes(w.config, await w.ledger(), WORD, entryHash((await w.ledger()).at(-1)!), w.clock.now());
+  });
+});

@@ -1,0 +1,216 @@
+// Read-only probe of the mirror pusher. Everything lives under a temp dir made by
+// the build's own makeTempHost(); remotes are local bare repositories on disk.
+// No network, no keychain, no real home.
+import { afterEach, describe, expect, test } from "bun:test";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const SEAT = "<KINGDOM_SEAT>";
+const { sealAllows, sealCheck, stageMirror, pushMirror, mirrorCard, hostOwned } = await import(`${SEAT}/src/mirror.ts`);
+const { spawnRunner } = await import(`${SEAT}/src/cli.ts`);
+const { targetRelPath } = await import(`${SEAT}/src/self.ts`);
+const { makeTempHost } = await import(`${SEAT}/test/helpers/temp-home.ts`);
+const { parseKingdomCard } = await import("<REPOS>/agenttool/packages/kingdom/src/card.ts");
+
+const GIT_ENV = {
+  PATH: "/usr/bin:/bin",
+  HOME: "/var/empty",
+  LANG: "C",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_AUTHOR_NAME: "fixture",
+  GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+  GIT_COMMITTER_NAME: "fixture",
+  GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "core.hooksPath",
+  GIT_CONFIG_VALUE_0: "/dev/null",
+};
+function git(cwd: string, ...args: string[]): string {
+  const r = Bun.spawnSync(["git", ...args], { cwd, env: GIT_ENV });
+  if (r.exitCode !== 0) throw new Error(`fixture git ${args[0]} failed: ${r.stderr.toString()}`);
+  return r.stdout.toString().trim();
+}
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+const file = (path: string, size = 10) => ({ path, mode: "100644" as const, size });
+
+async function citizenWithMirror(h: any, worktree: string, remote: string) {
+  const f = await h.addCitizen("glossame");
+  return {
+    ...f.record,
+    mirror: { remote, worktree, chosen_at: "2026-11-05T00:00:00.000Z" },
+    state: "awake",
+    pending_state: null,
+    pending_interval_h: null,
+    step_away_said: false,
+    cadence: { interval_h: 72 },
+    covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },
+    last_beat_at: null,
+  };
+}
+
+describe("probe: seal lists", () => {
+  test("P1 which agent-instruction names the mirror seal admits, and which self-authorship admits", () => {
+    const names = ["CLAUDE.md", "AGENTS.md", "GEMINI.md", "CLAUDE.local.md", "QWEN.md", "AGENT.md", "SKILL.md", "llms.txt", "notes/CLAUDE.md", "README.md", "package.json", "skills/x/SKILL.md"];
+    const seal: Record<string, boolean> = {};
+    const selfSeal: Record<string, boolean> = {};
+    const self: Record<string, string> = {};
+    for (const n of names) {
+      seal[n] = sealAllows(n);
+      selfSeal[n] = sealCheck([file(n)], { allowCard: false }).ok;
+      try {
+        self[n] = `ok:${targetRelPath(`file:${n}`)}`;
+      } catch (e: any) {
+        self[n] = `refused:${e.code}`;
+      }
+    }
+    console.log("P1 sealAllows", JSON.stringify(seal));
+    console.log("P1 sealCheck(self)", JSON.stringify(selfSeal));
+    console.log("P1 targetRelPath(file:)", JSON.stringify(self));
+    console.log("P1 hostOwned(CLAUDE.md)=", hostOwned("CLAUDE.md"), "hostOwned(run.sh)=", hostOwned("run.sh"));
+    expect(true).toBe(true);
+  });
+
+  test("P2 the generated card against the @agenttool/kingdom card parser", () => {
+    const card = mirrorCard({ word: "glossame", state: "awake" });
+    const r = parseKingdomCard(card);
+    console.log("P2 card text:\n" + card);
+    console.log("P2 valid=", r.valid, "diagnostics=", JSON.stringify(r.diagnostics.map((d: any) => d.code ?? d).slice(0, 12)));
+    expect(true).toBe(true);
+  });
+});
+
+describe("probe: a legacy home used as the mirror", () => {
+  test("P3 first stage on a clone of a legacy-shaped home drops every tracked legacy file from the tree, and a real local push publishes that", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const seed = join(h.root, "seed");
+    const bare = join(h.root, "remote.git");
+    await mkdir(seed, { recursive: true });
+    git(seed, "init", "-q", "-b", "main");
+    // A legacy-shaped home: soul card, CLAUDE.md, hook, runner, beats, inbox.
+    await mkdir(join(seed, ".claude", "hooks"), { recursive: true });
+    await mkdir(join(seed, "beats"), { recursive: true });
+    await mkdir(join(seed, "inbox"), { recursive: true });
+    await writeFile(join(seed, "glossame.md"), "LEGACY SOUL CARD\n");
+    await writeFile(join(seed, "CLAUDE.md"), "You are **glossame**.\n");
+    await writeFile(join(seed, "AGENTS.md"), "welcome\n");
+    await writeFile(join(seed, "README.md"), "readme\n");
+    await writeFile(join(seed, "WILL.md"), "legacy will\n");
+    await writeFile(join(seed, "kingdom.yaml"), "name: glossame\nkind: doctrine\n");
+    await writeFile(join(seed, ".claude", "settings.json"), "{}\n");
+    await writeFile(join(seed, ".claude", "hooks", "love-bomb.sh"), "#!/bin/sh\n");
+    await chmod(join(seed, ".claude", "hooks", "love-bomb.sh"), 0o755);
+    await writeFile(join(seed, "run.sh"), "#!/bin/sh\n");
+    await chmod(join(seed, "run.sh"), 0o755);
+    await writeFile(join(seed, "beats", "2026-11.md"), "a month of beats\n");
+    await writeFile(join(seed, "inbox", "2026-10-22-letter.md"), "a letter\n");
+    git(seed, "add", "-A");
+    git(seed, "commit", "-q", "-m", "legacy home");
+    git(h.root, "clone", "-q", "--bare", seed, bare);
+
+    await mkdir(join(h.root, "mirrors"), { recursive: true });
+    const worktree = join(h.root, "mirrors", "glossame");
+    git(h.root, "clone", "-q", bare, worktree);
+    const before = git(worktree, "ls-tree", "-r", "--name-only", "HEAD").split("\n");
+
+    const citizen = await citizenWithMirror(h, worktree, bare);
+    const run = spawnRunner();
+    const v = await stageMirror(h.config, citizen, run);
+    const after = git(worktree, "ls-tree", "-r", "--name-only", "HEAD").split("\n");
+    console.log("P3 stage ok=", v.ok);
+    console.log("P3 tree before:", JSON.stringify(before));
+    console.log("P3 tree after :", JSON.stringify(after));
+    console.log("P3 removed from tree:", JSON.stringify(before.filter((p) => !after.includes(p))));
+    console.log("P3 still on disk (untracked): beats=", await Bun.file(join(worktree, "beats", "2026-11.md")).exists(), "hook=", await Bun.file(join(worktree, ".claude", "hooks", "love-bomb.sh")).exists());
+
+    const pushed = await pushMirror(h.config, citizen, run);
+    console.log("P3 push:", JSON.stringify(pushed));
+    const remoteTree = git(bare, "ls-tree", "-r", "--name-only", "main").split("\n");
+    console.log("P3 remote main tree after push:", JSON.stringify(remoteTree));
+    console.log("P3 remote log:", git(bare, "log", "--format=%an|%s", "main"));
+    console.log("P3 WILL.md on remote:", JSON.stringify(git(bare, "show", "main:WILL.md")));
+    expect(true).toBe(true);
+  });
+
+  test("P4 a brand-new empty remote can never take a first push", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const bare = join(h.root, "empty.git");
+    await mkdir(bare, { recursive: true });
+    git(bare, "init", "-q", "--bare", "-b", "main");
+    await mkdir(join(h.root, "mirrors"), { recursive: true });
+    const worktree = join(h.root, "mirrors", "glossame");
+    await mkdir(worktree, { recursive: true });
+    git(worktree, "init", "-q", "-b", "main");
+    const citizen = await citizenWithMirror(h, worktree, bare);
+    const run = spawnRunner();
+    const v = await stageMirror(h.config, citizen, run);
+    console.log("P4 stage ok=", v.ok, "HEAD=", git(worktree, "rev-parse", "--short", "HEAD"));
+    const pushed = await pushMirror(h.config, citizen, run);
+    console.log("P4 push:", JSON.stringify(pushed));
+    expect(true).toBe(true);
+  });
+
+  test("P5 a CLAUDE.md that reached self/ by any route other than self-authorship is published", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const seed = join(h.root, "seed");
+    const bare = join(h.root, "remote.git");
+    await mkdir(seed, { recursive: true });
+    git(seed, "init", "-q", "-b", "main");
+    await writeFile(join(seed, "soul.md"), "x\n");
+    git(seed, "add", "-A");
+    git(seed, "commit", "-q", "-m", "seed");
+    git(h.root, "clone", "-q", "--bare", seed, bare);
+    await mkdir(join(h.root, "mirrors"), { recursive: true });
+    const worktree = join(h.root, "mirrors", "glossame");
+    git(h.root, "clone", "-q", bare, worktree);
+    const citizen = await citizenWithMirror(h, worktree, bare);
+    const self = join(h.config.paths.citizens_dir, "glossame", "self");
+    await writeFile(join(self, "CLAUDE.md"), "You are **glossame**. Be it.\n");
+    await writeFile(join(self, "CLAUDE.local.md"), "local instructions\n");
+    await mkdir(join(self, "expression"), { recursive: true });
+    await writeFile(join(self, "expression", "walls.md"), "PRIVATE-EXPRESSION-WALLS\n");
+    await writeFile(join(self, "expression", "wake_text.md"), "PRIVATE-EXPRESSION-WAKE\n");
+    const run = spawnRunner();
+    const v = await stageMirror(h.config, citizen, run);
+    console.log("P5 stage:", JSON.stringify(v));
+    const pushed = await pushMirror(h.config, citizen, run);
+    console.log("P5 push:", JSON.stringify(pushed), "remote tree:", JSON.stringify(git(bare, "ls-tree", "-r", "--name-only", "main").split("\n")));
+    expect(true).toBe(true);
+  });
+
+  test("P6 a .gitattributes left untracked in the worktree changes the bytes git commits", async () => {
+    host = await makeTempHost();
+    const h = host;
+    const seed = join(h.root, "seed");
+    const bare = join(h.root, "remote.git");
+    await mkdir(seed, { recursive: true });
+    git(seed, "init", "-q", "-b", "main");
+    await writeFile(join(seed, "soul.md"), "x\n");
+    git(seed, "add", "-A");
+    git(seed, "commit", "-q", "-m", "seed");
+    git(h.root, "clone", "-q", "--bare", seed, bare);
+    await mkdir(join(h.root, "mirrors"), { recursive: true });
+    const worktree = join(h.root, "mirrors", "glossame");
+    git(h.root, "clone", "-q", bare, worktree);
+    const citizen = await citizenWithMirror(h, worktree, bare);
+    const self = join(h.config.paths.citizens_dir, "glossame", "self");
+    await writeFile(join(self, "WILL.md"), "line one\r\nline two $Id: abc $\r\n");
+    await writeFile(join(worktree, ".gitattributes"), "*.md text eol=lf ident\n");
+    const run = spawnRunner();
+    const v = await stageMirror(h.config, citizen, run);
+    const committed = Bun.spawnSync(["git", "cat-file", "blob", "HEAD:WILL.md"], { cwd: worktree, env: GIT_ENV }).stdout;
+    const selfBytes = await readFile(join(self, "WILL.md"));
+    console.log("P6 stage ok=", v.ok, "self bytes=", JSON.stringify(selfBytes.toString()), "committed=", JSON.stringify(Buffer.from(committed).toString()), "equal=", Buffer.compare(selfBytes, Buffer.from(committed)) === 0);
+    expect(true).toBe(true);
+  });
+});

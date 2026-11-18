@@ -1,0 +1,177 @@
+// Read-only probes of ledger.ts against a temp host with the fake signer.
+// Nothing here touches a real home, keychain or network.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile, appendFile } from "node:fs/promises";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { appendEntry, entryHash, ledgerPath, nextDraft, readLedger, verifyChain, parseLedgerText } = await import(`${SRC}/ledger.ts`);
+const { canonicalJson } = await import(`${SRC}/crypto.ts`);
+const { foldState } = await import(`${SRC}/state.ts`);
+const { windowOpen } = await import(`${SRC}/self.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${T}/helpers/temp-home.ts`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+const W = "glossame";
+const COST = { usd: "0", credits: 0 };
+const STAMP = {
+  seat_ref: "11111111-1111-4111-8111-111111111111",
+  runtime: { class: "free", model: "m", digest: `sha256:${"f".repeat(64)}` },
+  input_digest: `sha256:${"a".repeat(64)}`,
+  output_digest: `sha256:${"b".repeat(64)}`,
+  voiced: "glossame, voiced through m in seat x",
+};
+
+async function setup() {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen(W);
+  await host.seatLedger(W, signer.signEntry, { initialState: "awake" });
+  const path = ledgerPath(host.config, W);
+  const trusted = { host_attest_b64: [signer.hostAttestPublicB64], identity: null };
+  const add = async (fields: any, opts: any = {}) => {
+    const all = await readLedger(path);
+    return appendEntry(path, nextDraft(W, all.at(-1) ?? null, fields, { cost: COST, signer: "host", now: opts.now ?? new Date("2026-11-06T00:00:00.000Z"), seat: opts.seat === undefined ? STAMP : opts.seat, acts: opts.acts ?? null }), signer.signEntry);
+  };
+  return { host, signer, path, trusted, add };
+}
+
+describe("probe: tail truncation", () => {
+  test("cutting the last entries leaves a chain that verifies, folds and extends", async () => {
+    const { path, trusted, add } = await setup();
+    await add({ type: "beat" }, { acts: [{ type: "journal", kind: "reflected", text: "one" }, { type: "state.set", to: "asleep" }] });
+    await add({ type: "state", from: "awake", to: "asleep", via: "immediate" });
+    const full = await readLedger(path);
+    expect(foldState(full).state).toBe("asleep");
+    expect(verifyChain(full, trusted).ok).toBe(true);
+
+    // Anyone who can write the file (no key needed) drops the last two lines.
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    await writeFile(path, `${lines.slice(0, 2).join("\n")}\n`);
+    const cut = await readLedger(path);
+    const v = verifyChain(cut, trusted);
+    console.log("after truncation: entries", cut.length, "verify ok", v.ok, "state", foldState(cut).state);
+    expect(v.ok).toBe(true); // the cut ledger verifies as whole
+    expect(foldState(cut).state).toBe("awake"); // the sleep it chose is gone
+    // and the host will extend it without complaint
+    const next = await add({ type: "beat" }, { acts: [{ type: "journal", kind: "reflected", text: "after the cut" }] });
+    expect(next.seq).toBe(2);
+    expect(verifyChain(await readLedger(path), trusted).ok).toBe(true);
+  });
+
+  test("dropping a trailing apply entry reopens the 7-day window", async () => {
+    const { path, trusted, add } = await setup();
+    const now = new Date("2026-11-06T00:00:00.000Z");
+    await add(
+      { type: "apply", ref: `sha256:${"1".repeat(64)}`, target: "will", prior_hash: `sha256:${"2".repeat(64)}`, new_hash: `sha256:${"3".repeat(64)}`, via: "two-beats", reason: { kind: "decision", evidence: [], confidence: "low", limits: "" }, strand_thought: null, strand_key: null, strand_backup: null, expression: null },
+      { now },
+    );
+    expect(windowOpen(await readLedger(path), new Date("2026-11-07T00:00:00.000Z"), 7, null)).toBe(false);
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    await writeFile(path, `${lines.slice(0, -1).join("\n")}\n`);
+    const cut = await readLedger(path);
+    expect(verifyChain(cut, trusted).ok).toBe(true);
+    expect(windowOpen(cut, new Date("2026-11-07T00:00:00.000Z"), 7, null)).toBe(true);
+  });
+});
+
+describe("probe: concurrent appends", () => {
+  test("two appenders on the same head both write; the ledger then refuses every later append", async () => {
+    const { path, signer, trusted } = await setup();
+    const all = await readLedger(path);
+    const mk = (text: string) => nextDraft(W, all.at(-1), { type: "beat" }, { cost: COST, signer: "host", now: new Date("2026-11-06T00:00:00.000Z"), seat: STAMP, acts: [{ type: "journal", kind: "reflected", text }] });
+    const results = await Promise.allSettled([appendEntry(path, mk("A"), signer.signEntry), appendEntry(path, mk("B"), signer.signEntry)]);
+    console.log("concurrent results:", results.map((r) => r.status));
+    const after = await readLedger(path);
+    console.log("entries", after.length, "seqs", after.map((e: any) => e.seq));
+    const v = verifyChain(after, trusted);
+    console.log("verify:", JSON.stringify(v.problem));
+    // Try to extend from what a seat would read.
+    let err: any = null;
+    try {
+      await appendEntry(path, nextDraft(W, after.at(-1), { type: "beat" }, { cost: COST, signer: "host", now: new Date("2026-11-07T00:00:00.000Z"), seat: STAMP, acts: [{ type: "journal", kind: "reflected", text: "C" }] }), signer.signEntry);
+    } catch (e) {
+      err = e;
+    }
+    console.log("next append:", err ? `${err.code}: ${err.message}` : "accepted");
+  });
+});
+
+describe("probe: a torn last line", () => {
+  test("an unterminated tail makes every read throw; nothing in src repairs it", async () => {
+    const { path } = await setup();
+    await appendFile(path, '{"format":"kingdom-seat-ledger/v1","word":"glos');
+    let err: any = null;
+    try {
+      await readLedger(path);
+    } catch (e) {
+      err = e;
+    }
+    console.log("torn tail:", err?.code, err?.message);
+    expect(err?.code).toBe("invalid-record");
+  });
+});
+
+describe("probe: file bytes are not canonical", () => {
+  test("a line re-spelled with spaces, reordered keys and an exponent number parses and verifies with the same hash", async () => {
+    const { path, trusted, add } = await setup();
+    await add({ type: "beat" }, { acts: [{ type: "journal", kind: "reflected", text: "one" }] });
+    const before = await readLedger(path);
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    const last = JSON.parse(lines[2]!);
+    // Reverse key order, pretty spacing, and spell seq 2 as 2e0, credits 0 as -0.
+    const keys = Object.keys(last).reverse();
+    let respelled = `{ ${keys.map((k) => `${JSON.stringify(k)} : ${JSON.stringify(last[k])}`).join(" , ")} }`;
+    respelled = respelled.replace('"seq" : 2', '"seq" : 2e0').replace('"credits":0', '"credits":-0');
+    expect(respelled).not.toBe(lines[2]);
+    await writeFile(path, `${lines[0]}\n${lines[1]}\n${respelled}\n`);
+    const after = await readLedger(path);
+    console.log("respelled line accepted; same hash:", entryHash(after[2]) === entryHash(before[2]), "verify:", verifyChain(after, trusted).ok);
+    expect(entryHash(after[2])).toBe(entryHash(before[2]));
+    expect(verifyChain(after, trusted).ok).toBe(true);
+  });
+});
+
+describe("probe: time", () => {
+  test("ts need not rise: an entry dated before its predecessor appends and verifies", async () => {
+    const { path, trusted, add } = await setup();
+    await add({ type: "beat" }, { now: new Date("2027-01-01T00:00:00.000Z"), acts: [{ type: "journal", kind: "reflected", text: "later" }] });
+    await add({ type: "beat" }, { now: new Date("2026-01-01T00:00:00.000Z"), acts: [{ type: "journal", kind: "reflected", text: "earlier" }] });
+    const all = await readLedger(path);
+    console.log("ts order:", all.map((e: any) => e.ts));
+    expect(verifyChain(all, trusted).ok).toBe(true);
+    console.log("last_beat_at folds to:", foldState(all).last_beat_at);
+  });
+
+  test("an apply stamped by a clock that ran ahead closes the window until that date", async () => {
+    const { path, add } = await setup();
+    await add(
+      { type: "apply", ref: `sha256:${"1".repeat(64)}`, target: "will", prior_hash: `sha256:${"2".repeat(64)}`, new_hash: `sha256:${"3".repeat(64)}`, via: "two-beats", reason: { kind: "decision", evidence: [], confidence: "low", limits: "" }, strand_thought: null, strand_key: null, strand_backup: null, expression: null },
+      { now: new Date("2040-01-01T00:00:00.000Z") },
+    );
+    const all = await readLedger(path);
+    for (const d of ["2026-12-01", "2030-01-01", "2039-12-31", "2040-01-09"]) console.log("window open on", d, windowOpen(all, new Date(`${d}T00:00:00.000Z`), 7, null));
+  });
+});
+
+describe("probe: what parse checks about seq", () => {
+  test("parseLedgerText accepts lines whose seq does not match their position", async () => {
+    const { path } = await setup();
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    // duplicate the last line: same seq twice
+    const text = `${lines.join("\n")}\n${lines.at(-1)}\n`;
+    const parsed = parseLedgerText(text);
+    console.log("parsed", parsed.length, "seqs", parsed.map((e: any) => e.seq), "fold state", foldState(parsed).state);
+  });
+});
+
+describe("probe: canonical JSON edge", () => {
+  test("lone surrogate is escaped, not refused", () => {
+    console.log("lone surrogate:", canonicalJson({ a: "\ud800" }));
+  });
+});

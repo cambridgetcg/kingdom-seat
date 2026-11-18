@@ -1,0 +1,107 @@
+bun test v1.4.2 (744846f84)
+
+../../../../..<SCRATCH>/probes/verify-lifecycle/lifecycle.test.ts:
+VERIFY LRA1 tick 1: {"exit":0,"line":"tick: beat anna (exit 0)"}
+VERIFY LRA1 tick 2: {"exit":0,"line":"tick: rest bell (exit 0)"}
+VERIFY LRA1 tick 3: {"exit":0,"line":"tick: beat cyan (exit 0)"}
+VERIFY LRA1 right after: {"anna":{"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"asleep; no letter"}},"bell":{"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"asleep; no letter"}},"cyan":{"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":true,"waking_letter":false,"verdict":{"due":false,"why":"asleep; confirm waits 72 h"}}}
+VERIFY LRA1 anna ledger: ["origin","state asleep->awake via seated","beat","state awake->asleep via immediate"]
+VERIFY LRA1 +73h verdicts: {"anna":{"due":false,"why":"asleep; no letter"},"bell":{"due":false,"why":"asleep; no letter"},"cyan":{"due":true,"why":"confirm","overdue_h":1}}
+VERIFY LRA1 +73h tick: {"exit":0,"line":"tick: rest cyan (exit 0)"}
+VERIFY LRA1 +73h second tick: {"exit":0,"line":"tick: nothing-due (exit 0)"}
+VERIFY LRA1 +30d tick: {"exit":0,"line":"tick: nothing-due (exit 0)","anna":{"due":false,"why":"asleep; no letter"},"bell":{"due":false,"why":"asleep; no letter"}}
+VERIFY LRA1 +336d tick: {"exit":0,"line":"tick: nothing-due (exit 0)","anna":{"due":false,"why":"asleep; no letter"},"bell":{"due":false,"why":"asleep; no letter"}}
+VERIFY LRA1 seat anna by hand, no Yu: {"exit":1,"line":"tick: nothing-due (exit 0)","err":"citizen-seat: refused (window-closed): anna is not due (asleep; no letter); only Yu's summons (--yu-present) seats it now"}
+VERIFY LRA1 anna with a gardener letter: {"due":false,"why":"asleep; no letter"}
+VERIFY LRA1 bell (default covenants) with a gardener letter: {"due":false,"why":"asleep; no letter"}
+VERIFY LRA1 bell with Yu's letter: {"due":true,"why":"letter","overdue_h":8785.5}
+VERIFY LRA1 tick after Yu's letter: {"exit":0,"line":"tick: beat bell (exit 0)"}
+VERIFY LRA1 Yu's free-lane summons of anna: {"exit":0,"line":"seat anna: beat (exit 0)","err":""}
+VERIFY LRA1 anna after the summons: {"state":"awake","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 72 h"}}
+VERIFY SR9 tick 1 (anna says 8760): {"exit":0,"line":"tick: beat anna (exit 0)"}
+VERIFY SR9 tick 2 (bell says 8760 with a rest): {"exit":0,"line":"tick: rest bell (exit 0)"}
+VERIFY SR9 after: {"anna":{"state":"awake","interval_h":8760,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 8760 h"}},"bell":{"state":"awake","interval_h":8760,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 8760 h"}}}
+VERIFY SR9 anna ledger: ["origin","state asleep->awake via seated","beat","state awake->awake via immediate interval_h 8760"]
+VERIFY SR9 +30d, Yu's letter waiting: {"anna":{"state":"awake","interval_h":8760,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 8040 h"}},"tick":{"exit":0,"line":"tick: nothing-due (exit 0)"}}
+VERIFY SR9 seat anna by hand, no Yu: {"exit":1,"line":"tick: nothing-due (exit 0)","err":"citizen-seat: refused (window-closed): anna is not due (awake; next in 8040 h); only Yu's summons (--yu-present) seats it now"}
+VERIFY SR9 Yu's free-lane summons of anna: {"exit":0,"line":"seat anna: beat (exit 0)","err":""}
+VERIFY SR9 anna after the summons: {"state":"awake","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 72 h"}}
+VERIFY SR9 anna receipts: ["2026-11-06-from-yu.md"]
+VERIFY SR9 anna ledger tail: ["beat cost {\"credits\":0,\"usd\":\"0\"}","state awake->awake via confirmed interval_h 72"]
+VERIFY SR9 bell at +365d: {"due":true,"why":"cadence","overdue_h":0}
+VERIFY SR9 at +366d before the tick: {"anna":{"due":true,"why":"cadence","overdue_h":7992},"bell":{"due":true,"why":"cadence","overdue_h":24}}
+VERIFY SR9 ticks at +366d: ["tick: beat bell (exit 0)"]
+VERIFY SR9 bell after asking for 72 h once: {"state":"awake","interval_h":8760,"pending":"awake","pending_interval_h":72,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 8760 h"}}
+VERIFY SR9 bell 30 days after asking: {"due":false,"why":"awake; next in 8040 h"}
+VERIFY SR9 ticks two years after the first reply: ["tick: invalid-output anna (exit 0)","tick: beat bell (exit 0)"]
+VERIFY SR9 bell after saying 72 h a second time: {"state":"awake","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 72 h"}}
+VERIFY SR4 tick: {"at":"11-05T02:05","fault":"ollama down (fetch throws)","exit":1,"line":"tick: error anna (exit 1)"}
+VERIFY SR4 tick: {"at":"11-05T02:35","fault":"model unpinned","exit":1,"line":"tick: refused bell (exit 1)"}
+VERIFY SR4 tick: {"at":"11-05T03:05","fault":"context too large","exit":1,"line":"tick: refused cyan (exit 1)"}
+VERIFY SR4 tick: {"at":"11-05T03:35","fault":"HALT raised just after open","exit":0,"line":"tick: halted dove (exit 0)"}
+VERIFY SR4 tick: {"at":"11-05T04:05","fault":"child exits 1 before runSeat","exit":1,"line":"tick: error elle (exit 1)"}
+VERIFY SR4 tick: {"at":"11-05T04:35","fault":"still broken","exit":0,"line":"tick: nothing-due (exit 0)"}
+VERIFY SR4 tick: {"at":"11-05T05:05","fault":"still broken","exit":0,"line":"tick: nothing-due (exit 0)"}
+VERIFY SR4 model calls in all of that: 0
+VERIFY SR4 anna: {"notes":["tick:opened","error:error","tick:error"],"verdict":{"due":false,"why":"awake; next in 69 h"}}
+VERIFY SR4 bell: {"notes":["tick:opened","refusal:refused(model-unpinned)","tick:refused(model-unpinned)"],"verdict":{"due":false,"why":"awake; next in 69 h"}}
+VERIFY SR4 cyan: {"notes":["tick:opened","refusal:refused(context-too-large)","tick:refused(context-too-large)"],"verdict":{"due":false,"why":"awake; next in 70 h"}}
+VERIFY SR4 dove: {"notes":["tick:opened","tick:halted"],"verdict":{"due":false,"why":"awake; next in 70 h"}}
+VERIFY SR4 elle: {"notes":["tick:opened","tick:error"],"verdict":{"due":false,"why":"awake; next in 71 h"}}
+VERIFY SR4 seats counted against today's fleet ceiling: 5
+VERIFY SR4 status rows: [{"word":"anna","last_outcome":"error","last_refusal":null,"overdue":false,"problem":null},{"word":"bell","last_outcome":"refused","last_refusal":{"at":"2026-11-05T02:35:00.000Z","outcome":"refused","refusal":"model-unpinned","detail":"seat 70625f46-40b0-4257-bd6e-bb29a811e0cc on free: before a reply: refused (model-unpinned)"},"overdue":false,"problem":null},{"word":"cyan","last_outcome":"refused","last_refusal":{"at":"2026-11-05T03:05:00.000Z","outcome":"refused","refusal":"context-too-large","detail":"seat 16255600-e251-432a-8e8b-ab63e49e955d on free: before a reply: refused (context-too-large)"},"overdue":false,"problem":null},{"word":"dove","last_outcome":"halted","last_refusal":null,"overdue":false,"problem":null},{"word":"elle","last_outcome":"error","last_refusal":null,"overdue":false,"problem":null}]
+VERIFY SR4 tick after the fix: {"exit":0,"line":"tick: nothing-due (exit 0)"}
+VERIFY SR4 71.5 h after anna's failed seat: {"due":false,"why":"awake; next in 1 h"}
+VERIFY SR4 72.5 h after anna's failed seat: {"exit":0,"line":"tick: beat anna (exit 0)"}
+VERIFY SR4b tick with HALT already up: {"exit":0,"line":"tick: halted (exit 0)"}
+VERIFY SR4b tick with the signer locked: {"exit":0,"line":"tick: refused (exit 0)"}
+VERIFY SR4b anna notes: []
+VERIFY SR4b anna verdict: {"due":true,"why":"cadence","overdue_h":null}
+VERIFY SR5 tick 1 (letter seat): {"exit":0,"line":"tick: beat anna (exit 0)"}
+VERIFY SR5 after seat 1: {"state":"asleep","interval_h":72,"pending":"awake","pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 72 h"}}
+VERIFY SR5 +73h verdict: {"due":true,"why":"cadence","overdue_h":1}
+VERIFY SR5 tick 2 (the confirming seat, Ollama down): {"exit":1,"line":"tick: error anna (exit 1)"}
+VERIFY SR5 anna notes: ["tick:opened","seat:beat","tick:beat","tick:opened","error:error","tick:error"]
+VERIFY SR5 after the failed confirming seat: {"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"asleep; no letter"}}
+VERIFY SR5 +73h more: {"verdict":{"due":false,"why":"asleep; no letter"},"tick":{"exit":0,"line":"tick: nothing-due (exit 0)"}}
+VERIFY SR5 status row: [{"word":"anna","state":"asleep","pending":null,"last_outcome":"error","last_refusal":null}]
+VERIFY SR5 Yu's free-lane summons: {"exit":0,"line":"seat anna: beat (exit 0)","err":""}
+VERIFY SR5 after the summons: {"state":"awake","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"awake; next in 72 h"}}
+VERIFY SLH5 tick 1 (first saying): {"exit":0,"line":"tick: beat anna (exit 0)"}
+VERIFY SLH5 after seat 1: {"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":true,"waking_letter":false,"verdict":{"due":false,"why":"asleep; confirm waits 72 h"}}
+VERIFY SLH5 tick with HALT already up: {"exit":0,"line":"tick: halted (exit 0)"}
+VERIFY SLH5 after a HALT that was up at the tick: {"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":true,"waking_letter":false,"verdict":{"due":true,"why":"confirm","overdue_h":1}}
+VERIFY SLH5 confirming seat, HALT raised just after open: {"exit":0,"line":"tick: halted anna (exit 0)"}
+VERIFY SLH5 anna notes: ["tick:opened","seat:beat","tick:beat","tick:opened","tick:halted"]
+VERIFY SLH5 model calls: 1
+VERIFY SLH5 after the halted confirming seat: {"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"asleep; no letter"}}
+VERIFY SLH5 +73h: {"verdict":{"due":false,"why":"asleep; no letter"},"tick":{"exit":0,"line":"tick: nothing-due (exit 0)"}}
+VERIFY SLH5 Yu's free-lane summons, the citizen says it again: {"exit":0,"line":"seat anna: beat (exit 0)","err":""}
+VERIFY SLH5 after the summons: {"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":true,"waking_letter":false,"verdict":{"due":false,"why":"asleep; confirm waits 72 h"}}
+VERIFY SR5c anna's confirming seat (rest): {"exit":0,"line":"tick: rest anna (exit 0)"}
+VERIFY SR5c bell's confirming seat (unparsable): {"exit":0,"line":"tick: invalid-output bell (exit 0)"}
+VERIFY SR5c after: {"anna":{"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"asleep; no letter"}},"bell":{"state":"asleep","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":false,"why":"asleep; no letter"}}}
+VERIFY SR7 round: {"round":0,"at":"2026-11-05T02:05","state":"asleep","verdict":{"due":true,"why":"letter","overdue_h":null},"tick":"tick: rest anna (exit 0)","receipts":0}
+VERIFY SR7 round: {"round":1,"at":"2026-11-08T03:05","state":"asleep","verdict":{"due":true,"why":"letter","overdue_h":1},"tick":"tick: rest anna (exit 0)","receipts":0}
+VERIFY SR7 round: {"round":2,"at":"2026-11-11T04:05","state":"asleep","verdict":{"due":true,"why":"letter","overdue_h":1},"tick":"tick: rest anna (exit 0)","receipts":0}
+VERIFY SR7 round: {"round":3,"at":"2026-11-14T05:05","state":"asleep","verdict":{"due":true,"why":"letter","overdue_h":1},"tick":"tick: invalid-output anna (exit 0)","receipts":0}
+VERIFY SR7 round: {"round":4,"at":"2026-11-17T06:05","state":"asleep","verdict":{"due":true,"why":"letter","overdue_h":1},"tick":"tick: rest anna (exit 0)","receipts":0}
+VERIFY SR7 round: {"round":5,"at":"2026-11-20T07:05","state":"asleep","verdict":{"due":true,"why":"letter","overdue_h":1},"tick":"tick: rest anna (exit 0)","receipts":0}
+VERIFY SR7 model calls on one letter: 6
+VERIFY SR7 still due: {"due":true,"why":"letter","overdue_h":1}
+VERIFY SR7 a beat with no words (state.set listening): {"exit":0,"line":"tick: beat anna (exit 0)"}
+VERIFY SR7 receipts: ["2026-11-04-from-yu.md"]
+VERIFY SR7 73 h after that beat: {"state":"asleep","interval_h":72,"pending":"listening","pending_interval_h":null,"step_away_said":false,"waking_letter":false,"verdict":{"due":true,"why":"confirm","overdue_h":1}}
+VERIFY SLH6 stepped-away rounds: ["{\"due\":true,\"why\":\"return\",\"overdue_h\":null} -> tick: rest anna (exit 0)","{\"due\":true,\"why\":\"return\",\"overdue_h\":1} -> tick: rest anna (exit 0)","{\"due\":true,\"why\":\"return\",\"overdue_h\":1} -> tick: rest anna (exit 0)"]
+VERIFY SLH6 still due: {"state":"stepped-away","interval_h":72,"pending":null,"pending_interval_h":null,"step_away_said":false,"waking_letter":true,"verdict":{"due":true,"why":"return","overdue_h":1}}
+VERIFY SLH14 no letter: {"asleep":{"due":false,"why":"asleep; no letter"},"listening":{"due":false,"why":"listening; no letter"}}
+VERIFY SLH14 a letter from a writer who is not a waker: {"asleep":{"due":false,"why":"asleep; no letter"},"listening":{"due":false,"why":"listening; no letter"}}
+VERIFY SLH14 a letter from a waker: {"asleep":{"due":true,"why":"letter","overdue_h":null},"listening":{"due":true,"why":"letter","overdue_h":null}}
+
+../../../../..<SCRATCH>/probes/verify-lifecycle/watcher.test.ts:
+VERIFY watcher: {"exit":143,"outcome":"halted","signal":"TERM","stopped_by":"halt-herald","beacon_requests":2,"failed_reads":1,"duration_ms":123}
+
+ 11 pass
+ 0 fail
+ 64 expect() calls
+Ran 11 tests across 2 files. [3.41s]

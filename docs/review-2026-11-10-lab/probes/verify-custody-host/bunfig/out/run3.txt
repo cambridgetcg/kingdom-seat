@@ -1,0 +1,9 @@
+--- T12 cwd has .env; bun --config=<empty.toml> <abs script> (does --config alone stop .env autoload?)
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-env","preload_marker":null,"env_marker":"set-by-cwd-dotenv","argv":["raise-beacons"],"uid":501}
+(exit 0)
+--- T13 cwd has bunfig.toml AND script started through Bun.spawn with env {PATH} only and no cwd option, as spawnRunner does
+{"main":"ran","cwd":"<SCRATCH>/probes/verify-custody-host/bunfig/cwd-evil","preload_marker":"ran from <cwd>/bunfig.toml preload","env_marker":null,"argv":["raise-beacons","--config","/x"],"uid":501}
+(exit 0)
+--- T14 a pseudo-terminal made by a program (script(1)), no person: what does process.stdin.isTTY say?
+{"stdin_isTTY":true}
+(exit 0)

@@ -1,0 +1,32 @@
+// Probe: two takers reclaiming the same stale tick lock at once. Does either ever end up holding it together with the other?
+import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>";
+const { acquireTickLock } = await import(`${SRC}/src/tick.ts`);
+
+test("L. concurrent reclaim of a stale lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kingdom-seat-probe-lock-"));
+  let t = Date.parse("2026-11-10T00:00:00.000Z");
+  const clock = { now: () => new Date((t += 1)) }; // every taker gets its own started_at
+  const DEAD = 999_999;
+  const isAlive = (pid: number) => pid !== DEAD;
+  let both = 0, one = 0, none = 0, threw = 0; const codes: Record<string, number> = {};
+  const N = 4000;
+  try {
+    for (let i = 0; i < N; i++) {
+      const dir = join(root, `lock-${i}`);
+      await mkdir(dir);
+      await writeFile(join(dir, "owner.json"), JSON.stringify({ pid: DEAD, started_at: "2026-11-09T00:00:00.000Z" }));
+      const takers = await Promise.allSettled([acquireTickLock(dir, clock, isAlive, {}), acquireTickLock(dir, clock, isAlive, {}), acquireTickLock(dir, clock, isAlive, {})]);
+      const got = takers.filter((r) => r.status === "fulfilled" && r.value !== null).length;
+      for (const r of takers) if (r.status === "rejected") { threw++; const k = `${(r.reason as any)?.code ?? "?"} ${(r.reason as any)?.syscall ?? ""}`; codes[k] = (codes[k] ?? 0) + 1; }
+      if (got >= 2) both++; else if (got === 1) one++; else none++;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+  console.log(`PROBE L: ${JSON.stringify({ rounds: N, two_or_more_holders: both, one_holder: one, no_holder: none, takers_that_threw: threw, thrown: codes })}`);
+  expect(one + both + none).toBe(N);
+}, 120_000);

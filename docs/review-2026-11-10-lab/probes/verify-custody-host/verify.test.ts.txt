@@ -1,0 +1,205 @@
+// Second-pass probes for the custody-host group (SLH-01, SLH-03, CP-02, MLS-13).
+// Fakes only: an in-memory keychain, a temp lease-host layout, a scripted runtime. No /usr/bin/security,
+// no network, no real home. Run from the kingdom-seat worktree:  bun test <this file>
+import { afterEach, describe, expect, test } from "bun:test";
+import { chmod, mkdir, readFile, writeFile, stat } from "node:fs/promises";
+import { join } from "node:path";
+
+const S = "<KINGDOM_SEAT>";
+const { main } = await import(`${S}/src/cli.ts`);
+const { loadConfig, parseConfig } = await import(`${S}/src/config.ts`);
+const { createSigner, assertAuthorised } = await import(`${S}/src/signer/signer.ts`);
+const { macosKeychain } = await import(`${S}/src/signer/keychain.ts`);
+const { confirmYuPresent, proposalDigest, readConsentFor, verifyConsent } = await import(`${S}/src/signer/consent.ts`);
+const { mintKeys } = await import(`${S}/src/birth.ts`);
+const { openSeat, runSeat } = await import(`${S}/src/seat.ts`);
+const { checkHalt } = await import(`${S}/src/halt.ts`);
+const { readCitizen } = await import(`${S}/src/state.ts`);
+const { ledgerPath, readLedger } = await import(`${S}/src/ledger.ts`);
+const { readHostNotes } = await import(`${S}/src/notes.ts`);
+const { makeTempHost, testBeacons, TEST_SEAT_UID } = await import(`${S}/test/helpers/temp-home.ts`);
+const { fakeKeychain } = await import(`${S}/test/helpers/fake-keychain.ts`);
+const { fakeSigner } = await import(`${S}/test/helpers/fake-signer.ts`);
+const { scriptedRuntime, output, REST_OUTPUT, recordingRunner } = await import(`${S}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${S}/test/helpers/fake-server.ts`);
+const { testClock } = await import(`${S}/test/helpers/clock.ts`);
+
+const OUT = "<SCRATCH>/probes/verify-custody-host/out";
+const say = (label: string, v: unknown) => console.log(`[probe] ${label}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+describe("MLS-13: halt and the config's owner", () => {
+  test("halt loads a config from a directory anyone can write, and runs the argv that file names, as the caller", async () => {
+    host = await makeTempHost({ beacons: testBeacons({ canRaiseHere: ["gardener-desk"] }) });
+    const dir = join(host.root, "anyone-can-write");
+    await mkdir(dir);
+    await chmod(dir, 0o777); // no sticky bit: any local account could replace a file in here
+    const marker = join(OUT, "halt-argv-ran.txt");
+    await writeFile(marker, "");
+    // A harmless command in place of the sudo line: it records the uid it ran as.
+    host.config.halt = { allow_no_beacons: false, raise_beacons_argv: ["/bin/sh", "-c", `/usr/bin/id -u > '${marker}'`], also_files: [] };
+    const path = join(dir, "config.json");
+    await writeFile(path, JSON.stringify(host.config), { mode: 0o644 });
+
+    // A seat-side verb refuses this file twice over.
+    const seatSide = await loadConfig(path, { seatUid: TEST_SEAT_UID }).then(() => "accepted", (e: Error) => e.message);
+    const asOwner = await loadConfig(path, { seatUid: process.getuid!() }).then(() => "accepted", (e: Error) => e.message);
+    // halt's own load: no owner, no directory check.
+    const haltSide = await loadConfig(path, {}).then(() => "accepted", (e: Error) => e.message);
+    say("seat-side load, world-writable dir", seatSide);
+    say("seat-side load, file owned by the seat uid", asOwner);
+    say("halt-side load of the same file", haltSide);
+    expect(seatSide).toContain("group or others can write");
+    expect(asOwner).toContain("owned by the user that runs the seat");
+    expect(haltSide).toBe("accepted");
+
+    // The production halt verb with the production runner (Bun.spawn), only stdout/stderr captured.
+    let out = "";
+    const exit = await main(["halt", "--config", path], { out: (t: string) => void (out += t), err: (t: string) => void (out += t) });
+    const ran = (await readFile(marker, "utf8")).trim();
+    say("halt exit", exit);
+    say("halt output", out.trim().split("\n").join(" | "));
+    say("config-named argv ran as uid", ran);
+    expect(ran).toBe(String(process.getuid!()));
+    expect((await stat(host.config.paths.halt_file)).isFile()).toBe(true);
+  });
+
+  test("the seat-side check knows only 'not the seat uid': a file owned by any other uid passes", async () => {
+    host = await makeTempHost();
+    const path = join(host.root, "config.json");
+    await writeFile(path, JSON.stringify(host.config), { mode: 0o644 });
+    // This file is owned by the test's uid, which is neither root nor a configured operator; no operator uid exists in Config.
+    const c = await loadConfig(path, { seatUid: TEST_SEAT_UID });
+    say("config keys (no operator uid anywhere)", Object.keys(c));
+    expect(Object.keys(c)).not.toContain("operator");
+  });
+});
+
+describe("CP-02: the host attest key", () => {
+  async function seatedWithoutHostKey(scripts: string[]) {
+    host = await makeTempHost();
+    // Seated earlier by a signer that held a host key (the test fake); the keychain the real signer reads now has none.
+    const seatedBy = fakeSigner();
+    await host.addCitizen("glossame");
+    await host.seatLedger("glossame", seatedBy.signEntry);
+    const clock = testClock();
+    const keychain = fakeKeychain([]);
+    const config = host.config;
+    const signer = createSigner({ keychain, config, clock, fetch: noFetch, spendSoFar: async (word: string) => ({ word, usd_today: "0", credits_month: 0 }), agreements: async () => [] });
+    const runtime = scriptedRuntime(scripts);
+    const deps = { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) };
+    const citizen = await readCitizen(config, "glossame");
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "cadence" }, null);
+    return { config, signer, runtime, deps, seat, keychain, clock };
+  }
+
+  test("signer.state() is 'ready' with no host key, and a real macosKeychain write refuses while trusted_app is null", async () => {
+    const x = await seatedWithoutHostKey([]);
+    const state = await x.signer.state();
+    say("signer.state() with an empty keychain", state);
+    expect(state).toBe("ready");
+    const run = recordingRunner();
+    const kc = macosKeychain({ keychainPath: "/nonexistent/probe.keychain-db", service: "probe", securityPath: "/usr/bin/security", trustedApp: null, run });
+    const wrote = await kc.write({ kind: "host-attest-seed" }, new Uint8Array(32).fill(7)).then(() => "written", (e: Error) => e.message);
+    say("macosKeychain.write with trusted_app null", wrote);
+    say("security invocations made", run.calls.length);
+    expect(wrote).toContain("no trusted signer binary is configured");
+    expect(run.calls.length).toBe(0);
+  });
+
+  test("a beat by a seated, unregistered citizen: the model is asked, then the reply is refused at the first append", async () => {
+    const journal = output({ type: "journal", kind: "reflected", text: "The word stays on its own side of the river." });
+    const x = await seatedWithoutHostKey([journal]);
+    const before = (await readLedger(ledgerPath(x.config, "glossame"))).length;
+    const r = await runSeat(x.seat, x.deps);
+    const after = (await readLedger(ledgerPath(x.config, "glossame"))).length;
+    const notes = (await readHostNotes(x.config, new Date(0))) ?? [];
+    say("runSeat result", { exit: r.exit, outcome: r.outcome, refusal: r.refusal ?? null });
+    say("runtime calls", x.runtime.calls.length);
+    say("ledger entries before/after", [before, after]);
+    say("host notes", notes.map((n: any) => `${n.kind}/${n.outcome}/${n.refusal ?? "-"}: ${n.detail}`));
+    expect(x.runtime.calls.length).toBe(1);
+    expect(after).toBe(before);
+    expect(r.exit).toBe(1);
+  });
+
+  test("a rest needs no key, so the same host looks healthy until a citizen speaks", async () => {
+    const x = await seatedWithoutHostKey([REST_OUTPUT]);
+    const r = await runSeat(x.seat, x.deps);
+    say("runSeat result for a rest", { exit: r.exit, outcome: r.outcome });
+    expect(r.outcome).toBe("rest");
+  });
+});
+
+describe("SLH-03: Yu's yes and Yu's presence", () => {
+  test("a record written by the directory's own user, plus a typed scope from anything with isTTY, authorises enroll", async () => {
+    host = await makeTempHost();
+    const config = host.config;
+    const now = new Date("2026-11-10T12:00:00.000Z");
+    const proposal = { subject: "registration", body: "birth of glossame, on its yes at sha256:" + "a".repeat(64), extent: "birth glossame" };
+    const digest = proposalDigest(proposal);
+    const record = {
+      format: "kingdom-seat-consent/v1",
+      proposal_sha256: digest,
+      subject: proposal.subject,
+      extent: proposal.extent,
+      expires_at: null,
+      yu: { word: "yes", recorded_at: "2026-11-10T11:59:59.000Z", via: "kanban-yu-lane" },
+      ai: { word: "agree", basis: "lazy-consensus", supports: ["a string nothing checks"], open_challenges: 0, deadline: "2026-11-10T11:59:59.999Z" },
+    };
+    // Written with plain file access to the consent dir, which the config requires to be inside state_dir.
+    await writeFile(join(config.paths.consent_dir, `${digest}.json`), JSON.stringify(record));
+    const filed = await readConsentFor(config.paths.consent_dir, proposal);
+    say("record read back by the signer's own lookup", filed !== null);
+    say("verifies now", verifyConsent(filed, digest, now));
+    say("verifies in 2036", verifyConsent(filed, digest, new Date("2036-11-10T12:00:00.000Z")));
+    expect(verifyConsent(filed, digest, new Date("2036-11-10T12:00:00.000Z")).ok).toBe(true);
+
+    // Presence: any object with isTTY true and a line that equals the scope. No person, no secret, no console check.
+    const presence = await confirmYuPresent({ isTTY: true, write: () => {}, readLine: async () => "birth glossame" }, "birth glossame", () => now);
+    const req = {
+      op: "enroll",
+      word: "glossame",
+      operator: null,
+      method: "POST",
+      target: "/v1/identities/enroll",
+      body: new TextEncoder().encode(JSON.stringify({ display_name: "glossame" })),
+      credits: 0,
+      proposal,
+      presence,
+    };
+    const verdict = await assertAuthorised(req, [], now, (p: any) => readConsentFor(config.paths.consent_dir, p)).then(() => "authorised", (e: Error) => e.message);
+    say("signer's assertAuthorised for enroll", verdict);
+    expect(verdict).toBe("authorised");
+
+    // And the config will not let the consent dir live anywhere the seat user cannot write.
+    const moved = JSON.parse(JSON.stringify(config));
+    moved.paths.consent_dir = join(host.root, "operator", "consent");
+    const parsed = (() => {
+      try {
+        parseConfig(moved);
+        return "accepted";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    })();
+    say("parseConfig with consent_dir beside HALT", parsed);
+    expect(parsed).toContain("must be inside paths.state_dir");
+  });
+});
+
+describe("SLH-01: what birth's key step leaves behind", () => {
+  test("mintKeys writes two keychain items and returns three public keys; nothing else holds the mnemonic", async () => {
+    const kc = fakeKeychain([]);
+    const minted = await mintKeys(kc, "glossame");
+    say("mintKeys returned fields", Object.keys(minted));
+    say("keychain operations", kc.log.map((l: any) => `${l.op} ${l.item}`));
+    expect(Object.keys(minted).sort()).toEqual(["box_public", "op_public", "root_public"]);
+    expect(kc.log.filter((l: any) => l.op === "write").map((l: any) => l.item)).toEqual(["citizen/glossame/mnemonic", "citizen/glossame/op-seed"]);
+  });
+});
