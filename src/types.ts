@@ -1215,6 +1215,8 @@ export interface CitizenStatus {
    * everything, or no seat has replied.
    */
   last_dropped: { at: IsoTime; outcome: "beat" | "rest" | "invalid-output"; dropped: DroppedRecord[] } | null;
+  /** Items waiting in `citizens/<word>/outbox/` (letters held for Yu, proposals for Yu + Ai); null when unreadable (CP-06). */
+  outbox_items: number | null;
   /** Why the record or ledger could not be read, so an unreadable citizen is shown rather than left out. */
   problem: string | null;
 }

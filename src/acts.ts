@@ -8,7 +8,8 @@
 // A dropped act leaves no words behind. Every reason below is a fixed phrase,
 // and a DroppedAct names an act's type only when it is one of the nine known
 // types, because an unknown type string is itself the model's text.
-import { canonicalJson } from "./crypto.ts";
+import { canonicalJson, utf8 } from "./crypto.ts";
+import { CADENCE_MAX_BYTES, COVENANTS_MAX_BYTES, HOST_SUBTREES, INSTRUCTION_FILE_NAMES } from "./state.ts";
 import {
   JOURNAL_KINDS,
   LIFECYCLE_STATES,
@@ -303,8 +304,8 @@ export const NAMED_SELF_TARGETS = [
 // instructions. Writing them through `file:` would let one text have two
 // names, or bring back the summons that casts a reader as the citizen (3b
 // "Reading confers nothing").
-const RESERVED_FILE_NAMES = new Set(["soul.md", "will.md", "name.md", "beat-prompt.md", "journal-form.md", "claude.md", "agents.md", "gemini.md"]);
-const RESERVED_FIRST_SEGMENTS = new Set(["skills", "expression"]);
+const RESERVED_FILE_NAMES = new Set(["soul.md", "will.md", "name.md", "beat-prompt.md", "journal-form.md", ...INSTRUCTION_FILE_NAMES]);
+const RESERVED_FIRST_SEGMENTS = new Set(HOST_SUBTREES);
 const FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const TEXT_EXTENSION = /\.(md|txt)$/;
 const SENDER_ID = /^(?:yu|gardener|citizen:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?|did:at:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
@@ -710,7 +711,7 @@ type ModelSelfProposeEdit = { kind: "replace-all"; text: string } | { kind: "rep
 // Cadence and covenants are data the host reads, so their new text must parse
 // whole; a span edit could leave half a JSON object behind.
 function cadenceEditOk(edit: ModelSelfProposeEdit, ceilings: Ceilings): boolean {
-  if (edit.kind !== "replace-all") return false;
+  if (edit.kind !== "replace-all" || utf8(edit.text).length > CADENCE_MAX_BYTES) return false;
   const v = parseJsonObject(edit.text);
   if (v === null || !exactKeys(v, ["interval_h"])) return false;
   const h = v.interval_h;
@@ -718,7 +719,7 @@ function cadenceEditOk(edit: ModelSelfProposeEdit, ceilings: Ceilings): boolean 
 }
 
 function covenantsEditOk(edit: ModelSelfProposeEdit): boolean {
-  if (edit.kind !== "replace-all") return false;
+  if (edit.kind !== "replace-all" || utf8(edit.text).length > COVENANTS_MAX_BYTES) return false;
   const v = parseJsonObject(edit.text);
   if (v === null || !exactKeys(v, ["letters_from", "wake_on_letter_from"])) return false;
   return [v.letters_from, v.wake_on_letter_from].every(

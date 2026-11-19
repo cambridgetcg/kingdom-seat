@@ -225,6 +225,7 @@ async function harness(opts: { runtimeScripts?: string[]; server?: FakeServer } 
       throw new Error("a real seat child must never be spawned by a test");
     },
     isAlive: () => true,
+    bootTime: () => null,
     uid: () => TEST_SEAT_UID,
     // A default host: the config is the one the test wrote, and the default HALT file is the configured one.
     defaults: { config: configPath, halt_file: h.config.paths.halt_file },

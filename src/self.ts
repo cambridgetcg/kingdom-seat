@@ -6,7 +6,7 @@
 // its own walls, goes to Yu + Ai. The origin soul is never overwritten, so
 // drift can always be measured against it. Every version is kept.
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, rename } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { canonicalJson, randomBytes, sha256Hex, toHex, utf8 } from "./crypto.ts";
 import {
@@ -26,8 +26,9 @@ import {
   type SeatStamp,
 } from "./ledger.ts";
 import { STRAND_KEY_ID } from "./agenttool/wire.ts";
-import { parseCadence, parseCovenants } from "./state.ts";
+import { CADENCE_MAX_BYTES, COVENANTS_MAX_BYTES, defaultCovenants, HOST_SUBTREES, INSTRUCTION_FILE_NAMES, parseCadence, parseCovenants } from "./state.ts";
 import {
+  DEFAULT_CEILINGS,
   Refusal,
   SHA256_HEX_PATTERN,
   WORD_PATTERN,
@@ -155,9 +156,16 @@ const BEYOND_SELF_TARGETS = new Set<string>(["expression.porch"]);
 const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Siblings of self/ that the host keeps, and self/ subtrees that belong to named targets. */
-const RESERVED_DIRS = new Set(["ledger", "proposals", "receipts", "origin", "versions", "letters", "outbox", "seats", "legacy", "expression", "skills"]);
+const RESERVED_DIRS = new Set<string>(HOST_SUBTREES);
 /** Agent instruction files would load in any session opened on a mirror; run.sh and citizen.json are the host's. */
-const HOST_OWNED_NAMES = new Set(["claude.md", "agents.md", "gemini.md", "run.sh", "citizen.json"]);
+const HOST_OWNED_NAMES = new Set<string>([...INSTRUCTION_FILE_NAMES, "run.sh", "citizen.json"]);
+
+/** The byte ceiling for a target, matching what state.ts and context.ts read. */
+function maxBytesFor(target: SelfTarget): number {
+  if (target === "cadence") return CADENCE_MAX_BYTES;
+  if (target === "covenants") return COVENANTS_MAX_BYTES;
+  return SELF_FILE_MAX_BYTES;
+}
 
 /** A target's path relative to `self/`; refuses host-owned paths, traversal and anything outside the citizen's own text files. */
 export function targetRelPath(target: SelfTarget): string {
@@ -230,7 +238,7 @@ export function materializeEdit(raw: ModelSelfPropose, currentText: string): { a
     next = currentText.slice(0, at) + replacement + currentText.slice(at + find.length);
   }
   if (next === currentText) throw new Refusal("invalid-request", "the edit changes nothing");
-  if (utf8(next).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  if (utf8(next).length > maxBytesFor(raw.target)) throw new Refusal("oversize", "the new text is larger than a seat can show");
   assertSettingShape(raw.target, next);
   const act: SelfProposeAct = {
     type: "self.propose",
@@ -433,7 +441,8 @@ export async function stageProposal(config: Config, word: Word, act: SelfPropose
   if (selfHash(current) !== act.prior_hash) throw new Refusal("invalid-request", "the target changed since the proposal was made");
   const next = applyDiff(current, act.diff);
   const verdict = classifyProposal(act, current, next, config.ceilings.self_rewrite_fraction);
-  if (utf8(next).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  if (utf8(next).length > maxBytesFor(act.target)) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  if (next !== "") assertSettingShape(act.target, next);
   await assertRoomFor(config, word, act.target, current);
   const proposal = proposalFor(word, act, seatId, now, verdict === "within-self" ? "pending" : "beyond-self");
   const root = citizenDir(config, word);
@@ -503,7 +512,8 @@ export async function applyChange(deps: SelfDeps, citizen: Citizen, proposal: Se
   if (classifyProposal(act, current, next, config.ceilings.self_rewrite_fraction) !== "within-self") {
     throw new Refusal("beyond-self", "this change goes beyond self");
   }
-  if (utf8(next).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  if (utf8(next).length > maxBytesFor(act.target)) throw new Refusal("oversize", "the new text is larger than a seat can show");
+  if (next !== "") assertSettingShape(act.target, next);
   await assertRoomFor(config, word, act.target, current);
 
   const path = ledgerPath(config, word);
@@ -653,7 +663,8 @@ export async function revertPlan(config: Config, word: Word, entries: LedgerEntr
   const text = toHash === originSoulHash(entries) && target === "soul" ? await readOriginSoul(config, word, toHash) : await readVersion(config, word, toHash);
   const current = await readTarget(config, word, target);
   if (selfHash(current) === toHash) throw new Refusal("invalid-request", "the target is already at that version");
-  if (utf8(text).length > SELF_FILE_MAX_BYTES) throw new Refusal("oversize", "that version is larger than a seat can show");
+  if (utf8(text).length > maxBytesFor(target)) throw new Refusal("oversize", "that version is larger than a seat can show");
+  if (text !== "") assertSettingShape(target, text);
   await assertRoomFor(config, word, target, current);
   const beyond = BEYOND_SELF_TARGETS.has(target) ? "the porch is a public invitation" : loosensWalls(target, current, text) ? "loosens a wall" : null;
   return { target, text, current, beyond };
@@ -674,16 +685,16 @@ async function readOriginSoul(config: Config, word: Word, hash: Sha256Hex): Prom
  * cadence, a sender added to its covenants) or toward rest (a longer cadence,
  * senders only removed). Other targets are neither.
  */
-export function exposureOf(target: SelfTarget, current: string, next: string): "wider" | "narrower" | "neither" {
+export function exposureOf(target: SelfTarget, current: string, next: string, defaultIntervalH: number = DEFAULT_CEILINGS.min_beat_interval_h): "wider" | "narrower" | "neither" {
   try {
     if (target === "cadence") {
-      const a = parseCadence(current).interval_h;
-      const b = parseCadence(next).interval_h;
+      const a = current === "" ? defaultIntervalH : parseCadence(current).interval_h;
+      const b = next === "" ? defaultIntervalH : parseCadence(next).interval_h;
       return b < a ? "wider" : b > a ? "narrower" : "neither";
     }
     if (target === "covenants") {
-      const a = parseCovenants(current);
-      const b = parseCovenants(next);
+      const a = current === "" ? defaultCovenants() : parseCovenants(current);
+      const b = next === "" ? defaultCovenants() : parseCovenants(next);
       const adds = (x: string[], y: string[]) => y.some((s) => !x.includes(s));
       if (adds(a.letters_from, b.letters_from) || adds(a.wake_on_letter_from, b.wake_on_letter_from)) return "wider";
       if (adds(b.letters_from, a.letters_from) || adds(b.wake_on_letter_from, a.wake_on_letter_from)) return "narrower";
@@ -792,6 +803,20 @@ async function keepVersion(config: Config, word: Word, text: string): Promise<Sh
 async function writeTarget(config: Config, word: Word, target: SelfTarget, text: string): Promise<void> {
   const root = citizenDir(config, word);
   const path = targetPath(config, word, target);
+  // Reverting an optional target or a file the citizen created back to "" removes the file rather than leaving a 0-byte one.
+  if (text === "" && target !== "soul") {
+    if (!(await parentsAreDirs(root, path, false))) return;
+    try {
+      const st = await lstat(path);
+      if (st.isSymbolicLink()) throw new Refusal("symlink", `${target}: is a symlink; refused, not followed`);
+      if (!st.isFile()) throw new Refusal("not-regular-file", `${target}: not a regular file`);
+      await unlink(path);
+      await syncDir(dirname(path));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    return;
+  }
   await parentsAreDirs(root, path, true);
   // Refuse to replace a link or a directory; rename would replace a link silently.
   try {

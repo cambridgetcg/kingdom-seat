@@ -32,7 +32,7 @@ import {
   sealInbox,
   thoughtDigestV2,
 } from "../agenttool/wire.ts";
-import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, fromUtf8, parseStrictJson, randomBytes, toB64, toB64url, wipe } from "../crypto.ts";
+import { edPublicKey, edSign, edVerifyStrict, fromB64, fromB64url, fromHex, fromUtf8, keyFingerprint, parseStrictJson, randomBytes, toB64, toB64url, wipe } from "../crypto.ts";
 import {
   DID_PATTERN,
   Refusal,
@@ -160,6 +160,13 @@ export interface Signer {
    * Refusal("keychain-missing") or Refusal("keychain-locked").
    */
   hostPublicKey(): Promise<string>;
+  /**
+   * Draw a fresh 32-byte host attest seed inside the signer, store it in
+   * Keychain once, and return only its public half and fingerprint (CP-02).
+   * Requires Yu confirmed present at this terminal for "init-host-key <host>",
+   * and refuses if host/attest-seed already exists.
+   */
+  initHostKey(presence: YuPresence): Promise<{ public_key_b64: string; fingerprint: string; kid: string }>;
   /**
    * Sign a ledger entry: the op key for a "citizen" entry, the host key for a
    * "host" one; never the root. It takes the unsigned draft, which must name
@@ -929,6 +936,32 @@ export function createSigner(deps: SignerDeps): Signer {
       const seed = await readSeed({ kind: "host-attest-seed" });
       try {
         return toB64(edPublicKey(seed));
+      } finally {
+        wipe(seed);
+      }
+    },
+
+    async initHostKey(presence) {
+      const scope = `init-host-key ${config.host}`;
+      if (!(presenceConfirmedHere(presence) && presenceValid(presence, scope, deps.clock.now()))) {
+        throw new Refusal("yu-not-present", `creating the host attest key needs Yu confirmed present at this terminal for "${scope}"`);
+      }
+      if (await keychain.has({ kind: "host-attest-seed" })) {
+        throw new Refusal("invalid-request", "the keychain already holds host-attest-seed; it is never overwritten");
+      }
+      const seed = random(32);
+      try {
+        const pub = edPublicKey(seed);
+        await keychain.write({ kind: "host-attest-seed" }, seed);
+        const stored = await readSeed({ kind: "host-attest-seed" });
+        try {
+          if (toB64(edPublicKey(stored)) !== toB64(pub)) {
+            throw new Refusal("keychain-missing", "the signer does not read the host key it wrote");
+          }
+        } finally {
+          wipe(stored);
+        }
+        return { public_key_b64: toB64(pub), fingerprint: keyFingerprint(pub), kid: hostKid(pub) };
       } finally {
         wipe(seed);
       }

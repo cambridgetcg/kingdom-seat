@@ -162,7 +162,7 @@ export async function citizenSnapshot(h: TempHost): Promise<Map<string, string>>
 /** The repo's own models.lock: unpinned, so the free lane must refuse until a test pins a digest. */
 export const UNPINNED_LOCK: ModelsLock = {
   format: "kingdom-seat-models-lock/v1",
-  models: [{ name: "qwen2.5:7b", digest: "UNSET-PIN-ON-LEASE-HOST", runner: null, store: "unknown", num_ctx: 8192, num_predict: 600, temperature: 0.7, seed: null }],
+  models: [{ name: "qwen2.5:7b", digest: "UNSET-PIN-ON-LEASE-HOST", runner: null, store: "unknown", num_ctx: 32768, num_predict: 600, temperature: 0.7, seed: null }],
 };
 
 export async function makeTempHost(opts: { beacons?: Beacon[]; allowNoBeacons?: boolean; ollamaBaseUrl?: string } = {}): Promise<TempHost> {

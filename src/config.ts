@@ -505,8 +505,7 @@ export function checkRealPaths(config: Config): void {
  * above it may be the seat user's, or writable by group or others without the
  * sticky bit (which keeps others' entries from being renamed).
  */
-async function assertSeatCannotWrite(fileUid: number, path: string, seatUid: number): Promise<void> {
-  if (fileUid === seatUid) throw new ConfigError("file", "is owned by the user that runs the seat, who could rewrite it to lower HALT; the operator or root must own it");
+async function assertConfigParentsSafe(path: string, seatUid?: number): Promise<void> {
   let dir: string;
   try {
     dir = await realpath(dirname(path));
@@ -520,12 +519,19 @@ async function assertSeatCannotWrite(fileUid: number, path: string, seatUid: num
     } catch (e) {
       throw new ConfigError("file", `its directory cannot be checked (${(e as NodeJS.ErrnoException).code ?? "error"})`);
     }
-    if (st.uid === seatUid) throw new ConfigError("file", `is under ${dir}, which the user that runs the seat owns, so it could replace the config`);
+    if (seatUid !== undefined && st.uid === seatUid) {
+      throw new ConfigError("file", `is under ${dir}, which the user that runs the seat owns, so it could replace the config`);
+    }
     if ((st.mode & 0o022) !== 0 && (st.mode & 0o1000) === 0) throw new ConfigError("file", `is under ${dir}, which group or others can write`);
     const up = dirname(dir);
     if (up === dir) return;
     dir = up;
   }
+}
+
+async function assertSeatCannotWrite(fileUid: number, path: string, seatUid: number): Promise<void> {
+  if (fileUid === seatUid) throw new ConfigError("file", "is owned by the user that runs the seat, who could rewrite it to lower HALT; the operator or root must own it");
+  await assertConfigParentsSafe(path, seatUid);
 }
 
 /**
@@ -553,6 +559,7 @@ export async function loadConfig(path: string, opts: { seatUid?: number } = {}):
     // A config others can write could loosen any wall in it.
     if ((st.mode & 0o022) !== 0) throw new ConfigError("file", "is writable by group or others");
     if (opts.seatUid !== undefined) await assertSeatCannotWrite(st.uid, path, opts.seatUid);
+    else await assertConfigParentsSafe(path);
     bytes = new Uint8Array(await fh.readFile());
   } finally {
     await fh.close();

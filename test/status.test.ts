@@ -251,6 +251,7 @@ describe("status", () => {
         registration: null,
         last_refusal: null,
         last_dropped: null,
+        outbox_items: 0,
         problem: null,
       })),
     });

@@ -4,7 +4,7 @@
 // refusals, unsigned commits, spend and the pinned origin. REGISTRY probes
 // it. Host notes, which it reads, live in notes.ts.
 import { constants } from "node:fs";
-import { chmod, lstat, open, readFile, rename, rm } from "node:fs/promises";
+import { chmod, lstat, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { NO_BEACONS_ID } from "./halt.ts";
 import { fromB64, keyFingerprint } from "./crypto.ts";
@@ -320,8 +320,33 @@ async function citizenStatus(deps: StatusDeps, word: Word, notes: HostNote[] | n
     registration: record?.identity != null || entries === null ? null : await registrationFor(config, entries, word, now),
     last_refusal: lastRefusal(mine),
     last_dropped: await lastDroppedFor(config, word, entries),
+    outbox_items: await outboxCount(config, word),
     problem: problems.length > 0 ? problems.join("; ") : null,
   };
+}
+
+/** Count regular `.json` items in `citizens/<word>/outbox/` without reading any words; null when unreadable (CP-06). */
+async function outboxCount(config: Config, word: Word): Promise<number | null> {
+  const citizen = join(config.paths.citizens_dir, word);
+  const outbox = join(citizen, "outbox");
+  try {
+    const cst = await lstat(citizen);
+    if (cst.isSymbolicLink() || !cst.isDirectory()) return null;
+    const ost = await lstat(outbox);
+    if (ost.isSymbolicLink() || !ost.isDirectory()) return null;
+    const names = await readdir(outbox);
+    let count = 0;
+    for (const name of names) {
+      if (!name.endsWith(".json") || name.startsWith(".")) continue;
+      const fst = await lstat(join(outbox, name));
+      if (fst.isSymbolicLink()) return null;
+      if (fst.isFile()) count++;
+    }
+    return count;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    return null;
+  }
 }
 
 /**
@@ -487,6 +512,8 @@ function citizenLine(c: CitizenStatus): string {
     const d = c.last_dropped;
     parts.push(`last ${d.outcome === "invalid-output" ? "invalid reply" : d.outcome} ${d.at} did not keep ${d.dropped.length}: ${d.dropped.map((x) => `${x.type ?? "unknown"} (${x.reason})`).join(", ")}`);
   }
+  if (c.outbox_items === null) parts.push("outbox unreadable");
+  else if (c.outbox_items > 0) parts.push(`${c.outbox_items} in outbox`);
   if (c.problem) parts.push(`PROBLEM: ${c.problem}`);
   return parts.join(" | ");
 }

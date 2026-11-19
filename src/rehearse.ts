@@ -560,6 +560,7 @@ export function rehearsalSigner(): Signer & { close(): void } {
       live();
       return pubB64;
     },
+    initHostKey: none("keeps no keychain"),
     async signEntry(word: Word, signer, draft: LedgerDraft): Promise<EntrySignature> {
       const s = live();
       if (signer !== "host") throw new Refusal("not-registered", "a throwaway citizen has no key of its own; its entries are the rehearsal's host entries");

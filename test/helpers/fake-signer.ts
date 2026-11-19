@@ -2,7 +2,7 @@
 // public test keys through the real Ed25519 in src/crypto.ts, records every
 // request it is asked to send, and sends nothing anywhere.
 import { Refusal, type LedgerSigner, type RootEvidence, type SignerOp, type Word, type YuPresence } from "../../src/types.ts";
-import { edPublicKey, edSign, fromB64, fromHex, sha256, toB64, toB64url } from "../../src/crypto.ts";
+import { edPublicKey, edSign, fromB64, fromHex, keyFingerprint, sha256, toB64, toB64url } from "../../src/crypto.ts";
 import { hostKid, signingDigest, type EntrySignature } from "../../src/ledger.ts";
 import { AUTHORITY_HEADERS, AGENTTOOL_ORIGIN, authorityDigest, authorityHeaders, inboxDigest, openInbox, sealInbox } from "../../src/agenttool/wire.ts";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -54,6 +54,7 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
   const opPub = toB64(edPublicKey(opSeed));
   const hostPub = toB64(edPublicKey(hostSeed));
   const hostKidOf = hostKid(edPublicKey(hostSeed));
+  let missingHostKey = opts.noHostKey === true;
   let answer: (req: SignerRequest) => SignerResponse = () => ({ status: 200, json: {} });
   // A sequence per identity, so evidence moves only upward, as agenttool's does.
   const sequences = new Map<string, number>();
@@ -100,12 +101,19 @@ export function fakeSigner(opts: { opSeed?: Uint8Array; hostSeed?: Uint8Array; r
     },
     async hostPublicKey(): Promise<string> {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
-      if (opts.noHostKey) throw new Refusal("keychain-missing", "fake signer: no host key");
+      if (missingHostKey) throw new Refusal("keychain-missing", "fake signer: no host key");
       return hostPub;
+    },
+    async initHostKey(presence: YuPresence) {
+      if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
+      if (!presence?.present) throw new Refusal("yu-not-present", "fake signer: initHostKey needs Yu present");
+      if (!missingHostKey) throw new Refusal("invalid-request", "fake signer: host key already exists");
+      missingHostKey = false;
+      return { public_key_b64: hostPub, fingerprint: keyFingerprint(edPublicKey(hostSeed)), kid: hostKidOf };
     },
     async signEntry(word, signer, draft): Promise<EntrySignature> {
       if (s.locked) throw new Refusal("keychain-locked", "fake signer locked");
-      if (opts.noHostKey && signer === "host") throw new Refusal("keychain-missing", "fake signer: no host key");
+      if (missingHostKey && signer === "host") throw new Refusal("keychain-missing", "fake signer: no host key");
       // As the real signer: the draft must be this citizen's, for this signer, and the digest is the ledger's own.
       if (draft.word !== word || draft.signer !== signer) throw new Refusal("invalid-request", "fake signer: the entry names another citizen or signer");
       s.signed.push({ word, signer });

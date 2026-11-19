@@ -837,7 +837,7 @@ async function planActs(
             drop("self.revert", "another change to that text in this reply");
             break;
           }
-          const exposure = exposureOf(target, now_text, text);
+          const exposure = exposureOf(target, now_text, text, config.ceilings.min_beat_interval_h);
           // A held revert is a staged saying, so it counts against the seat's one, as a self.propose does.
           if (exposure === "wider" && !yu && plan.stage.length >= ACT_LIMITS.self_proposals_per_seat) {
             drop("self.revert", ONE_STAGED);
@@ -1120,8 +1120,9 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
     if (ref.runtime === "summon" && !seat.presence?.present) throw new Refusal("yu-not-present", "a summons needs Yu present");
     if (ref.word !== word) throw new Refusal("invalid-record", "seat ref names another citizen");
     assertCwdOutsideHomes(seat.cwd, config.paths.homes);
-    // A locked keychain rests the beat before any inference is spent on it.
+    // A locked keychain rests the beat before any inference is spent on it; an unregistered citizen needs the host key too.
     if ((await signer.state()) === "locked") throw new Refusal("keychain-locked", "signer is locked");
+    if (!seat.citizen.identity) await signer.hostPublicKey();
   } catch (e) {
     if (e instanceof Refusal) return refused(e, "before inference");
     throw e;
@@ -1210,7 +1211,7 @@ export async function runSeat(seat: OpenSeat, deps: SeatDeps): Promise<SeatResul
   }
 
   if (!validated) {
-    const why = parsed.ok ? "invalid" : parsed.reason;
+    const why = rt.done_reason === "length" ? "cut-at-length" : parsed.ok ? "invalid" : parsed.reason;
     await note("seat", "invalid-output", null, `reply did not parse (${why})`);
     await recordLastSeat("invalid-output", [{ type: null, reason: `the reply did not parse (${why})` }]);
     return result(EXIT.OK, "invalid-output");

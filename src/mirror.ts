@@ -17,7 +17,7 @@ import { isInside } from "./config.ts";
 import { fromB64 } from "./crypto.ts";
 import { HOST_PRINCIPAL, allowedSigners, citizenPrincipal, sshPublicKey } from "./ssh.ts";
 import { appendHostNote } from "./status.ts";
-import { mirrorCardState } from "./state.ts";
+import { INSTRUCTION_FILE_NAMES, mirrorCardState } from "./state.ts";
 import { Refusal, type Citizen, type CommandResult, type CommandRunner, type Config, type DivergenceState, type RefusalCode } from "./types.ts";
 
 /** One entry of a tree as git or lstat sees it. Modes as git spells them; "000000" is anything git cannot hold (a fifo, socket or device). */
@@ -39,8 +39,8 @@ export interface PushResult {
 /** The largest file a mirror admits; bigger is refused, not truncated. */
 export const MIRROR_MAX_FILE_BYTES = 256 * 1024;
 
-/** Paths a mirror may never carry, whatever the citizen writes: host code, CI, hooks, the ledger, runner state. */
-export const HOST_OWNED = Object.freeze([".claude/", ".github/", ".git/", ".citizen/", "run.sh", "ledger/", "proposals/", "receipts/"]);
+/** Paths a mirror may never carry, whatever the citizen writes: host code, CI, hooks, instruction files, the ledger, runner state. */
+export const HOST_OWNED = Object.freeze([".claude/", ".github/", ".git/", ".citizen/", "run.sh", "citizen.json", ...INSTRUCTION_FILE_NAMES, "ledger/", "proposals/", "receipts/"]);
 
 /** The generated status card at the mirror's root (3.3 "Mirror card state"). The host writes it; a self file of that name is refused. */
 export const MIRROR_CARD_PATH = "kingdom.yaml";

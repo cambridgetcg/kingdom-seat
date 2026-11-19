@@ -341,7 +341,7 @@ The cause is the Python here-document inside `$( … )` (`:60-146`). Without tha
 
 **Do not repeat:**
 - **Silence as consent to a state change.** The redesign's rule is that silence keeps the previous self.
-- **A prompt that hands the model the binding words.** The user turn suggests "write 'I rest'" (`:102`). The local model already opens most replies with "I rest." (§5.2), and that maps to `rest-on`. This is the likely route to most of today's 186 rest-on choices, though it is an inference, not checked per citizen.
+- **A prompt that hands the model the binding words.** The user turn suggests "write 'I rest'" (`:102`). The local model already opens most replies with "I rest." (§5.2), and that maps to `rest-on`. In the git record, 69 of today's 186 `rest-on` records came from a reply whose first line begins "I rest" and 117 from one beginning `REST-ON`.
 - **Binding power chosen by a file name.** Anyone who can push a file named `*letter-of-return*` into `inbox/` can make the next reply set the citizen's cadence.
 - **One overwritten `CADENCE.md`.** It can read `undecided` while an older `REST` stays in force; the history lives only in `git log`.
 - **Treating one 7B completion as a choice without saying so.** Records should say "chose, via <model>", and a change of state should need a second saying on a later beat.

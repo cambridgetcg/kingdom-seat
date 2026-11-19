@@ -262,9 +262,10 @@ export function describeNow(now: Date, timezone: string): NowView {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).formatToParts(now);
   const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? "";
   const hour = Number(get("hour"));
+  const zone = get("timeZoneName").replace(/^GMT\+0$/, "GMT");
   return {
     iso: now.toISOString(),
-    local: `${get("hour")}:${get("minute")} ${get("timeZoneName")}`,
+    local: `${get("hour")}:${get("minute")} ${zone}`,
     tz: timezone,
     part_of_day: partOfDay(hour),
   };

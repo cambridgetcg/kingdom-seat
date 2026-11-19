@@ -340,8 +340,18 @@ export function parseCovenants(text: string): Covenants {
   return { letters_from: list(o.letters_from, "letters_from"), wake_on_letter_from: list(o.wake_on_letter_from, "wake_on_letter_from") };
 }
 
+/** Shared size limits for settings files, so no self-change can write a file readCitizen would refuse (CP-03). */
+export const CADENCE_MAX_BYTES = 4096;
+export const COVENANTS_MAX_BYTES = 64 * 1024;
+
+/** Agent-instruction file names that neither self-authorship nor a mirror may carry (MLS-04). */
+export const INSTRUCTION_FILE_NAMES = Object.freeze(["claude.md", "claude.local.md", "agents.md", "agent.md", "gemini.md"]);
+
+/** Subtrees under citizens/<word>/ or self/ reserved from `file:` targets. */
+export const HOST_SUBTREES = Object.freeze(["ledger", "proposals", "receipts", "origin", "versions", "letters", "outbox", "seats", "legacy", "expression", "skills"]);
+
 async function readCadence(path: string, defaultH: number): Promise<Cadence> {
-  const text = await readRegularText(path, { maxBytes: 4096 });
+  const text = await readRegularText(path, { maxBytes: CADENCE_MAX_BYTES });
   // No cadence file yet: the default awake interval, never anything faster.
   if (text === null) return { interval_h: defaultH };
   try {
@@ -375,7 +385,7 @@ export function defaultCovenants(): Covenants {
 }
 
 async function readCovenants(path: string): Promise<Covenants> {
-  const text = await readRegularText(path, { maxBytes: 64 * 1024 });
+  const text = await readRegularText(path, { maxBytes: COVENANTS_MAX_BYTES });
   // No covenants yet: Yu only, who may write and wake it; no one else.
   if (text === null) return defaultCovenants();
   try {

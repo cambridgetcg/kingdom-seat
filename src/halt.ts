@@ -153,7 +153,7 @@ export async function raiseHalt(deps: { config: Config; now: () => Date; run: Co
   else if (held.length > 0 && argv !== null) {
     try {
       const timeoutMs = Math.max(30_000, 3 * held.length * deps.config.timing.beacon_timeout_ms);
-      const r = await deps.run(argv, { timeoutMs });
+      const r = await deps.run(argv, { cwd: "/var/empty", timeoutMs });
       raised = raisedIn(new TextDecoder().decode(r.stdout));
       if (r.code !== 0) why = `the signer call exited ${r.code}`;
     } catch {

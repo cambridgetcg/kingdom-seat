@@ -101,6 +101,7 @@ beforeAll(async () => {
     tty: { isTTY: false, write: () => {}, readLine: async () => null },
     keychain: () => kc,
     seatArgv: (config, word, extra) => [process.execPath, E2E_CHILD, "seat", word, "--child", ...extra, "--config", config],
+    bootTime: () => null,
     uid: () => E2E_SEAT_UID,
     defaults: { config: configPath, halt_file: h.config.paths.halt_file },
   };

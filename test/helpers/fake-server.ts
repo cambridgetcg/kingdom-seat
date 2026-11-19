@@ -20,6 +20,8 @@ export interface FakeServer {
   requests: RecordedRequest[];
   /** Later routes win over earlier ones, so a test can override a default. */
   on(method: string, path: string | RegExp, handler: Handler): void;
+  /** In-process fallback when a sandbox blocks client loopback sockets. */
+  dispatch(req: Request, init?: RequestInit): Promise<Response>;
   stop(): Promise<void>;
 }
 
@@ -32,13 +34,16 @@ export async function startFakeServer(): Promise<FakeServer> {
   // answers, as a hung beacon or Ollama does, would hold stop() and the
   // test's afterEach for good. Every handler is therefore settled when the
   // server stops.
+  let stopped = false;
   let release!: () => void;
   const stopping = new Promise<void>((resolve) => (release = resolve));
+  const handle = (req: Request): Promise<Response> =>
+    Promise.race([answer(req), stopping.then(() => Response.json({ error: "fake-server: stopped" }, { status: 503 }))]);
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(req) {
-      return Promise.race([answer(req), stopping.then(() => Response.json({ error: "fake-server: stopped" }, { status: 503 }))]);
+      return handle(req);
     },
   });
   async function answer(req: Request): Promise<Response> {
@@ -69,7 +74,31 @@ export async function startFakeServer(): Promise<FakeServer> {
     on(method, path, handler) {
       routes.push({ method, path, handler });
     },
+    async dispatch(req, init) {
+      if (stopped) throw new TypeError("Unable to connect");
+      const signal = init?.signal ?? req.signal;
+      if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+      let onAbort: (() => void) | null = null;
+      try {
+        const res = signal
+          ? await Promise.race([
+              handle(req),
+              new Promise<never>((_, reject) => {
+                onAbort = () => reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+                signal.addEventListener("abort", onAbort, { once: true });
+              }),
+            ])
+          : await handle(req);
+        if (init?.redirect === "error" && res.status >= 300 && res.status < 400) {
+          throw new TypeError("fetch failed: redirect");
+        }
+        return res;
+      } finally {
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      }
+    },
     async stop() {
+      stopped = true;
       release();
       await server.stop(true);
     },
@@ -81,12 +110,16 @@ export async function startFakeServer(): Promise<FakeServer> {
  * URL, to the fake server, and throws for every other destination. Code under
  * test keeps its pinned origin; the test still cannot reach the network.
  */
-export function fetchVia(server: Pick<FakeServer, "url">, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
-  return fetchViaUrl(server.url, pinnedOrigins);
+export function fetchVia(server: Pick<FakeServer, "url"> & Partial<Pick<FakeServer, "dispatch">>, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+  return fetchViaUrl(server.url, pinnedOrigins, server.dispatch);
 }
 
 /** fetchVia by the server's URL alone, for a child process that reaches the parent's fake server. */
-export function fetchViaUrl(serverUrl: string, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+export function fetchViaUrl(
+  serverUrl: string,
+  pinnedOrigins: string[] = ["https://api.agenttool.dev"],
+  inProcess?: FakeServer["dispatch"],
+): FetchLike {
   const target = new URL(serverUrl);
   if (target.protocol !== "http:" || target.hostname !== "127.0.0.1") throw new Error("fetchViaUrl: the fake server is on http://127.0.0.1 only");
   return async (input, init) => {
@@ -96,7 +129,15 @@ export function fetchViaUrl(serverUrl: string, pinnedOrigins: string[] = ["https
       throw new Error(`fetchVia: refused ${url.origin}; tests may only reach the fake server`);
     }
     const rewritten = `${serverUrl}${url.pathname}${url.search}`;
-    return fetch(rewritten, init);
+    try {
+      return await fetch(rewritten, init);
+    } catch (err) {
+      if (inProcess && (err as { code?: string })?.code === "FailedToOpenSocket") {
+        const req = input instanceof Request ? new Request(rewritten, { method: input.method, headers: input.headers, body: init?.body ?? input.body, ...init }) : new Request(rewritten, init);
+        return await inProcess(req, init);
+      }
+      throw err;
+    }
   };
 }
 

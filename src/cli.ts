@@ -94,6 +94,7 @@ export type Command =
     }
   | { verb: "halt"; config: string | null }
   | { verb: "raise-beacons"; config: string | null }
+  | { verb: "init-host-key"; config: string | null }
   | { verb: "status"; config: string | null; json: boolean }
   | { verb: "verify"; config: string | null; word: Word }
   | {
@@ -119,6 +120,7 @@ export const USAGE = [
   "  seat <word> [--runtime free|summon] [--why <text>] [--yu-present]",
   "  halt",
   "  raise-beacons",
+  "  init-host-key",
   "  status [--json]",
   "  verify <word>",
   "  admit <word> --from <legacy home> (--canon <canon file> | --archetype) [--runtime summon|free]",
@@ -140,13 +142,14 @@ export class UsageError extends Error {
 /* ── Parsing ──────────────────────────────────────────────────────────── */
 
 type FlagKind = "value" | "switch";
-const VERBS = ["tick", "seat", "halt", "raise-beacons", "status", "verify", "admit", "draft-first-letter", "rehearse"] as const;
+const VERBS = ["tick", "seat", "halt", "raise-beacons", "init-host-key", "status", "verify", "admit", "draft-first-letter", "rehearse"] as const;
 const FLAGS: Record<(typeof VERBS)[number], Record<string, FlagKind>> = {
   tick: { "--config": "value" },
   seat: { "--config": "value", "--runtime": "value", "--why": "value", "--yu-present": "switch", "--child": "switch", "--seat-ref": "value" },
   halt: { "--config": "value" },
   // Only --config, so the sudoers line that allows the operator's call can pin every argument.
   "raise-beacons": { "--config": "value" },
+  "init-host-key": { "--config": "value" },
   status: { "--config": "value", "--json": "switch" },
   verify: { "--config": "value" },
   admit: { "--config": "value", "--from": "value", "--canon": "value", "--archetype": "switch", "--runtime": "value" },
@@ -225,6 +228,7 @@ export function parseArgs(argv: string[]): Command {
     case "tick":
     case "halt":
     case "raise-beacons":
+    case "init-host-key":
       if (positionals.length > 0) throw new UsageError(`${v} takes no arguments`);
       return { verb: v, config };
     case "status":
@@ -534,18 +538,7 @@ async function hostTrust(signer: Signer, config: Config): Promise<{ host_attest_
   const pinned = pinnedTrust(config);
   if (pinned) return pinned;
   try {
-    const words = await listSeated(config);
-    let pick: Word | null = null;
-    for (const w of words) {
-      const r = await readCitizenRecord(config, w).catch(() => null);
-      if (r && r.identity === null) {
-        pick = w;
-        break;
-      }
-      pick ??= r ? w : null;
-    }
-    if (!pick) return null;
-    return { host_attest_b64: [(await signer.publicKeys(pick)).host_attest_b64] };
+    return { host_attest_b64: [await signer.hostPublicKey()] };
   } catch {
     return null;
   }
@@ -633,6 +626,19 @@ async function verbRaiseBeacons(ctx: Ctx): Promise<ExitCode> {
   // A halted tick writes nothing, so this refresh is what makes the status say "halted by ..." before the next tick.
   await (async () => refreshStatus(ctx, signer ?? makeSigner(ctx)))().catch(() => {});
   return failed > 0 ? EXIT.ERROR : EXIT.OK;
+}
+
+async function verbInitHostKey(ctx: Ctx): Promise<ExitCode> {
+  const halt = await haltNow(ctx);
+  if (!halt || halt.halted) throw new Refusal("halted", "HALT is raised or cannot be read; nothing was written");
+  if (!ctx.deps.tty.isTTY) throw new Refusal("yu-not-present", "stdin is not a terminal, so Yu cannot be confirmed present; init-host-key never runs unattended");
+  const presence = await confirmYuPresent(ctx.deps.tty, `init-host-key ${ctx.config.host}`, () => now(ctx));
+  const signer = makeSigner(ctx);
+  const created = await signer.initHostKey(presence);
+  await note(ctx, "signer", null, "beat", null, `initialized host attest key ${created.fingerprint}`);
+  await refreshStatus(ctx, signer).catch(() => {});
+  ctx.deps.out(`host         ${ctx.config.host}\nkid          ${created.kid}\nfingerprint  ${created.fingerprint}\npublic_key   ${created.public_key_b64}\n`);
+  return EXIT.OK;
 }
 
 async function verbStatus(ctx: Ctx, json: boolean): Promise<ExitCode> {
@@ -1192,6 +1198,8 @@ export async function main(argv: string[], over: Partial<CliDeps> = {}): Promise
         return await verbHalt(ctx);
       case "raise-beacons":
         return await verbRaiseBeacons(ctx);
+      case "init-host-key":
+        return await verbInitHostKey(ctx);
       case "status":
         return await verbStatus(ctx, cmd.json);
       case "verify":
