@@ -27,7 +27,7 @@ export function scriptedRuntime(scripts: Script[]): ScriptedRuntime {
       model: FAKE_MODEL,
       model_digest: FAKE_MODEL_DIGEST,
       raw_output: raw,
-      spend: { usd: 0, usd_basis: "local-zero", credits: 0 },
+      spend: { usd: "0", usd_basis: "local-zero", credits: 0 },
       done_reason: "stop",
       duration_ms: 1,
     };
@@ -63,8 +63,11 @@ export const FAKE_RUNTIME_BIN = join(import.meta.dir, "fake-runtime-bin.ts");
  *   ignore-term <ms>           ignore SIGTERM and sleep, so only KILL ends it
  *   grandchild <pidfile> <ms>  spawn a TERM-ignoring grandchild, write its pid, then sleep
  *   record <file> [text]       write argv, env keys (never values), cwd and stdin to file, then print text
+ *   note <log> <word> <outcome> [exit] [ts]  append one host note as a seat child would, then exit
+ *   speak-later <started> <ledger> <ms> [ignore-term]  write <started>, sleep, then append a canary line to <ledger>,
+ *                              as a seat child mid-inference would write in the citizen's voice if nothing stopped it
  */
-export function fakeBinArgv(mode: "print" | "sleep" | "ignore-term" | "grandchild" | "record", ...args: string[]): string[] {
+export function fakeBinArgv(mode: "print" | "sleep" | "ignore-term" | "grandchild" | "record" | "note" | "speak-later", ...args: string[]): string[] {
   return [process.execPath, FAKE_RUNTIME_BIN, mode, ...args];
 }
 
@@ -93,6 +96,16 @@ export function recordingRunner(respond: (cmd: RecordedCommand) => CommandResult
   }) as RecordingRunner;
   runner.calls = calls;
   return runner;
+}
+
+/** Poll until cond holds; throws after ms, so a child that never starts fails the test instead of hanging it. */
+export async function waitFor(cond: () => boolean | Promise<boolean>, ms = 3_000): Promise<void> {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    if (await cond()) return;
+    await Bun.sleep(20);
+  }
+  throw new Error("waitFor: timed out");
 }
 
 /** True while a pid is alive (signal 0 probes without sending anything). */

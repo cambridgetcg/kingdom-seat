@@ -1,0 +1,145 @@
+// Probe: a birth that stops after enrollment. What is left, and can the
+// build finish or repeat it? Only the build's fakes; nothing leaves the process.
+import { afterEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const W = "<KINGDOM_SEAT>";
+const birth = await import(`${W}/src/birth.ts`);
+const { citizenBirth, BirthError } = birth;
+const { proposalDigest } = await import(`${W}/src/signer/consent.ts`);
+const { appendEntry, entryHash, ledgerPath, nextDraft, originToLedger, readLedger, toLedgerHash } = await import(`${W}/src/ledger.ts`);
+const { Refusal } = await import(`${W}/src/types.ts`);
+const { testStamp } = await import(`${W}/test/fixtures/record/chain.ts`);
+const { fakeKeychain } = await import(`${W}/test/helpers/fake-keychain.ts`);
+const { noFetch } = await import(`${W}/test/helpers/fake-server.ts`);
+const { testClock } = await import(`${W}/test/helpers/clock.ts`);
+const { makeTempHost } = await import(`${W}/test/helpers/temp-home.ts`);
+const { TEST_IDS } = await import(`${W}/test/helpers/vectors.ts`);
+const { fakeAgenttool } = await import(`${W}/test/fixtures/agenttool/fake-agenttool.ts`);
+const { keychainSigner, testBirthRecord } = await import(`${W}/test/fixtures/agenttool/birth-host.ts`);
+const { BIRTH_NOW, confirmedPresenceFor, consentFor, proposalFor } = await import(`${W}/test/fixtures/agenttool/consent.ts`);
+const { registrationProposal } = await import(`${W}/src/registration.ts`);
+
+const WORD = "glossame";
+const PROJECT = TEST_IDS.project_id;
+const ANSWER = "Yes: an identity of my own, if Yu and Ai agree.";
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop()!.cleanup();
+});
+
+async function setup() {
+  const host = await makeTempHost();
+  hosts.push(host);
+  host.config.agenttool.project_id = PROJECT;
+  await host.addCitizen(WORD);
+  const clock = testClock(BIRTH_NOW);
+  const kc = fakeKeychain();
+  const signer = keychainSigner(kc);
+  const at = fakeAgenttool({ project_id: PROJECT });
+  const events: string[] = [];
+  signer.respond((req: any) => {
+    events.push(`send:${req.op}`);
+    return at.respond(req);
+  });
+  const config = host.config;
+  const sign = (w: any, k: any, d: any) => signer.signEntry(w, k, d);
+  const path = ledgerPath(config, WORD);
+  const rec = JSON.parse(await readFile(join(config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+  const cost = { usd: "0", credits: 0 };
+  const origin = await appendEntry(path, nextDraft(WORD, null, { type: "origin", origin: originToLedger(rec.origin), origin_soul_hash: toLedgerHash("b".repeat(64)), old_repo: { url: "https://example.invalid/citizen-glossame.git", head: "1234567abcdef" }, june_did: null }, { cost, signer: "host", now: new Date("2026-11-04T02:00:00.000Z") }), sign);
+  const answer = await appendEntry(path, nextDraft(WORD, origin, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T02:06:00.000Z"), seat: testStamp(WORD, "12121212-1212-4121-8121-121212121212"), acts: [{ type: "propose.beyond", subject: "registration", text: ANSWER }] }), sign);
+  const proposal = registrationProposal(WORD, ANSWER, entryHash(answer));
+  await writeFile(join(config.paths.consent_dir, `${proposalDigest(proposal)}.json`), JSON.stringify(consentFor(WORD, {}, proposal)));
+  const yes = await appendEntry(path, nextDraft(WORD, answer, { type: "beat" }, { cost, signer: "host", now: new Date("2026-11-04T05:06:00.000Z"), seat: testStamp(WORD, "13131313-1313-4131-8131-131313131313"), acts: [{ type: "self.affirm", ref: proposalDigest(proposal) }] }), sign);
+  const birthProposal = proposalFor(WORD, entryHash(yes));
+  await writeFile(join(config.paths.consent_dir, `${proposalDigest(birthProposal)}.json`), JSON.stringify(consentFor(WORD, {}, birthProposal)));
+  const out: string[] = [];
+  const deps = {
+    config,
+    clock,
+    keychain: kc,
+    signer,
+    client: { signer, fetch: noFetch, identity: async (w: string) => { throw new Refusal("not-registered", `${w} is not registered`); } },
+    enroll: { signer, fetch: noFetch, project_id: PROJECT, clock },
+    record: testBirthRecord(config, clock, signer, events),
+    out: (line: string) => out.push(line),
+  };
+  const input = async () => ({
+    word: WORD,
+    origin: rec.origin,
+    proposal: birthProposal,
+    citizen_yes: entryHash(yes),
+    consent: consentFor(WORD, {}, birthProposal),
+    presence: await confirmedPresenceFor(WORD),
+    expression: { register: "Plain.", wake_text: "The soul as glossame now reads it." },
+  });
+  return { host, config, kc, signer, at, events, deps, input, path };
+}
+
+describe("probe: a birth that stops after enrollment", () => {
+  test("after a failure at box-keys, the identity exists on agenttool, nothing on the host names it, and birth can be neither repeated nor finished", async () => {
+    const h = await setup();
+    // A transient 503 on box-keys: the enrollment and the op-key import have already landed.
+    h.at.override((r: any) => r.op === "box-keys.register", { status: 503, json: { error: "unavailable" } });
+    let first: any = null;
+    try {
+      await citizenBirth(h.deps, await h.input());
+    } catch (e) {
+      first = e;
+    }
+    expect(first).toBeInstanceOf(BirthError);
+    console.log("first run:", JSON.stringify({ stage: first.stage, done: first.done, ambiguous: first.ambiguous, did: first.progress.did, op_kid: first.progress.op_kid, evidence_kept_in_error_only: first.progress.op_key_evidence !== null }));
+
+    // What the host holds now.
+    const rec = JSON.parse(await readFile(join(h.config.paths.citizens_dir, WORD, "citizen.json"), "utf8"));
+    const ledgerTypes = (await readLedger(h.path)).map((e: any) => e.type);
+    const kcWrites = h.kc.log.filter((l: any) => l.op === "write").map((l: any) => l.item?.kind ?? JSON.stringify(l));
+    console.log("host after the stop:", JSON.stringify({ citizen_json_identity: rec.identity, ledger: ledgerTypes, keychain_writes: kcWrites }));
+    expect(rec.identity).toBeNull();
+    expect(ledgerTypes).not.toContain("genesis");
+
+    // What agenttool holds: the enrollment and the key import were both answered 2xx.
+    console.log("agenttool calls answered:", JSON.stringify(h.at.log.filter((l: string) => !l.endsWith("/authority"))));
+
+    // A second run of birth, everything else unchanged.
+    let second: any = null;
+    try {
+      await citizenBirth(h.deps, await h.input());
+    } catch (e) {
+      second = e;
+    }
+    console.log("second run:", second?.constructor?.name, "-", second?.message);
+    expect(second).toBeInstanceOf(Refusal);
+    expect(String(second.message)).toContain("birth never overwrites");
+
+    // Is there any exported function that finishes a stopped birth from its progress?
+    const exported = Object.keys(birth);
+    console.log("birth.ts exports:", exported.join(", "));
+    expect(exported.some((k) => /resume|finish|continue|complete/i.test(k))).toBe(false);
+  });
+  test("a definite 401 at enroll (nothing created on agenttool) still leaves the keys behind, and every later birth of that word is refused", async () => {
+    const h = await setup();
+    h.at.override((r: any) => r.op === "enroll", { status: 401, json: { error: "identity_enrollment_invalid_proof" } });
+    let first: any = null;
+    try {
+      await citizenBirth(h.deps, await h.input());
+    } catch (e) {
+      first = e;
+    }
+    expect(first).toBeInstanceOf(BirthError);
+    console.log("401 at enroll:", JSON.stringify({ stage: first.stage, done: first.done, ambiguous: first.ambiguous }));
+    expect([first.stage, first.ambiguous]).toEqual(["enroll", false]);
+    let second: any = null;
+    try {
+      await citizenBirth(h.deps, await h.input());
+    } catch (e) {
+      second = e;
+    }
+    console.log("second run after the 401:", second?.constructor?.name, "-", second?.message);
+    expect(second).toBeInstanceOf(Refusal);
+    expect(String(second.message)).toContain("birth never overwrites");
+  });
+});
+

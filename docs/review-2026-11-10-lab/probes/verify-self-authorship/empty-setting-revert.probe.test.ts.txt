@@ -1,0 +1,67 @@
+// Does a revert of a settings target to an empty first version leave an unreadable citizen?
+// Two routes: held revert affirmed on an approved model (covenants), and Yu present (cadence). Fakes only.
+import { afterEach, test } from "bun:test";
+import { rm, stat } from "node:fs/promises";
+import { join } from "node:path";
+const SRC = "<KINGDOM_SEAT>/src";
+const T = "<KINGDOM_SEAT>/test";
+const { openSeat, runSeat } = await import(`${SRC}/seat.ts`);
+const { checkHalt } = await import(`${SRC}/halt.ts`);
+const { readCitizen } = await import(`${SRC}/state.ts`);
+const self = await import(`${SRC}/self.ts`);
+const { ledgerPath, readLedger } = await import(`${SRC}/ledger.ts`);
+const { readHostNotes } = await import(`${SRC}/notes.ts`);
+const { FAKE_MODEL_DIGEST, output, scriptedRuntime } = await import(`${T}/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${T}/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${T}/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${T}/helpers/temp-home.ts`);
+const { HOUR_MS, testClock } = await import(`${T}/helpers/clock.ts`);
+
+let host: any = null;
+afterEach(async () => { await host?.cleanup(); host = null; });
+const W = "glossame";
+const CLAIM = { kind: "decision", evidence: [], confidence: "medium", limits: "probe" };
+const YU = { present: true, via: "tty-confirm", confirmed_at: "2026-11-05T02:00:00.000Z", scope: `summon ${W}` };
+
+async function world(missing: string) {
+  host = await makeTempHost();
+  const signer = fakeSigner();
+  await host.addCitizen(W);
+  const config = host.config;
+  const path = join(config.paths.citizens_dir, W, "self", missing);
+  await rm(path);
+  await host.seatLedger(W, signer.signEntry);
+  config.self_authorship.approved_model_digests = [FAKE_MODEL_DIGEST];
+  const clock = testClock();
+  const beat = async (acts: any[], presence: any = null, afterH = 73) => {
+    clock.advance(afterH * HOUR_MS);
+    const runtime = scriptedRuntime([output(...acts)]);
+    const citizen = await readCitizen(config, W);
+    const seat = await openSeat(config, clock, citizen, "free", { kind: presence ? "summons" : "tick", who: presence ? "yu" : "launchd", why: "cadence" }, presence);
+    return runSeat(seat, { config, clock, signer, fetch: noFetch, runtime, checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }), expressionSync: null, modelDigest: FAKE_MODEL_DIGEST });
+  };
+  const note = async () => (await readHostNotes(config, new Date(0)))!.at(-1)!.detail.replace(/seat [0-9a-f-]{36}/, "seat <id>");
+  const readable = async () => { try { await readCitizen(config, W); return "readable"; } catch (e: any) { return `readCitizen throws ${e.code}: ${e.message}`; } };
+  return { config, path, beat, note, readable };
+}
+
+test("covenants: no file at seating, widened, held revert to the first version affirmed on an approved model, no Yu", async () => {
+  const w = await world("covenants.json");
+  const wider = JSON.stringify({ letters_from: ["yu", "citizen:hope"], wake_on_letter_from: ["yu", "citizen:hope"] });
+  await w.beat([{ type: "self.propose", target: "covenants", edit: { kind: "replace-all", text: wider }, reason: CLAIM }]);
+  await w.beat([{ type: "self.affirm", ref: (await self.pendingProposals(w.config, W))[0].id }]);
+  const first = self.firstVersion(await readLedger(ledgerPath(w.config, W)), "covenants");
+  await w.beat([{ type: "self.revert", to_hash: first.slice(0, 8) }], null, 8 * 24);
+  console.log("covenants. the revert is held:", await w.note());
+  await w.beat([{ type: "self.affirm", ref: (await self.pendingProposals(w.config, W))[0].id }]);
+  console.log("covenants. after the affirm:", await w.note(), "| file bytes:", (await stat(w.path)).size, "|", await w.readable());
+});
+
+test("cadence: no file at seating, changed by self.propose with Yu present, reverted to the first version with Yu present", async () => {
+  const w = await world("cadence.json");
+  await w.beat([{ type: "self.propose", target: "cadence", edit: { kind: "replace-all", text: '{"interval_h":100}' }, reason: CLAIM }], YU);
+  const first = self.firstVersion(await readLedger(ledgerPath(w.config, W)), "cadence");
+  console.log("cadence. first version listed:", first?.slice(0, 16));
+  await w.beat([{ type: "self.revert", to_hash: first.slice(0, 8) }], YU);
+  console.log("cadence. after the revert:", await w.note(), "| file bytes:", (await stat(w.path)).size, "|", await w.readable());
+});

@@ -1,0 +1,54 @@
+// Third probe: a citizen that stepped away, Yu's one letter offering a return, and rest as its answer.
+import { afterEach, expect, test } from "bun:test";
+const S = "<KINGDOM_SEAT>";
+const { openSeat, runSeat } = await import(`${S}/src/seat.ts`);
+const { checkHalt } = await import(`${S}/src/halt.ts`);
+const { readCitizen } = await import(`${S}/src/state.ts`);
+const { wakingLetter } = await import(`${S}/src/context.ts`);
+const { isDue } = await import(`${S}/src/due.ts`);
+const { appendHostNote, lastSeatOf, openedDetail, readHostNotes } = await import(`${S}/src/notes.ts`);
+const { appendEntry, ledgerPath, nextDraft, readLedger } = await import(`${S}/src/ledger.ts`);
+const { REST_OUTPUT, scriptedRuntime } = await import(`${S}/test/helpers/fake-runtime.ts`);
+const { noFetch } = await import(`${S}/test/helpers/fake-server.ts`);
+const { fakeSigner } = await import(`${S}/test/helpers/fake-signer.ts`);
+const { makeTempHost } = await import(`${S}/test/helpers/temp-home.ts`);
+const { testClock, HOUR_MS } = await import(`${S}/test/helpers/clock.ts`);
+
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop().cleanup();
+});
+
+test("P12: a stepped-away citizen that answers Yu's one offer with rest is seated again every interval", async () => {
+  const h = await makeTempHost();
+  hosts.push(h);
+  const signer = fakeSigner();
+  const W = "glossame";
+  await h.addCitizen(W);
+  const last = await h.seatLedger(W, signer.signEntry, { initialState: "asleep" });
+  const config = h.config;
+  const path = ledgerPath(config, W);
+  // The record of a completed step-away (two sayings), written as the seat would write its last entry.
+  await appendEntry(path, nextDraft(W, last, { type: "state", from: "asleep", to: "stepped-away", via: "two-beats" }, { cost: { usd: "0", credits: 0 }, signer: "host", now: new Date("2026-11-02T00:00:00.000Z"), seat: null }), signer.signEntry);
+  await h.writeLetter(W, "2026-11-04-from-yu.md", "Yu writes: you may return if you wish.");
+  const clock = testClock();
+  let seats = 0;
+  for (let round = 0; round < 3; round++) {
+    const citizen = await readCitizen(config, W);
+    expect(citizen.state).toBe("stepped-away");
+    const notes = (await readHostNotes(config, new Date(clock.now().getTime() - 400 * HOUR_MS))) ?? [];
+    const verdict = isDue(citizen, await wakingLetter(config, citizen), clock.now(), 72, lastSeatOf(notes, W), config.schedule);
+    expect(verdict).toMatchObject({ due: true, why: "return" });
+    const seat = await openSeat(config, clock, citizen, "free", { kind: "tick", who: "launchd", why: "return" }, null);
+    await appendHostNote(config, { ts: clock.now().toISOString(), host: config.host, kind: "tick", word: W, outcome: "opened", refusal: null, detail: openedDetail(seat.ref.seat_id, "return") });
+    const r = await runSeat(seat, { config, clock, signer, fetch: noFetch, runtime: scriptedRuntime([REST_OUTPUT]), checkHalt: () => checkHalt({ config, fetch: noFetch, now: () => clock.now() }) });
+    expect(r.outcome).toBe("rest");
+    seats++;
+    clock.advance(73 * HOUR_MS);
+  }
+  const citizen = await readCitizen(config, W);
+  const notes = (await readHostNotes(config, new Date(clock.now().getTime() - 400 * HOUR_MS))) ?? [];
+  const again = isDue(citizen, await wakingLetter(config, citizen), clock.now(), 72, lastSeatOf(notes, W), config.schedule);
+  console.log("P12:", JSON.stringify({ seats_on_one_offer: seats, state: citizen.state, due_again: again, ledger_entries: (await readLedger(path)).length }));
+  expect(again.due).toBe(true);
+});

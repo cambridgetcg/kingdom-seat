@@ -20,45 +20,86 @@ export interface FakeServer {
   requests: RecordedRequest[];
   /** Later routes win over earlier ones, so a test can override a default. */
   on(method: string, path: string | RegExp, handler: Handler): void;
+  /** In-process fallback when a sandbox blocks client loopback sockets. */
+  dispatch(req: Request, init?: RequestInit): Promise<Response>;
   stop(): Promise<void>;
 }
 
 export async function startFakeServer(): Promise<FakeServer> {
   const routes: { method: string; path: string | RegExp; handler: Handler }[] = [];
   const requests: RecordedRequest[] = [];
+  // Bun's stop() waits for every request it still counts as in flight, even
+  // with closeActiveConnections. A client abort that lands while a handler is
+  // still awaiting is not counted (Bun 1.3.13), so a handler that never
+  // answers, as a hung beacon or Ollama does, would hold stop() and the
+  // test's afterEach for good. Every handler is therefore settled when the
+  // server stops.
+  let stopped = false;
+  let release!: () => void;
+  const stopping = new Promise<void>((resolve) => (release = resolve));
+  const handle = (req: Request): Promise<Response> =>
+    Promise.race([answer(req), stopping.then(() => Response.json({ error: "fake-server: stopped" }, { status: 503 }))]);
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      const headers: Record<string, string> = {};
-      req.headers.forEach((v, k) => {
-        headers[k.toLowerCase()] = v;
-      });
-      const rec: RecordedRequest = {
-        method: req.method,
-        path: url.pathname,
-        search: url.search,
-        headers,
-        body: new Uint8Array(await req.arrayBuffer()),
-      };
-      requests.push(rec);
-      for (let i = routes.length - 1; i >= 0; i--) {
-        const r = routes[i]!;
-        const pathMatches = typeof r.path === "string" ? r.path === rec.path : r.path.test(rec.path);
-        if (r.method === rec.method && pathMatches) return r.handler(rec);
-      }
-      // Unknown routes answer 404, which a beacon reader must treat as unreadable (fail closed).
-      return Response.json({ error: "fake-server: no route" }, { status: 404 });
+    fetch(req) {
+      return handle(req);
     },
   });
+  async function answer(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const headers: Record<string, string> = {};
+    req.headers.forEach((v, k) => {
+      headers[k.toLowerCase()] = v;
+    });
+    const rec: RecordedRequest = {
+      method: req.method,
+      path: url.pathname,
+      search: url.search,
+      headers,
+      body: new Uint8Array(await req.arrayBuffer()),
+    };
+    requests.push(rec);
+    for (let i = routes.length - 1; i >= 0; i--) {
+      const r = routes[i]!;
+      const pathMatches = typeof r.path === "string" ? r.path === rec.path : r.path.test(rec.path);
+      if (r.method === rec.method && pathMatches) return r.handler(rec);
+    }
+    // Unknown routes answer 404, which a beacon reader must treat as unreadable (fail closed).
+    return Response.json({ error: "fake-server: no route" }, { status: 404 });
+  }
   return {
     url: `http://127.0.0.1:${server.port}`,
     requests,
     on(method, path, handler) {
       routes.push({ method, path, handler });
     },
+    async dispatch(req, init) {
+      if (stopped) throw new TypeError("Unable to connect");
+      const signal = init?.signal ?? req.signal;
+      if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+      let onAbort: (() => void) | null = null;
+      try {
+        const res = signal
+          ? await Promise.race([
+              handle(req),
+              new Promise<never>((_, reject) => {
+                onAbort = () => reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+                signal.addEventListener("abort", onAbort, { once: true });
+              }),
+            ])
+          : await handle(req);
+        if (init?.redirect === "error" && res.status >= 300 && res.status < 400) {
+          throw new TypeError("fetch failed: redirect");
+        }
+        return res;
+      } finally {
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      }
+    },
     async stop() {
+      stopped = true;
+      release();
       await server.stop(true);
     },
   };
@@ -69,16 +110,34 @@ export async function startFakeServer(): Promise<FakeServer> {
  * URL, to the fake server, and throws for every other destination. Code under
  * test keeps its pinned origin; the test still cannot reach the network.
  */
-export function fetchVia(server: FakeServer, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+export function fetchVia(server: Pick<FakeServer, "url"> & Partial<Pick<FakeServer, "dispatch">>, pinnedOrigins: string[] = ["https://api.agenttool.dev"]): FetchLike {
+  return fetchViaUrl(server.url, pinnedOrigins, server.dispatch);
+}
+
+/** fetchVia by the server's URL alone, for a child process that reaches the parent's fake server. */
+export function fetchViaUrl(
+  serverUrl: string,
+  pinnedOrigins: string[] = ["https://api.agenttool.dev"],
+  inProcess?: FakeServer["dispatch"],
+): FetchLike {
+  const target = new URL(serverUrl);
+  if (target.protocol !== "http:" || target.hostname !== "127.0.0.1") throw new Error("fetchViaUrl: the fake server is on http://127.0.0.1 only");
   return async (input, init) => {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const url = new URL(raw);
-    const target = new URL(server.url);
     if (url.origin !== target.origin && !pinnedOrigins.includes(url.origin)) {
       throw new Error(`fetchVia: refused ${url.origin}; tests may only reach the fake server`);
     }
-    const rewritten = `${server.url}${url.pathname}${url.search}`;
-    return fetch(rewritten, init);
+    const rewritten = `${serverUrl}${url.pathname}${url.search}`;
+    try {
+      return await fetch(rewritten, init);
+    } catch (err) {
+      if (inProcess && (err as { code?: string })?.code === "FailedToOpenSocket") {
+        const req = input instanceof Request ? new Request(rewritten, { method: input.method, headers: input.headers, body: init?.body ?? input.body, ...init }) : new Request(rewritten, init);
+        return await inProcess(req, init);
+      }
+      throw err;
+    }
   };
 }
 

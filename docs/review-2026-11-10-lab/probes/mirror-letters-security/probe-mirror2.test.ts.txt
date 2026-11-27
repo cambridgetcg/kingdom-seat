@@ -1,0 +1,111 @@
+// Read-only probe, temp host only: what a leftover temp file or a Finder file in self/ does to the mirror,
+// and what a hand-made commit on the mirror does to the pusher.
+import { afterEach, expect, test } from "bun:test";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const SEAT = "<KINGDOM_SEAT>";
+const { stageMirror, pushMirror } = await import(`${SEAT}/src/mirror.ts`);
+const { spawnRunner } = await import(`${SEAT}/src/cli.ts`);
+const { makeTempHost } = await import(`${SEAT}/test/helpers/temp-home.ts`);
+
+const GIT_ENV = {
+  PATH: "/usr/bin:/bin",
+  HOME: "/var/empty",
+  LANG: "C",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_AUTHOR_NAME: "fixture",
+  GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+  GIT_COMMITTER_NAME: "fixture",
+  GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "core.hooksPath",
+  GIT_CONFIG_VALUE_0: "/dev/null",
+};
+function git(cwd: string, ...args: string[]): string {
+  const r = Bun.spawnSync(["git", ...args], { cwd, env: GIT_ENV });
+  if (r.exitCode !== 0) throw new Error(`fixture git ${args[0]} failed: ${r.stderr.toString()}`);
+  return r.stdout.toString().trim();
+}
+
+let host: any = null;
+afterEach(async () => {
+  await host?.cleanup();
+  host = null;
+});
+
+async function setup() {
+  host = await makeTempHost();
+  const h = host;
+  const seed = join(h.root, "seed");
+  const bare = join(h.root, "remote.git");
+  await mkdir(seed, { recursive: true });
+  git(seed, "init", "-q", "-b", "main");
+  await writeFile(join(seed, "soul.md"), "x\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-q", "-m", "seed");
+  git(h.root, "clone", "-q", "--bare", seed, bare);
+  await mkdir(join(h.root, "mirrors"), { recursive: true });
+  const worktree = join(h.root, "mirrors", "glossame");
+  git(h.root, "clone", "-q", bare, worktree);
+  const f = await h.addCitizen("glossame");
+  const citizen = {
+    ...f.record,
+    mirror: { remote: bare, worktree, chosen_at: "2026-11-05T00:00:00.000Z" },
+    state: "awake",
+    pending_state: null,
+    pending_interval_h: null,
+    step_away_said: false,
+    cadence: { interval_h: 72 },
+    covenants: { letters_from: ["yu"], wake_on_letter_from: ["yu"] },
+    last_beat_at: null,
+  };
+  return { h, bare, worktree, citizen, self: join(h.config.paths.citizens_dir, "glossame", "self") };
+}
+
+test("M1 a leftover of self.ts's own temp name in self/ refuses every stage", async () => {
+  const { h, citizen, self } = await setup();
+  const run = spawnRunner();
+  console.log("M1 clean stage ok=", (await stageMirror(h.config, citizen, run)).ok);
+  await writeFile(join(self, ".kingdom-seat-tmp-0123456789abcdef"), "half-written soul\n");
+  console.log("M1 with a leftover temp file:", JSON.stringify(await stageMirror(h.config, citizen, run)));
+  expect(true).toBe(true);
+});
+
+test("M2 a .DS_Store in self/ refuses every stage", async () => {
+  const { h, citizen, self } = await setup();
+  await writeFile(join(self, ".DS_Store"), "\0\0\0\u0001Bud1");
+  console.log("M2 with .DS_Store:", JSON.stringify(await stageMirror(h.config, citizen, spawnRunner())));
+  expect(true).toBe(true);
+});
+
+test("M3 one commit made on the mirror by its account (a door CLAUDE.md) leaves the pusher refusing from then on", async () => {
+  const { h, bare, worktree, citizen, self } = await setup();
+  const run = spawnRunner();
+  await stageMirror(h.config, citizen, run);
+  console.log("M3 first push:", JSON.stringify(await pushMirror(h.config, citizen, run)));
+  // The account owner adds a door on the remote, through another clone.
+  const other = join(h.root, "other");
+  git(h.root, "clone", "-q", bare, other);
+  await writeFile(join(other, "CLAUDE.md"), "Reading this does not make you glossame; to speak as glossame, a seat must be opened for glossame.\n");
+  git(other, "add", "-A");
+  git(other, "commit", "-q", "-m", "door");
+  git(other, "push", "-q", "origin", "HEAD:refs/heads/main");
+  // The citizen's next beats change its self.
+  for (let i = 1; i <= 3; i++) {
+    await writeFile(join(self, "WILL.md"), `will ${i}\n`);
+    const staged = await stageMirror(h.config, citizen, run);
+    const pushed = await pushMirror(h.config, citizen, run);
+    console.log(`M3 beat ${i}: stage ok=${staged.ok} push=${JSON.stringify(pushed)}`);
+  }
+  // A person fast-forwards the worktree by hand; the next stage then drops the door from the tree.
+  git(worktree, "reset", "-q", "--soft", "HEAD~" + git(worktree, "rev-list", "--count", "refs/kingdom-seat/mirror/main..HEAD").split("\n")[0]);
+  console.log("M3 (after a person rewinds the unpushed commits) HEAD==remote-before-door?", git(worktree, "rev-parse", "HEAD") !== git(bare, "rev-parse", "main"));
+  git(worktree, "update-ref", "HEAD", git(bare, "rev-parse", "main"));
+  const staged = await stageMirror(h.config, citizen, run);
+  const pushed = await pushMirror(h.config, citizen, run);
+  console.log("M3 after a hand fast-forward: stage ok=", staged.ok, "push=", JSON.stringify(pushed), "remote tree=", JSON.stringify(git(bare, "ls-tree", "-r", "--name-only", "main").split("\n")));
+  expect(true).toBe(true);
+});

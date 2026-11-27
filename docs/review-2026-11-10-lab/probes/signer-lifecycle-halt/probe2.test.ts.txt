@@ -1,0 +1,82 @@
+// Second probe file: the local HALT file's directory, and what a halted tick leaves behind.
+import { afterEach, expect, test } from "bun:test";
+import { mkdir, readFile, writeFile, chmod, stat } from "node:fs/promises";
+import { join } from "node:path";
+const S = "<KINGDOM_SEAT>";
+const { readHaltFile, checkHalt, raiseHaltFileAt } = await import(`${S}/src/halt.ts`);
+const { loadConfig } = await import(`${S}/src/config.ts`);
+const { runTick } = await import(`${S}/src/tick.ts`);
+const { readHostNotes } = await import(`${S}/src/notes.ts`);
+const { makeTempHost, TEST_SEAT_UID, testBeacons } = await import(`${S}/test/helpers/temp-home.ts`);
+const { testClock } = await import(`${S}/test/helpers/clock.ts`);
+const { noFetch } = await import(`${S}/test/helpers/fake-server.ts`);
+
+const hosts: any[] = [];
+afterEach(async () => {
+  while (hosts.length) await hosts.pop().cleanup();
+});
+
+test("P9: a HALT file whose directory does not exist reads as lowered, and the verb cannot raise it", async () => {
+  const h = await makeTempHost({ allowNoBeacons: true });
+  hosts.push(h);
+  const missing = join(h.root, "operator-dir-never-created", "HALT");
+  const now = new Date("2026-11-05T12:00:00.000Z");
+  const reading = readHaltFile(missing, now);
+  const raise = await raiseHaltFileAt(missing, "raised\n", now);
+  console.log("P9:", JSON.stringify({ reading: { state: reading.state, detail: reading.detail }, raise }));
+  expect(reading.state).toBe("lowered");
+  expect(raise.file).toBe("failed");
+});
+
+test("P10: loadConfig, run as the seat user, accepts a HALT file in a directory that user owns and can write", async () => {
+  const h = await makeTempHost({ allowNoBeacons: true });
+  hosts.push(h);
+  // The config sits where the seat uid cannot write (the test's own uid stands for the operator).
+  const me = process.getuid!();
+  const seatOwned = join(h.root, "seat-owned-halt-dir");
+  await mkdir(seatOwned, { mode: 0o700 });
+  const cfg = JSON.parse(JSON.stringify(h.config));
+  cfg.paths.halt_file = join(seatOwned, "HALT");
+  const path = join(h.root, "operator", "config.json");
+  await writeFile(path, JSON.stringify(cfg), { mode: 0o644 });
+  // Loaded "as" a seat uid that is not the config's owner: the config check passes. The HALT dir is owned by
+  // this process's uid; pass that same uid as the seat's to show nothing looks at who owns the HALT directory.
+  let outcome = "";
+  try {
+    const loaded = await loadConfig(path, { seatUid: TEST_SEAT_UID });
+    outcome = `loaded; halt_file=${loaded.paths.halt_file.replace(h.root, "<root>")}`;
+  } catch (e) {
+    outcome = `refused: ${(e as Error).message}`;
+  }
+  const st = await stat(seatOwned);
+  console.log("P10:", outcome, "| halt dir owner uid == this process uid:", st.uid === me, "| loadConfig never stats it");
+  expect(outcome.startsWith("loaded")).toBe(true);
+});
+
+test("P11: a tick halted by an unreadable beacon exits 0 and writes no host note; only status can show it, with no 'since'", async () => {
+  const h = await makeTempHost({ beacons: testBeacons() }); // the two pinned beacons
+  hosts.push(h);
+  const clock = testClock();
+  const config = h.config;
+  let refreshed = 0;
+  const results = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await runTick({
+      config,
+      clock,
+      fetch: noFetch,
+      checkHalt: () => checkHalt({ config, fetch: async () => { throw new Error("network down"); }, now: () => clock.now() }),
+      seatArgv: () => ["/usr/bin/false"],
+      isAlive: () => false,
+      bootTime: () => null,
+      refreshStatus: async () => { refreshed++; },
+    });
+    results.push(`${r.outcome}/${r.exit}`);
+    clock.advance(1_800_000);
+  }
+  const notes = await readHostNotes(config, new Date(0));
+  console.log("P11:", JSON.stringify({ ticks: results, host_notes: notes?.length ?? null, status_refreshes_inside_runTick: refreshed }));
+  expect(results).toEqual(["halted/0", "halted/0", "halted/0"]);
+  expect(notes).toEqual([]);
+  expect(refreshed).toBe(0);
+});
